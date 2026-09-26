@@ -1,11 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { Buffer } from 'node:buffer';
-import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
-import { basename, dirname, join } from 'node:path';
-import type { Chat, ChatKind, ChatPatch, Project, ProjectPatch, Settings, SettingsPatch, Theme } from './contracts';
+import { constants } from 'node:fs';
+import { copyFile, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { basename, dirname, extname, join } from 'node:path';
+import type { ChatArtifact, ChatDetail, ChatKind, ChatMessage, ChatPatch, ChatSummary, Project, ProjectPatch, Settings, SettingsPatch, Theme } from './contracts';
 
 type ProjectFile = { schemaVersion: 2; projects: Project[] };
-type ChatFile = { schemaVersion: 2; chats: Chat[] };
+type LegacyChat = ChatSummary & { draft: string };
+type ChatFile = { schemaVersion: 2; chats: LegacyChat[] };
 type SettingsFile = { schemaVersion: 3; settings: Settings };
 
 export interface LocalStore {
@@ -13,9 +15,14 @@ export interface LocalStore {
   createProject(name: unknown): Promise<Project>;
   updateProject(id: unknown, patch: unknown): Promise<Project>;
   deleteProject(id: unknown): Promise<void>;
-  listChats(): Promise<Chat[]>;
-  createChat(projectId?: unknown, kind?: unknown): Promise<Chat>;
-  updateChat(id: unknown, patch: unknown): Promise<Chat>;
+  listChats(): Promise<ChatSummary[]>;
+  getChat(id: unknown): Promise<ChatDetail>;
+  createChat(projectId?: unknown, kind?: unknown): Promise<ChatSummary>;
+  updateChat(id: unknown, patch: unknown): Promise<ChatSummary>;
+  appendLocalMessage(id: unknown, text: unknown): Promise<ChatDetail>;
+  importFile(id: unknown, sourcePath: string, projectId?: unknown): Promise<ChatDetail>;
+  getArtifactPath(id: unknown, artifactId: unknown): Promise<string>;
+  getChatFolder(id: unknown): Promise<string>;
   deleteChat(id: unknown): Promise<void>;
   getSettings(): Promise<Settings>;
   updateSettings(patch: unknown): Promise<Settings>;
@@ -83,7 +90,7 @@ function validateProject(value: unknown, version: 1 | 2): Project {
   };
 }
 
-function validateChat(value: unknown, version: 1 | 2): Chat {
+function validateChat(value: unknown, version: 1 | 2): LegacyChat {
   if (!isRecord(value)) throw new Error('Chat record is invalid.');
   if (value.projectId !== null && value.projectId !== undefined && typeof value.projectId !== 'string') {
     throw new Error('Некорректный проект чата.');
@@ -144,7 +151,7 @@ function validateRows<T>(
     throw new Error(`Invalid ${key} file.`);
   }
   const rows = (value[key] as unknown[]).map((row) => validate(row, version));
-  const ids = rows.map((row) => (row as Project | Chat).id);
+  const ids = rows.map((row) => (row as Project | LegacyChat).id);
   if (new Set(ids).size !== ids.length) throw new Error(`Duplicate ID in ${key} file.`);
   return rows;
 }
@@ -223,6 +230,48 @@ function parseChatFile(value: unknown): Loaded<ChatFile> {
     value: { schemaVersion: 2, chats: validateRows(value, 'chats', 2, validateChat) },
     needsWrite: false,
   };
+}
+
+function validateChatDetail(value: unknown): ChatDetail {
+  if (!isRecord(value) || value.schemaVersion !== 3 || !Array.isArray(value.messages) || !Array.isArray(value.artifacts)) {
+    throw new Error('Invalid chat detail.');
+  }
+  const chat = validateChat(value, 2);
+  const messages: ChatMessage[] = value.messages.map((entry: unknown) => {
+    if (!isRecord(entry) || (entry.role !== 'user' && entry.role !== 'assistant') || typeof entry.text !== 'string') {
+      throw new Error('Invalid chat message.');
+    }
+    return { id: requireId(entry.id), role: entry.role, text: entry.text, createdAt: requireTimestamp(entry.createdAt) };
+  });
+  const artifacts: ChatArtifact[] = value.artifacts.map((entry: unknown) => {
+    if (!isRecord(entry) || typeof entry.name !== 'string' || !entry.name.trim() || entry.name.length > 255
+      || typeof entry.storedName !== 'string' || !/^[A-Za-z0-9_-]{1,128}(\.[A-Za-z0-9]{1,12})?$/.test(entry.storedName)
+      || !Number.isSafeInteger(entry.size) || (entry.size as number) < 0
+      || (entry.messageId !== null && typeof entry.messageId !== 'string')) {
+      throw new Error('Invalid chat artifact.');
+    }
+    return {
+      id: requireId(entry.id), name: entry.name, storedName: entry.storedName, size: entry.size as number,
+      createdAt: requireTimestamp(entry.createdAt), messageId: entry.messageId === null ? null : requireId(entry.messageId),
+    };
+  });
+  if (new Set(messages.map((message) => message.id)).size !== messages.length
+    || new Set(artifacts.map((artifact) => artifact.id)).size !== artifacts.length
+    || artifacts.some((artifact) => artifact.messageId && !messages.some((message) => message.id === artifact.messageId))) {
+    throw new Error('Duplicate or unbound chat resource.');
+  }
+  return { ...chat, messages, artifacts };
+}
+
+function summary(chat: ChatDetail): ChatSummary {
+  return {
+    id: chat.id, title: chat.title, projectId: chat.projectId, pinned: chat.pinned,
+    archived: chat.archived, createdAt: chat.createdAt, updatedAt: chat.updatedAt, kind: chat.kind,
+  };
+}
+
+function detailFile(chat: ChatDetail): Record<string, unknown> {
+  return { schemaVersion: 3, ...chat };
 }
 
 function parseSettingsFile(value: unknown): Loaded<SettingsFile> {
@@ -311,12 +360,13 @@ export async function openStore(directory: string): Promise<LocalStore> {
   await mkdir(directory, { recursive: true });
   const projectPath = join(directory, 'projects.json');
   const chatPath = join(directory, 'chats.json');
+  const chatsDirectory = join(directory, 'chats');
+  const migrationMarker = join(directory, 'chats.migrated');
   const settingsPath = join(directory, 'settings.json');
 
   // Parse every existing file before creating or migrating any of them.
-  const [projectFile, chatFile, settingsFile] = await Promise.all([
+  const [projectFile, settingsFile] = await Promise.all([
     loadVersioned<ProjectFile>(projectPath, { schemaVersion: 2, projects: [] }, parseProjectFile),
-    loadVersioned<ChatFile>(chatPath, { schemaVersion: 2, chats: [] }, parseChatFile),
     loadVersioned<SettingsFile>(settingsPath, {
       schemaVersion: 3,
       settings: {
@@ -329,12 +379,59 @@ export async function openStore(directory: string): Promise<LocalStore> {
     }, parseSettingsFile),
   ]);
 
+  const migrated = await readFile(migrationMarker, 'utf8').then(() => true, (error: unknown) => {
+    if (isMissingFile(error)) return false;
+    throw error;
+  });
+  const legacyContents = migrated ? null : await readFile(chatPath, 'utf8').catch((error: unknown) => {
+    if (isMissingFile(error)) return null;
+    throw error;
+  });
+  let legacyChats: LegacyChat[] = [];
+  if (legacyContents !== null) {
+    try { legacyChats = parseChatFile(JSON.parse(legacyContents) as unknown).value.chats; }
+    catch { throw storageError(chatPath); }
+  }
+  const entries = await readdir(chatsDirectory, { withFileTypes: true }).catch((error: unknown) => {
+    if (isMissingFile(error)) return [];
+    throw error;
+  });
+  const loadedChats: ChatDetail[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const detailPath = join(chatsDirectory, entry.name, 'chat.json');
+    let contents: string;
+    try { contents = await readFile(detailPath, 'utf8'); }
+    catch (error) {
+      if (!migrated && legacyChats.some((chat) => chat.id === entry.name) && isMissingFile(error)) continue;
+      throw storageError(detailPath);
+    }
+    try {
+      const detail = validateChatDetail(JSON.parse(contents) as unknown);
+      if (detail.id !== entry.name) throw new Error('Chat ID mismatch.');
+      loadedChats.push(detail);
+    } catch { throw storageError(detailPath); }
+  }
+
+  if (!migrated) {
+    if (legacyContents !== null) {
+      await copyFile(chatPath, join(directory, 'chats.json.bak'), constants.COPYFILE_EXCL)
+        .catch((error: unknown) => { if (!isRecord(error) || error.code !== 'EEXIST') throw error; });
+    }
+    for (const legacy of legacyChats) {
+      if (loadedChats.some((chat) => chat.id === legacy.id)) continue;
+      const detail: ChatDetail = { ...legacy, messages: [], artifacts: [] };
+      await writeAtomic(join(chatsDirectory, legacy.id, 'chat.json'), detailFile(detail));
+      loadedChats.push(detail);
+    }
+    await writeTextAtomic(migrationMarker, '3\n');
+  }
+
   if (projectFile.needsWrite) await writeAtomic(projectPath, projectFile.value);
-  if (chatFile.needsWrite) await writeAtomic(chatPath, chatFile.value);
   if (settingsFile.needsWrite) await writeAtomic(settingsPath, settingsFile.value);
 
   let projects = projectFile.value.projects;
-  let chats = chatFile.value.chats;
+  let chats = loadedChats;
   let settings = settingsFile.value.settings;
   let writeQueue: Promise<void> = Promise.resolve();
 
@@ -347,9 +444,27 @@ export async function openStore(directory: string): Promise<LocalStore> {
     await writeAtomic(projectPath, { schemaVersion: 2, projects: next });
     projects = next;
   };
-  const saveChats = async (next: Chat[]): Promise<void> => {
-    await writeAtomic(chatPath, { schemaVersion: 2, chats: next });
-    chats = next;
+  const chatFolder = (id: string): string => join(chatsDirectory, id);
+  const saveChat = async (chat: ChatDetail): Promise<void> => {
+    await writeAtomic(join(chatFolder(chat.id), 'chat.json'), detailFile(chat));
+    chats = chats.some((item) => item.id === chat.id)
+      ? chats.map((item) => item.id === chat.id ? chat : item)
+      : [...chats, chat];
+  };
+  const findChat = (idInput: unknown): ChatDetail => {
+    const chat = chats.find((item) => item.id === requireId(idInput));
+    if (!chat) throw new Error('Чат не найден.');
+    return chat;
+  };
+  const createStoredChat = async (projectId: string | null, kind: ChatKind): Promise<ChatDetail> => {
+    const now = new Date().toISOString();
+    const chat: ChatDetail = {
+      id: randomUUID(), title: kind === 'image' ? 'Новое изображение' : 'Новый чат', projectId,
+      pinned: false, archived: false, createdAt: now, updatedAt: now, draft: '', kind,
+      messages: [], artifacts: [],
+    };
+    await saveChat(chat);
+    return chat;
   };
   const saveSettings = async (next: Settings): Promise<void> => {
     await writeAtomic(settingsPath, { schemaVersion: 3, settings: next });
@@ -390,13 +505,13 @@ export async function openStore(directory: string): Promise<LocalStore> {
       const id = requireId(idInput);
       if (!projects.some((project) => project.id === id)) throw new Error('Проект не найден.');
       const now = new Date().toISOString();
-      const nextChats = chats.map((chat) => chat.projectId === id
-        ? { ...chat, projectId: null, updatedAt: now }
-        : chat);
-      if (nextChats.some((chat, index) => chat !== chats[index])) await saveChats(nextChats);
+      for (const chat of chats.filter((item) => item.projectId === id)) {
+        await saveChat({ ...chat, projectId: null, updatedAt: now });
+      }
       await saveProjects(projects.filter((project) => project.id !== id));
     }),
-    listChats: () => serialize(async () => chats.map((chat) => ({ ...chat }))),
+    listChats: () => serialize(async () => chats.map(summary)),
+    getChat: (id) => serialize(async () => structuredClone(findChat(id))),
     createChat: (projectIdInput = null, kindInput = 'text') => serialize(async () => {
       const projectId = projectIdInput === null || projectIdInput === undefined
         ? null
@@ -405,20 +520,7 @@ export async function openStore(directory: string): Promise<LocalStore> {
       if (projectId && !projects.some((project) => project.id === projectId && !project.archived)) {
         throw new Error('Выбранный проект недоступен.');
       }
-      const now = new Date().toISOString();
-      const chat: Chat = {
-        id: randomUUID(),
-        title: kindInput === 'image' ? 'Новое изображение' : 'Новый чат',
-        projectId,
-        pinned: false,
-        archived: false,
-        createdAt: now,
-        updatedAt: now,
-        draft: '',
-        kind: kindInput as ChatKind,
-      };
-      await saveChats([...chats, chat]);
-      return { ...chat };
+      return summary(await createStoredChat(projectId, kindInput as ChatKind));
     }),
     updateChat: (idInput, patchInput) => serialize(async () => {
       const id = requireId(idInput);
@@ -426,16 +528,67 @@ export async function openStore(directory: string): Promise<LocalStore> {
       if (patch.projectId && !projects.some((project) => project.id === patch.projectId && !project.archived)) {
         throw new Error('Выбранный проект недоступен.');
       }
-      const chat = chats.find((item) => item.id === id);
-      if (!chat) throw new Error('Чат не найден.');
+      const chat = findChat(id);
       const updated = { ...chat, ...patch, updatedAt: new Date().toISOString() };
-      await saveChats(chats.map((item) => item.id === id ? updated : item));
-      return { ...updated };
+      await saveChat(updated);
+      return summary(updated);
     }),
+    appendLocalMessage: (id, textInput) => serialize(async () => {
+      const chat = findChat(id);
+      if (typeof textInput !== 'string' || !textInput.trim() || textInput.length > 100_000) {
+        throw new Error('Сообщение должно содержать от 1 до 100 000 символов.');
+      }
+      const now = new Date().toISOString();
+      const message: ChatMessage = { id: randomUUID(), role: 'user', text: textInput.trim(), createdAt: now };
+      const updated = { ...chat, draft: '', updatedAt: now, messages: [...chat.messages, message] };
+      await saveChat(updated);
+      return structuredClone(updated);
+    }),
+    importFile: (idInput, sourcePath, projectIdInput = null) => serialize(async () => {
+      if (typeof sourcePath !== 'string' || !sourcePath || sourcePath.includes('\0')) throw new Error('Файл не выбран.');
+      const source = await stat(sourcePath);
+      if (!source.isFile()) throw new Error('Выбранный путь не является файлом.');
+      if (!Number.isSafeInteger(source.size)) throw new Error('Размер файла недоступен.');
+      const existing = idInput === null ? null : findChat(idInput);
+      const projectId = projectIdInput === null ? null : requireId(projectIdInput);
+      if (!existing && projectId && !projects.some((project) => project.id === projectId && !project.archived)) {
+        throw new Error('Выбранный проект недоступен.');
+      }
+      const chat = existing ?? await createStoredChat(projectId, 'text');
+      const id = randomUUID();
+      const extension = extname(sourcePath).match(/^\.[A-Za-z0-9]{1,12}$/)?.[0].toLowerCase() ?? '';
+      const storedName = `${id}${extension}`;
+      const target = join(chatFolder(chat.id), 'files', storedName);
+      await mkdir(dirname(target), { recursive: true });
+      try {
+        await copyFile(sourcePath, target, constants.COPYFILE_EXCL);
+        const now = new Date().toISOString();
+        const artifact: ChatArtifact = {
+          id, name: basename(sourcePath), storedName, size: source.size, createdAt: now, messageId: null,
+        };
+        const updated = { ...chat, updatedAt: now, artifacts: [...chat.artifacts, artifact] };
+        await saveChat(updated);
+        return structuredClone(updated);
+      } catch (error) {
+        await unlink(target).catch(() => undefined);
+        if (!existing) {
+          chats = chats.filter((item) => item.id !== chat.id);
+          await rm(chatFolder(chat.id), { recursive: true, force: true }).catch(() => undefined);
+        }
+        throw error;
+      }
+    }),
+    getArtifactPath: (id, artifactId) => serialize(async () => {
+      const chat = findChat(id);
+      const artifact = chat.artifacts.find((item) => item.id === requireId(artifactId));
+      if (!artifact) throw new Error('Файл чата не найден.');
+      return join(chatFolder(chat.id), 'files', artifact.storedName);
+    }),
+    getChatFolder: (id) => serialize(async () => chatFolder(findChat(id).id)),
     deleteChat: (idInput) => serialize(async () => {
-      const id = requireId(idInput);
-      if (!chats.some((chat) => chat.id === id)) throw new Error('Чат не найден.');
-      await saveChats(chats.filter((chat) => chat.id !== id));
+      const chat = findChat(idInput);
+      await rm(chatFolder(chat.id), { recursive: true });
+      chats = chats.filter((item) => item.id !== chat.id);
     }),
     getSettings: () => serialize(async () => ({ ...settings })),
     updateSettings: (patchInput) => serialize(async () => {

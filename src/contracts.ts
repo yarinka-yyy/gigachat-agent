@@ -12,7 +12,7 @@ export interface Project {
   workingFolder: string | null;
 }
 
-export interface Chat {
+export interface ChatSummary {
   id: string;
   title: string;
   projectId: string | null;
@@ -20,12 +20,33 @@ export interface Chat {
   archived: boolean;
   createdAt: string;
   updatedAt: string;
-  draft: string;
   kind: ChatKind;
 }
 
+export interface ChatMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  text: string;
+  createdAt: string;
+}
+
+export interface ChatArtifact {
+  id: string;
+  name: string;
+  storedName: string;
+  size: number;
+  createdAt: string;
+  messageId: string | null;
+}
+
+export interface ChatDetail extends ChatSummary {
+  draft: string;
+  messages: ChatMessage[];
+  artifacts: ChatArtifact[];
+}
+
 export type ProjectPatch = Partial<Pick<Project, 'name' | 'pinned' | 'archived' | 'workingFolder'>>;
-export type ChatPatch = Partial<Pick<Chat, 'title' | 'projectId' | 'pinned' | 'archived' | 'draft'>>;
+export type ChatPatch = Partial<Pick<ChatDetail, 'title' | 'projectId' | 'pinned' | 'archived' | 'draft'>>;
 
 export interface Settings {
   theme: Theme;
@@ -61,9 +82,14 @@ export interface AppApi {
     saveInstructions(id: string, contents: string): Promise<void>;
   };
   chats: {
-    list(): Promise<Chat[]>;
-    create(projectId?: string | null, kind?: ChatKind): Promise<Chat>;
-    update(id: string, patch: ChatPatch): Promise<Chat>;
+    list(): Promise<ChatSummary[]>;
+    get(id: string): Promise<ChatDetail>;
+    create(projectId?: string | null, kind?: ChatKind): Promise<ChatSummary>;
+    update(id: string, patch: ChatPatch): Promise<ChatSummary>;
+    appendLocalMessage(id: string, text: string): Promise<ChatDetail>;
+    importFile(id: string | null, projectId?: string | null): Promise<ChatDetail | null>;
+    openArtifact(id: string, artifactId: string): Promise<void>;
+    openFolder(id: string): Promise<void>;
     remove(id: string): Promise<void>;
   };
   settings: {

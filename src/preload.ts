@@ -2,7 +2,8 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type {
   AppApi,
   AppInfo,
-  Chat,
+  ChatDetail,
+  ChatSummary,
   ChatKind,
   FolderOpener,
   Project,
@@ -22,10 +23,15 @@ const api: AppApi = {
     saveInstructions: (id, contents) => ipcRenderer.invoke('projects:save-instructions', id, contents) as Promise<void>,
   },
   chats: {
-    list: () => ipcRenderer.invoke('chats:list') as Promise<Chat[]>,
+    list: () => ipcRenderer.invoke('chats:list') as Promise<ChatSummary[]>,
+    get: (id) => ipcRenderer.invoke('chats:get', id) as Promise<ChatDetail>,
     create: (projectId = null, kind: ChatKind = 'text') =>
-      ipcRenderer.invoke('chats:create', projectId, kind) as Promise<Chat>,
-    update: (id, patch) => ipcRenderer.invoke('chats:update', id, patch) as Promise<Chat>,
+      ipcRenderer.invoke('chats:create', projectId, kind) as Promise<ChatSummary>,
+    update: (id, patch) => ipcRenderer.invoke('chats:update', id, patch) as Promise<ChatSummary>,
+    appendLocalMessage: (id, text) => ipcRenderer.invoke('chats:append-local-message', id, text) as Promise<ChatDetail>,
+    importFile: (id, projectId) => ipcRenderer.invoke('chats:import-file', id, projectId) as Promise<ChatDetail | null>,
+    openArtifact: (id, artifactId) => ipcRenderer.invoke('chats:open-artifact', id, artifactId) as Promise<void>,
+    openFolder: (id) => ipcRenderer.invoke('chats:open-folder', id) as Promise<void>,
     remove: (id) => ipcRenderer.invoke('chats:delete', id) as Promise<void>,
   },
   settings: {

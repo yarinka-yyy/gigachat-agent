@@ -190,8 +190,26 @@ async function registerIpcHandlers(store: LocalStore): Promise<void> {
   handle('projects:save-instructions', (id, contents) => store.saveProjectInstructions(requireId(id), contents));
 
   handle('chats:list', () => store.listChats());
+  handle('chats:get', (id) => store.getChat(id));
   handle('chats:create', (projectId, kind) => store.createChat(projectId, kind));
   handle('chats:update', (id, patch) => store.updateChat(id, patch));
+  handle('chats:append-local-message', (id, text) => store.appendLocalMessage(id, text));
+  handle('chats:import-file', async (id, projectId) => {
+    const options = { properties: ['openFile'] as Array<'openFile'> };
+    const selected = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);
+    if (selected.canceled || !selected.filePaths[0]) return null;
+    return store.importFile(id, selected.filePaths[0], projectId);
+  });
+  handle('chats:open-artifact', async (id, artifactId) => {
+    const path = await store.getArtifactPath(id, artifactId);
+    if (!(await stat(path).catch(() => null))?.isFile()) throw new Error('Копия файла не найдена.');
+    const error = await shell.openPath(path);
+    if (error) throw new Error(`Не удалось открыть файл: ${error}`);
+  });
+  handle('chats:open-folder', async (id) => {
+    const settings = await store.getSettings();
+    await openDirectory(await store.getChatFolder(id), settings.preferredOpener);
+  });
   handle('chats:delete', (id) => store.deleteChat(id));
 
   handle('settings:get', () => store.getSettings());
@@ -248,11 +266,12 @@ const createWindow = (): void => {
   const { width: displayWidth, height: displayHeight } = screen.getPrimaryDisplay().workAreaSize;
   const icon = join(app.isPackaged ? process.resourcesPath : app.getAppPath(),
     app.isPackaged ? 'gigachat-icon.ico' : 'src/assets/gigachat-icon.ico');
+  const initialZoomFactor = 0.8;
   allowClose = false;
   const window = new BrowserWindow({
     height: Math.min(720, displayHeight),
-    minHeight: Math.min(620, displayHeight),
-    minWidth: Math.min(850, displayWidth),
+    minHeight: Math.min(480, displayHeight),
+    minWidth: Math.min(560, displayWidth),
     icon,
     show: false,
     title: 'GigaChat Agents',
@@ -266,7 +285,7 @@ const createWindow = (): void => {
       nodeIntegration: false,
       sandbox: true,
       preload: MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY,
-      zoomFactor: 1,
+      zoomFactor: initialZoomFactor,
     },
   });
   mainWindow = window;
@@ -291,7 +310,7 @@ const createWindow = (): void => {
     if (navigationUrl !== entryUrl.href) event.preventDefault();
   });
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-  window.webContents.once('did-finish-load', () => window.webContents.setZoomFactor(1));
+  window.webContents.once('did-finish-load', () => window.webContents.setZoomFactor(initialZoomFactor));
   window.once('ready-to-show', () => window.show());
   window.on('close', (event) => {
     if (allowClose || window.webContents.isDestroyed() || window.webContents.isLoadingMainFrame()) return;

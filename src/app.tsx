@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import {
   Archive,
   ArrowLeft,
@@ -49,7 +49,8 @@ import {
 } from 'lucide-react';
 import type {
   AppInfo,
-  Chat,
+  ChatDetail,
+  ChatSummary,
   ChatKind,
   ChatPatch,
   FolderOpener,
@@ -165,7 +166,7 @@ function Icon({ name, className = '' }: { name: IconName; className?: string }) 
   return <Component className={className ? `icon ${className}` : 'icon'} aria-hidden="true" focusable="false" strokeWidth={1.8} />;
 }
 
-function ActionMenu({ children, label, trigger, className = '' }: { children: ReactNode; label: string; trigger?: ReactNode; className?: string }) {
+function ActionMenu({ children, label, trigger, className = '', placement = 'side' }: { children: ReactNode; label: string; trigger?: ReactNode; className?: string; placement?: 'side' | 'below' }) {
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
@@ -177,11 +178,14 @@ function ActionMenu({ children, label, trigger, className = '' }: { children: Re
     const anchor = trigger.getBoundingClientRect();
     const gap = 5;
     const edge = 8;
-    const left = Math.max(edge, Math.min(anchor.right - popup.offsetWidth, window.innerWidth - popup.offsetWidth - edge));
+    const desiredLeft = placement === 'side'
+      ? (anchor.right + gap + popup.offsetWidth + edge <= window.innerWidth ? anchor.right + gap : anchor.left - popup.offsetWidth - gap)
+      : anchor.right - popup.offsetWidth;
+    const left = Math.max(edge, Math.min(desiredLeft, window.innerWidth - popup.offsetWidth - edge));
     const below = window.innerHeight - anchor.bottom;
     const above = anchor.top;
-    const placeAbove = below < popup.offsetHeight + gap + edge && above > below;
-    const desiredTop = placeAbove ? anchor.top - popup.offsetHeight - gap : anchor.bottom + gap;
+    const placeAbove = placement === 'below' && below < popup.offsetHeight + gap + edge && above > below;
+    const desiredTop = placement === 'side' ? anchor.top : placeAbove ? anchor.top - popup.offsetHeight - gap : anchor.bottom + gap;
     const top = Math.max(edge, Math.min(desiredTop, window.innerHeight - popup.offsetHeight - edge));
     popup.style.left = `${left}px`;
     popup.style.top = `${top}px`;
@@ -190,7 +194,10 @@ function ActionMenu({ children, label, trigger, className = '' }: { children: Re
   useEffect(() => {
     if (!open) return;
     const onResize = () => positionPopup();
-    const onScroll = () => popupRef.current?.hidePopover();
+    const onScroll = (event: Event) => {
+      if (event.target instanceof Node && popupRef.current?.contains(event.target)) return;
+      popupRef.current?.hidePopover();
+    };
     const observer = new ResizeObserver(positionPopup);
     if (popupRef.current) observer.observe(popupRef.current);
     window.addEventListener('resize', onResize);
@@ -214,9 +221,116 @@ function ActionMenu({ children, label, trigger, className = '' }: { children: Re
           positionPopup();
         }
       }}>{trigger ?? <MoreHorizontal className="icon" aria-hidden="true" />}</button>
-      <div ref={popupRef} popover="auto" className="action-menu-content" onToggle={() => setOpen(popupRef.current?.matches(':popover-open') ?? false)} onClick={(event) => {
-        if (event.target instanceof Element && event.target.closest('button')) popupRef.current?.hidePopover();
+      <div ref={popupRef} popover="auto" className="action-menu-content" onToggle={() => {
+        const isOpen = popupRef.current?.matches(':popover-open') ?? false;
+        if (!isOpen) popupRef.current?.querySelectorAll<HTMLDivElement>('.submenu-content:popover-open').forEach((submenu) => submenu.hidePopover());
+        setOpen(isOpen);
+      }} onClick={(event) => {
+        const button = event.target instanceof Element ? event.target.closest('button') : null;
+        if (button && !button.classList.contains('submenu-trigger')) popupRef.current?.hidePopover();
       }}>{children}</div>
+    </div>
+  );
+}
+
+function ProjectSubmenu({ chat, projects, onSelect }: { chat: ChatSummary; projects: Project[]; onSelect: (projectId: string) => void }) {
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const popupRef = useRef<HTMLDivElement>(null);
+  const openTimer = useRef<number | null>(null);
+  const closeTimer = useRef<number | null>(null);
+  const [open, setOpen] = useState(false);
+  const popupId = useId();
+
+  function cancelOpen(): void {
+    if (openTimer.current !== null) window.clearTimeout(openTimer.current);
+    openTimer.current = null;
+  }
+
+  function cancelClose(): void {
+    if (closeTimer.current !== null) window.clearTimeout(closeTimer.current);
+    closeTimer.current = null;
+  }
+
+  function positionPopup(): void {
+    const trigger = triggerRef.current;
+    const popup = popupRef.current;
+    if (!trigger || !popup) return;
+    const anchor = trigger.getBoundingClientRect();
+    const gap = 6;
+    const edge = 8;
+    const rightSpace = window.innerWidth - anchor.right - gap - edge;
+    const leftSpace = anchor.left - gap - edge;
+    const desiredLeft = rightSpace < popup.offsetWidth && leftSpace > rightSpace
+      ? anchor.left - popup.offsetWidth - gap : anchor.right + gap;
+    popup.style.left = `${Math.max(edge, Math.min(desiredLeft, window.innerWidth - popup.offsetWidth - edge))}px`;
+    popup.style.top = `${Math.max(edge, Math.min(anchor.top, window.innerHeight - popup.offsetHeight - edge))}px`;
+  }
+
+  function showPopup(focusFirst = false): void {
+    cancelOpen();
+    cancelClose();
+    const popup = popupRef.current;
+    if (!popup) return;
+    if (!popup.matches(':popover-open')) popup.showPopover();
+    positionPopup();
+    if (focusFirst) popup.querySelector('button')?.focus();
+  }
+
+  function hidePopup(): void {
+    cancelOpen();
+    cancelClose();
+    if (popupRef.current?.matches(':popover-open')) popupRef.current.hidePopover();
+  }
+
+  function scheduleClose(): void {
+    cancelOpen();
+    cancelClose();
+    closeTimer.current = window.setTimeout(hidePopup, 180);
+  }
+
+  useEffect(() => {
+    const parent = triggerRef.current?.closest('.action-menu-content');
+    const onParentToggle = () => { if (!parent?.matches(':popover-open')) hidePopup(); };
+    parent?.addEventListener('toggle', onParentToggle);
+    return () => {
+      cancelOpen();
+      cancelClose();
+      parent?.removeEventListener('toggle', onParentToggle);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    window.addEventListener('resize', positionPopup);
+    return () => window.removeEventListener('resize', positionPopup);
+  }, [open]);
+
+  return (
+    <div className="submenu" onPointerEnter={cancelClose} onPointerLeave={scheduleClose}>
+      <button ref={triggerRef} type="button" className="submenu-trigger" aria-expanded={open} aria-controls={popupId}
+        onPointerEnter={(event) => {
+          if (event.pointerType === 'touch' || open) return;
+          cancelOpen();
+          openTimer.current = window.setTimeout(() => showPopup(), 500);
+        }}
+        onClick={(event) => showPopup(event.detail === 0)}
+        onKeyDown={(event) => { if (event.key === 'ArrowRight') { event.preventDefault(); showPopup(true); } }}>
+        <Icon name="folder" />Переместить в проект<ChevronRight className="icon submenu-chevron" aria-hidden="true" />
+      </button>
+      <div ref={popupRef} id={popupId} popover="auto" className="submenu-content" onToggle={() => setOpen(popupRef.current?.matches(':popover-open') ?? false)}
+        onPointerEnter={cancelClose} onPointerLeave={scheduleClose}
+        onKeyDown={(event) => {
+          if (event.key === 'Escape' || event.key === 'ArrowLeft') {
+            event.preventDefault();
+            hidePopup();
+            triggerRef.current?.focus();
+          }
+        }}>
+        {chat.projectId && <button type="button" onClick={() => onSelect('')}>Без проекта</button>}
+        {projects.length === 0
+          ? <span className="submenu-empty">Нету проектов</span>
+          : projects.map((project) => <button key={project.id} type="button" onClick={() => onSelect(project.id)}>{project.name}</button>)}
+      </div>
     </div>
   );
 }
@@ -262,7 +376,9 @@ function ThemePreview({ theme, transparent }: { theme: 'emerald' | 'dark' | 'lig
 }
 
 function getErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : 'Не удалось выполнить действие.';
+  return error instanceof Error
+    ? error.message.replace(/^Error invoking remote method '[^']+': Error: /, '')
+    : 'Не удалось выполнить действие.';
 }
 
 function sameRoute(left: Route | undefined, right: Route): boolean {
@@ -284,7 +400,7 @@ function saveStatusLabel(status: SaveStatus): string {
 
 export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
-  const [chats, setChats] = useState<Chat[]>([]);
+  const [chats, setChats] = useState<ChatSummary[]>([]);
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [runtimeMode, setRuntimeMode] = useState<'api' | 'web'>('api');
   const [navigation, setNavigation] = useState<Navigation>({ history: [{ page: 'home' }], index: 0 });
@@ -295,8 +411,16 @@ export default function App() {
   const [showAllChats, setShowAllChats] = useState(false);
   const [selectedProjectId, setSelectedProjectId] = useState('');
   const [draft, setDraft] = useState('');
+  const [chatDetail, setChatDetail] = useState<ChatDetail | null>(null);
+  const [sending, setSending] = useState(false);
+  const [dialogRequest, setDialogRequest] = useState<{ kind: 'create-project' | 'rename-project' | 'delete-project' | 'rename-chat' | 'delete-chat'; project?: Project; chat?: ChatSummary; hasFiles?: boolean } | null>(null);
+  const [dialogValue, setDialogValue] = useState('');
+  const [dialogError, setDialogError] = useState('');
+  const [dialogBusy, setDialogBusy] = useState(false);
   const [systemDark, setSystemDark] = useState(() => window.matchMedia('(prefers-color-scheme: dark)').matches);
-  const [notice, setNotice] = useState('');
+  const [notice, setNoticeText] = useState('');
+  const [noticeKind, setNoticeKind] = useState<'success' | 'error'>('error');
+  const [noticeSequence, setNoticeSequence] = useState(0);
   const [loading, setLoading] = useState(true);
   const [autoStart, setAutoStart] = useState(false);
   const [openers, setOpeners] = useState<FolderOpener[]>([]);
@@ -307,12 +431,24 @@ export default function App() {
   const [projectInstructions, setProjectInstructions] = useState('');
   const [projectInstructionsOpen, setProjectInstructionsOpen] = useState(false);
   const [projectInstructionsStatus, setProjectInstructionsStatus] = useState<SaveStatus>('saved');
-  const pendingChat = useRef<Promise<Chat> | null>(null);
+  const pendingChat = useRef<Promise<ChatSummary> | null>(null);
   const homeChatId = useRef<string | null>(null);
   const draftRef = useRef('');
+  const draftSave = useRef<Promise<unknown>>(Promise.resolve());
+  const dialogRef = useRef<HTMLDialogElement>(null);
   const routeRef = useRef<Route>({ page: 'home' });
   const settingsRevision = useRef(0);
   const sidebarButtonRef = useRef<HTMLButtonElement>(null);
+  function setNotice(value: string): void {
+    setNoticeText(value);
+    setNoticeKind('error');
+    setNoticeSequence((sequence) => sequence + 1);
+  }
+  function showSuccess(value: string): void {
+    setNoticeText(value);
+    setNoticeKind('success');
+    setNoticeSequence((sequence) => sequence + 1);
+  }
   const [globalSaver] = useState(() => createInstructionAutosave(
     (_key, value) => window.gigaChat.settings.saveInstructions(value),
     (_key, status, error) => {
@@ -351,7 +487,7 @@ export default function App() {
 
   useEffect(() => window.gigaChat.onCloseRequested(async () => {
     try {
-      await Promise.all([globalSaver.flushAll(), projectSaver.flushAll()]);
+      await Promise.all([globalSaver.flushAll(), projectSaver.flushAll(), draftSave.current]);
     } catch (error) {
       setNotice(getErrorMessage(error));
       throw error;
@@ -362,6 +498,19 @@ export default function App() {
     void Promise.all([globalSaver.flushAll(), projectSaver.flushAll()])
       .catch((error: unknown) => setNotice(getErrorMessage(error)));
   }, [route.page, route.id, settingsSection, globalSaver, projectSaver]);
+
+  useEffect(() => {
+    if (!notice || noticeKind === 'error') return;
+    const timer = window.setTimeout(() => setNoticeText(''), 2000);
+    return () => window.clearTimeout(timer);
+  }, [notice, noticeKind, noticeSequence]);
+
+  useEffect(() => {
+    if (dialogRequest) {
+      dialogRef.current?.showModal();
+      (dialogRef.current?.querySelector('input') ?? dialogRef.current?.querySelector<HTMLButtonElement>('.dialog-actions .secondary-button'))?.focus();
+    } else dialogRef.current?.close();
+  }, [dialogRequest]);
 
   useEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)');
@@ -389,20 +538,44 @@ export default function App() {
   }, [compactLayout, sidebarPreview]);
 
   useEffect(() => {
-    routeRef.current = route;
-    if (route.page === 'chat') {
-      const selected = chats.find((chat) => chat.id === route.id);
-      const value = selected?.draft ?? '';
-      setDraft(value);
-      draftRef.current = value;
-    } else if (route.page === 'home') {
-      setDraft('');
-      draftRef.current = '';
-      homeChatId.current = null;
+    if (route.page === 'settings') {
+      document.querySelector<HTMLButtonElement>('.settings-nav-item.active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     }
+  }, [route.page, settingsSection, compactLayout]);
+
+  useEffect(() => {
+    routeRef.current = route;
     if (route.page !== 'project') {
       setProjectInstructionsOpen(false);
       setProjectInstructions('');
+    }
+    if (route.page === 'chat') {
+      const id = route.id;
+      if (!id) return;
+      const fromHome = homeChatId.current === id;
+      if (fromHome) homeChatId.current = null;
+      if (!fromHome) {
+        setDraft('');
+        draftRef.current = '';
+        draftSave.current = Promise.resolve();
+      }
+      let cancelled = false;
+      setChatDetail(null);
+      void window.gigaChat.chats.get(id).then((detail) => {
+        if (cancelled) return;
+        setChatDetail(detail);
+        if (!fromHome) {
+          setDraft(detail.draft);
+          draftRef.current = detail.draft;
+        }
+      }).catch((error: unknown) => { if (!cancelled) setNotice(getErrorMessage(error)); });
+      return () => { cancelled = true; };
+    } else if (route.page === 'home') {
+      setDraft('');
+      draftRef.current = '';
+      draftSave.current = Promise.resolve();
+      homeChatId.current = null;
+      setChatDetail(null);
     }
   }, [route.page, route.id]);
 
@@ -498,8 +671,47 @@ export default function App() {
   }
 
   function saveChatDraft(chatId: string, value: string): void {
-    setChats((current) => current.map((chat) => chat.id === chatId ? { ...chat, draft: value } : chat));
-    void window.gigaChat.chats.update(chatId, { draft: value }).catch((error: unknown) => setNotice(getErrorMessage(error)));
+    draftSave.current = window.gigaChat.chats.update(chatId, { draft: value });
+    void draftSave.current.catch((error: unknown) => setNotice(getErrorMessage(error)));
+  }
+
+  async function submitMessage(): Promise<void> {
+    const value = draftRef.current.trim();
+    if (!value || sending) return;
+    setSending(true);
+    try {
+      const chatId = routeRef.current.page === 'chat' ? routeRef.current.id
+        : homeChatId.current ?? (await pendingChat.current)?.id;
+      if (!chatId) throw new Error('Не удалось создать чат. Попробуйте снова.');
+      await draftSave.current;
+      const detail = await window.gigaChat.chats.appendLocalMessage(chatId, value);
+      if (routeRef.current.page === 'chat' && routeRef.current.id === chatId) {
+        setChatDetail(detail);
+        setDraft('');
+        draftRef.current = '';
+      }
+      setChats(await window.gigaChat.chats.list());
+      showSuccess('Не отправлено в GigaChat API. Сообщение сохранено локально.');
+    } catch (error) {
+      setNotice(getErrorMessage(error));
+    } finally {
+      setSending(false);
+    }
+  }
+
+  async function attachFile(): Promise<void> {
+    try {
+      const chatId = routeRef.current.page === 'chat' ? routeRef.current.id
+        : homeChatId.current ?? (await pendingChat.current)?.id ?? null;
+      const detail = await window.gigaChat.chats.importFile(chatId ?? null, selectedProjectId || null);
+      if (!detail) return;
+      setChats(await window.gigaChat.chats.list());
+      setChatDetail(detail);
+      if (routeRef.current.page === 'home') navigate({ page: 'chat', id: detail.id });
+      showSuccess('Файл скопирован в чат.');
+    } catch (error) {
+      setNotice(getErrorMessage(error));
+    }
   }
 
   function changeDraft(value: string): void {
@@ -530,30 +742,14 @@ export default function App() {
     });
   }
 
-  async function createProject(): Promise<void> {
-    const name = window.prompt('Название проекта');
-    if (name === null) return;
-    try {
-      const project = await window.gigaChat.projects.create(name);
-      setProjects((current) => [project, ...current]);
-      setSelectedProjectId(project.id);
-      setNotice(`Проект «${project.name}» создан.`);
-    } catch (error) {
-      setNotice(getErrorMessage(error));
-    }
+  function openDialog(request: NonNullable<typeof dialogRequest>, value = ''): void {
+    setDialogValue(value);
+    setDialogError('');
+    setDialogRequest(request);
   }
 
-  async function renameProject(project: Project): Promise<void> {
-    const name = window.prompt('Новое название проекта', project.name);
-    if (name === null) return;
-    try {
-      const updated = await window.gigaChat.projects.update(project.id, { name });
-      setProjects((current) => current.map((item) => item.id === project.id ? updated : item));
-      setNotice('Название проекта сохранено.');
-    } catch (error) {
-      setNotice(getErrorMessage(error));
-    }
-  }
+  function createProject(): void { openDialog({ kind: 'create-project' }); }
+  function renameProject(project: Project): void { openDialog({ kind: 'rename-project', project }, project.name); }
 
   async function updateProject(project: Project, patch: ProjectPatch): Promise<void> {
     try {
@@ -573,32 +769,11 @@ export default function App() {
     }
   }
 
-  async function removeProject(project: Project): Promise<void> {
-    if (!window.confirm(`Удалить проект «${project.name}»? Его чаты останутся и будут отвязаны от проекта.`)) return;
-    try {
-      await window.gigaChat.projects.remove(project.id);
-      setProjects((current) => current.filter((item) => item.id !== project.id));
-      setChats((current) => current.map((chat) => chat.projectId === project.id ? { ...chat, projectId: null } : chat));
-      if (routeRef.current.page === 'project' && routeRef.current.id === project.id) navigate({ page: 'home' });
-      setNotice('Проект удалён. Его чаты сохранены.');
-    } catch (error) {
-      setNotice(getErrorMessage(error));
-    }
-  }
+  function removeProject(project: Project): void { openDialog({ kind: 'delete-project', project }); }
 
-  async function renameChat(chat: Chat): Promise<void> {
-    const title = window.prompt('Новое название чата', chat.title);
-    if (title === null) return;
-    try {
-      const updated = await window.gigaChat.chats.update(chat.id, { title });
-      setChats((current) => current.map((item) => item.id === chat.id ? updated : item));
-      setNotice('Название чата сохранено.');
-    } catch (error) {
-      setNotice(getErrorMessage(error));
-    }
-  }
+  function renameChat(chat: ChatSummary): void { openDialog({ kind: 'rename-chat', chat }, chat.title); }
 
-  async function updateChat(chat: Chat, patch: ChatPatch): Promise<void> {
+  async function updateChat(chat: ChatSummary, patch: ChatPatch): Promise<void> {
     try {
       const updated = await window.gigaChat.chats.update(chat.id, patch);
       setChats((current) => current.map((item) => item.id === chat.id ? updated : item));
@@ -607,19 +782,56 @@ export default function App() {
     }
   }
 
-  async function removeChat(chat: Chat): Promise<void> {
-    if (!window.confirm(`Удалить чат «${chat.title}»? Это действие нельзя отменить.`)) return;
+  async function removeChat(chat: ChatSummary): Promise<void> {
     try {
-      await window.gigaChat.chats.remove(chat.id);
-      setChats((current) => current.filter((item) => item.id !== chat.id));
-      if (routeRef.current.page === 'chat' && routeRef.current.id === chat.id) navigate({ page: 'home' });
-      setNotice('Чат удалён.');
+      const detail = await window.gigaChat.chats.get(chat.id);
+      openDialog({ kind: 'delete-chat', chat, hasFiles: detail.artifacts.length > 0 });
     } catch (error) {
       setNotice(getErrorMessage(error));
     }
   }
 
-  async function changeChatProject(chat: Chat, projectId: string): Promise<void> {
+  async function submitDialog(): Promise<void> {
+    if (!dialogRequest || dialogBusy) return;
+    setDialogBusy(true);
+    setDialogError('');
+    try {
+      const { kind, chat, project } = dialogRequest;
+      if (kind === 'create-project') {
+        const created = await window.gigaChat.projects.create(dialogValue);
+        setProjects((current) => [created, ...current]);
+        setSelectedProjectId(created.id);
+        showSuccess(`Проект «${created.name}» создан.`);
+      } else if (kind === 'rename-project' && project) {
+        const updated = await window.gigaChat.projects.update(project.id, { name: dialogValue });
+        setProjects((current) => current.map((item) => item.id === project.id ? updated : item));
+        showSuccess('Название проекта сохранено.');
+      } else if (kind === 'delete-project' && project) {
+        await window.gigaChat.projects.remove(project.id);
+        setProjects((current) => current.filter((item) => item.id !== project.id));
+        setChats((current) => current.map((item) => item.projectId === project.id ? { ...item, projectId: null } : item));
+        if (routeRef.current.page === 'project' && routeRef.current.id === project.id) navigate({ page: 'home' });
+        showSuccess('Проект удалён. Его чаты сохранены.');
+      } else if (kind === 'rename-chat' && chat) {
+        const updated = await window.gigaChat.chats.update(chat.id, { title: dialogValue });
+        setChats((current) => current.map((item) => item.id === chat.id ? updated : item));
+        setChatDetail((current) => current?.id === chat.id ? { ...current, title: updated.title } : current);
+        showSuccess('Название чата сохранено.');
+      } else if (kind === 'delete-chat' && chat) {
+        await window.gigaChat.chats.remove(chat.id);
+        setChats((current) => current.filter((item) => item.id !== chat.id));
+        if (routeRef.current.page === 'chat' && routeRef.current.id === chat.id) navigate({ page: 'home' });
+        showSuccess('Чат удалён.');
+      }
+      setDialogRequest(null);
+    } catch (error) {
+      setDialogError(getErrorMessage(error));
+    } finally {
+      setDialogBusy(false);
+    }
+  }
+
+  async function changeChatProject(chat: ChatSummary, projectId: string): Promise<void> {
     await updateChat(chat, { projectId: projectId || null });
   }
 
@@ -664,41 +876,31 @@ export default function App() {
   function projectMenu(project: Project): ReactNode {
     return (
       <ActionMenu label={`Действия проекта ${project.name}`}>
-        <button type="button" onClick={() => void renameProject(project)}>Переименовать</button>
+        <button type="button" onClick={() => renameProject(project)}><Icon name="edit" />Переименовать</button>
         <button type="button" onClick={() => void updateProject(project, { pinned: !project.pinned })}>
-          {project.pinned ? 'Открепить' : 'Закрепить'}
+          <Icon name="pin" />{project.pinned ? 'Открепить' : 'Закрепить'}
         </button>
-        <button type="button" onClick={() => navigate({ page: 'project', id: project.id })}>Открыть проект</button>
+        <button type="button" onClick={() => navigate({ page: 'project', id: project.id })}><Icon name="folderOpen" />Открыть проект</button>
         <button type="button" onClick={() => void updateProject(project, { archived: !project.archived })}>
-          {project.archived ? 'Восстановить из архива' : 'Архивировать'}
+          <Icon name="archive" />{project.archived ? 'Восстановить из архива' : 'Архивировать'}
         </button>
-        <button type="button" className="danger-item" onClick={() => void removeProject(project)}>Удалить</button>
+        <button type="button" className="danger-item" onClick={() => removeProject(project)}><Icon name="trash" />Удалить</button>
       </ActionMenu>
     );
   }
 
-  function chatMenu(chat: Chat): ReactNode {
+  function chatMenu(chat: ChatSummary): ReactNode {
     return (
       <ActionMenu label={`Действия чата ${chat.title}`}>
-        <button type="button" onClick={() => void renameChat(chat)}>Переименовать</button>
+        <button type="button" onClick={() => renameChat(chat)}><Icon name="edit" />Переименовать</button>
         <button type="button" onClick={() => void updateChat(chat, { pinned: !chat.pinned })}>
-          {chat.pinned ? 'Открепить' : 'Закрепить'}
+          <Icon name="pin" />{chat.pinned ? 'Открепить' : 'Закрепить'}
         </button>
-        <details className="submenu">
-          <summary>Переместить в проект<ChevronRight className="icon" aria-hidden="true" /></summary>
-          <div className="submenu-content">
-            <button type="button" onClick={() => void changeChatProject(chat, '')}>Без проекта</button>
-            {activeProjects.map((project) => (
-              <button key={project.id} type="button" onClick={() => void changeChatProject(chat, project.id)}>
-                {project.name}
-              </button>
-            ))}
-          </div>
-        </details>
+        <ProjectSubmenu chat={chat} projects={activeProjects} onSelect={(projectId) => void changeChatProject(chat, projectId)} />
         <button type="button" onClick={() => void updateChat(chat, { archived: !chat.archived })}>
-          {chat.archived ? 'Восстановить из архива' : 'Архивировать'}
+          <Icon name="archive" />{chat.archived ? 'Восстановить из архива' : 'Архивировать'}
         </button>
-        <button type="button" className="danger-item" onClick={() => void removeChat(chat)}>Удалить</button>
+        <button type="button" className="danger-item" onClick={() => void removeChat(chat)}><Icon name="trash" />Удалить</button>
       </ActionMenu>
     );
   }
@@ -955,7 +1157,7 @@ export default function App() {
       case 'home':
         return (
           <section className="empty-state">
-            <img className="empty-logo" src={gigaChatLogo} alt="" />
+            <img className="empty-logo" src={gigaChatLogo} alt="" draggable={false} />
             <h1>Что будем создавать?</h1>
             <p>Ваши идеи. Возможности ГигаЧат.</p>
           </section>
@@ -964,12 +1166,24 @@ export default function App() {
         return selectedChat ? (
           <section className="chat-view">
             <div className="chat-intro">
-              <span className="eyebrow">{selectedChat.kind === 'image' ? 'Чат изображений · локальный черновик' : 'Локальный черновик'}</span>
+              <span className="eyebrow">{selectedChat.kind === 'image' ? 'Чат изображений · локально' : 'Локальная история'}</span>
               <h1>{selectedChat.title}</h1>
-              {selectedChat.kind === 'image'
-                ? <p>Сохранённая оболочка запроса. Генерация изображений подключится вместе с GigaChat API.</p>
-                : <p>GigaChat API не подключён. Текст сохранится в черновике, но не будет отправлен.</p>}
+              <p>Сообщения и файлы хранятся на этом компьютере. GigaChat API пока не подключён.</p>
             </div>
+            {chatDetail?.messages.length ? <div className="chat-history" aria-label="История сообщений">
+              {chatDetail.messages.map((message) => <article key={message.id} className={`chat-message message-${message.role}`}>
+                <span className="message-author">{message.role === 'user' ? 'Вы' : 'GigaChat · тестовый пример'}</span>
+                <p>{message.text}</p>
+              </article>)}
+            </div> : null}
+            {chatDetail?.artifacts.length ? <section className="chat-files" aria-label="Файлы чата">
+              <h2>Файлы чата</h2>
+              {chatDetail.artifacts.map((artifact) => <div className="chat-file" key={artifact.id}>
+                <Icon name="file" /><span><strong>{artifact.name}</strong><small>{Math.ceil(artifact.size / 1024)} КБ</small></span>
+                <button type="button" className="quiet-button" onClick={() => void window.gigaChat.chats.openArtifact(chatDetail.id, artifact.id).catch((error: unknown) => setNotice(getErrorMessage(error)))}>Открыть</button>
+                <button type="button" className="quiet-button" onClick={() => void window.gigaChat.chats.openFolder(chatDetail.id).catch((error: unknown) => setNotice(getErrorMessage(error)))}>Открыть папку чата</button>
+              </div>)}
+            </section> : null}
           </section>
         ) : <section className="content-page"><h1>Чат не найден</h1><button type="button" className="secondary-button" onClick={() => navigate({ page: 'home' })}>На главный экран</button></section>;
       case 'project':
@@ -989,7 +1203,7 @@ export default function App() {
               : <div className="project-chat-list">{activeChats.filter((chat) => chat.projectId === selectedProject.id).map((chat) => (
                   <div className="project-chat-row" key={chat.id}>
                     <button type="button" className="project-chat-main" onClick={() => navigate({ page: 'chat', id: chat.id })}>
-                      <Icon name="chat" /><span>{chat.title}<small>{chat.kind === 'image' ? 'Чат изображений' : 'Черновик'}</small></span>
+                      <Icon name="chat" /><span>{chat.title}<small>{chat.kind === 'image' ? 'Чат изображений' : 'Локальный чат'}</small></span>
                     </button>
                     {chatMenu(chat)}
                   </div>
@@ -1035,9 +1249,8 @@ export default function App() {
           <section className="content-page profile-page">
             <div className="page-heading"><span className="eyebrow">Профиль и использование</span><h1>Локальный профиль</h1><p>Данные принадлежат этому устройству. Учётная запись не подключена.</p></div>
             <div className="profile-summary"><span className="profile-avatar large"><Icon name="user" /></span><div><strong>На этом компьютере</strong><p>GigaChat API не подключён</p></div><span className="status-pill"><i />Локально</span></div>
-            <div className="usage-grid"><article><span>Всего чатов</span><strong>{chats.length}</strong><small>Локальные черновики</small></article><article><span>Всего проектов</span><strong>{projects.length}</strong><small>Локальные проекты</small></article><article className="usage-unavailable"><span>Токены и модели</span><strong>—</strong><small>Нет данных API</small></article></div>
+            <div className="usage-grid"><article><span>Всего чатов</span><strong>{chats.length}</strong><small>Локальная история</small></article><article><span>Всего проектов</span><strong>{projects.length}</strong><small>Локальные проекты</small></article><article className="usage-unavailable"><span>Токены и модели</span><strong>—</strong><small>Нет данных API</small></article></div>
             <EmptyState title="Статистика модели пока не собирается" description="Токены, серии активности и вызовы инструментов не показываются без реальных измерений." icon="gauge" />
-            <div className="profile-actions"><button type="button" className="secondary-button" onClick={() => openSettings('general')}><Icon name="settings" />Настройки</button><button type="button" className="secondary-button" onClick={() => navigate({ page: 'archive' })}><Icon name="archive" />Архив</button></div>
           </section>
         );
     }
@@ -1100,7 +1313,7 @@ export default function App() {
           aria-hidden={!sidebarShown}
           inert={!sidebarShown}
         >
-          <ActionMenu className="brand-menu" label="Выбрать режим GigaChat" trigger={
+          <ActionMenu className="brand-menu" label="Выбрать режим GigaChat" placement="below" trigger={
             <><span className="brand-wordmark">ГИГАЧАТ <i>{runtimeMode === 'api' ? 'API' : 'WEB'}</i></span><Icon name="chevron" className="brand-chevron" /></>
           }>
             <button type="button" aria-pressed={runtimeMode === 'api'} onClick={() => setRuntimeMode('api')}>GigaChat API{runtimeMode === 'api' && <Icon name="check" />}</button>
@@ -1145,19 +1358,11 @@ export default function App() {
             <button type="button" className="profile-button" onClick={() => navigate({ page: 'profile' })}>
               <span className="profile-avatar"><Icon name="user" /></span><span className="profile-copy"><strong>Локальный профиль</strong><small>API не подключён</small></span>
             </button>
-            <ActionMenu label="Меню профиля">
-              <button type="button" onClick={() => openSettings('general')}>Настройки</button>
-              <button type="button" onClick={() => navigate({ page: 'archive' })}>Архив</button>
-              <button type="button" onClick={() => navigate({ page: 'profile' })}>Профиль</button>
-            </ActionMenu>
+            <button type="button" className="profile-settings-button" aria-label="Настройки" onClick={() => openSettings('general')}><Icon name="settings" /><span className="profile-tooltip" role="tooltip">Настройки</span></button>
           </div>
         </aside>}
 
         <main className={route.page === 'settings' ? 'main-panel settings-panel' : 'main-panel'}>
-          <div className="panel-controls">
-            <button type="button" className="panel-control" aria-label="Справка" title="Справка появится вместе с подключением API" disabled><Icon name="help" /></button>
-            <button type="button" className="panel-control" aria-label="Настройки" title="Настройки" onClick={() => openSettings('general')}><Icon name="settings" /></button>
-          </div>
           <div className={route.page === 'home' ? 'view-area home-view' : route.page === 'settings' ? 'view-area settings-view' : 'view-area'}>{renderContent()}</div>
           {(route.page === 'home' || route.page === 'chat') && (
             <div className="composer-stack">
@@ -1175,12 +1380,15 @@ export default function App() {
               </label>
               <div className="composer">
                 <label className="sr-only" htmlFor="chat-draft">Черновик сообщения</label>
-                <textarea id="chat-draft" value={draft} onChange={(event) => changeDraft(event.target.value)} placeholder={selectedChat?.kind === 'image' ? 'Опишите изображение' : 'Поручите что угодно'} rows={2} />
+                <textarea id="chat-draft" value={draft} onChange={(event) => changeDraft(event.target.value)} onKeyDown={(event) => {
+                  if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                    event.preventDefault();
+                    void submitMessage();
+                  }
+                }} disabled={sending} placeholder={selectedChat?.kind === 'image' ? 'Опишите изображение' : 'Поручите что угодно'} rows={2} />
                 <div className="composer-toolbar">
                   <div className="toolbar-leading">
-                  <span className="disabled-control" role="note" tabIndex={0} aria-label="Вложения недоступны до подключения GigaChat API" title="Вложения появятся после подключения GigaChat API.">
-                    <button type="button" className="attach-button" disabled aria-label="Прикрепить файл"><Icon name="plus" /></button>
-                  </span>
+                  <button type="button" className="attach-button" aria-label="Прикрепить файл" title="Прикрепить файл" onClick={() => void attachFile()}><Icon name="plus" /></button>
                   <span className="disabled-control permission-control" role="note" tabIndex={0} aria-label="Профили доступа пока недоступны" title="Профили разрешений появятся вместе с permission engine.">
                     <button type="button" className="permission-button" disabled><Icon name="shield" /><span>Подтверждать за меня</span><Icon name="chevron" /></button>
                   </span>
@@ -1195,17 +1403,36 @@ export default function App() {
                   <span className="disabled-control" role="note" tabIndex={0} aria-label="Диктовка появится в отдельном плане" title="Диктовка появится в отдельном плане.">
                     <button type="button" className="mic-button" disabled aria-label="Диктовка"><Icon name="mic" /></button>
                   </span>
-                  <span className="disabled-control" role="note" tabIndex={0} aria-label={`Отправка недоступна: ${disabledReason}`} title={disabledReason}>
-                    <button type="button" className="send-button" disabled aria-label="Отправить"><Icon name="audio" /></button>
-                  </span>
+                  <button type="button" className="send-button" disabled={!draft.trim() || sending} aria-label={draft.trim() ? 'Сохранить сообщение локально' : 'Голосовой чат пока недоступен'} title={draft.trim() ? 'Сохранить локально без отправки в API' : 'Голосовой чат пока недоступен'} onClick={() => void submitMessage()}><Icon name={draft.trim() ? 'send' : 'audio'} /></button>
                   </div>
                 </div>
               </div>
             </div>
           )}
-          {notice && <div className="notice" role="status"><span>{notice}</span><button type="button" aria-label="Закрыть уведомление" onClick={() => setNotice('')}><Icon name="x" /></button></div>}
+          {notice && <div className={`notice notice-${noticeKind}`} role={noticeKind === 'error' ? 'alert' : 'status'}><span>{notice}</span><button type="button" aria-label="Закрыть уведомление" onClick={() => setNotice('')}><Icon name="x" /></button></div>}
         </main>
       </div>
+      <dialog ref={dialogRef} className="app-dialog" onClose={() => setDialogRequest(null)} onCancel={(event) => { if (dialogBusy) event.preventDefault(); }}>
+        {dialogRequest && <form onSubmit={(event) => { event.preventDefault(); void submitDialog(); }}>
+          <button type="button" className="dialog-close" aria-label="Закрыть" disabled={dialogBusy} onClick={() => setDialogRequest(null)}><Icon name="x" /></button>
+          <h2>{dialogRequest.kind === 'create-project' ? 'Создать проект'
+            : dialogRequest.kind === 'rename-project' ? 'Переименовать проект'
+              : dialogRequest.kind === 'delete-project' ? `Удалить проект «${dialogRequest.project?.name}»?`
+                : dialogRequest.kind === 'rename-chat' ? 'Переименовать чат'
+                  : `Удалить чат «${dialogRequest.chat?.title}»?`}</h2>
+          {dialogRequest.kind === 'delete-project' && <p>Чаты проекта останутся в истории без привязки к проекту.</p>}
+          {dialogRequest.kind === 'delete-chat' && dialogRequest.hasFiles && <p>Копии файлов внутри этого чата также будут удалены. Исходные файлы останутся на месте.</p>}
+          {(dialogRequest.kind === 'create-project' || dialogRequest.kind === 'rename-project' || dialogRequest.kind === 'rename-chat') && <label className="dialog-label">
+            {dialogRequest.kind === 'rename-chat' ? 'Название чата' : 'Название проекта'}
+            <input autoFocus value={dialogValue} onChange={(event) => setDialogValue(event.target.value)} maxLength={dialogRequest.kind === 'rename-chat' ? 160 : 120} />
+          </label>}
+          {dialogError && <p className="dialog-error" role="alert">{dialogError}</p>}
+          <div className="dialog-actions">
+            <button type="button" className="secondary-button" disabled={dialogBusy} onClick={() => setDialogRequest(null)}>Отмена</button>
+            <button type="submit" className={dialogRequest.kind.startsWith('delete') ? 'danger-button' : 'primary-button'} disabled={dialogBusy}>{dialogBusy ? 'Подождите…' : dialogRequest.kind.startsWith('delete') ? 'Удалить' : dialogRequest.kind === 'create-project' ? 'Создать' : 'Сохранить'}</button>
+          </div>
+        </form>}
+      </dialog>
     </div>
   );
 }
