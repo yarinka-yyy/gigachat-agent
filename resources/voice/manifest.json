@@ -1,0 +1,76 @@
+{
+  "formatVersion": 1,
+  "runtime": {
+    "name": "gigastt",
+    "version": "2.21.0",
+    "archive": {
+      "url": "https://github.com/ekhodzitsky/gigastt/releases/download/v2.21.0/gigastt-2.21.0-x86_64-pc-windows-msvc.tar.gz",
+      "sha256": "dbdbd34914a304006b00d0ce95bfdddb608c66b4fec81b88803f7be277daebbd",
+      "sizeBytes": 12934850
+    },
+    "license": "MIT",
+    "licenseUrl": "https://github.com/ekhodzitsky/gigastt/blob/v2.21.0/LICENSE",
+    "files": [
+      {
+        "name": "gigastt.exe",
+        "sha256": "a2b2a5e43be092a8b87db716ab9fd371999dd437d4dcbffeafc1eb26ed7efde6",
+        "sizeBytes": 36234752
+      },
+      {
+        "name": "LICENSE",
+        "sha256": "dc9b2dc749e3d48f00cb17fe618bec6d836f01856a0b5c6c7ea5a1d1c6bd2dd9",
+        "sizeBytes": 1095
+      },
+      {
+        "name": "NOTICE",
+        "sha256": "14456d0c23ddaa4bb7dd830820f2c313a491aa5acf620c72f5d7d1d1f7618600",
+        "sizeBytes": 4420
+      }
+    ]
+  },
+  "recognition": {
+    "name": "GigaAM-v3-e2e-RNNT",
+    "variant": "e2e_rnnt",
+    "releaseUrl": "https://github.com/ekhodzitsky/gigastt/releases/tag/models-v3-2026-06-22",
+    "license": "MIT",
+    "licenseUrl": "https://huggingface.co/ai-sage/GigaAM-v3/blob/main/README.md",
+    "files": [
+      {
+        "name": "v3_e2e_rnnt_encoder_int8.onnx",
+        "url": "https://github.com/ekhodzitsky/gigastt/releases/download/models-v3-2026-06-22/v3_e2e_rnnt_encoder_int8.onnx",
+        "sha256": "cf51b300af47cea099e17c806f8fecce2c46e9e8deb4709ec203f8970a067389",
+        "sizeBytes": 225250603
+      },
+      {
+        "name": "v3_e2e_rnnt_decoder.onnx",
+        "url": "https://github.com/ekhodzitsky/gigastt/releases/download/models-v3-2026-06-22/v3_e2e_rnnt_decoder.onnx",
+        "sha256": "7b0a16d67fd2cb37061decc93c69e364a9ab27afee3c57495d55b1c974cf7231",
+        "sizeBytes": 4599910
+      },
+      {
+        "name": "v3_e2e_rnnt_joint.onnx",
+        "url": "https://github.com/ekhodzitsky/gigastt/releases/download/models-v3-2026-06-22/v3_e2e_rnnt_joint.onnx",
+        "sha256": "602ff7017a93311aad34df1437c8d7f49911353c13d6eae7a6ee7b041339465c",
+        "sizeBytes": 2712896
+      },
+      {
+        "name": "v3_e2e_rnnt_vocab.txt",
+        "url": "https://github.com/ekhodzitsky/gigastt/releases/download/models-v3-2026-06-22/v3_e2e_rnnt_vocab.txt",
+        "sha256": "39abae20e692998290c574e606f11a9edef2902a1995463fcff63d1490cf22b7",
+        "sizeBytes": 13354
+      }
+    ]
+  },
+  "vad": {
+    "name": "Silero VAD",
+    "version": "5.1.2",
+    "url": "https://github.com/snakers4/silero-vad/raw/v5.1.2/src/silero_vad/data/silero_vad.onnx",
+    "license": "MIT",
+    "licenseUrl": "https://github.com/snakers4/silero-vad/blob/v5.1.2/LICENSE",
+    "file": {
+      "name": "silero_vad.onnx",
+      "sha256": "2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f",
+      "sizeBytes": 2327524
+    }
+  }
+}

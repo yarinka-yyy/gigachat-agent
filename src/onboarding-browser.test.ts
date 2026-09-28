@@ -1,0 +1,90 @@
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { test } from 'node:test';
+import type { BrowserWindow, WebContentsView } from 'electron';
+import { clampBrowserBounds, createOnboardingBrowser, getOnboardingPopupTitle, isAllowedOnboardingUrl, isStudioLandingUrl } from './onboarding-browser';
+
+test('onboarding browser accepts only HTTPS URLs without embedded credentials', () => {
+  assert.equal(isAllowedOnboardingUrl('https://developers.sber.ru/studio/'), true);
+  assert.equal(isAllowedOnboardingUrl('https://login.example.test/continue'), true);
+  assert.equal(isAllowedOnboardingUrl('http://developers.sber.ru/'), false);
+  assert.equal(isAllowedOnboardingUrl('file:///C:/private.txt'), false);
+  assert.equal(isAllowedOnboardingUrl('javascript:alert(1)'), false);
+  assert.equal(isAllowedOnboardingUrl('https://user:password@example.test/'), false);
+  assert.equal(isAllowedOnboardingUrl('not a url'), false);
+});
+
+test('popup title exposes only the current HTTPS host, not page-controlled title or URL details', () => {
+  const title = getOnboardingPopupTitle('https://login.example.test/path?code=synthetic#fragment');
+  assert.equal(title, 'Страница входа · login.example.test');
+  assert.equal(title.includes('synthetic'), false);
+});
+
+test('Studio return control recognizes only the official landing origin and path', () => {
+  assert.equal(isStudioLandingUrl('https://developers.sber.ru/studio/'), true);
+  assert.equal(isStudioLandingUrl('https://developers.sber.ru/studio/?state=synthetic'), true);
+  assert.equal(isStudioLandingUrl('https://developers.sber.ru/docs/'), false);
+  assert.equal(isStudioLandingUrl('https://developers.example.test/studio/'), false);
+});
+
+test('in-page navigation updates Studio status and keeps the return control usable', async () => {
+  let currentUrl = '';
+  let loadCount = 0;
+  const contents = Object.assign(new EventEmitter(), {
+    isDestroyed: () => false,
+    canGoBack: () => false,
+    getURL: () => currentUrl,
+    setWindowOpenHandler: () => undefined,
+    loadURL: async (url: string) => {
+      currentUrl = url;
+      loadCount += 1;
+      contents.emit('did-start-loading');
+      contents.emit('did-navigate', {}, url);
+      contents.emit('did-stop-loading');
+    },
+    close: () => undefined,
+  });
+  const view = {
+    webContents: contents,
+    setVisible: () => undefined,
+    setBounds: () => undefined,
+  } as unknown as WebContentsView;
+  const session = Object.assign(new EventEmitter(), {
+    setPermissionRequestHandler: () => undefined,
+    setPermissionCheckHandler: () => undefined,
+    webRequest: { onBeforeRequest: () => undefined },
+  });
+  const window = {
+    isDestroyed: () => false,
+    contentView: { addChildView: () => undefined, removeChildView: () => undefined },
+    getContentBounds: () => ({ x: 0, y: 0, width: 960, height: 720 }),
+    webContents: { getZoomFactor: () => 1 },
+  } as unknown as BrowserWindow;
+  const browser = createOnboardingBrowser(() => window, {
+    createSession: () => session as never,
+    createView: () => view,
+  });
+
+  await browser.openStudio();
+  assert.equal(browser.getStatus().atStudio, true);
+  contents.emit('did-navigate-in-page', {}, 'https://developers.sber.ru/studio/register', false);
+  assert.equal(browser.getStatus().atStudio, true);
+  contents.emit('did-navigate-in-page', {}, 'https://developers.sber.ru/studio/register', true);
+  assert.equal(browser.getStatus().atStudio, false);
+
+  const returned = await browser.openStudio();
+  assert.equal(returned.atStudio, true);
+  assert.equal(loadCount, 2);
+});
+
+test('onboarding browser bounds are zoomed and clipped to the app content area', () => {
+  assert.deepEqual(
+    clampBrowserBounds({ x: 100, y: 50, width: 600, height: 500 }, 800, 600, 0.8),
+    { x: 80, y: 40, width: 480, height: 400 },
+  );
+  assert.deepEqual(
+    clampBrowserBounds({ x: 900, y: 700, width: 200, height: 200 }, 800, 600, 1),
+    null,
+  );
+  assert.equal(clampBrowserBounds({ x: Number.NaN, y: 0, width: 20, height: 20 }, 800, 600, 1), null);
+});

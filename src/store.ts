@@ -1,14 +1,19 @@
 import { randomUUID } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import { constants } from 'node:fs';
-import { copyFile, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
-import { basename, dirname, extname, join } from 'node:path';
-import type { ChatArtifact, ChatDetail, ChatKind, ChatMessage, ChatPatch, ChatSummary, Project, ProjectPatch, Settings, SettingsPatch, Theme } from './contracts';
+import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { basename, dirname, extname, isAbsolute, join, relative, sep } from 'node:path';
+import { DEFAULT_NOTIFICATION_SETTINGS, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type Settings, type SettingsPatch, type Theme } from './contracts';
+import { requirePermissionProfile } from './permissions';
+import { isSkillId } from './skills';
 
 type ProjectFile = { schemaVersion: 2; projects: Project[] };
 type LegacyChat = ChatSummary & { draft: string };
 type ChatFile = { schemaVersion: 2; chats: LegacyChat[] };
-type SettingsFile = { schemaVersion: 3; settings: Settings };
+type SettingsFile = { schemaVersion: 6; settings: Settings };
+
+const MAX_IMPORTED_FILE_BYTES = 25 * 1024 * 1024;
+const MAX_INSTRUCTION_BYTES = 64 * 1024;
 
 export interface LocalStore {
   listProjects(): Promise<Project[]>;
@@ -20,12 +25,14 @@ export interface LocalStore {
   createChat(projectId?: unknown, kind?: unknown): Promise<ChatSummary>;
   updateChat(id: unknown, patch: unknown): Promise<ChatSummary>;
   appendLocalMessage(id: unknown, text: unknown): Promise<ChatDetail>;
+  appendAssistantMessageFromRuntime(id: unknown, text: unknown): Promise<ChatDetail>;
   importFile(id: unknown, sourcePath: string, projectId?: unknown): Promise<ChatDetail>;
   getArtifactPath(id: unknown, artifactId: unknown): Promise<string>;
   getChatFolder(id: unknown): Promise<string>;
   deleteChat(id: unknown): Promise<void>;
   getSettings(): Promise<Settings>;
   updateSettings(patch: unknown): Promise<Settings>;
+  getLocalUsageStats(): Promise<LocalUsageStats>;
   readGlobalInstructions(): Promise<string>;
   saveGlobalInstructions(contents: unknown): Promise<void>;
   readProjectInstructions(id: unknown): Promise<string>;
@@ -116,7 +123,18 @@ function validateTheme(value: unknown): Theme {
   throw new Error('Неизвестная тема оформления.');
 }
 
-function validateSettings(value: unknown, version: 1 | 2 | 3): Settings {
+function validateNotificationSettings(value: unknown): NotificationSettings {
+  if (!isRecord(value)
+    || typeof value.taskStarted !== 'boolean'
+    || typeof value.taskCompleted !== 'boolean'
+    || typeof value.failures !== 'boolean'
+    || Object.keys(value).some((key) => !['taskStarted', 'taskCompleted', 'failures'].includes(key))) {
+    throw new Error('Некорректные категории уведомлений.');
+  }
+  return { taskStarted: value.taskStarted, taskCompleted: value.taskCompleted, failures: value.failures };
+}
+
+function validateSettings(value: unknown, version: 1 | 2 | 3 | 4 | 5 | 6): Settings {
   if (!isRecord(value)) throw new Error('Settings record is invalid.');
   const theme = validateTheme(value.theme);
   const migratedTheme = version < 3 && theme === 'dark' ? 'emerald' : theme;
@@ -127,6 +145,9 @@ function validateSettings(value: unknown, version: 1 | 2 | 3): Settings {
       sidebarVisible: true,
       defaultProjectsFolder: null,
       preferredOpener: 'system',
+      defaultPermissionProfile: 'ask',
+      onboardingCompleted: true,
+      notifications: { ...DEFAULT_NOTIFICATION_SETTINGS },
     };
   }
   if (value.preferredOpener !== 'system' && value.preferredOpener !== 'explorer' && value.preferredOpener !== 'detected-app') {
@@ -138,6 +159,11 @@ function validateSettings(value: unknown, version: 1 | 2 | 3): Settings {
     sidebarVisible: requireBoolean(value.sidebarVisible, 'Видимость боковой панели'),
     defaultProjectsFolder: requireFolderPath(value.defaultProjectsFolder, 'Папка проектов'),
     preferredOpener: value.preferredOpener,
+    defaultPermissionProfile: version >= 4 ? requirePermissionProfile(value.defaultPermissionProfile) : 'ask',
+    onboardingCompleted: version >= 5
+      ? requireBoolean(value.onboardingCompleted, 'Статус первичной настройки')
+      : true,
+    notifications: version >= 6 ? validateNotificationSettings(value.notifications) : { ...DEFAULT_NOTIFICATION_SETTINGS },
   };
 }
 
@@ -158,6 +184,35 @@ function validateRows<T>(
 
 function isMissingFile(error: unknown): boolean {
   return isRecord(error) && error.code === 'ENOENT';
+}
+
+function isOutside(root: string, path: string): boolean {
+  const pathFromRoot = relative(root, path);
+  return pathFromRoot === '..' || pathFromRoot.startsWith(`..${sep}`) || isAbsolute(pathFromRoot);
+}
+
+async function assertOwnedPath(root: string, targetPath: string): Promise<void> {
+  const relativePath = relative(root, targetPath);
+  if (isOutside(root, targetPath)) {
+    throw new Error('Путь локальных данных выходит за границу хранилища.');
+  }
+
+  let current = root;
+  for (const part of relativePath.split(sep).filter(Boolean)) {
+    current = join(current, part);
+    let entry;
+    try { entry = await lstat(current); }
+    catch (error) {
+      if (isMissingFile(error)) return;
+      throw error;
+    }
+    if (entry.isSymbolicLink()) {
+      throw new Error('Путь локальных данных содержит символическую ссылку.');
+    }
+    if (isOutside(root, await realpath(current))) {
+      throw new Error('Путь локальных данных выходит за границу хранилища.');
+    }
+  }
 }
 
 async function writeAtomic(filePath: string, value: unknown): Promise<void> {
@@ -232,10 +287,12 @@ function parseChatFile(value: unknown): Loaded<ChatFile> {
   };
 }
 
-function validateChatDetail(value: unknown): ChatDetail {
-  if (!isRecord(value) || value.schemaVersion !== 3 || !Array.isArray(value.messages) || !Array.isArray(value.artifacts)) {
+function validateChatDetail(value: unknown): Loaded<ChatDetail> {
+  if (!isRecord(value) || (value.schemaVersion !== 3 && value.schemaVersion !== 4 && value.schemaVersion !== 5)
+    || !Array.isArray(value.messages) || !Array.isArray(value.artifacts)) {
     throw new Error('Invalid chat detail.');
   }
+  const version = value.schemaVersion;
   const chat = validateChat(value, 2);
   const messages: ChatMessage[] = value.messages.map((entry: unknown) => {
     if (!isRecord(entry) || (entry.role !== 'user' && entry.role !== 'assistant') || typeof entry.text !== 'string') {
@@ -260,7 +317,18 @@ function validateChatDetail(value: unknown): ChatDetail {
     || artifacts.some((artifact) => artifact.messageId && !messages.some((message) => message.id === artifact.messageId))) {
     throw new Error('Duplicate or unbound chat resource.');
   }
-  return { ...chat, messages, artifacts };
+  const nextTurnPermissionProfile = version === 3
+    ? null
+    : value.nextTurnPermissionProfile === null ? null : requirePermissionProfile(value.nextTurnPermissionProfile);
+  let nextTurnSkillId: string | null = null;
+  if (version === 5 && value.nextTurnSkillId !== null) {
+    if (!isSkillId(value.nextTurnSkillId)) throw new Error('Invalid next-turn Skill.');
+    nextTurnSkillId = value.nextTurnSkillId;
+  }
+  return {
+    value: { ...chat, messages, artifacts, nextTurnPermissionProfile, nextTurnSkillId },
+    needsWrite: version < 5,
+  };
 }
 
 function summary(chat: ChatDetail): ChatSummary {
@@ -271,26 +339,44 @@ function summary(chat: ChatDetail): ChatSummary {
 }
 
 function detailFile(chat: ChatDetail): Record<string, unknown> {
-  return { schemaVersion: 3, ...chat };
+  return { schemaVersion: 5, ...chat };
 }
 
 function parseSettingsFile(value: unknown): Loaded<SettingsFile> {
   if (!isRecord(value)) throw new Error('Invalid settings file.');
   if (value.schemaVersion === 1) {
     return {
-      value: { schemaVersion: 3, settings: validateSettings(value.settings, 1) },
+      value: { schemaVersion: 6, settings: validateSettings(value.settings, 1) },
       needsWrite: true,
     };
   }
   if (value.schemaVersion === 2) {
     return {
-      value: { schemaVersion: 3, settings: validateSettings(value.settings, 2) },
+      value: { schemaVersion: 6, settings: validateSettings(value.settings, 2) },
       needsWrite: true,
     };
   }
-  if (value.schemaVersion !== 3) throw new Error('Unknown settings file version.');
+  if (value.schemaVersion === 3) {
+    return {
+      value: { schemaVersion: 6, settings: validateSettings(value.settings, 3) },
+      needsWrite: true,
+    };
+  }
+  if (value.schemaVersion === 4) {
+    return {
+      value: { schemaVersion: 6, settings: validateSettings(value.settings, 4) },
+      needsWrite: true,
+    };
+  }
+  if (value.schemaVersion === 5) {
+    return {
+      value: { schemaVersion: 6, settings: validateSettings(value.settings, 5) },
+      needsWrite: true,
+    };
+  }
+  if (value.schemaVersion !== 6) throw new Error('Unknown settings file version.');
   return {
-    value: { schemaVersion: 3, settings: validateSettings(value.settings, 3) },
+    value: { schemaVersion: 6, settings: validateSettings(value.settings, 6) },
     needsWrite: false,
   };
 }
@@ -319,6 +405,11 @@ function validateChatPatch(value: unknown): ChatPatch {
     else if (key === 'draft') {
       if (typeof item !== 'string') throw new Error('Черновик должен быть текстом.');
       patch.draft = item;
+    } else if (key === 'nextTurnPermissionProfile') {
+      patch.nextTurnPermissionProfile = item === null ? null : requirePermissionProfile(item);
+    } else if (key === 'nextTurnSkillId') {
+      if (item !== null && !isSkillId(item)) throw new Error('Некорректный идентификатор Skill для следующего хода.');
+      patch.nextTurnSkillId = item as string | null;
     } else throw new Error('Недопустимое поле чата.');
   }
   return patch;
@@ -334,55 +425,87 @@ function validateSettingsPatch(value: unknown): SettingsPatch {
     else if (key === 'defaultProjectsFolder') patch.defaultProjectsFolder = requireFolderPath(item, 'Папка проектов');
     else if (key === 'preferredOpener' && (item === 'system' || item === 'explorer' || item === 'detected-app')) {
       patch.preferredOpener = item;
-    } else throw new Error('Недопустимое поле настроек.');
+    } else if (key === 'defaultPermissionProfile') patch.defaultPermissionProfile = requirePermissionProfile(item);
+    else if (key === 'onboardingCompleted') patch.onboardingCompleted = requireBoolean(item, 'Статус первичной настройки');
+    else if (key === 'notifications') patch.notifications = validateNotificationSettings(item);
+    else throw new Error('Недопустимое поле настроек.');
   }
   return patch;
 }
 
 function requireInstructions(value: unknown): string {
-  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > 64 * 1024) {
+  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > MAX_INSTRUCTION_BYTES) {
     throw new Error('Инструкция должна быть текстом размером не более 64 КБ.');
   }
   return value;
 }
 
-async function readInstructions(filePath: string): Promise<string> {
-  try {
-    const value = await readFile(filePath, 'utf8');
-    return requireInstructions(value);
-  } catch (error) {
-    if (isMissingFile(error)) return '';
-    throw error;
-  }
-}
-
 export async function openStore(directory: string): Promise<LocalStore> {
   await mkdir(directory, { recursive: true });
-  const projectPath = join(directory, 'projects.json');
-  const chatPath = join(directory, 'chats.json');
-  const chatsDirectory = join(directory, 'chats');
-  const migrationMarker = join(directory, 'chats.migrated');
-  const settingsPath = join(directory, 'settings.json');
+  const storageRoot = await realpath(directory);
+  const projectPath = join(storageRoot, 'projects.json');
+  const chatPath = join(storageRoot, 'chats.json');
+  const chatsDirectory = join(storageRoot, 'chats');
+  const migrationMarker = join(storageRoot, 'chats.migrated');
+  const settingsPath = join(storageRoot, 'settings.json');
+  const writeOwnedAtomic = async (filePath: string, value: unknown): Promise<void> => {
+    await assertOwnedPath(storageRoot, filePath);
+    await mkdir(dirname(filePath), { recursive: true });
+    await assertOwnedPath(storageRoot, filePath);
+    await writeAtomic(filePath, value);
+  };
+  const writeOwnedTextAtomic = async (filePath: string, value: string): Promise<void> => {
+    await assertOwnedPath(storageRoot, filePath);
+    await mkdir(dirname(filePath), { recursive: true });
+    await assertOwnedPath(storageRoot, filePath);
+    await writeTextAtomic(filePath, value);
+  };
+  const readOwnedInstructions = async (filePath: string): Promise<string> => {
+    await assertOwnedPath(storageRoot, filePath);
+    const file = await lstat(filePath).catch((error: unknown) => {
+      if (isMissingFile(error)) return null;
+      throw error;
+    });
+    if (!file) return '';
+    if (!file.isFile()) throw new Error('Файл инструкции недоступен для чтения.');
+    if (file.size > MAX_INSTRUCTION_BYTES) {
+      throw new Error('Инструкция должна быть текстом размером не более 64 КБ.');
+    }
+    return requireInstructions(await readFile(filePath, 'utf8'));
+  };
+
+  await Promise.all([
+    assertOwnedPath(storageRoot, projectPath),
+    assertOwnedPath(storageRoot, chatPath),
+    assertOwnedPath(storageRoot, chatsDirectory),
+    assertOwnedPath(storageRoot, migrationMarker),
+    assertOwnedPath(storageRoot, settingsPath),
+  ]);
 
   // Parse every existing file before creating or migrating any of them.
   const [projectFile, settingsFile] = await Promise.all([
     loadVersioned<ProjectFile>(projectPath, { schemaVersion: 2, projects: [] }, parseProjectFile),
     loadVersioned<SettingsFile>(settingsPath, {
-      schemaVersion: 3,
+      schemaVersion: 6,
       settings: {
         theme: 'emerald',
         sidebarTransparent: false,
         sidebarVisible: true,
         defaultProjectsFolder: null,
         preferredOpener: 'system',
+        defaultPermissionProfile: 'ask',
+        onboardingCompleted: false,
+        notifications: { ...DEFAULT_NOTIFICATION_SETTINGS },
       },
     }, parseSettingsFile),
   ]);
 
+  await assertOwnedPath(storageRoot, migrationMarker);
   const migrated = await readFile(migrationMarker, 'utf8').then(() => true, (error: unknown) => {
     if (isMissingFile(error)) return false;
     throw error;
   });
+  if (!migrated) await assertOwnedPath(storageRoot, chatPath);
   const legacyContents = migrated ? null : await readFile(chatPath, 'utf8').catch((error: unknown) => {
     if (isMissingFile(error)) return null;
     throw error;
@@ -392,14 +515,18 @@ export async function openStore(directory: string): Promise<LocalStore> {
     try { legacyChats = parseChatFile(JSON.parse(legacyContents) as unknown).value.chats; }
     catch { throw storageError(chatPath); }
   }
+  await assertOwnedPath(storageRoot, chatsDirectory);
   const entries = await readdir(chatsDirectory, { withFileTypes: true }).catch((error: unknown) => {
     if (isMissingFile(error)) return [];
     throw error;
   });
   const loadedChats: ChatDetail[] = [];
+  const chatsNeedingMigration: ChatDetail[] = [];
   for (const entry of entries) {
+    if (entry.isSymbolicLink()) throw new Error('Каталог чата не может быть символической ссылкой.');
     if (!entry.isDirectory()) continue;
     const detailPath = join(chatsDirectory, entry.name, 'chat.json');
+    await assertOwnedPath(storageRoot, detailPath);
     let contents: string;
     try { contents = await readFile(detailPath, 'utf8'); }
     catch (error) {
@@ -408,8 +535,9 @@ export async function openStore(directory: string): Promise<LocalStore> {
     }
     try {
       const detail = validateChatDetail(JSON.parse(contents) as unknown);
-      if (detail.id !== entry.name) throw new Error('Chat ID mismatch.');
-      loadedChats.push(detail);
+      if (detail.value.id !== entry.name) throw new Error('Chat ID mismatch.');
+      loadedChats.push(detail.value);
+      if (detail.needsWrite) chatsNeedingMigration.push(detail.value);
     } catch { throw storageError(detailPath); }
   }
 
@@ -420,15 +548,19 @@ export async function openStore(directory: string): Promise<LocalStore> {
     }
     for (const legacy of legacyChats) {
       if (loadedChats.some((chat) => chat.id === legacy.id)) continue;
-      const detail: ChatDetail = { ...legacy, messages: [], artifacts: [] };
-      await writeAtomic(join(chatsDirectory, legacy.id, 'chat.json'), detailFile(detail));
+      const detail: ChatDetail = { ...legacy, nextTurnPermissionProfile: null, nextTurnSkillId: null, messages: [], artifacts: [] };
+      await writeOwnedAtomic(join(chatsDirectory, legacy.id, 'chat.json'), detailFile(detail));
       loadedChats.push(detail);
     }
-    await writeTextAtomic(migrationMarker, '3\n');
+    await writeOwnedTextAtomic(migrationMarker, '3\n');
   }
 
-  if (projectFile.needsWrite) await writeAtomic(projectPath, projectFile.value);
-  if (settingsFile.needsWrite) await writeAtomic(settingsPath, settingsFile.value);
+  for (const chat of chatsNeedingMigration) {
+    await writeOwnedAtomic(join(chatsDirectory, chat.id, 'chat.json'), detailFile(chat));
+  }
+
+  if (projectFile.needsWrite) await writeOwnedAtomic(projectPath, projectFile.value);
+  if (settingsFile.needsWrite) await writeOwnedAtomic(settingsPath, settingsFile.value);
 
   let projects = projectFile.value.projects;
   let chats = loadedChats;
@@ -441,12 +573,12 @@ export async function openStore(directory: string): Promise<LocalStore> {
     return result;
   };
   const saveProjects = async (next: Project[]): Promise<void> => {
-    await writeAtomic(projectPath, { schemaVersion: 2, projects: next });
+    await writeOwnedAtomic(projectPath, { schemaVersion: 2, projects: next });
     projects = next;
   };
-  const chatFolder = (id: string): string => join(chatsDirectory, id);
+  const chatFolder = (id: string): string => join(chatsDirectory, requireId(id));
   const saveChat = async (chat: ChatDetail): Promise<void> => {
-    await writeAtomic(join(chatFolder(chat.id), 'chat.json'), detailFile(chat));
+    await writeOwnedAtomic(join(chatFolder(chat.id), 'chat.json'), detailFile(chat));
     chats = chats.some((item) => item.id === chat.id)
       ? chats.map((item) => item.id === chat.id ? chat : item)
       : [...chats, chat];
@@ -461,19 +593,19 @@ export async function openStore(directory: string): Promise<LocalStore> {
     const chat: ChatDetail = {
       id: randomUUID(), title: kind === 'image' ? 'Новое изображение' : 'Новый чат', projectId,
       pinned: false, archived: false, createdAt: now, updatedAt: now, draft: '', kind,
-      messages: [], artifacts: [],
+      nextTurnPermissionProfile: null, nextTurnSkillId: null, messages: [], artifacts: [],
     };
     await saveChat(chat);
     return chat;
   };
   const saveSettings = async (next: Settings): Promise<void> => {
-    await writeAtomic(settingsPath, { schemaVersion: 3, settings: next });
+    await writeOwnedAtomic(settingsPath, { schemaVersion: 6, settings: next });
     settings = next;
   };
   const projectInstructionsPath = (idInput: unknown): string => {
     const id = requireId(idInput);
     if (!projects.some((project) => project.id === id)) throw new Error('Проект не найден.');
-    return join(directory, 'project-instructions', id, 'AGENTS.md');
+    return join(storageRoot, 'project-instructions', id, 'AGENTS.md');
   };
 
   return {
@@ -504,11 +636,36 @@ export async function openStore(directory: string): Promise<LocalStore> {
     deleteProject: (idInput) => serialize(async () => {
       const id = requireId(idInput);
       if (!projects.some((project) => project.id === id)) throw new Error('Проект не найден.');
+      const instructionsPath = projectInstructionsPath(id);
+      await assertOwnedPath(storageRoot, instructionsPath);
+      const instructions = await lstat(instructionsPath).catch((error: unknown) => {
+        if (isMissingFile(error)) return null;
+        throw error;
+      });
+      if (instructions && !instructions.isFile()) throw new Error('Файл инструкции проекта недоступен для удаления.');
+      const previousProjects = projects;
+      const linkedChats = chats.filter((item) => item.projectId === id);
       const now = new Date().toISOString();
-      for (const chat of chats.filter((item) => item.projectId === id)) {
-        await saveChat({ ...chat, projectId: null, updatedAt: now });
+      try {
+        for (const chat of linkedChats) {
+          await saveChat({ ...chat, projectId: null, updatedAt: now });
+        }
+        await saveProjects(projects.filter((project) => project.id !== id));
+        if (instructions) {
+          await assertOwnedPath(storageRoot, instructionsPath);
+          await unlink(instructionsPath).catch((error: unknown) => {
+            if (!isMissingFile(error)) throw error;
+          });
+        }
+      } catch (error) {
+        try {
+          for (const chat of linkedChats) await saveChat(chat);
+          await saveProjects(previousProjects);
+        } catch {
+          throw new Error('Удаление проекта завершилось ошибкой, и восстановить исходные данные не удалось.');
+        }
+        throw error;
       }
-      await saveProjects(projects.filter((project) => project.id !== id));
     }),
     listChats: () => serialize(async () => chats.map(summary)),
     getChat: (id) => serialize(async () => structuredClone(findChat(id))),
@@ -544,11 +701,23 @@ export async function openStore(directory: string): Promise<LocalStore> {
       await saveChat(updated);
       return structuredClone(updated);
     }),
+    appendAssistantMessageFromRuntime: (id, textInput) => serialize(async () => {
+      const chat = findChat(id);
+      if (typeof textInput !== 'string' || !textInput.trim() || textInput.length > 100_000) {
+        throw new Error('Ответ должен содержать от 1 до 100 000 символов.');
+      }
+      const now = new Date().toISOString();
+      const message: ChatMessage = { id: randomUUID(), role: 'assistant', text: textInput.trim(), createdAt: now };
+      const updated = { ...chat, updatedAt: now, messages: [...chat.messages, message] };
+      await saveChat(updated);
+      return structuredClone(updated);
+    }),
     importFile: (idInput, sourcePath, projectIdInput = null) => serialize(async () => {
       if (typeof sourcePath !== 'string' || !sourcePath || sourcePath.includes('\0')) throw new Error('Файл не выбран.');
       const source = await stat(sourcePath);
       if (!source.isFile()) throw new Error('Выбранный путь не является файлом.');
       if (!Number.isSafeInteger(source.size)) throw new Error('Размер файла недоступен.');
+      if (source.size > MAX_IMPORTED_FILE_BYTES) throw new Error('Размер файла превышает лимит 25 МиБ.');
       const existing = idInput === null ? null : findChat(idInput);
       const projectId = projectIdInput === null ? null : requireId(projectIdInput);
       if (!existing && projectId && !projects.some((project) => project.id === projectId && !project.archived)) {
@@ -559,21 +728,35 @@ export async function openStore(directory: string): Promise<LocalStore> {
       const extension = extname(sourcePath).match(/^\.[A-Za-z0-9]{1,12}$/)?.[0].toLowerCase() ?? '';
       const storedName = `${id}${extension}`;
       const target = join(chatFolder(chat.id), 'files', storedName);
-      await mkdir(dirname(target), { recursive: true });
+      let targetReady = false;
+      let copied = false;
       try {
+        await assertOwnedPath(storageRoot, target);
+        await mkdir(dirname(target), { recursive: true });
+        await assertOwnedPath(storageRoot, target);
+        targetReady = true;
         await copyFile(sourcePath, target, constants.COPYFILE_EXCL);
+        copied = true;
+        await assertOwnedPath(storageRoot, target);
+        const storedFile = await stat(target);
+        if (!storedFile.isFile() || storedFile.size > MAX_IMPORTED_FILE_BYTES) {
+          throw new Error('Размер файла превышает лимит 25 МиБ.');
+        }
         const now = new Date().toISOString();
         const artifact: ChatArtifact = {
-          id, name: basename(sourcePath), storedName, size: source.size, createdAt: now, messageId: null,
+          id, name: basename(sourcePath), storedName, size: storedFile.size, createdAt: now, messageId: null,
         };
         const updated = { ...chat, updatedAt: now, artifacts: [...chat.artifacts, artifact] };
         await saveChat(updated);
         return structuredClone(updated);
       } catch (error) {
-        await unlink(target).catch(() => undefined);
+        if (targetReady && (copied || !isRecord(error) || error.code !== 'EEXIST')) {
+          await assertOwnedPath(storageRoot, target).then(() => unlink(target)).catch(() => undefined);
+        }
         if (!existing) {
           chats = chats.filter((item) => item.id !== chat.id);
-          await rm(chatFolder(chat.id), { recursive: true, force: true }).catch(() => undefined);
+          const folder = chatFolder(chat.id);
+          await assertOwnedPath(storageRoot, folder).then(() => rm(folder, { recursive: true, force: true })).catch(() => undefined);
         }
         throw error;
       }
@@ -582,12 +765,20 @@ export async function openStore(directory: string): Promise<LocalStore> {
       const chat = findChat(id);
       const artifact = chat.artifacts.find((item) => item.id === requireId(artifactId));
       if (!artifact) throw new Error('Файл чата не найден.');
-      return join(chatFolder(chat.id), 'files', artifact.storedName);
+      const path = join(chatFolder(chat.id), 'files', artifact.storedName);
+      await assertOwnedPath(storageRoot, path);
+      return path;
     }),
-    getChatFolder: (id) => serialize(async () => chatFolder(findChat(id).id)),
+    getChatFolder: (id) => serialize(async () => {
+      const path = chatFolder(findChat(id).id);
+      await assertOwnedPath(storageRoot, path);
+      return path;
+    }),
     deleteChat: (idInput) => serialize(async () => {
       const chat = findChat(idInput);
-      await rm(chatFolder(chat.id), { recursive: true });
+      const path = chatFolder(chat.id);
+      await assertOwnedPath(storageRoot, path);
+      await rm(path, { recursive: true });
       chats = chats.filter((item) => item.id !== chat.id);
     }),
     getSettings: () => serialize(async () => ({ ...settings })),
@@ -597,16 +788,32 @@ export async function openStore(directory: string): Promise<LocalStore> {
       await saveSettings(next);
       return { ...settings };
     }),
-    readGlobalInstructions: () => serialize(() => readInstructions(join(directory, 'GIGACHAT.md'))),
-    saveGlobalInstructions: (contents) => serialize(() => writeTextAtomic(join(directory, 'GIGACHAT.md'), requireInstructions(contents))),
+    getLocalUsageStats: () => serialize(async () => {
+      const activityDays = new Set<string>();
+      const addActivityDay = (value: string): void => {
+        const timestamp = Date.parse(value);
+        if (Number.isFinite(timestamp)) activityDays.add(new Date(timestamp).toISOString().slice(0, 10));
+      };
+      for (const project of projects) {
+        addActivityDay(project.createdAt);
+        addActivityDay(project.updatedAt);
+      }
+      for (const chat of chats) {
+        addActivityDay(chat.createdAt);
+        for (const message of chat.messages) addActivityDay(message.createdAt);
+      }
+      return { chatCount: chats.length, projectCount: projects.length, activityDayCount: activityDays.size };
+    }),
+    readGlobalInstructions: () => serialize(() => readOwnedInstructions(join(storageRoot, 'GIGACHAT.md'))),
+    saveGlobalInstructions: (contents) => serialize(() => writeOwnedTextAtomic(join(storageRoot, 'GIGACHAT.md'), requireInstructions(contents))),
     readProjectInstructions: (id) => {
       const validatedId = requireId(id);
-      return serialize(() => readInstructions(projectInstructionsPath(validatedId)));
+      return serialize(() => readOwnedInstructions(projectInstructionsPath(validatedId)));
     },
     saveProjectInstructions: (id, contents) => {
       const validatedId = requireId(id);
       const validatedContents = requireInstructions(contents);
-      return serialize(() => writeTextAtomic(projectInstructionsPath(validatedId), validatedContents));
+      return serialize(() => writeOwnedTextAtomic(projectInstructionsPath(validatedId), validatedContents));
     },
   };
 }

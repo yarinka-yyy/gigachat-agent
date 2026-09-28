@@ -1,6 +1,26 @@
+import type { PermissionProfile } from './permissions';
+
 export type Theme = 'system' | 'emerald' | 'light' | 'dark' | 'warm';
 export type ChatKind = 'text' | 'image';
 export type PreferredOpener = 'system' | 'explorer' | 'detected-app';
+
+export interface NotificationSettings {
+  taskStarted: boolean;
+  taskCompleted: boolean;
+  failures: boolean;
+}
+
+export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {
+  taskStarted: false,
+  taskCompleted: true,
+  failures: true,
+};
+
+export interface LocalUsageStats {
+  chatCount: number;
+  projectCount: number;
+  activityDayCount: number;
+}
 
 export interface Project {
   id: string;
@@ -30,6 +50,64 @@ export interface ChatMessage {
   createdAt: string;
 }
 
+export type InstructionSource = 'runtime' | 'global' | 'project' | 'skill';
+
+export interface InstructionLayer {
+  source: InstructionSource;
+  label: string;
+  scope?: string;
+  text: string;
+}
+
+export interface ProviderTurnRequest {
+  system: InstructionLayer[];
+  messages: ChatMessage[];
+  permissionProfile: PermissionProfile;
+}
+
+export type ProviderToolName = 'list' | 'search' | 'read' | 'write' | 'open' | 'powershell';
+
+export type ProviderEvent =
+  | { type: 'activity'; activity: 'connecting' | 'receiving' | 'waiting-for-tool' | 'tool-started' | 'tool-finished'; tool?: ProviderToolName }
+  | { type: 'text-delta'; text: string }
+  | { type: 'completed'; responseId?: string }
+  | { type: 'error'; code: string; retryable: boolean };
+
+export interface GigaChatProvider {
+  stream(request: ProviderTurnRequest, signal: AbortSignal): AsyncIterable<ProviderEvent>;
+}
+
+export type RuntimeTurnStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+
+export type RuntimeActivity =
+  | { kind: 'provider'; at: string; activity: Extract<ProviderEvent, { type: 'activity' }>['activity']; tool?: ProviderToolName }
+  | { kind: 'tool'; at: string; tool: ProviderToolName; phase: 'started' | 'completed' | 'failed' | 'cancelled'; durationMs?: number };
+
+export interface RuntimeTurnSnapshot {
+  id: string;
+  chatId: string;
+  status: RuntimeTurnStatus;
+  createdAt: string;
+  startedAt?: string;
+  endedAt?: string;
+  queueDurationMs?: number;
+  activeDurationMs?: number;
+  activity: RuntimeActivity[];
+  error?: string;
+}
+
+export interface RuntimeAvailability {
+  providerConfigured: boolean;
+  helperRecovered: boolean;
+  rendererToolApi: false;
+  helperUnavailableReason: string | null;
+}
+
+export interface VoiceAvailability {
+  available: boolean;
+  reason: string | null;
+}
+
 export interface ChatArtifact {
   id: string;
   name: string;
@@ -41,12 +119,76 @@ export interface ChatArtifact {
 
 export interface ChatDetail extends ChatSummary {
   draft: string;
+  nextTurnPermissionProfile: PermissionProfile | null;
+  nextTurnSkillId: string | null;
   messages: ChatMessage[];
   artifacts: ChatArtifact[];
 }
 
 export type ProjectPatch = Partial<Pick<Project, 'name' | 'pinned' | 'archived' | 'workingFolder'>>;
-export type ChatPatch = Partial<Pick<ChatDetail, 'title' | 'projectId' | 'pinned' | 'archived' | 'draft'>>;
+export type ChatPatch = Partial<Pick<ChatDetail, 'title' | 'projectId' | 'pinned' | 'archived' | 'draft' | 'nextTurnPermissionProfile' | 'nextTurnSkillId'>>;
+
+export type SkillScope = 'global' | 'project';
+
+export interface SkillRecord {
+  id: string;
+  name: string;
+  description: string;
+  command: string;
+  scope: SkillScope;
+  projectId: string | null;
+  projectName: string | null;
+  source: string;
+  enabled: boolean;
+}
+
+export interface SkillIssue {
+  source: string;
+  reason: string;
+}
+
+export interface SkillRegistrySnapshot {
+  skills: SkillRecord[];
+  issues: SkillIssue[];
+}
+
+export interface SkillSource {
+  id: string;
+  name: string;
+  source: string;
+  contents: string;
+}
+
+export type HookEvent =
+  | 'session-start' | 'project-start' | 'user-prompt-submitted' | 'before-tool' | 'after-tool'
+  | 'permission-request' | 'before-compaction' | 'after-compaction' | 'interrupt' | 'stop' | 'session-end' | 'project-end';
+
+export type HookOrigin = 'global' | 'project' | 'skill' | 'plugin';
+
+export interface HookRecord {
+  id: string;
+  name: string;
+  description: string;
+  event: HookEvent;
+  origin: HookOrigin;
+  scope: string;
+  owner: string;
+  source: string;
+  enabled: false;
+  verified: false;
+  actionFile: string;
+  unavailableReason: string;
+}
+
+export interface HookIssue {
+  source: string;
+  reason: string;
+}
+
+export interface HookRegistrySnapshot {
+  hooks: HookRecord[];
+  issues: HookIssue[];
+}
 
 export interface Settings {
   theme: Theme;
@@ -54,6 +196,9 @@ export interface Settings {
   sidebarVisible: boolean;
   defaultProjectsFolder: string | null;
   preferredOpener: PreferredOpener;
+  defaultPermissionProfile: PermissionProfile;
+  onboardingCompleted: boolean;
+  notifications: NotificationSettings;
 }
 
 export type SettingsPatch = Partial<Settings>;
@@ -68,6 +213,28 @@ export interface AppInfo {
   dataPath: string;
   packaged: boolean;
   platform: string;
+}
+
+export interface SecureStoreStatus {
+  available: boolean;
+  saved: boolean;
+  usable: boolean;
+}
+
+export interface BrowserBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface OnboardingBrowserStatus {
+  open: boolean;
+  loading: boolean;
+  canGoBack: boolean;
+  atStudio: boolean;
+  hostname: string | null;
+  error: string | null;
 }
 
 export interface AppApi {
@@ -92,6 +259,37 @@ export interface AppApi {
     openFolder(id: string): Promise<void>;
     remove(id: string): Promise<void>;
   };
+  runtime: {
+    getStatus(): Promise<RuntimeAvailability>;
+    list(chatId: string): Promise<RuntimeTurnSnapshot[]>;
+    cancel(chatId: string, turnId: string): Promise<boolean>;
+    onUpdate(listener: (turn: RuntimeTurnSnapshot) => void): () => void;
+  };
+  skills: {
+    list(): Promise<SkillRegistrySnapshot>;
+    readSource(id: string): Promise<SkillSource>;
+    setEnabled(id: string, enabled: boolean): Promise<SkillRegistrySnapshot>;
+    openFolder(scope: SkillScope, projectId?: string | null): Promise<void>;
+  };
+  hooks: {
+    list(): Promise<HookRegistrySnapshot>;
+  };
+  onboarding: {
+    getKeyStatus(): Promise<SecureStoreStatus>;
+    saveKey(key: string): Promise<SecureStoreStatus>;
+    getBrowserStatus(): Promise<OnboardingBrowserStatus>;
+    openStudio(): Promise<OnboardingBrowserStatus>;
+    closeBrowser(): Promise<void>;
+    setBrowserBounds(bounds: BrowserBounds): Promise<void>;
+    back(): Promise<void>;
+    reload(): Promise<void>;
+    onBrowserStatus(listener: (status: OnboardingBrowserStatus) => void): () => void;
+  };
+  voice: {
+    getStatus(): Promise<VoiceAvailability>;
+    transcribe(requestId: string, audio: Uint8Array, mediaType: string): Promise<string>;
+    cancel(requestId: string): Promise<boolean>;
+  };
   settings: {
     get(): Promise<Settings>;
     update(patch: SettingsPatch): Promise<Settings>;
@@ -103,6 +301,10 @@ export interface AppApi {
     setAutoStart(enabled: boolean): Promise<boolean>;
     readInstructions(): Promise<string>;
     saveInstructions(contents: string): Promise<void>;
+    deleteAppData(): Promise<boolean>;
+  };
+  usage: {
+    getLocalStats(): Promise<LocalUsageStats>;
   };
   onCloseRequested(flush: () => Promise<void>): () => void;
 }

@@ -94,6 +94,13 @@ typings/
 # Electron-Forge
 out/
 
+# Self-contained local runtime build output
+native/**/bin/
+native/**/obj/
+/resources/native/
+/resources/voice/*
+!/resources/voice/manifest.json
+
 # Local application data
 .local-data/
 local-data/

@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
 import {
   Archive,
   ArrowLeft,
@@ -47,6 +47,7 @@ import {
   X,
   type LucideIcon,
 } from 'lucide-react';
+import { completeComposerSuggestion, getComposerCompletion, isUnavailableCompactCommand, type ComposerSuggestion } from './commands';
 import type {
   AppInfo,
   ChatDetail,
@@ -54,16 +55,30 @@ import type {
   ChatKind,
   ChatPatch,
   FolderOpener,
+  HookEvent,
+  HookRegistrySnapshot,
+  LocalUsageStats,
   Project,
   ProjectPatch,
+  RuntimeActivity,
+  RuntimeTurnSnapshot,
+  SkillRecord,
+  SkillRegistrySnapshot,
+  SkillScope,
+  SkillSource,
   Settings,
   SettingsPatch,
+  NotificationSettings,
   Theme,
+  VoiceAvailability,
 } from './contracts';
+import type { PermissionProfile } from './permissions';
 import gigaChatLogo from './assets/gigachat-logo.png';
 import { createInstructionAutosave, type SaveStatus } from './instruction-autosave';
+import ConnectionSetup from './components/ConnectionSetup';
+import VoiceCaptureControl from './components/VoiceCaptureControl';
 
-type Page = 'home' | 'chat' | 'project' | 'settings' | 'images' | 'video' | 'podcasts' | 'archive' | 'profile';
+type Page = 'home' | 'chat' | 'project' | 'settings' | 'onboarding' | 'images' | 'video' | 'podcasts' | 'archive' | 'profile';
 type Route = { page: Page; id?: string };
 type Navigation = { history: Route[]; index: number };
 type SettingsSection =
@@ -144,7 +159,7 @@ const SETTINGS_SECTIONS: PageIcon[] = [
   { id: 'personalization', label: 'Персонализация', icon: 'book' },
   { id: 'integrations', label: 'Skills и интеграции', icon: 'puzzle' },
   { id: 'hooks', label: 'Hooks', icon: 'plug' },
-  { id: 'browser', label: 'Браузер и Computer Use', icon: 'globe' },
+  { id: 'browser', label: 'Подключение API', icon: 'globe' },
   { id: 'voice', label: 'Голос', icon: 'volume' },
   { id: 'notifications', label: 'Уведомления', icon: 'bell' },
   { id: 'files', label: 'Проекты и файлы', icon: 'folderOpen' },
@@ -159,7 +174,28 @@ const DEFAULT_SETTINGS: Settings = {
   sidebarVisible: true,
   defaultProjectsFolder: null,
   preferredOpener: 'system',
+  defaultPermissionProfile: 'ask',
+  onboardingCompleted: false,
+  notifications: { taskStarted: false, taskCompleted: true, failures: true },
 };
+
+const AVAILABLE_PERMISSION_PROFILES = [
+  {
+    id: 'ask',
+    name: 'Спросить перед действием',
+    description: 'Всё вне выбранного проекта требует вашего решения. Ход не запускается без GigaChat API.',
+  },
+  {
+    id: 'approve',
+    name: 'Подтверждать за меня',
+    description: 'Автопроверяющего пока нет, поэтому неопределённые действия требуют подтверждения.',
+  },
+  {
+    id: 'full',
+    name: 'Полный доступ',
+    description: 'Разрешает доступные действия внутри проекта; доступа ко всей машине и сети не добавляет.',
+  },
+] as const;
 
 function Icon({ name, className = '' }: { name: IconName; className?: string }) {
   const Component = ICONS[name];
@@ -381,6 +417,47 @@ function getErrorMessage(error: unknown): string {
     : 'Не удалось выполнить действие.';
 }
 
+function runtimeStatusLabel(status: RuntimeTurnSnapshot['status']): string {
+  if (status === 'queued') return 'В очереди';
+  if (status === 'running') return 'Выполняется';
+  if (status === 'completed') return 'Завершено';
+  if (status === 'cancelled') return 'Отменено';
+  return 'Ошибка';
+}
+
+function runtimeActivityLabel(activity: RuntimeActivity): string {
+  if (activity.kind === 'tool') {
+    type ToolActivity = Extract<RuntimeActivity, { kind: 'tool' }>;
+    const names: Record<ToolActivity['tool'], string> = {
+      list: 'Список файлов', search: 'Поиск', read: 'Чтение файла', write: 'Запись файла', open: 'Открытие', powershell: 'PowerShell',
+    };
+    const phases: Record<ToolActivity['phase'], string> = {
+      started: 'запущен', completed: 'завершён', failed: 'ошибка', cancelled: 'отменён',
+    };
+    return `${names[activity.tool]}: ${phases[activity.phase]}`;
+  }
+  if (activity.activity === 'connecting') return 'Подключение к GigaChat';
+  if (activity.activity === 'receiving') return 'Получение ответа';
+  if (activity.activity === 'waiting-for-tool') return 'Ожидание инструмента';
+  return activity.activity === 'tool-started' ? 'Запуск инструмента' : 'Инструмент завершён';
+}
+
+function elapsedLabel(durationMs: number | undefined): string | null {
+  if (durationMs === undefined || !Number.isFinite(durationMs) || durationMs < 0) return null;
+  return `${Math.round(durationMs / 1000)} с`;
+}
+
+function hookEventLabel(event: HookEvent): string {
+  const labels: Record<HookEvent, string> = {
+    'session-start': 'Начало сессии', 'project-start': 'Открытие проекта',
+    'user-prompt-submitted': 'Отправка запроса', 'before-tool': 'Перед инструментом',
+    'after-tool': 'После инструмента', 'permission-request': 'Запрос разрешения',
+    'before-compaction': 'Перед сжатием контекста', 'after-compaction': 'После сжатия контекста',
+    interrupt: 'Прерывание', stop: 'Остановка', 'session-end': 'Завершение сессии', 'project-end': 'Завершение проекта',
+  };
+  return labels[event];
+}
+
 function sameRoute(left: Route | undefined, right: Route): boolean {
   return left?.page === right.page && left.id === right.id;
 }
@@ -402,6 +479,7 @@ export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [chats, setChats] = useState<ChatSummary[]>([]);
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
+  const settingsRef = useRef<Settings>(DEFAULT_SETTINGS);
   const [runtimeMode, setRuntimeMode] = useState<'api' | 'web'>('api');
   const [navigation, setNavigation] = useState<Navigation>({ history: [{ page: 'home' }], index: 0 });
   const [sidebarPreview, setSidebarPreview] = useState(false);
@@ -411,7 +489,12 @@ export default function App() {
   const [showAllChats, setShowAllChats] = useState(false);
   const [selectedProjectId, setSelectedProjectId] = useState('');
   const [draft, setDraft] = useState('');
+  const [composerCaret, setComposerCaret] = useState(0);
+  const [completionDismissed, setCompletionDismissed] = useState(false);
+  const [completionIndex, setCompletionIndex] = useState(0);
   const [chatDetail, setChatDetail] = useState<ChatDetail | null>(null);
+  const [runtimeTurns, setRuntimeTurns] = useState<RuntimeTurnSnapshot[]>([]);
+  const [pendingPermissionProfile, setPendingPermissionProfile] = useState<PermissionProfile | null>(null);
   const [sending, setSending] = useState(false);
   const [dialogRequest, setDialogRequest] = useState<{ kind: 'create-project' | 'rename-project' | 'delete-project' | 'rename-chat' | 'delete-chat'; project?: Project; chat?: ChatSummary; hasFiles?: boolean } | null>(null);
   const [dialogValue, setDialogValue] = useState('');
@@ -425,6 +508,15 @@ export default function App() {
   const [autoStart, setAutoStart] = useState(false);
   const [openers, setOpeners] = useState<FolderOpener[]>([]);
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
+  const [localUsageStats, setLocalUsageStats] = useState<LocalUsageStats | null>(null);
+  const [voiceAvailability, setVoiceAvailability] = useState<VoiceAvailability>({ available: false, reason: 'Проверяем локальный runtime диктовки…' });
+  const [skillRegistry, setSkillRegistry] = useState<SkillRegistrySnapshot>({ skills: [], issues: [] });
+  const [hookRegistry, setHookRegistry] = useState<HookRegistrySnapshot>({ hooks: [], issues: [] });
+  const [skillProjectId, setSkillProjectId] = useState('');
+  const [pendingSkillId, setPendingSkillId] = useState<string | null>(null);
+  const [skillSource, setSkillSource] = useState<SkillSource | null>(null);
+  const [skillSourceLoading, setSkillSourceLoading] = useState<string | null>(null);
+  const [skillBusyId, setSkillBusyId] = useState<string | null>(null);
   const [globalInstructions, setGlobalInstructions] = useState('');
   const [globalInstructionsStatus, setGlobalInstructionsStatus] = useState<SaveStatus>('saved');
   const [integrationTab, setIntegrationTab] = useState<'skills' | 'plugins' | 'tools'>('skills');
@@ -433,7 +525,16 @@ export default function App() {
   const [projectInstructionsStatus, setProjectInstructionsStatus] = useState<SaveStatus>('saved');
   const pendingChat = useRef<Promise<ChatSummary> | null>(null);
   const homeChatId = useRef<string | null>(null);
+  const pendingPermissionProfileRef = useRef<PermissionProfile | null>(null);
+  const pendingPermissionChatIdRef = useRef<string | null>(null);
+  const permissionProfileRevision = useRef(0);
+  const permissionProfileSave = useRef<Promise<unknown>>(Promise.resolve());
+  const pendingSkillIdRef = useRef<string | null>(null);
+  const pendingSkillChatIdRef = useRef<string | null>(null);
+  const skillSelectionRevision = useRef(0);
+  const skillSelectionSave = useRef<Promise<unknown>>(Promise.resolve());
   const draftRef = useRef('');
+  const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const draftSave = useRef<Promise<unknown>>(Promise.resolve());
   const dialogRef = useRef<HTMLDialogElement>(null);
   const routeRef = useRef<Route>({ page: 'home' });
@@ -465,6 +566,8 @@ export default function App() {
   ));
   const route = navigation.history[navigation.index] ?? { page: 'home' as const };
 
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
+
   useEffect(() => {
     let cancelled = false;
     void Promise.all([
@@ -476,6 +579,11 @@ export default function App() {
       setProjects(loadedProjects);
       setChats(loadedChats);
       setSettings(loadedSettings);
+      if (!loadedSettings.onboardingCompleted) {
+        const onboardingRoute: Route = { page: 'onboarding' };
+        routeRef.current = onboardingRoute;
+        setNavigation({ history: [onboardingRoute], index: 0 });
+      }
       setLoading(false);
     }).catch((error: unknown) => {
       if (cancelled) return;
@@ -485,9 +593,62 @@ export default function App() {
     return () => { cancelled = true; };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    void window.gigaChat.voice.getStatus().then((availability) => {
+      if (!cancelled) setVoiceAvailability(availability);
+    }).catch(() => {
+      if (!cancelled) setVoiceAvailability({ available: false, reason: 'Не удалось проверить локальный runtime диктовки.' });
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void window.gigaChat.skills.list().then((snapshot) => {
+      if (!cancelled) setSkillRegistry(snapshot);
+    }).catch((error: unknown) => {
+      if (!cancelled) setNotice(getErrorMessage(error));
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (route.page !== 'settings' || settingsSection !== 'integrations') return undefined;
+    let cancelled = false;
+    void window.gigaChat.skills.list().then((snapshot) => {
+      if (!cancelled) setSkillRegistry(snapshot);
+    }).catch((error: unknown) => { if (!cancelled) setNotice(getErrorMessage(error)); });
+    return () => { cancelled = true; };
+  }, [route.page, settingsSection]);
+
+  useEffect(() => {
+    if (route.page !== 'settings' || settingsSection !== 'hooks') return undefined;
+    let cancelled = false;
+    void window.gigaChat.hooks.list().then((snapshot) => {
+      if (!cancelled) setHookRegistry(snapshot);
+    }).catch((error: unknown) => { if (!cancelled) setNotice(getErrorMessage(error)); });
+    return () => { cancelled = true; };
+  }, [route.page, settingsSection]);
+
+  useEffect(() => {
+    if (route.page !== 'profile') return undefined;
+    let cancelled = false;
+    setLocalUsageStats(null);
+    void window.gigaChat.usage.getLocalStats().then((stats) => {
+      if (!cancelled) setLocalUsageStats(stats);
+    }).catch((error: unknown) => {
+      if (!cancelled) setNotice(getErrorMessage(error));
+    });
+    return () => { cancelled = true; };
+  }, [route.page, chats.length, projects.length]);
+
   useEffect(() => window.gigaChat.onCloseRequested(async () => {
     try {
-      await Promise.all([globalSaver.flushAll(), projectSaver.flushAll(), draftSave.current]);
+      await Promise.all([
+        globalSaver.flushAll(), projectSaver.flushAll(), draftSave.current,
+        permissionProfileSave.current, skillSelectionSave.current,
+      ]);
     } catch (error) {
       setNotice(getErrorMessage(error));
       throw error;
@@ -580,6 +741,39 @@ export default function App() {
   }, [route.page, route.id]);
 
   useEffect(() => {
+    const chatId = route.page === 'chat' ? route.id : undefined;
+    setRuntimeTurns([]);
+    if (!chatId) return undefined;
+    let cancelled = false;
+    const merge = (turn: RuntimeTurnSnapshot): void => {
+      if (turn.chatId !== chatId) return;
+      setRuntimeTurns((current) => {
+        const byId = new Map(current.map((item) => [item.id, item]));
+        byId.set(turn.id, turn);
+        return [...byId.values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt)).slice(-12);
+      });
+      if (turn.status === 'completed') {
+        void window.gigaChat.chats.get(chatId).then((detail) => {
+          if (!cancelled && routeRef.current.page === 'chat' && routeRef.current.id === chatId) setChatDetail(detail);
+        }).catch((error: unknown) => { if (!cancelled) setNotice(getErrorMessage(error)); });
+      }
+    };
+    const unsubscribe = window.gigaChat.runtime.onUpdate(merge);
+    void window.gigaChat.runtime.list(chatId).then((turns) => {
+      if (cancelled) return;
+      setRuntimeTurns((current) => {
+        const byId = new Map(turns.map((turn) => [turn.id, turn]));
+        for (const turn of current) if (!byId.has(turn.id)) byId.set(turn.id, turn);
+        return [...byId.values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt)).slice(-12);
+      });
+    }).catch((error: unknown) => { if (!cancelled) setNotice(getErrorMessage(error)); });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [route.page, route.id]);
+
+  useEffect(() => {
     if (route.page !== 'settings') return;
     let cancelled = false;
     void Promise.all([
@@ -610,6 +804,12 @@ export default function App() {
     .sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt.localeCompare(a.updatedAt));
   const activeChats = chats.filter((chat) => !chat.archived)
     .sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt.localeCompare(a.updatedAt));
+  const pinnedProjects = activeProjects.filter((project) => project.pinned);
+  const unpinnedProjects = activeProjects.filter((project) => !project.pinned);
+  const visibleProjects = showAllProjects ? activeProjects : [...pinnedProjects, ...unpinnedProjects.slice(0, 5)];
+  const pinnedChats = activeChats.filter((chat) => chat.pinned);
+  const unpinnedChats = activeChats.filter((chat) => !chat.pinned);
+  const visibleChats = showAllChats ? activeChats : [...pinnedChats, ...unpinnedChats.slice(0, 8)];
   const archivedProjects = projects.filter((project) => project.archived);
   const archivedChats = chats.filter((chat) => chat.archived);
   const selectedChat = chats.find((chat) => chat.id === route.id);
@@ -620,6 +820,62 @@ export default function App() {
   const canGoForward = navigation.index < navigation.history.length - 1;
   const settingTitle = SETTINGS_SECTIONS.find((item) => item.id === settingsSection)?.label ?? 'Настройки';
   const disabledReason = 'Станет доступно после подключения GigaChat API.';
+  const composerPermissionProfile = selectedChat && chatDetail?.id === selectedChat.id
+    ? chatDetail.nextTurnPermissionProfile ?? (pendingPermissionChatIdRef.current === selectedChat.id ? pendingPermissionProfile : null) ?? settings.defaultPermissionProfile
+    : pendingPermissionProfile ?? settings.defaultPermissionProfile;
+  const canChangeComposerPermissionProfile = (route.page === 'home' && !selectedChat)
+    || Boolean(selectedChat && chatDetail?.id === selectedChat.id);
+  const composerProjectId = route.page === 'chat' ? selectedChat?.projectId ?? null
+    : route.page === 'home' ? selectedProjectId || null : null;
+  const composerSkills = skillRegistry.skills
+    .filter((skill) => skill.scope === 'global' || skill.projectId === composerProjectId)
+    .map((skill) => ({
+      id: skill.id, name: skill.name, command: skill.command, enabled: skill.enabled,
+      scope: skill.scope, projectId: skill.projectId,
+      scopeLabel: skill.scope === 'global' ? 'Global' : skill.projectName ?? 'Project',
+    }));
+  const selectedComposerSkillId = selectedChat && chatDetail?.id === selectedChat.id
+    ? (pendingSkillChatIdRef.current === selectedChat.id ? pendingSkillId : null) ?? chatDetail.nextTurnSkillId
+    : route.page === 'home' && pendingSkillChatIdRef.current === null ? pendingSkillId : null;
+  const selectedComposerSkill = skillRegistry.skills.find((skill) => skill.id === selectedComposerSkillId && skill.enabled) ?? null;
+  const composerCompletion = completionDismissed ? null : getComposerCompletion(draft, composerCaret, composerSkills, composerProjectId);
+
+  function insertComposerSuggestion(suggestion: ComposerSuggestion, caret = composerInputRef.current?.selectionStart ?? composerCaret): void {
+    const inserted = completeComposerSuggestion(draft, caret, suggestion);
+    changeDraft(inserted.value, inserted.caret);
+    if (suggestion.skillId) void changeComposerSkill(suggestion.skillId);
+    window.requestAnimationFrame(() => {
+      composerInputRef.current?.focus();
+      composerInputRef.current?.setSelectionRange(inserted.caret, inserted.caret);
+    });
+  }
+
+  function handleComposerKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>): void {
+    const completion = completionDismissed ? null : getComposerCompletion(draft, event.currentTarget.selectionStart, composerSkills, composerProjectId);
+    if (event.key === 'Escape' && completion) {
+      event.preventDefault();
+      setCompletionDismissed(true);
+      return;
+    }
+    if (completion && completion.items.length && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+      event.preventDefault();
+      const delta = event.key === 'ArrowDown' ? 1 : -1;
+      setCompletionIndex((index) => (index + delta + completion.items.length) % completion.items.length);
+      return;
+    }
+    if (completion && event.key === 'Enter' && !event.shiftKey) {
+      const suggestion = completion.items[completionIndex];
+      if (suggestion?.available) {
+        event.preventDefault();
+        insertComposerSuggestion(suggestion, event.currentTarget.selectionStart);
+        return;
+      }
+    }
+    if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+      event.preventDefault();
+      void submitMessage();
+    }
+  }
 
   function navigate(next: Route): void {
     routeRef.current = next;
@@ -661,6 +917,13 @@ export default function App() {
     try {
       const chat = await window.gigaChat.chats.create(projectId, kind);
       setChats((current) => [chat, ...current]);
+      if (routeRef.current.page === 'home' && pendingPermissionProfileRef.current) {
+        pendingPermissionChatIdRef.current = chat.id;
+      }
+      if (routeRef.current.page === 'home' && pendingSkillIdRef.current) {
+        pendingSkillChatIdRef.current = chat.id;
+        void saveSkillSelectionForChat(chat.id, pendingSkillIdRef.current, skillSelectionRevision.current);
+      }
       draftRef.current = '';
       setDraft('');
       setSelectedProjectId('');
@@ -678,17 +941,34 @@ export default function App() {
   async function submitMessage(): Promise<void> {
     const value = draftRef.current.trim();
     if (!value || sending) return;
+    if (isUnavailableCompactCommand(value)) {
+      showSuccess('/compact станет доступна после подключения модели. История не изменена.');
+      return;
+    }
     setSending(true);
     try {
       const chatId = routeRef.current.page === 'chat' ? routeRef.current.id
         : homeChatId.current ?? (await pendingChat.current)?.id;
       if (!chatId) throw new Error('Не удалось создать чат. Попробуйте снова.');
       await draftSave.current;
+      await permissionProfileSave.current;
+      await skillSelectionSave.current;
+      const pendingProfile = pendingPermissionChatIdRef.current === chatId ? pendingPermissionProfileRef.current : null;
+      if (pendingProfile) await window.gigaChat.chats.update(chatId, { nextTurnPermissionProfile: pendingProfile });
+      if (pendingSkillChatIdRef.current !== chatId && pendingSkillIdRef.current) {
+        pendingSkillChatIdRef.current = chatId;
+        await saveSkillSelectionForChat(chatId, pendingSkillIdRef.current, skillSelectionRevision.current);
+      }
       const detail = await window.gigaChat.chats.appendLocalMessage(chatId, value);
       if (routeRef.current.page === 'chat' && routeRef.current.id === chatId) {
         setChatDetail(detail);
         setDraft('');
         draftRef.current = '';
+      }
+      if (pendingProfile) {
+        pendingPermissionProfileRef.current = null;
+        pendingPermissionChatIdRef.current = null;
+        setPendingPermissionProfile(null);
       }
       setChats(await window.gigaChat.chats.list());
       showSuccess('Не отправлено в GigaChat API. Сообщение сохранено локально.');
@@ -714,8 +994,11 @@ export default function App() {
     }
   }
 
-  function changeDraft(value: string): void {
+  function changeDraft(value: string, caret = value.length): void {
     setDraft(value);
+    setComposerCaret(Math.max(0, Math.min(value.length, caret)));
+    setCompletionDismissed(false);
+    setCompletionIndex(0);
     draftRef.current = value;
     if (route.page === 'chat' && route.id) {
       saveChatDraft(route.id, value);
@@ -732,6 +1015,11 @@ export default function App() {
     pendingChat.current = creation;
     void creation.then((chat) => {
       homeChatId.current = chat.id;
+      if (pendingPermissionProfileRef.current) pendingPermissionChatIdRef.current = chat.id;
+      if (pendingSkillIdRef.current) {
+        pendingSkillChatIdRef.current = chat.id;
+        void saveSkillSelectionForChat(chat.id, pendingSkillIdRef.current, skillSelectionRevision.current);
+      }
       setChats((current) => [chat, ...current]);
       if (routeRef.current.page === 'home') navigate({ page: 'chat', id: chat.id });
       saveChatDraft(chat.id, draftRef.current);
@@ -739,6 +1027,18 @@ export default function App() {
       setNotice(getErrorMessage(error));
     }).finally(() => {
       if (pendingChat.current === creation) pendingChat.current = null;
+    });
+  }
+
+  function insertVoiceTranscript(text: string): void {
+    const current = draftRef.current;
+    const separator = current && !current.endsWith('\n') ? '\n' : '';
+    const next = `${current}${separator}${text}`;
+    changeDraft(next, next.length);
+    window.requestAnimationFrame(() => {
+      const input = composerInputRef.current;
+      input?.focus();
+      input?.setSelectionRange(next.length, next.length);
     });
   }
 
@@ -777,6 +1077,10 @@ export default function App() {
     try {
       const updated = await window.gigaChat.chats.update(chat.id, patch);
       setChats((current) => current.map((item) => item.id === chat.id ? updated : item));
+      setChatDetail((current) => current?.id === chat.id ? { ...current, ...patch } : current);
+      if (patch.projectId !== undefined && routeRef.current.page === 'chat' && routeRef.current.id === chat.id) {
+        setChatDetail(await window.gigaChat.chats.get(chat.id));
+      }
     } catch (error) {
       setNotice(getErrorMessage(error));
     }
@@ -832,20 +1136,165 @@ export default function App() {
   }
 
   async function changeChatProject(chat: ChatSummary, projectId: string): Promise<void> {
-    await updateChat(chat, { projectId: projectId || null });
+    const nextProjectId = projectId || null;
+    const skillId = chatDetail?.id === chat.id ? chatDetail.nextTurnSkillId : null;
+    const projectSkill = skillId ? /^project\/([^/]+)\//.exec(skillId) : null;
+    await updateChat(chat, {
+      projectId: nextProjectId,
+      ...(projectSkill && projectSkill[1] !== nextProjectId ? { nextTurnSkillId: null } : {}),
+    });
   }
 
   async function updateLocalSettings(patch: SettingsPatch): Promise<void> {
     const revision = ++settingsRevision.current;
-    setSettings((current) => ({ ...current, ...patch }));
+    const optimisticSettings = { ...settingsRef.current, ...patch };
+    settingsRef.current = optimisticSettings;
+    setSettings(optimisticSettings);
     try {
       const updated = await window.gigaChat.settings.update(patch);
-      if (revision === settingsRevision.current) setSettings(updated);
+      if (revision === settingsRevision.current) {
+        settingsRef.current = updated;
+        setSettings(updated);
+      }
     } catch (error) {
       setNotice(getErrorMessage(error));
       if (revision === settingsRevision.current) {
-        try { setSettings(await window.gigaChat.settings.get()); }
+        try {
+          const latest = await window.gigaChat.settings.get();
+          settingsRef.current = latest;
+          setSettings(latest);
+        }
         catch (readError) { setNotice(getErrorMessage(readError)); }
+      }
+    }
+  }
+
+  function updateNotificationSetting(category: keyof NotificationSettings, enabled: boolean): void {
+    void updateLocalSettings({ notifications: { ...settingsRef.current.notifications, [category]: enabled } });
+  }
+
+  async function finishOnboarding(): Promise<void> {
+    const updated = await window.gigaChat.settings.update({ onboardingCompleted: true });
+    setSettings(updated);
+    navigate({ page: 'home' });
+  }
+
+  async function saveSkillSelectionForChat(chatId: string, skillId: string | null, revision: number): Promise<void> {
+    const save = skillSelectionSave.current.catch(() => undefined).then(() =>
+      window.gigaChat.chats.update(chatId, { nextTurnSkillId: skillId }),
+    );
+    skillSelectionSave.current = save;
+    try {
+      await save;
+      if (revision !== skillSelectionRevision.current) return;
+      setChatDetail((current) => current?.id === chatId ? { ...current, nextTurnSkillId: skillId } : current);
+      if (pendingSkillChatIdRef.current === chatId) {
+        pendingSkillIdRef.current = null;
+        pendingSkillChatIdRef.current = null;
+        setPendingSkillId(null);
+      }
+    } catch (error) {
+      if (revision !== skillSelectionRevision.current) return;
+      try {
+        const latest = await window.gigaChat.chats.get(chatId);
+        setChatDetail((current) => current?.id === chatId ? latest : current);
+      } catch (readError) {
+        setNotice(getErrorMessage(readError));
+      }
+      setNotice(getErrorMessage(error));
+    }
+  }
+
+  async function changeComposerSkill(skillId: string | null): Promise<void> {
+    const skill = skillId ? skillRegistry.skills.find((item) => item.id === skillId) : null;
+    if (skillId && (!skill || !skill.enabled)) {
+      setNotice('Skill удалён или выключен; обновите список и выберите доступный Skill.');
+      return;
+    }
+    if (skill && skill.scope === 'project' && skill.projectId !== composerProjectId) {
+      setNotice('Выберите Skill из Global или текущего проекта.');
+      return;
+    }
+    const revision = ++skillSelectionRevision.current;
+    pendingSkillIdRef.current = skillId;
+    setPendingSkillId(skillId);
+    if (route.page === 'home' && !selectedChat) {
+      pendingSkillChatIdRef.current = null;
+      const chatId = homeChatId.current ?? (await pendingChat.current)?.id ?? null;
+      if (chatId) {
+        pendingSkillChatIdRef.current = chatId;
+        await saveSkillSelectionForChat(chatId, skillId, revision);
+      }
+      return;
+    }
+    if (!selectedChat) return;
+    pendingSkillChatIdRef.current = selectedChat.id;
+    setChatDetail((current) => current?.id === selectedChat.id ? { ...current, nextTurnSkillId: skillId } : current);
+    await saveSkillSelectionForChat(selectedChat.id, skillId, revision);
+  }
+
+  async function refreshSkillRegistry(): Promise<void> {
+    try { setSkillRegistry(await window.gigaChat.skills.list()); }
+    catch (error) { setNotice(getErrorMessage(error)); }
+  }
+
+  async function setSkillEnabled(skill: SkillRecord, enabled: boolean): Promise<void> {
+    setSkillBusyId(skill.id);
+    try { setSkillRegistry(await window.gigaChat.skills.setEnabled(skill.id, enabled)); }
+    catch (error) { setNotice(getErrorMessage(error)); }
+    finally { setSkillBusyId(null); }
+  }
+
+  async function inspectSkill(skill: SkillRecord): Promise<void> {
+    if (skillSource?.id === skill.id) {
+      setSkillSource(null);
+      return;
+    }
+    setSkillSourceLoading(skill.id);
+    try { setSkillSource(await window.gigaChat.skills.readSource(skill.id)); }
+    catch (error) { setNotice(getErrorMessage(error)); }
+    finally { setSkillSourceLoading(null); }
+  }
+
+  async function openSkillFolder(scope: SkillScope, projectId?: string | null): Promise<void> {
+    try { await window.gigaChat.skills.openFolder(scope, projectId); }
+    catch (error) { setNotice(getErrorMessage(error)); }
+  }
+
+  async function changeComposerPermissionProfile(profile: PermissionProfile): Promise<void> {
+    if (profile === 'custom') return;
+    if (!selectedChat || !chatDetail || chatDetail.id !== selectedChat.id) {
+      if (route.page === 'home' && !selectedChat) {
+        pendingPermissionProfileRef.current = profile;
+        pendingPermissionChatIdRef.current = null;
+        setPendingPermissionProfile(profile);
+      }
+      return;
+    }
+
+    const next = profile === settings.defaultPermissionProfile ? null : profile;
+    const revision = ++permissionProfileRevision.current;
+    setChatDetail((current) => current?.id === selectedChat.id ? { ...current, nextTurnPermissionProfile: next } : current);
+    const save = permissionProfileSave.current.catch(() => undefined).then(() =>
+      window.gigaChat.chats.update(selectedChat.id, { nextTurnPermissionProfile: next }),
+    );
+    permissionProfileSave.current = save;
+    try {
+      await save;
+      if (revision === permissionProfileRevision.current && pendingPermissionChatIdRef.current === selectedChat.id) {
+        pendingPermissionProfileRef.current = null;
+        pendingPermissionChatIdRef.current = null;
+        setPendingPermissionProfile(null);
+      }
+    } catch (error) {
+      if (revision === permissionProfileRevision.current) {
+        try {
+          const latest = await window.gigaChat.chats.get(selectedChat.id);
+          setChatDetail((current) => current?.id === selectedChat.id ? latest : current);
+        } catch (readError) {
+          setNotice(getErrorMessage(readError));
+        }
+        setNotice(getErrorMessage(error));
       }
     }
   }
@@ -874,13 +1323,15 @@ export default function App() {
   }
 
   function projectMenu(project: Project): ReactNode {
+    const currentProject = route.page === 'project' && route.id === project.id;
     return (
       <ActionMenu label={`Действия проекта ${project.name}`}>
         <button type="button" onClick={() => renameProject(project)}><Icon name="edit" />Переименовать</button>
         <button type="button" onClick={() => void updateProject(project, { pinned: !project.pinned })}>
           <Icon name="pin" />{project.pinned ? 'Открепить' : 'Закрепить'}
         </button>
-        <button type="button" onClick={() => navigate({ page: 'project', id: project.id })}><Icon name="folderOpen" />Открыть проект</button>
+        {!currentProject && <button type="button" onClick={() => navigate({ page: 'project', id: project.id })}><Icon name="folderOpen" />Настройки проекта</button>}
+        {!currentProject && project.workingFolder && <button type="button" onClick={() => void window.gigaChat.projects.openFolder(project.id).catch((error: unknown) => setNotice(getErrorMessage(error)))}><Icon name="external" />Открыть папку</button>}
         <button type="button" onClick={() => void updateProject(project, { archived: !project.archived })}>
           <Icon name="archive" />{project.archived ? 'Восстановить из архива' : 'Архивировать'}
         </button>
@@ -1009,18 +1460,27 @@ export default function App() {
       case 'permissions':
         return (
           <>
-            <div className="settings-section-heading"><h2>Разрешения</h2><p>Профили появятся вместе с механизмом разрешений. Сейчас выбор не сохраняется и не влияет на доступ.</p></div>
+            <div className="settings-section-heading"><h2>Разрешения</h2><p>Профиль хранится локально для следующего хода. Пока API не подключён, ход не запускается.</p></div>
             <div className="permission-profile-list">
-              {[
-                ['Спросить перед действием', 'Действия внутри заданной границы; запросы на расширение подтверждает пользователь.'],
-                ['Подтверждать за меня', 'Действия остаются ограниченными; подходящие запросы сможет обработать политика приложения.'],
-                ['Полный доступ', 'Широкий доступ к системе. Этот режим не включён до появления защитного механизма.'],
-                ['Настроить вручную', 'Редактор профиля будет добавлен вместе с permission engine.'],
-              ].map(([name, description]) => (
-                <article className="permission-profile disabled-card" key={name}>
-                  <Icon name="lock" /><div><strong>{name}</strong><p>{description}</p></div><span className="status-label">Недоступно</span>
-                </article>
-              ))}
+              {AVAILABLE_PERMISSION_PROFILES.map((profile) => {
+                const selected = settings.defaultPermissionProfile === profile.id;
+                return (
+                  <button
+                    type="button"
+                    className={`permission-profile permission-profile-selectable${selected ? ' selected' : ''}`}
+                    key={profile.id}
+                    aria-pressed={selected}
+                    onClick={() => void updateLocalSettings({ defaultPermissionProfile: profile.id })}
+                  >
+                    <Icon name="shield" />
+                    <span className="permission-profile-copy"><strong>{profile.name}</strong><span>{profile.description}</span></span>
+                    <span className="status-label">{selected ? 'По умолчанию' : 'Выбрать'}</span>
+                  </button>
+                );
+              })}
+              <article className="permission-profile disabled-card">
+                <Icon name="lock" /><div><strong>Настроить вручную</strong><p>Редактор профиля пока недоступен.</p></div><span className="status-label">Недоступно</span>
+              </article>
             </div>
           </>
         );
@@ -1044,43 +1504,77 @@ export default function App() {
             <EmptyState title="Долгосрочная память пока недоступна" description="Её управление появится вместе с подключением API." icon="book" />
           </>
         );
-      case 'integrations':
+      case 'integrations': {
+        const skillProjects = projects.filter((project) => !project.archived);
         return (
           <>
-            <div className="settings-section-heading"><h2>Skills и интеграции</h2><p>Подключение инструментов будет добавлено в следующих планах.</p></div>
+            <div className="settings-section-heading"><h2>Skills и интеграции</h2><p>Локальные Skills доступны только после ручного выбора через `$`. Их инструкции подключатся к ходу после API; scripts/assets не запускаются.</p></div>
             <div className="settings-tabs" role="tablist" aria-label="Интеграции">
               {([['skills', 'Skills'], ['plugins', 'Plugins / MCP'], ['tools', 'Tools']] as const).map(([id, label]) => (
                 <button key={id} type="button" role="tab" aria-selected={integrationTab === id} className={integrationTab === id ? 'active' : ''} onClick={() => setIntegrationTab(id)}>{label}</button>
               ))}
             </div>
-            <EmptyState title={integrationTab === 'skills' ? 'Skills не установлены' : integrationTab === 'plugins' ? 'Plugins / MCP не подключены' : 'Инструменты не настроены'} description="Здесь появятся реальные записи, источник и состояние включения. Skills Codex не являются Skills этого приложения." icon="puzzle" />
+            {integrationTab === 'skills' ? <>
+              <section className="settings-card skill-locations">
+                <div className="setting-row">
+                  <div className="setting-row-copy"><strong>Global Skills</strong><p>Папка приложения · <code>global/&lt;имя&gt;/SKILL.md</code></p></div>
+                  <button type="button" className="secondary-button" onClick={() => void openSkillFolder('global')}>Открыть папку</button>
+                </div>
+                <div className="setting-row">
+                  <div className="setting-row-copy"><strong>Project Skills</strong><p>Отдельная папка для каждого проекта.</p></div>
+                  <div className="inline-actions">
+                    <select className="settings-select" aria-label="Проект для локальных Skills" value={skillProjectId} onChange={(event) => setSkillProjectId(event.target.value)}>
+                      <option value="">Выберите проект</option>
+                      {skillProjects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
+                    </select>
+                    <button type="button" className="secondary-button" disabled={!skillProjectId} onClick={() => void openSkillFolder('project', skillProjectId)}>Открыть</button>
+                  </div>
+                </div>
+                <div className="skill-registry-actions"><span>В начале <code>SKILL.md</code> читаются поля <code>name</code> и <code>description</code>.</span><button type="button" className="quiet-button" onClick={() => void refreshSkillRegistry()}>Обновить список</button></div>
+              </section>
+              {skillRegistry.skills.length === 0
+                ? <EmptyState title="SKILL.md не найдены" description="Добавьте папку Skill с SKILL.md в Global или выбранный Project каталог приложения. Skills Codex автоматически не импортируются." icon="puzzle" />
+                : <div className="skill-list">{skillRegistry.skills.map((skill) => <article className="settings-card skill-card" key={skill.id}>
+                    <div className="skill-card-heading"><div className="skill-card-copy"><h3>{skill.name}</h3><p>{skill.description}</p><small>{skill.scope === 'global' ? 'Global' : `Project · ${skill.projectName ?? 'неизвестный проект'}`} · <code>{skill.source}</code></small></div><span className={`status-label${skill.enabled ? ' status-enabled' : ''}`}>{skill.enabled ? 'Доступен в $' : 'Выключен'}</span></div>
+                    <div className="skill-card-actions">
+                      <button type="button" className="quiet-button" disabled={skillSourceLoading === skill.id} onClick={() => void inspectSkill(skill)}>{skillSourceLoading === skill.id ? 'Чтение…' : skillSource?.id === skill.id ? 'Скрыть источник' : 'Просмотреть SKILL.md'}</button>
+                      <label className="skill-enabled-toggle"><span>Разрешить ручной выбор</span><span className="switch-control"><input type="checkbox" aria-label={`${skill.enabled ? 'Выключить' : 'Включить'} Skill ${skill.name} для ручного выбора`} checked={skill.enabled} disabled={skillBusyId === skill.id} onChange={(event) => void setSkillEnabled(skill, event.target.checked)} /><span /></span></label>
+                    </div>
+                    {skillSource?.id === skill.id && <details className="skill-source" open><summary>Источник · {skillSource.source}</summary><pre>{skillSource.contents}</pre></details>}
+                  </article>)}</div>}
+              {skillRegistry.issues.map((issue) => <p className="registry-issue" role="status" key={`${issue.source}:${issue.reason}`}>{issue.source}: {issue.reason}</p>)}
+            </> : <EmptyState title={integrationTab === 'plugins' ? 'Plugins / MCP не подключены' : 'Инструменты не настроены'} description={integrationTab === 'plugins' ? 'Реестр Plugins/MCP и их разрешения пока не подключены.' : 'Дополнительные интеграции появятся после отдельной проверки runtime и разрешений.'} icon="puzzle" />}
           </>
         );
+      }
       case 'hooks':
         return (
           <>
-            <div className="settings-section-heading"><h2>Hooks</h2><p>Панель подготовлена; произвольные скрипты пока не запускаются.</p></div>
-            <div className="settings-card settings-list">
-              {['Начало сессии / проекта', 'Отправка запроса', 'Перед инструментом', 'После инструмента', 'Запрос разрешения', 'Перед сжатием контекста', 'После сжатия контекста', 'Остановка и завершение'].map((name) => (
-                <SettingRow key={name} title={name} description="Global · Project · Skill · Plugin"><span className="status-label">Нет runtime</span></SettingRow>
-              ))}
-            </div>
+            <div className="settings-section-heading"><h2>Hooks</h2><p>Реестр показывает только обнаруженные hook.json. Произвольные действия не запускаются и остаются выключенными до проверки источника и разрешения.</p></div>
+            {hookRegistry.hooks.length === 0
+              ? <EmptyState title="Hook-записи не обнаружены" description="Реальные Global / Project / Skill / Plugin записи будут показаны здесь; события без настроенной записи не выдаются за установленный Hook." icon="plug" />
+              : <div className="settings-card settings-list">{hookRegistry.hooks.map((hook) => (
+                <div className="setting-row" key={hook.id}>
+                  <div className="setting-row-copy">
+                    <strong>{hook.name}</strong>
+                    <p>{hook.description}</p>
+                    <small className="hook-record-location">{hookEventLabel(hook.event)} · {hook.scope} · {hook.source} · {hook.actionFile}</small>
+                  </div>
+                  <div className="setting-row-control"><span className="status-label">Исполнение выключено</span></div>
+                </div>
+              ))}</div>}
+            {hookRegistry.issues.map((issue) => <p className="registry-issue" role="status" key={`${issue.source}:${issue.reason}`}>{issue.source}: {issue.reason}</p>)}
           </>
         );
       case 'browser':
-        return (
-          <>
-            <div className="settings-section-heading"><h2>Браузер и Computer Use</h2><p>Браузерный runtime ещё не подключён.</p></div>
-            <EmptyState title="Не настроено" description="Встроенный и внешний браузер, а также управление компьютером появятся после отдельного подключения runtime." icon="globe" />
-          </>
-        );
+        return <ConnectionSetup firstRun={false} />;
       case 'voice':
         return (
           <>
-            <div className="settings-section-heading"><h2>Голос</h2><p>Состояние микрофона и локального распознавания будет показано при наличии voice runtime.</p></div>
+            <div className="settings-section-heading"><h2>Голос</h2><p>Диктовка работает локально. Запись начинается после нажатия на микрофон, а распознанный текст добавляется в черновик без отправки.</p></div>
             <div className="settings-card settings-list">
-              <SettingRow title="Диктовка" description="Микрофон не используется приложением."><span className="status-label">Не настроено</span></SettingRow>
-              <SettingRow title="GigaAM" description="Локальная модель не подключена."><span className="status-label">Не загружена</span></SettingRow>
+              <SettingRow title="Диктовка" description={voiceAvailability.available ? 'Разрешение микрофона запрашивается только при нажатии на кнопку записи.' : voiceAvailability.reason ?? 'Локальный runtime недоступен.'}><span className={`status-label${voiceAvailability.available ? ' status-enabled' : ''}`}>{voiceAvailability.available ? 'Доступна офлайн' : 'Недоступна'}</span></SettingRow>
+              <SettingRow title="GigaAM v3" description="Распознавание речи выполняется на этом компьютере."><span className={`status-label${voiceAvailability.available ? ' status-enabled' : ''}`}>{voiceAvailability.available ? 'Локально' : 'Не загружена'}</span></SettingRow>
               <SettingRow title="Синтез речи" description="Голосовой ответ — FUTURE."><span className="status-label">Позже</span></SettingRow>
             </div>
           </>
@@ -1088,11 +1582,17 @@ export default function App() {
       case 'notifications':
         return (
           <>
-            <div className="settings-section-heading"><h2>Уведомления</h2><p>Категории перечислены заранее. Настройки появятся вместе с реальными уведомлениями.</p></div>
+            <div className="settings-section-heading"><h2>Уведомления</h2><p>Windows показывает уведомления только для реальных событий, когда окно приложения не в фокусе. Запуск очереди и ответ модели появятся после подключения провайдера.</p></div>
             <div className="settings-card settings-list">
-              {['Ответ готов, когда приложение не в фокусе', 'Ожидающая задача запущена', 'Ошибка требует внимания'].map((name) => (
-                <SettingRow key={name} title={name}><span className="status-label">Пока недоступно</span></SettingRow>
-              ))}
+              <SettingRow title="Ответ готов" description="Появится после подключения API и завершения настоящего ответа.">
+                <label className="notification-toggle"><input type="checkbox" checked={settings.notifications.taskCompleted} onChange={(event) => updateNotificationSetting('taskCompleted', event.target.checked)} /><span>{settings.notifications.taskCompleted ? 'Включено' : 'Выключено'}</span></label>
+              </SettingRow>
+              <SettingRow title="Начался следующий ход" description="Появится после подключения очереди провайдера.">
+                <label className="notification-toggle"><input type="checkbox" checked={settings.notifications.taskStarted} onChange={(event) => updateNotificationSetting('taskStarted', event.target.checked)} /><span>{settings.notifications.taskStarted ? 'Включено' : 'Выключено'}</span></label>
+              </SettingRow>
+              <SettingRow title="Ошибка локальной операции" description="Ошибка сохранения, импорта или локального инструмента; без текста данных и только когда окно не в фокусе.">
+                <label className="notification-toggle"><input type="checkbox" checked={settings.notifications.failures} onChange={(event) => updateNotificationSetting('failures', event.target.checked)} /><span>{settings.notifications.failures ? 'Включено' : 'Выключено'}</span></label>
+              </SettingRow>
             </div>
           </>
         );
@@ -1143,6 +1643,9 @@ export default function App() {
               <SettingRow title="Каталог локальных данных" description="Папка приложения, не рабочая папка проекта."><span className="path-value">{appInfo?.dataPath ?? 'Загрузка…'}</span></SettingRow>
               <SettingRow title="Диагностика и журналы"><span className="status-label">Пока недоступно</span></SettingRow>
               <SettingRow title="Экспериментальные параметры"><span className="status-label">Не включены</span></SettingRow>
+              <SettingRow title="Удалить локальные данные" description="После подтверждения будут удалены чаты, копии файлов, проекты и настройки приложения, Skills/Hooks и сохранённый ключ. Рабочие папки проектов и исходные файлы не затрагиваются; приложение закроется.">
+                <button type="button" className="danger-button" onClick={() => void window.gigaChat.settings.deleteAppData().catch((error: unknown) => setNotice(getErrorMessage(error)))}>Удалить данные…</button>
+              </SettingRow>
             </div>
           </>
         );
@@ -1154,6 +1657,8 @@ export default function App() {
   function renderContent(): ReactNode {
     if (loading) return <div className="loading-state" role="status">Загрузка локальных данных…</div>;
     switch (route.page) {
+      case 'onboarding':
+        return <ConnectionSetup firstRun onContinue={finishOnboarding} />;
       case 'home':
         return (
           <section className="empty-state">
@@ -1176,6 +1681,22 @@ export default function App() {
                 <p>{message.text}</p>
               </article>)}
             </div> : null}
+            {runtimeTurns.length ? <section className="runtime-timeline" aria-label="Состояние локального хода">
+              {runtimeTurns.map((turn) => <article className="runtime-turn" key={turn.id}>
+                <div className="runtime-turn-heading">
+                  <strong>{runtimeStatusLabel(turn.status)}</strong>
+                  {turn.queueDurationMs !== undefined && <small>Очередь · {elapsedLabel(turn.queueDurationMs)}</small>}
+                  {turn.activeDurationMs !== undefined && <small>Работа · {elapsedLabel(turn.activeDurationMs)}</small>}
+                  {(turn.status === 'queued' || turn.status === 'running') && <button type="button" className="quiet-button runtime-cancel" onClick={() => {
+                    void window.gigaChat.runtime.cancel(turn.chatId, turn.id).catch((error: unknown) => setNotice(getErrorMessage(error)));
+                  }}>Отменить</button>}
+                </div>
+                {turn.activity.length > 0 && <ul className="runtime-activity-list">
+                  {turn.activity.map((activity, index) => <li key={`${turn.id}-${index}`}>{runtimeActivityLabel(activity)}{activity.kind === 'tool' && activity.durationMs !== undefined ? ` · ${elapsedLabel(activity.durationMs)}` : ''}</li>)}
+                </ul>}
+                {turn.error && <p className="runtime-error" role="alert">{turn.error}</p>}
+              </article>)}
+            </section> : null}
             {chatDetail?.artifacts.length ? <section className="chat-files" aria-label="Файлы чата">
               <h2>Файлы чата</h2>
               {chatDetail.artifacts.map((artifact) => <div className="chat-file" key={artifact.id}>
@@ -1231,7 +1752,7 @@ export default function App() {
               ))}
             </nav>
             <div className="settings-content">
-              <div className="settings-content-heading"><span className="eyebrow">Настройки</span><h1>{settingTitle}</h1></div>
+              {settingsSection !== 'browser' && <div className="settings-content-heading"><span className="eyebrow">Настройки</span><h1>{settingTitle}</h1></div>}
               {renderSettingsSection()}
             </div>
           </section>
@@ -1249,14 +1770,19 @@ export default function App() {
           <section className="content-page profile-page">
             <div className="page-heading"><span className="eyebrow">Профиль и использование</span><h1>Локальный профиль</h1><p>Данные принадлежат этому устройству. Учётная запись не подключена.</p></div>
             <div className="profile-summary"><span className="profile-avatar large"><Icon name="user" /></span><div><strong>На этом компьютере</strong><p>GigaChat API не подключён</p></div><span className="status-pill"><i />Локально</span></div>
-            <div className="usage-grid"><article><span>Всего чатов</span><strong>{chats.length}</strong><small>Локальная история</small></article><article><span>Всего проектов</span><strong>{projects.length}</strong><small>Локальные проекты</small></article><article className="usage-unavailable"><span>Токены и модели</span><strong>—</strong><small>Нет данных API</small></article></div>
-            <EmptyState title="Статистика модели пока не собирается" description="Токены, серии активности и вызовы инструментов не показываются без реальных измерений." icon="gauge" />
+            <div className="usage-grid">
+              <article><span>Всего чатов</span><strong>{localUsageStats?.chatCount ?? '…'}</strong><small>Включая архив</small></article>
+              <article><span>Всего проектов</span><strong>{localUsageStats?.projectCount ?? '…'}</strong><small>Включая архив</small></article>
+              <article><span>Дни локальной активности</span><strong>{localUsageStats?.activityDayCount ?? '…'}</strong><small>UTC-даты проектов, чатов и сообщений</small></article>
+            </div>
+            <EmptyState title="Данные API пока недоступны" description="Токены, модели, баланс и тепловая карта появятся только после подключения и реальных измерений." icon="gauge" />
           </section>
         );
     }
   }
 
   const title = route.page === 'home' ? 'Новый чат'
+    : route.page === 'onboarding' ? 'Первый запуск'
     : route.page === 'chat' ? selectedChat?.title ?? 'Чат'
     : route.page === 'project' ? selectedProject?.name ?? 'Проект'
     : route.page === 'images' ? 'Изображения'
@@ -1265,10 +1791,10 @@ export default function App() {
     : route.page === 'archive' ? 'Архив'
     : route.page === 'profile' ? 'Профиль'
     : settingTitle;
-  const composerProjectId = route.page === 'chat' ? selectedChat?.projectId ?? '' : selectedProjectId;
   const sidebarClasses = [
     'workspace',
     route.page === 'settings' ? 'settings-workspace' : '',
+    route.page === 'onboarding' ? 'onboarding-workspace' : '',
     compactLayout ? 'compact-workspace' : '',
     compactLayout || !settings.sidebarVisible ? 'sidebar-hidden' : '',
     sidebarPreview ? 'sidebar-preview' : '',
@@ -1279,7 +1805,7 @@ export default function App() {
     <div className={`app-frame theme-${resolvedTheme}${transparentSidebar ? ' sidebar-transparent' : ''}`}>
       <header className="titlebar" aria-label={`Панель приложения: ${title}`}>
         <div className="titlebar-actions">
-          {route.page !== 'settings' && <button
+          {route.page !== 'settings' && route.page !== 'onboarding' && <button
             ref={sidebarButtonRef}
             type="button"
             className="window-action"
@@ -1306,7 +1832,7 @@ export default function App() {
 
       <div className={sidebarClasses}>
         {compactLayout && sidebarPreview && <button type="button" className="compact-backdrop" aria-label="Закрыть боковую панель" onClick={() => setSidebarPreview(false)} />}
-        {route.page !== 'settings' && <aside
+        {route.page !== 'settings' && route.page !== 'onboarding' && <aside
           id="application-sidebar"
           className="sidebar"
           aria-label="Навигация"
@@ -1331,26 +1857,26 @@ export default function App() {
             <div className="section-heading"><h2>Проекты</h2><button type="button" className="small-icon-button" aria-label="Создать проект" title="Создать проект" onClick={() => void createProject()}><Icon name="plus" /></button></div>
             {activeProjects.length === 0
               ? <p className="sidebar-empty">Здесь появятся ваши проекты</p>
-              : activeProjects.slice(0, showAllProjects ? undefined : 5).map((project) => (
+              : visibleProjects.map((project) => (
                   <div className={route.page === 'project' && route.id === project.id ? 'list-row selected' : 'list-row'} key={project.id}>
                     <button type="button" className="list-row-main" onClick={() => navigate({ page: 'project', id: project.id })}><Icon name="folder" /><span>{project.name}</span></button>
                     {project.pinned && <Icon name="pin" className="pin-mark" />}{projectMenu(project)}
                   </div>
                 ))}
-            {activeProjects.length > 5 && <button type="button" className="show-more" onClick={() => setShowAllProjects((value) => !value)}>{showAllProjects ? 'Свернуть' : 'Показать больше'}<Icon name="chevron" /></button>}
+            {unpinnedProjects.length > 5 && <button type="button" className="show-more" onClick={() => setShowAllProjects((value) => !value)}>{showAllProjects ? 'Свернуть' : 'Показать больше'}<Icon name="chevron" /></button>}
           </section>
 
           <section className={activeProjects.length === 0 && activeChats.length === 0 ? 'sidebar-section history-section empty-library' : 'sidebar-section history-section'}>
             <div className="section-heading"><h2>Недавние</h2></div>
             {activeChats.length === 0
               ? <p className="sidebar-empty">Нет чатов</p>
-              : activeChats.slice(0, showAllChats ? undefined : 8).map((chat) => (
+              : visibleChats.map((chat) => (
                   <div className={route.page === 'chat' && route.id === chat.id ? 'list-row selected' : 'list-row'} key={chat.id}>
                     <button type="button" className="list-row-main" onClick={() => navigate({ page: 'chat', id: chat.id })}><Icon name="chat" /><span>{chat.title}</span></button>
                     {chat.pinned && <Icon name="pin" className="pin-mark" />}{chatMenu(chat)}
                   </div>
                 ))}
-            {activeChats.length > 8 && <button type="button" className="show-more" onClick={() => setShowAllChats((value) => !value)}>{showAllChats ? 'Свернуть' : 'Показать больше'}<Icon name="chevron" /></button>}
+            {unpinnedChats.length > 8 && <button type="button" className="show-more" onClick={() => setShowAllChats((value) => !value)}>{showAllChats ? 'Свернуть' : 'Показать больше'}<Icon name="chevron" /></button>}
             <button type="button" className="archive-link" onClick={() => navigate({ page: 'archive' })}><Icon name="archive" /><span>Архив</span></button>
           </section>
 
@@ -1363,12 +1889,26 @@ export default function App() {
         </aside>}
 
         <main className={route.page === 'settings' ? 'main-panel settings-panel' : 'main-panel'}>
-          <div className={route.page === 'home' ? 'view-area home-view' : route.page === 'settings' ? 'view-area settings-view' : 'view-area'}>{renderContent()}</div>
+          <div className={route.page === 'home' ? 'view-area home-view' : route.page === 'settings' ? 'view-area settings-view' : route.page === 'onboarding' ? 'view-area onboarding-view' : 'view-area'}>{renderContent()}</div>
           {(route.page === 'home' || route.page === 'chat') && (
             <div className="composer-stack">
+              {composerCompletion && <div id="composer-suggestions" className="composer-suggestions" role="listbox" aria-label={composerCompletion.kind === 'command' ? 'Команды' : 'Локальные Skills'}>
+                {composerCompletion.items.map((suggestion, index) => <button
+                  id={`composer-suggestion-${suggestion.id}`}
+                  key={suggestion.id}
+                  type="button"
+                  role="option"
+                  aria-selected={index === completionIndex}
+                  disabled={!suggestion.available}
+                  className={index === completionIndex ? 'composer-suggestion active' : 'composer-suggestion'}
+                  onMouseEnter={() => setCompletionIndex(index)}
+                  onClick={() => insertComposerSuggestion(suggestion)}
+                ><strong>{suggestion.label}</strong><span>{suggestion.description}</span></button>)}
+                {composerCompletion.emptyMessage && <p className="composer-suggestions-empty" role="status">{composerCompletion.emptyMessage}</p>}
+              </div>}
               <label className="project-picker"><Icon name="folder" />
                 <span className="project-picker-select">
-                <select value={composerProjectId} aria-label="Выбрать проект" onChange={(event) => {
+                <select value={composerProjectId ?? ''} aria-label="Выбрать проект" onChange={(event) => {
                   const projectId = event.target.value;
                   if (route.page === 'chat' && selectedChat) void changeChatProject(selectedChat, projectId);
                   else setSelectedProjectId(projectId);
@@ -1380,18 +1920,42 @@ export default function App() {
               </label>
               <div className="composer">
                 <label className="sr-only" htmlFor="chat-draft">Черновик сообщения</label>
-                <textarea id="chat-draft" value={draft} onChange={(event) => changeDraft(event.target.value)} onKeyDown={(event) => {
-                  if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-                    event.preventDefault();
-                    void submitMessage();
-                  }
-                }} disabled={sending} placeholder={selectedChat?.kind === 'image' ? 'Опишите изображение' : 'Поручите что угодно'} rows={2} />
+                <textarea
+                  id="chat-draft"
+                  ref={composerInputRef}
+                  value={draft}
+                  aria-autocomplete="list"
+                  aria-controls={composerCompletion ? 'composer-suggestions' : undefined}
+                  aria-activedescendant={composerCompletion?.items[completionIndex] ? `composer-suggestion-${composerCompletion.items[completionIndex]?.id}` : undefined}
+                  onChange={(event) => changeDraft(event.target.value, event.currentTarget.selectionStart)}
+                  onSelect={(event) => setComposerCaret(event.currentTarget.selectionStart)}
+                  onClick={(event) => setComposerCaret(event.currentTarget.selectionStart)}
+                  onKeyDown={handleComposerKeyDown}
+                  disabled={sending}
+                  placeholder={selectedChat?.kind === 'image' ? 'Опишите изображение' : 'Поручите что угодно'}
+                  rows={2}
+                />
+                {selectedComposerSkillId && <div className="composer-skill-selection" role="status">
+                  <span><strong>{selectedComposerSkill?.name ?? 'Выбранный Skill недоступен'}</strong><small>{selectedComposerSkill ? `${selectedComposerSkill.scope === 'global' ? 'Global' : selectedComposerSkill.projectName ?? 'Project'} · будет применён при подключении API` : 'Включите Skill в настройках или снимите выбор.'}</small></span>
+                  <button type="button" className="quiet-button" aria-label="Снять выбор Skill" title="Снять выбор Skill" onClick={() => void changeComposerSkill(null)}>Снять</button>
+                </div>}
                 <div className="composer-toolbar">
                   <div className="toolbar-leading">
                   <button type="button" className="attach-button" aria-label="Прикрепить файл" title="Прикрепить файл" onClick={() => void attachFile()}><Icon name="plus" /></button>
-                  <span className="disabled-control permission-control" role="note" tabIndex={0} aria-label="Профили доступа пока недоступны" title="Профили разрешений появятся вместе с permission engine.">
-                    <button type="button" className="permission-button" disabled><Icon name="shield" /><span>Подтверждать за меня</span><Icon name="chevron" /></button>
-                  </span>
+                  <label className={`permission-select-control permission-control${canChangeComposerPermissionProfile ? '' : ' is-disabled'}`} title={canChangeComposerPermissionProfile ? 'Профиль для следующего локального хода. Инструменты не запускаются, API не вызывается.' : 'Откройте чат, чтобы задать для него профиль.'}>
+                    <Icon name="shield" />
+                    <select
+                      className="permission-select"
+                      aria-label={`Профиль разрешений для следующего хода: ${AVAILABLE_PERMISSION_PROFILES.find((profile) => profile.id === composerPermissionProfile)?.name ?? 'Настроить вручную'}`}
+                      value={composerPermissionProfile}
+                      disabled={!canChangeComposerPermissionProfile}
+                      onChange={(event) => void changeComposerPermissionProfile(event.target.value as PermissionProfile)}
+                    >
+                      {AVAILABLE_PERMISSION_PROFILES.map((profile) => <option key={profile.id} value={profile.id}>{profile.id === 'ask' ? 'Спросить' : profile.id === 'approve' ? 'Подтверждать' : 'Полный доступ'}</option>)}
+                      <option value="custom" disabled>Custom · недоступен</option>
+                    </select>
+                    <Icon name="chevron" />
+                  </label>
                   </div>
                   <div className="toolbar-trailing">
                   <span className="disabled-control" role="note" tabIndex={0} aria-label={`Выбор модели: ${disabledReason}`} title={disabledReason}>
@@ -1400,9 +1964,14 @@ export default function App() {
                   <span className="disabled-control" role="note" tabIndex={0} aria-label="Контекст станет доступен после загрузки модели" title="Контекст станет доступен после подключения API.">
                     <button type="button" className="context-ring" disabled aria-label="Использование контекста"><i /></button>
                   </span>
-                  <span className="disabled-control" role="note" tabIndex={0} aria-label="Диктовка появится в отдельном плане" title="Диктовка появится в отдельном плане.">
-                    <button type="button" className="mic-button" disabled aria-label="Диктовка"><Icon name="mic" /></button>
-                  </span>
+                  <VoiceCaptureControl
+                    key={route.page === 'chat' ? route.id ?? 'chat' : 'home'}
+                    available={voiceAvailability.available}
+                    reason={voiceAvailability.reason}
+                    onTranscript={insertVoiceTranscript}
+                    onError={setNotice}
+                    onSuccess={showSuccess}
+                  />
                   <button type="button" className="send-button" disabled={!draft.trim() || sending} aria-label={draft.trim() ? 'Сохранить сообщение локально' : 'Голосовой чат пока недоступен'} title={draft.trim() ? 'Сохранить локально без отправки в API' : 'Голосовой чат пока недоступен'} onClick={() => void submitMessage()}><Icon name={draft.trim() ? 'send' : 'audio'} /></button>
                   </div>
                 </div>

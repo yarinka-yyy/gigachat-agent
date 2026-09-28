@@ -6,10 +6,14 @@
   "main": ".webpack/main",
   "private": true,
   "scripts": {
+    "prestart": "node scripts/build-local-runtime.mjs && node scripts/prepare-voice-resources.mjs",
     "start": "electron-forge start",
+    "prepackage": "node scripts/build-local-runtime.mjs && node scripts/prepare-voice-resources.mjs",
     "package": "electron-forge package",
-    "test": "tsx --test src/store.test.ts src/instruction-autosave.test.ts",
+    "premake": "node scripts/build-local-runtime.mjs && node scripts/prepare-voice-resources.mjs && node scripts/prepare-squirrel-vendor.mjs",
+    "test": "tsx --test src/store.test.ts src/instruction-autosave.test.ts src/permissions.test.ts src/local-tools.test.ts src/instructions.test.ts src/commands.test.ts src/runtime.test.ts src/skills.test.ts src/hooks.test.ts src/secure-store.test.ts src/onboarding-browser.test.ts src/voice.test.ts",
     "make": "electron-forge make",
+    "prepublish": "node scripts/build-local-runtime.mjs && node scripts/prepare-voice-resources.mjs",
     "publish": "electron-forge publish",
     "lint": "eslint --ext .ts,.tsx ."
   },

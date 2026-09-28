@@ -7,6 +7,7 @@ import { AutoUnpackNativesPlugin } from '@electron-forge/plugin-auto-unpack-nati
 import { WebpackPlugin } from '@electron-forge/plugin-webpack';
 import { FusesPlugin } from '@electron-forge/plugin-fuses';
 import { FuseV1Options, FuseVersion } from '@electron/fuses';
+import { resolve } from 'node:path';
 
 import { mainConfig } from './webpack.main.config';
 import { rendererConfig } from './webpack.renderer.config';
@@ -15,11 +16,19 @@ const config: ForgeConfig = {
   packagerConfig: {
     asar: true,
     icon: 'src/assets/gigachat-icon.ico',
-    extraResource: ['src/assets/gigachat-icon.ico'],
+    extraResource: [
+      'src/assets/gigachat-icon.ico',
+      ...(process.platform === 'win32' ? ['resources/native/LocalPowerShell.exe'] : []),
+      ...(process.platform === 'win32' ? ['resources/voice/'] : []),
+    ],
   },
   rebuildConfig: {},
   makers: [
-    new MakerSquirrel({ setupIcon: 'src/assets/gigachat-icon.ico', authors: 'GigaChat Agents' }),
+    new MakerSquirrel({
+      setupIcon: 'src/assets/gigachat-icon.ico',
+      authors: 'GigaChat Agents',
+      vendorDirectory: resolve(process.cwd(), 'resources/native/squirrel-vendor-7.9.0.83'),
+    }),
     new MakerZIP({}, ['darwin']),
     new MakerRpm({}),
     new MakerDeb({}),

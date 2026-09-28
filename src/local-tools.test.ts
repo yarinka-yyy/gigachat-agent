@@ -1,0 +1,523 @@
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import type { ChildProcessWithoutNullStreams, SpawnOptions } from 'node:child_process';
+import { join, relative, resolve, sep } from 'node:path';
+import { PassThrough } from 'node:stream';
+import { test } from 'node:test';
+import type { Project } from './contracts';
+import {
+  createLocalTools,
+  createPowerShellHelper,
+  MAX_LOCAL_FILE_BYTES,
+  resolvePowerShellHelperPath,
+  type LocalToolEvent,
+  type PowerShellRequest,
+  type PowerShellRunner,
+  type ProjectFileWriteRequest,
+} from './local-tools';
+
+const projectId = 'local-tools-project';
+
+async function createFixture(): Promise<{
+  root: string;
+  projectFolder: string;
+  outsideFolder: string;
+  project: Project;
+  cleanup(): Promise<void>;
+}> {
+  const appRoot = resolve(process.cwd());
+  const gitDirectory = await lstat(join(appRoot, '.git'));
+  assert.ok(gitDirectory.isDirectory(), 'tests must run from the app Git checkout');
+
+  const qaRoot = join(appRoot, '.qa', 'pre-api', 'local-tools-tests');
+  let parent = join(appRoot, '.qa');
+  await mkdir(parent, { recursive: true });
+  assert.equal((await lstat(parent)).isSymbolicLink(), false, 'QA root cannot be a symlink');
+  for (const component of ['pre-api', 'local-tools-tests']) {
+    parent = join(parent, component);
+    await mkdir(parent, { recursive: true });
+    assert.equal((await lstat(parent)).isSymbolicLink(), false, 'QA path cannot contain a symlink');
+  }
+  const qaReal = await realpath(qaRoot);
+  const root = await mkdtemp(join(qaReal, 'run-'));
+  const rel = relative(qaReal, root);
+  assert.ok(rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`), 'fixture must stay inside .qa/pre-api');
+  const projectFolder = join(root, 'project');
+  const outsideFolder = join(root, 'outside');
+  await mkdir(projectFolder);
+  await mkdir(outsideFolder);
+  const project: Project = {
+    id: projectId,
+    name: 'Synthetic QA project',
+    pinned: false,
+    archived: false,
+    createdAt: '2026-09-27T00:00:00.000Z',
+    updatedAt: '2026-09-27T00:00:00.000Z',
+    workingFolder: projectFolder,
+  };
+
+  return {
+    root, projectFolder, outsideFolder, project,
+    async cleanup() {
+      const rootInfo = await lstat(root).catch(() => null);
+      if (!rootInfo) return;
+      assert.ok(rootInfo.isDirectory() && !rootInfo.isSymbolicLink(), 'refusing to remove a changed QA root');
+      const cleanupRel = relative(qaReal, resolve(root));
+      assert.ok(cleanupRel.startsWith('run-') && !cleanupRel.startsWith('..'), 'refusing cleanup outside QA');
+      await rm(root, { recursive: true, force: true });
+    },
+  };
+}
+
+function makeTools(project: Project, events: LocalToolEvent[], opened: string[], runPowerShell?: PowerShellRunner,
+  writeFile?: (request: ProjectFileWriteRequest) => Promise<{ bytes: number; replacedExisting: boolean }>) {
+  return createLocalTools({
+    resolveProject: async (id) => id === project.id ? project : null,
+    openPath: async (path) => { opened.push(path); },
+    ...(runPowerShell ? { runPowerShell } : {}),
+    ...(writeFile ? { writeFile } : {}),
+    onEvent: (event) => { events.push(event); },
+  });
+}
+
+type FakeChild = ChildProcessWithoutNullStreams & {
+  stdin: PassThrough;
+  stdout: PassThrough;
+  stderr: PassThrough;
+};
+
+function fakeChild(kill: () => void = () => undefined): FakeChild {
+  const child = Object.assign(new EventEmitter(), {
+    stdin: new PassThrough(),
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+  });
+  Object.assign(child, { kill });
+  return child as unknown as FakeChild;
+}
+
+function finishFakeChild(child: FakeChild, output: string, exitCode = 0): void {
+  setImmediate(() => {
+    child.stdout.end(output);
+    child.stderr.end();
+    setImmediate(() => child.emit('close', exitCode, null));
+  });
+}
+
+test('selects the packaged or development helper path without enabling a non-Windows shell', () => {
+  const appPath = resolve(process.cwd());
+  const resourcesPath = join(appPath, 'out', 'resources');
+  assert.equal(resolvePowerShellHelperPath({ platform: 'win32', isPackaged: true, resourcesPath, appPath }),
+    join(resourcesPath, 'LocalPowerShell.exe'));
+  assert.equal(resolvePowerShellHelperPath({ platform: 'win32', isPackaged: false, resourcesPath, appPath }),
+    join(appPath, 'resources', 'native', 'LocalPowerShell.exe'));
+  assert.equal(resolvePowerShellHelperPath({ platform: 'linux', isPackaged: false, resourcesPath, appPath }), null);
+});
+
+test('sends PowerShell only as JSON stdin and keeps script text out of helper argv', async () => {
+  const calls: Array<{ command: string; args: string[]; options: SpawnOptions; input: string }> = [];
+  const spawnProcess = (command: string, args: string[], options: SpawnOptions): ChildProcessWithoutNullStreams => {
+    const child = fakeChild();
+    const call = { command, args, options, input: '' };
+    calls.push(call);
+    child.stdin.on('data', (chunk: Buffer) => { call.input += chunk.toString('utf8'); });
+    child.stdin.once('finish', () => {
+      if (args[0] === '--run') {
+        finishFakeChild(child, `${JSON.stringify({ ExitCode: 0, Stdout: 'ok', Stderr: '', TimedOut: false, OutputLimited: false })}\n`);
+      }
+    });
+    return child;
+  };
+  const helperPath = join(process.cwd(), 'resources', 'native', 'LocalPowerShell.exe');
+  const recoveryDirectory = join(process.cwd(), '.qa', 'pre-api', 'runtime');
+  const script = 'Write-Output "private script text"';
+  const helper = createPowerShellHelper({ helperPath, recoveryDirectory, spawnProcess });
+
+  assert.deepEqual(await helper.run({
+    workingFolder: join(process.cwd(), '.qa', 'pre-api', 'project'),
+    script,
+    timeoutMs: 10_000,
+    maxOutputBytes: 1024,
+  }), { exitCode: 0, stdout: 'ok', stderr: '', timedOut: false, outputLimited: false });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.command, helperPath);
+  assert.deepEqual(calls[0]?.args, ['--run', recoveryDirectory]);
+  assert.equal(JSON.stringify(calls[0]?.args).includes(script), false);
+  assert.deepEqual(JSON.parse(calls[0]?.input), {
+    WorkingFolder: join(process.cwd(), '.qa', 'pre-api', 'project'),
+    Script: script,
+    TimeoutMs: 10_000,
+    MaxOutputBytes: 1024,
+  });
+  assert.equal(calls[0]?.options.shell, false);
+  assert.deepEqual(calls[0]?.options.stdio, ['pipe', 'pipe', 'pipe']);
+});
+
+test('sends project writes as structured JSON without a script or payload in argv', async () => {
+  const calls: Array<{ command: string; args: string[]; options: SpawnOptions; input: string }> = [];
+  const contents = Buffer.from('Сохранено: ёж', 'utf8');
+  const spawnProcess = (command: string, args: string[], options: SpawnOptions): ChildProcessWithoutNullStreams => {
+    const child = fakeChild();
+    const call = { command, args, options, input: '' };
+    calls.push(call);
+    child.stdin.on('data', (chunk: Buffer) => { call.input += chunk.toString('utf8'); });
+    child.stdin.once('finish', () => {
+      finishFakeChild(child, `${JSON.stringify({ Bytes: contents.byteLength, ReplacedExisting: true })}\n`);
+    });
+    return child;
+  };
+  const helperPath = join(process.cwd(), 'resources', 'native', 'LocalPowerShell.exe');
+  const recoveryDirectory = join(process.cwd(), '.qa', 'pre-api', 'runtime');
+  const helper = createPowerShellHelper({ helperPath, recoveryDirectory, spawnProcess });
+  const root = join(process.cwd(), '.qa', 'pre-api', 'project');
+
+  assert.deepEqual(await helper.writeFile({
+    workingFolder: root,
+    relativePath: 'nested/result.txt',
+    contentsBase64: contents.toString('base64'),
+  }), { bytes: contents.byteLength, replacedExisting: true });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.command, helperPath);
+  assert.deepEqual(calls[0]?.args, ['--write', recoveryDirectory]);
+  assert.equal(JSON.stringify(calls[0]?.args).includes(contents.toString('base64')), false);
+  assert.deepEqual(JSON.parse(calls[0]?.input ?? ''), {
+    WorkingFolder: root,
+    RelativePath: 'nested\\result.txt',
+    ContentsBase64: contents.toString('base64'),
+  });
+  assert.equal(calls[0]?.options.shell, false);
+  assert.deepEqual(calls[0]?.options.stdio, ['pipe', 'pipe', 'pipe']);
+});
+
+test('serializes project writes with PowerShell through the same helper queue', async () => {
+  const modes: string[] = [];
+  let pendingRun: FakeChild | null = null;
+  const spawnProcess = (_command: string, args: string[], options: SpawnOptions): ChildProcessWithoutNullStreams => {
+    assert.equal(options.shell, false);
+    const mode = args[0] ?? '';
+    modes.push(mode);
+    const child = fakeChild();
+    child.stdin.once('finish', () => {
+      if (mode === '--run') pendingRun = child;
+      else if (mode === '--write') finishFakeChild(child, '{"Bytes":1,"ReplacedExisting":false}\n');
+    });
+    return child;
+  };
+  const helper = createPowerShellHelper({
+    helperPath: join(process.cwd(), 'resources', 'native', 'LocalPowerShell.exe'),
+    recoveryDirectory: join(process.cwd(), '.qa', 'pre-api', 'runtime'),
+    spawnProcess,
+  });
+  const runPending = helper.run({
+    workingFolder: join(process.cwd(), '.qa', 'pre-api', 'project'),
+    script: "Write-Output 'done'",
+    timeoutMs: 10_000,
+    maxOutputBytes: 1024,
+  });
+  await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+  const writePending = helper.writeFile({
+    workingFolder: join(process.cwd(), '.qa', 'pre-api', 'project'),
+    relativePath: 'out.txt',
+    contentsBase64: Buffer.from('x').toString('base64'),
+  });
+  await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+  assert.deepEqual(modes, ['--run']);
+  assert.ok(pendingRun);
+  finishFakeChild(pendingRun, '{"ExitCode":0,"Stdout":"","Stderr":"","TimedOut":false,"OutputLimited":false}\n');
+  await runPending;
+  assert.deepEqual(await writePending, { bytes: 1, replacedExisting: false });
+  assert.deepEqual(modes, ['--run', '--write']);
+});
+
+test('recovers a cancelled structured write and reports an unknown commit result', async () => {
+  const modes: string[] = [];
+  let writeChild: FakeChild | null = null;
+  const helperPath = join(process.cwd(), 'resources', 'native', 'LocalPowerShell.exe');
+  const recoveryDirectory = join(process.cwd(), '.qa', 'pre-api', 'runtime');
+  const spawnProcess = (_command: string, args: string[], options: SpawnOptions): ChildProcessWithoutNullStreams => {
+    assert.equal(options.shell, false);
+    const mode = args[0] ?? '';
+    modes.push(mode);
+    if (mode === '--recover') {
+      const child = fakeChild();
+      child.stdin.once('finish', () => finishFakeChild(child, '{"recovered":true}\n'));
+      return child;
+    }
+    const child = fakeChild(() => {
+      child.stdout.end();
+      child.stderr.end();
+      setImmediate(() => child.emit('close', null, 'SIGTERM'));
+    });
+    child.stdin.once('finish', () => { writeChild = child; });
+    return child;
+  };
+  const helper = createPowerShellHelper({ helperPath, recoveryDirectory, spawnProcess });
+  const controller = new AbortController();
+  const pending = helper.writeFile({
+    workingFolder: join(process.cwd(), '.qa', 'pre-api', 'project'),
+    relativePath: 'out.txt',
+    contentsBase64: Buffer.from('x').toString('base64'),
+    signal: controller.signal,
+  });
+  await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+  assert.ok(writeChild);
+  controller.abort();
+  await assert.rejects(pending, (error: unknown) => error instanceof Error
+    && error.name === 'AbortError' && /результат мог уже зафиксироваться/.test(error.message));
+  assert.deepEqual(modes, ['--write', '--recover']);
+});
+
+test('waits for a cancelled helper to exit before running ACL recovery', async () => {
+  const order: string[] = [];
+  const calls: string[][] = [];
+  const helperPath = join(process.cwd(), 'resources', 'native', 'LocalPowerShell.exe');
+  const recoveryDirectory = join(process.cwd(), '.qa', 'pre-api', 'runtime');
+  const spawnProcess = (command: string, args: string[], options: SpawnOptions): ChildProcessWithoutNullStreams => {
+    calls.push(args);
+    assert.equal(command, helperPath);
+    assert.equal(options.shell, false);
+    if (args[0] === '--recover') {
+      const child = fakeChild();
+      child.stdin.once('finish', () => {
+        order.push('recovery-start');
+        finishFakeChild(child, '{"recovered":true}\n');
+      });
+      child.once('close', () => order.push('recovery-close'));
+      return child;
+    }
+    const child = fakeChild(() => {
+      order.push('run-kill');
+      child.stdout.end();
+      child.stderr.end();
+      setImmediate(() => {
+        order.push('run-close');
+        child.emit('close', null, 'SIGTERM');
+      });
+    });
+    child.once('close', () => order.push('run-closed-listener'));
+    return child;
+  };
+  const controller = new AbortController();
+  const helper = createPowerShellHelper({
+    helperPath,
+    recoveryDirectory,
+    spawnProcess,
+  });
+  const pending = helper.run({
+    workingFolder: join(process.cwd(), '.qa', 'pre-api', 'project'),
+    script: 'Start-Sleep -Seconds 10',
+    timeoutMs: 10_000,
+    maxOutputBytes: 1024,
+    signal: controller.signal,
+  });
+  await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+  controller.abort();
+  await assert.rejects(pending, { name: 'AbortError' });
+
+  assert.deepEqual(calls, [['--run', recoveryDirectory], ['--recover', recoveryDirectory]]);
+  assert.ok(order.indexOf('run-close') < order.indexOf('recovery-start'));
+});
+
+test('recovers from a malformed successful helper response without reentrant locking', { timeout: 5000 }, async () => {
+  const calls: string[] = [];
+  const helperPath = join(process.cwd(), 'resources', 'native', 'LocalPowerShell.exe');
+  const recoveryDirectory = join(process.cwd(), '.qa', 'pre-api', 'runtime');
+  const spawnProcess = (_command: string, args: string[], options: SpawnOptions): ChildProcessWithoutNullStreams => {
+    assert.equal(options.shell, false);
+    calls.push(args[0] ?? '');
+    const child = fakeChild();
+    child.stdin.once('finish', () => {
+      finishFakeChild(child, args[0] === '--recover' ? '{"recovered":true}\n' : '{}\n');
+    });
+    return child;
+  };
+  const helper = createPowerShellHelper({ helperPath, recoveryDirectory, spawnProcess });
+
+  await assert.rejects(helper.run({
+    workingFolder: join(process.cwd(), '.qa', 'pre-api', 'project'),
+    script: "Write-Output 'ok'",
+    timeoutMs: 1000,
+    maxOutputBytes: 1024,
+  }), /некорректный ответ/);
+  assert.deepEqual(calls, ['--run', '--recover']);
+});
+
+test('lists, searches, reads, sends structured writes, and opens files inside a selected project', async (t) => {
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  await mkdir(join(fixture.projectFolder, 'docs'));
+  await writeFile(join(fixture.projectFolder, 'docs', 'readme.md'), 'GigaChat local tools\nsecond line\n');
+  const events: LocalToolEvent[] = [];
+  const opened: string[] = [];
+  const requests: PowerShellRequest[] = [];
+  const writeRequests: ProjectFileWriteRequest[] = [];
+  const readText = 'Локальный файл: ёж\nвторая строка\n';
+  const runPowerShell: PowerShellRunner = async (request) => {
+    requests.push(request);
+    if (request.script.includes('GIGACHAT_LOCAL_TOOL:list')) {
+      return { exitCode: 0, stdout: JSON.stringify([
+        { path: 'docs', kind: 'directory', size: null },
+      ]), stderr: '', timedOut: false, outputLimited: false };
+    }
+    if (request.script.includes('GIGACHAT_LOCAL_TOOL:search')) {
+      return { exitCode: 0, stdout: JSON.stringify([
+        { path: 'docs/readme.md', line: 1, text: 'GigaChat local tools' },
+      ]), stderr: '', timedOut: false, outputLimited: false };
+    }
+    const output = Buffer.from(readText, 'utf8');
+    return { exitCode: 0, stdout: output.toString('base64') + '\n',
+      stderr: '', timedOut: false, outputLimited: false };
+  };
+  const projectWriter = async (request: ProjectFileWriteRequest) => {
+    writeRequests.push(request);
+    return { bytes: Buffer.from(request.contentsBase64, 'base64').byteLength, replacedExisting: false };
+  };
+  const tools = makeTools(fixture.project, events, opened, runPowerShell, projectWriter);
+
+  assert.deepEqual(await tools.list(projectId, 'ask'), [
+    { path: 'docs', kind: 'directory', size: null },
+  ]);
+  assert.deepEqual(await tools.search(projectId, 'ask', 'LOCAL TOOLS'), [
+    { path: 'docs/readme.md', line: 1, text: 'GigaChat local tools' },
+  ]);
+  assert.equal(await tools.read(projectId, 'ask', 'docs/readme.md'), readText);
+  assert.deepEqual(await tools.write(projectId, 'ask', 'result.txt', 'Сохранено: ёж'),
+    { bytes: Buffer.byteLength('Сохранено: ёж', 'utf8') });
+  assert.equal(requests.length, 3);
+  assert.ok(requests.every((request) => request.workingFolder === fixture.projectFolder));
+  assert.match(requests[0]?.script ?? '', /GIGACHAT_LOCAL_TOOL:list/);
+  assert.match(requests[0]?.script ?? '', /GetFileSystemEntries\(\$target\)/);
+  assert.match(requests[0]?.script ?? '', /ReparsePoint/);
+  assert.match(requests[1]?.script ?? '', /GIGACHAT_LOCAL_TOOL:search/);
+  assert.match(requests[1]?.script ?? '', /inspectedDirectories -gt 500/);
+  assert.match(requests[1]?.script ?? '', /inspectedEntries -gt 5000/);
+  assert.match(requests[2]?.script ?? '', /\$Candidate\.Substring\(\$rootPrefix\.Length\)/);
+  assert.doesNotMatch(requests[2]?.script ?? '', /GetRelativePath/);
+  assert.equal(requests[0]?.maxOutputBytes, 1024 * 1024);
+  assert.equal(requests[1]?.maxOutputBytes, 1024 * 1024);
+  assert.equal(requests[2]?.maxOutputBytes, 2 * 1024 * 1024);
+  assert.equal(writeRequests.length, 1);
+  assert.equal(writeRequests[0]?.workingFolder, fixture.projectFolder);
+  assert.equal(writeRequests[0]?.relativePath, 'result.txt');
+  assert.equal(Buffer.from(writeRequests[0]?.contentsBase64 ?? '', 'base64').toString('utf8'), 'Сохранено: ёж');
+  await tools.open(projectId, 'full', 'docs');
+  await tools.open(projectId, 'full', 'docs/readme.md');
+  const canonicalProject = await realpath(fixture.projectFolder);
+  assert.deepEqual(opened, [join(canonicalProject, 'docs'), join(canonicalProject, 'docs', 'readme.md')]);
+  assert.equal(events.filter((event) => event.phase === 'started').length, 6);
+  assert.equal(events.filter((event) => event.phase === 'completed').length, 6);
+  assert.ok(events.every((event) => !('script' in event) && !('path' in event)));
+});
+
+test('keeps existing file contents when structured broker rejects a write', async (t) => {
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  const existingPath = join(fixture.projectFolder, 'existing.txt');
+  const previousText = 'keep previous content';
+  await writeFile(existingPath, previousText, 'utf8');
+  const events: LocalToolEvent[] = [];
+  const requests: ProjectFileWriteRequest[] = [];
+  const projectWriter = async (request: ProjectFileWriteRequest) => {
+    requests.push(request);
+    throw new Error('Файловый writer отказал: дескриптор не поддерживается.');
+  };
+  const tools = makeTools(fixture.project, events, [], undefined, projectWriter);
+
+  await assert.rejects(tools.write(projectId, 'ask', 'existing.txt', 'replacement'), /дескриптор не поддерживается/);
+  assert.equal(await readFile(existingPath, 'utf8'), previousText);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.relativePath, 'existing.txt');
+  assert.equal(Buffer.from(requests[0]?.contentsBase64 ?? '', 'base64').toString('utf8'), 'replacement');
+  assert.equal(events[events.length - 1]?.phase, 'failed');
+});
+
+test('rejects traversal, malformed requests, oversized writes, and project symlinks', async (t) => {
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  await writeFile(join(fixture.outsideFolder, 'sentinel.txt'), 'outside');
+  await writeFile(join(fixture.projectFolder, 'keep.txt'), 'preserve');
+  await writeFile(join(fixture.projectFolder, 'not-a-folder.txt'), 'still here');
+  const events: LocalToolEvent[] = [];
+  const tools = makeTools(fixture.project, events, []);
+
+  await assert.rejects(tools.read(projectId, 'ask', '../outside/sentinel.txt'), /относительный путь|недопустимый компонент/);
+  await assert.rejects(tools.read(projectId, 'ask', join(fixture.outsideFolder, 'sentinel.txt')), /относительный путь/);
+  await assert.rejects(tools.read('missing-project', 'ask', 'keep.txt'), /рабочая папка/);
+  await assert.rejects(tools.read(projectId, 'custom', 'keep.txt'), /Custom/);
+  await assert.rejects(tools.write(projectId, 'ask', 'keep.txt', 'x'.repeat(MAX_LOCAL_FILE_BYTES + 1)), /1 МиБ/);
+  await assert.rejects(tools.write(projectId, 'ask', 'not-a-folder.txt/child.txt', 'replacement'), /Компонент пути не является папкой/);
+  assert.equal(await readFile(join(fixture.projectFolder, 'keep.txt'), 'utf8'), 'preserve');
+  assert.equal(await readFile(join(fixture.projectFolder, 'not-a-folder.txt'), 'utf8'), 'still here');
+  await assert.rejects(tools.open(projectId, 'ask', 'keep.txt'), /требуется подтверждение/);
+
+  const link = join(fixture.projectFolder, 'outside-link');
+  await symlink(fixture.outsideFolder, link, 'junction');
+  await assert.rejects(tools.read(projectId, 'ask', 'outside-link/sentinel.txt'), /ссыл|повторной обработки/);
+  assert.equal(events.filter((event) => event.phase === 'failed').length, 8);
+});
+
+test('rechecks the working-folder path on every request and keeps PowerShell disabled without a verified helper', async (t) => {
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  await writeFile(join(fixture.projectFolder, 'before.txt'), 'ok');
+  const events: LocalToolEvent[] = [];
+  const runPowerShell: PowerShellRunner = async () => ({
+    exitCode: 0, stdout: Buffer.from('ok', 'utf8').toString('base64') + '\n',
+    stderr: '', timedOut: false, outputLimited: false,
+  });
+  const tools = makeTools(fixture.project, events, [], runPowerShell);
+  assert.equal(await tools.read(projectId, 'ask', 'before.txt'), 'ok');
+
+  const moved = join(fixture.root, 'moved');
+  await rename(fixture.projectFolder, moved);
+  await symlink(moved, fixture.projectFolder, 'junction');
+  await assert.rejects(tools.read(projectId, 'ask', 'before.txt'), /ссыл/);
+  const unavailable = makeTools(fixture.project, [], []);
+  await assert.rejects(unavailable.runPowerShell(projectId, 'full', 'Get-Location'), /пока недоступен/);
+  assert.equal(events.filter((event) => event.phase === 'failed').length, 1);
+});
+
+test('can cancel a long search between filesystem operations', async (t) => {
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  const controller = new AbortController();
+  const events: LocalToolEvent[] = [];
+  const tools = createLocalTools({
+    resolveProject: async (id) => id === fixture.project.id ? fixture.project : null,
+    onEvent: (event) => {
+      events.push(event);
+      if (event.tool === 'search' && event.phase === 'started') setTimeout(() => controller.abort(), 0);
+    },
+  });
+  await writeFile(join(fixture.projectFolder, 'one.txt'), 'search me');
+  await assert.rejects(tools.search(projectId, 'ask', 'search', '', { signal: controller.signal }), { name: 'AbortError' });
+  assert.equal(events[events.length - 1]?.phase, 'cancelled');
+});
+
+test('rejects malformed or over-bound list/search helper output', async (t) => {
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  let output = '[]';
+  const tools = createLocalTools({
+    resolveProject: async (id) => id === fixture.project.id ? fixture.project : null,
+    runPowerShell: async () => ({
+      exitCode: 0,
+      stdout: output,
+      stderr: '', timedOut: false, outputLimited: false,
+    }),
+  });
+
+  output = JSON.stringify([{ path: '../outside/sentinel.txt', kind: 'file', size: 1 }]);
+  await assert.rejects(tools.list(projectId, 'ask'), /путь вне выбранной папки|недопустимый компонент/);
+  output = JSON.stringify(Array.from({ length: 501 }, (_, index) => ({
+    path: `item-${index}`, kind: 'file', size: 0,
+  })));
+  await assert.rejects(tools.list(projectId, 'ask'), /слишком много элементов/);
+  output = JSON.stringify([{ path: '../outside/sentinel.txt', line: 1, text: 'outside' }]);
+  await assert.rejects(tools.search(projectId, 'ask', 'sentinel'), /путь вне выбранной папки|недопустимый компонент/);
+  output = JSON.stringify(Array.from({ length: 201 }, (_, index) => ({
+    path: `file-${index}.txt`, line: 1, text: 'match',
+  })));
+  await assert.rejects(tools.search(projectId, 'ask', 'match'), /слишком много результатов/);
+});
