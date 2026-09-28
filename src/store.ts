@@ -11,7 +11,7 @@ import { isSkillId } from './skills';
 type ProjectFile = { schemaVersion: 2; projects: Project[] };
 type LegacyChat = ChatSummary & { draft: string };
 type ChatFile = { schemaVersion: 2; chats: LegacyChat[] };
-type SettingsFile = { schemaVersion: 9; settings: Settings };
+type SettingsFile = { schemaVersion: 10; settings: Settings };
 
 const MAX_IMPORTED_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_INSTRUCTION_BYTES = 64 * 1024;
@@ -142,6 +142,13 @@ function requireSidebarWidth(value: unknown): number {
   return value;
 }
 
+function requireBrowserWidth(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 320 || value > 16384) {
+    throw new Error('Некорректная ширина браузера.');
+  }
+  return value;
+}
+
 function validateBrowserTabs(value: unknown): BrowserTabRecord[] {
   if (!Array.isArray(value) || value.length > 20) throw new Error('Некорректные вкладки браузера.');
   const tabs = value.map((item): BrowserTabRecord => {
@@ -160,7 +167,7 @@ function validateBrowserTabs(value: unknown): BrowserTabRecord[] {
   return tabs;
 }
 
-function validateSettings(value: unknown, version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9): Settings {
+function validateSettings(value: unknown, version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10): Settings {
   if (!isRecord(value)) throw new Error('Settings record is invalid.');
   if (version >= 8 && value.microphoneConsent !== 'unasked' && value.microphoneConsent !== 'allowed' && value.microphoneConsent !== 'declined') {
     throw new Error('Некорректное разрешение микрофона.');
@@ -179,6 +186,7 @@ function validateSettings(value: unknown, version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8
       sidebarVisible: true,
       sidebarWidthPx: null,
       browserPaneOpen: false,
+      browserWidthPx: null,
       browserTabs: [],
       browserActiveTabId: null,
       defaultProjectsFolder: null,
@@ -199,6 +207,7 @@ function validateSettings(value: unknown, version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8
     sidebarVisible: requireBoolean(value.sidebarVisible, 'Видимость боковой панели'),
     sidebarWidthPx: version >= 9 && value.sidebarWidthPx !== null ? requireSidebarWidth(value.sidebarWidthPx) : null,
     browserPaneOpen: version >= 9 ? requireBoolean(value.browserPaneOpen, 'Видимость браузера') : false,
+    browserWidthPx: version >= 10 && value.browserWidthPx !== null ? requireBrowserWidth(value.browserWidthPx) : null,
     browserTabs,
     browserActiveTabId: activeTabId as string | null,
     defaultProjectsFolder: requireFolderPath(value.defaultProjectsFolder, 'Папка проектов'),
@@ -394,38 +403,38 @@ function parseSettingsFile(value: unknown): Loaded<SettingsFile> {
   if (!isRecord(value)) throw new Error('Invalid settings file.');
   if (value.schemaVersion === 1) {
     return {
-      value: { schemaVersion: 9, settings: validateSettings(value.settings, 1) },
+      value: { schemaVersion: 10, settings: validateSettings(value.settings, 1) },
       needsWrite: true,
     };
   }
   if (value.schemaVersion === 2) {
     return {
-      value: { schemaVersion: 9, settings: validateSettings(value.settings, 2) },
+      value: { schemaVersion: 10, settings: validateSettings(value.settings, 2) },
       needsWrite: true,
     };
   }
   if (value.schemaVersion === 3) {
     return {
-      value: { schemaVersion: 9, settings: validateSettings(value.settings, 3) },
+      value: { schemaVersion: 10, settings: validateSettings(value.settings, 3) },
       needsWrite: true,
     };
   }
   if (value.schemaVersion === 4) {
     return {
-      value: { schemaVersion: 9, settings: validateSettings(value.settings, 4) },
+      value: { schemaVersion: 10, settings: validateSettings(value.settings, 4) },
       needsWrite: true,
     };
   }
   if (value.schemaVersion === 5) {
     return {
-      value: { schemaVersion: 9, settings: validateSettings(value.settings, 5) },
+      value: { schemaVersion: 10, settings: validateSettings(value.settings, 5) },
       needsWrite: true,
     };
   }
-  if (value.schemaVersion === 6 || value.schemaVersion === 7 || value.schemaVersion === 8) return { value: { schemaVersion: 9, settings: validateSettings(value.settings, value.schemaVersion) }, needsWrite: true };
-  if (value.schemaVersion !== 9) throw new Error('Unknown settings file version.');
+  if (value.schemaVersion === 6 || value.schemaVersion === 7 || value.schemaVersion === 8 || value.schemaVersion === 9) return { value: { schemaVersion: 10, settings: validateSettings(value.settings, value.schemaVersion) }, needsWrite: true };
+  if (value.schemaVersion !== 10) throw new Error('Unknown settings file version.');
   return {
-    value: { schemaVersion: 9, settings: validateSettings(value.settings, 9) },
+    value: { schemaVersion: 10, settings: validateSettings(value.settings, 10) },
     needsWrite: false,
   };
 }
@@ -475,6 +484,7 @@ function validateSettingsPatch(value: unknown): SettingsPatch {
     else if (key === 'sidebarVisible') patch.sidebarVisible = requireBoolean(item, 'Видимость боковой панели');
     else if (key === 'sidebarWidthPx') patch.sidebarWidthPx = item === null ? null : requireSidebarWidth(item);
     else if (key === 'browserPaneOpen') patch.browserPaneOpen = requireBoolean(item, 'Видимость браузера');
+    else if (key === 'browserWidthPx') patch.browserWidthPx = item === null ? null : requireBrowserWidth(item);
     else if (key === 'browserTabs') patch.browserTabs = validateBrowserTabs(item);
     else if (key === 'browserActiveTabId') patch.browserActiveTabId = item === null ? null : requireId(item);
     else if (key === 'defaultProjectsFolder') patch.defaultProjectsFolder = requireFolderPath(item, 'Папка проектов');
@@ -543,13 +553,14 @@ export async function openStore(directory: string): Promise<LocalStore> {
   const [projectFile, settingsFile] = await Promise.all([
     loadVersioned<ProjectFile>(projectPath, { schemaVersion: 2, projects: [] }, parseProjectFile),
     loadVersioned<SettingsFile>(settingsPath, {
-      schemaVersion: 9,
+      schemaVersion: 10,
       settings: {
         theme: 'emerald',
         sidebarTransparent: false,
         sidebarVisible: true,
         sidebarWidthPx: null,
         browserPaneOpen: false,
+        browserWidthPx: null,
         browserTabs: [],
         browserActiveTabId: null,
         defaultProjectsFolder: null,
@@ -662,7 +673,7 @@ export async function openStore(directory: string): Promise<LocalStore> {
     return chat;
   };
   const saveSettings = async (next: Settings): Promise<void> => {
-    await writeOwnedAtomic(settingsPath, { schemaVersion: 9, settings: next });
+    await writeOwnedAtomic(settingsPath, { schemaVersion: 10, settings: next });
     settings = next;
   };
   const projectInstructionsPath = (idInput: unknown): string => {
@@ -847,7 +858,7 @@ export async function openStore(directory: string): Promise<LocalStore> {
     getSettings: () => serialize(async () => ({ ...settings })),
     updateSettings: (patchInput) => serialize(async () => {
       const patch = validateSettingsPatch(patchInput);
-      const next = validateSettings({ ...settings, ...patch }, 9);
+      const next = validateSettings({ ...settings, ...patch }, 10);
       await saveSettings(next);
       return { ...settings };
     }),

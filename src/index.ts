@@ -210,7 +210,7 @@ function requireId(value: unknown): string {
 
 function requireSettingsPatch(value: unknown): SettingsPatch {
   if (!isRecord(value)) throw new Error('Некорректные настройки.');
-  const allowedFields = ['theme', 'sidebarTransparent', 'sidebarVisible', 'sidebarWidthPx', 'browserPaneOpen', 'defaultProjectsFolder', 'preferredOpener', 'defaultPermissionProfile', 'defaultModelId', 'onboardingCompleted', 'notifications'];
+  const allowedFields = ['theme', 'sidebarTransparent', 'sidebarVisible', 'sidebarWidthPx', 'browserPaneOpen', 'browserWidthPx', 'defaultProjectsFolder', 'preferredOpener', 'defaultPermissionProfile', 'defaultModelId', 'onboardingCompleted', 'notifications'];
   if (Object.keys(value).some((key) => !allowedFields.includes(key))) throw new Error('Недопустимое поле настроек.');
   if ('defaultPermissionProfile' in value) requirePermissionProfile(value.defaultPermissionProfile);
   if ('defaultModelId' in value && value.defaultModelId !== null) requireModelId(value.defaultModelId);

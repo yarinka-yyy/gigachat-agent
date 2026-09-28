@@ -182,6 +182,7 @@ const DEFAULT_SETTINGS: Settings = {
   sidebarVisible: true,
   sidebarWidthPx: null,
   browserPaneOpen: false,
+  browserWidthPx: null,
   browserTabs: [],
   browserActiveTabId: null,
   defaultProjectsFolder: null,
@@ -535,7 +536,7 @@ export default function App() {
   const [sidebarPreview, setSidebarPreview] = useState(false);
   const [sidebarDragWidth, setSidebarDragWidth] = useState<number | null>(null);
   const [sidebarDragging, setSidebarDragging] = useState(false);
-  const [compactLayout, setCompactLayout] = useState(() => window.innerWidth <= 720);
+  const [compactLayout, setCompactLayout] = useState(() => window.innerWidth <= 802);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>('general');
   const [showAllProjects, setShowAllProjects] = useState(false);
   const [showAllChats, setShowAllChats] = useState(false);
@@ -854,7 +855,7 @@ export default function App() {
 
   useEffect(() => {
     const update = () => {
-      setCompactLayout(window.innerWidth <= 720);
+      setCompactLayout(window.innerWidth <= 802);
       closePreview();
     };
     window.addEventListener('resize', update);
@@ -1681,12 +1682,11 @@ export default function App() {
         return (
           <>
             <div className="settings-section-heading"><h2>Модели и лимиты</h2><p>Выбор модели сохранится для следующих ходов. Доступность проверим после подключения API.</p></div>
-            <div className="settings-card connection-card"><div className="connection-mark">G</div><div><strong>GigaChat API</strong><p>Провайдер не подключён. Список моделей и их доступность пока не загружены.</p></div><span className="status-pill"><i />Не подключён</span></div>
+            <div className="settings-card connection-card"><div><strong>GigaChat API</strong><p>Провайдер не подключён. Список моделей и их доступность пока не загружены.</p></div><span className="status-pill"><i />Не подключён</span></div>
             <div className="model-settings-list">
               {GIGACHAT_MODELS.map((model) => <button type="button" key={model.id}
                 className={`permission-profile permission-profile-selectable${settings.defaultModelId === model.id ? ' selected' : ''}`}
                 aria-pressed={settings.defaultModelId === model.id} onClick={() => void updateLocalSettings({ defaultModelId: model.id })}>
-                <span className="model-mark">G</span>
                 <span className="permission-profile-copy"><strong>{model.name}</strong><span>{model.description} · Доступ не проверен</span></span>
                 <span className="status-label">{settings.defaultModelId === model.id ? 'По умолчанию' : 'Выбрать'}</span>
               </button>)}
@@ -1987,7 +1987,7 @@ export default function App() {
         return (
           <section className="settings-layout">
             <nav className="settings-nav" aria-label="Разделы настроек">
-              <div className="settings-nav-heading"><span className="eyebrow">Приложение</span><h1>Настройки</h1></div>
+              <div className="settings-nav-heading"><h1>Настройки</h1></div>
               {SETTINGS_SECTIONS.map((item) => (
                 <button key={item.id} type="button" className={settingsSection === item.id ? 'settings-nav-item active' : 'settings-nav-item'} onClick={() => setSettingsSection(item.id)}>
                   <Icon name={item.icon} /><span>{item.label}</span>
@@ -1995,7 +1995,7 @@ export default function App() {
               ))}
             </nav>
             <div className="settings-content">
-              {settingsSection !== 'browser' && <div className="settings-content-heading"><span className="eyebrow">Настройки</span><h1>{settingTitle}</h1></div>}
+              {settingsSection !== 'browser' && <div className="settings-content-heading"><h1>{settingTitle}</h1></div>}
               {renderSettingsSection()}
             </div>
           </section>
@@ -2263,7 +2263,7 @@ export default function App() {
                   <div className="toolbar-trailing">
                   <ActionMenu className="composer-model-menu" placement="below" label="Выбрать модель GigaChat"
                     disabled={!canChangeComposerPermissionProfile}
-                    trigger={<><span className="model-mark">G</span><span>{GIGACHAT_MODELS.find((model) => model.id === composerModelId)?.name ?? 'Выбрать модель'}</span><Icon name="chevron" /></>}>
+                    trigger={<><span>{GIGACHAT_MODELS.find((model) => model.id === composerModelId)?.name ?? 'Выбрать модель'}</span><Icon name="chevron" /></>}>
                     <div className="model-picker-popup"><p className="picker-heading">Модель для следующих ходов</p>
                       <p className="picker-caption">Доступность будет проверена после подключения API.</p>
                       {GIGACHAT_MODELS.map((model) => <button type="button" className="model-picker-option" key={model.id}
@@ -2289,7 +2289,7 @@ export default function App() {
             </div>
           )}
           </div>
-          {route.page === 'chat' && settings.browserPaneOpen && <BrowserPanel onClose={() => void updateLocalSettings({ browserPaneOpen: false })} suspended={sidebarPreview || Boolean(dialogRequest) || Boolean(approvalRequest)} />}
+          {route.page === 'chat' && settings.browserPaneOpen && <BrowserPanel onClose={() => void updateLocalSettings({ browserPaneOpen: false })} onWidthChange={(browserWidthPx) => void updateLocalSettings({ browserWidthPx })} preferredWidth={settings.browserWidthPx} suspended={sidebarPreview || Boolean(dialogRequest) || Boolean(approvalRequest)} />}
           </div>
           {notice && <div className={`notice notice-${noticeKind}`} role={noticeKind === 'error' ? 'alert' : 'status'}><span>{notice}</span><button type="button" aria-label="Закрыть уведомление" onClick={() => setNotice('')}><Icon name="x" /></button></div>}
         </main>

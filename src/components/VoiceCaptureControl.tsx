@@ -255,14 +255,24 @@ export default function VoiceCaptureControl({ available, reason, onTranscript, o
 
   return (
     <div className={`voice-capture${phase === 'recording' ? ' is-recording' : ''}`}>
-      <span
-        className={`voice-capture-status${!available ? ' is-unavailable' : ''}`}
-        role="status"
-        aria-live="polite"
-        title={!available ? reason ?? 'Диктовка недоступна' : undefined}
-      >
-        {phase === 'recording' ? `Запись ${formatElapsed(elapsed)} / 10:00` : statusText || (!available ? reason ?? 'Диктовка недоступна' : '')}
-      </span>
+      <div className="voice-capture-feedback">
+        <span
+          className={`voice-capture-status${!available ? ' is-unavailable' : ''}`}
+          role="status"
+          aria-live="polite"
+          title={!available ? reason ?? 'Диктовка недоступна' : undefined}
+        >
+          {phase === 'recording' ? `Запись ${formatElapsed(elapsed)} / 10:00` : statusText || (!available ? reason ?? 'Диктовка недоступна' : '')}
+        </span>
+        {isBusy && <button
+          type="button"
+          className="voice-cancel-button"
+          disabled={phase === 'cancelling'}
+          aria-label={phase === 'recording' || phase === 'starting' ? 'Отменить запись' : 'Отменить распознавание'}
+          title={phase === 'recording' || phase === 'starting' ? 'Отменить запись' : 'Отменить распознавание'}
+          onClick={cancelRecording}
+        ><X aria-hidden="true" /></button>}
+      </div>
       <button
         type="button"
         className={`mic-button${phase === 'recording' ? ' is-recording' : ''}`}
@@ -276,14 +286,6 @@ export default function VoiceCaptureControl({ available, reason, onTranscript, o
           : phase === 'transcribing' || phase === 'cancelling' ? <LoaderCircle className="voice-spinner" aria-hidden="true" />
             : <Mic aria-hidden="true" />}
       </button>
-      {isBusy && <button
-        type="button"
-        className="voice-cancel-button"
-        disabled={phase === 'cancelling'}
-        aria-label={phase === 'recording' || phase === 'starting' ? 'Отменить запись' : 'Отменить распознавание'}
-        title={phase === 'recording' || phase === 'starting' ? 'Отменить запись' : 'Отменить распознавание'}
-        onClick={cancelRecording}
-      ><X aria-hidden="true" /></button>}
     </div>
   );
 }

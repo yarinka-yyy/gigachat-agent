@@ -144,7 +144,7 @@ export default function ConnectionSetup({ firstRun, onContinue }: ConnectionSetu
   return (
     <section className="connection-setup" aria-label="Подключение GigaChat API">
       <header className="connection-heading">
-        <span className="eyebrow">{firstRun ? 'Первый запуск' : 'Подключение API'}</span>
+        {firstRun && <span className="eyebrow">Первый запуск</span>}
         <h1>{firstRun ? 'Настройте GigaChat Agents' : 'Подключение GigaChat API'}</h1>
         <p>API пока не подключён. Эти шаги не проверяют ключ и не отправляют данные в GigaChat.</p>
       </header>

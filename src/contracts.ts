@@ -208,6 +208,7 @@ export interface Settings {
   sidebarVisible: boolean;
   sidebarWidthPx: number | null;
   browserPaneOpen: boolean;
+  browserWidthPx: number | null;
   browserTabs: BrowserTabRecord[];
   browserActiveTabId: string | null;
   defaultProjectsFolder: string | null;
