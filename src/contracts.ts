@@ -211,6 +211,7 @@ export interface Settings {
   defaultPermissionProfile: PermissionProfile;
   defaultModelId: GigaChatModelId | null;
   onboardingCompleted: boolean;
+  microphoneConsent: 'unasked' | 'allowed' | 'declined';
   notifications: NotificationSettings;
 }
 
@@ -306,6 +307,7 @@ export interface AppApi {
   };
   voice: {
     getStatus(): Promise<VoiceAvailability>;
+    requestAccess(): Promise<boolean>;
     transcribe(requestId: string, audio: Uint8Array, mediaType: string): Promise<string>;
     cancel(requestId: string): Promise<boolean>;
   };

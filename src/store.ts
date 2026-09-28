@@ -11,7 +11,7 @@ import { isSkillId } from './skills';
 type ProjectFile = { schemaVersion: 2; projects: Project[] };
 type LegacyChat = ChatSummary & { draft: string };
 type ChatFile = { schemaVersion: 2; chats: LegacyChat[] };
-type SettingsFile = { schemaVersion: 7; settings: Settings };
+type SettingsFile = { schemaVersion: 8; settings: Settings };
 
 const MAX_IMPORTED_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_INSTRUCTION_BYTES = 64 * 1024;
@@ -135,8 +135,11 @@ function validateNotificationSettings(value: unknown): NotificationSettings {
   return { taskStarted: value.taskStarted, taskCompleted: value.taskCompleted, failures: value.failures };
 }
 
-function validateSettings(value: unknown, version: 1 | 2 | 3 | 4 | 5 | 6 | 7): Settings {
+function validateSettings(value: unknown, version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8): Settings {
   if (!isRecord(value)) throw new Error('Settings record is invalid.');
+  if (version === 8 && value.microphoneConsent !== 'unasked' && value.microphoneConsent !== 'allowed' && value.microphoneConsent !== 'declined') {
+    throw new Error('Некорректное разрешение микрофона.');
+  }
   const theme = validateTheme(value.theme);
   const migratedTheme = version < 3 && theme === 'dark' ? 'emerald' : theme;
   if (version === 1) {
@@ -149,6 +152,7 @@ function validateSettings(value: unknown, version: 1 | 2 | 3 | 4 | 5 | 6 | 7): S
       defaultPermissionProfile: 'ask',
       defaultModelId: null,
       onboardingCompleted: true,
+      microphoneConsent: 'unasked',
       notifications: { ...DEFAULT_NOTIFICATION_SETTINGS },
     };
   }
@@ -166,6 +170,8 @@ function validateSettings(value: unknown, version: 1 | 2 | 3 | 4 | 5 | 6 | 7): S
     onboardingCompleted: version >= 5
       ? requireBoolean(value.onboardingCompleted, 'Статус первичной настройки')
       : true,
+    microphoneConsent: version >= 8 && (value.microphoneConsent === 'unasked' || value.microphoneConsent === 'allowed' || value.microphoneConsent === 'declined')
+      ? value.microphoneConsent : 'unasked',
     notifications: version >= 6 ? validateNotificationSettings(value.notifications) : { ...DEFAULT_NOTIFICATION_SETTINGS },
   };
 }
@@ -350,38 +356,38 @@ function parseSettingsFile(value: unknown): Loaded<SettingsFile> {
   if (!isRecord(value)) throw new Error('Invalid settings file.');
   if (value.schemaVersion === 1) {
     return {
-      value: { schemaVersion: 7, settings: validateSettings(value.settings, 1) },
+      value: { schemaVersion: 8, settings: validateSettings(value.settings, 1) },
       needsWrite: true,
     };
   }
   if (value.schemaVersion === 2) {
     return {
-      value: { schemaVersion: 7, settings: validateSettings(value.settings, 2) },
+      value: { schemaVersion: 8, settings: validateSettings(value.settings, 2) },
       needsWrite: true,
     };
   }
   if (value.schemaVersion === 3) {
     return {
-      value: { schemaVersion: 7, settings: validateSettings(value.settings, 3) },
+      value: { schemaVersion: 8, settings: validateSettings(value.settings, 3) },
       needsWrite: true,
     };
   }
   if (value.schemaVersion === 4) {
     return {
-      value: { schemaVersion: 7, settings: validateSettings(value.settings, 4) },
+      value: { schemaVersion: 8, settings: validateSettings(value.settings, 4) },
       needsWrite: true,
     };
   }
   if (value.schemaVersion === 5) {
     return {
-      value: { schemaVersion: 7, settings: validateSettings(value.settings, 5) },
+      value: { schemaVersion: 8, settings: validateSettings(value.settings, 5) },
       needsWrite: true,
     };
   }
-  if (value.schemaVersion === 6) return { value: { schemaVersion: 7, settings: validateSettings(value.settings, 6) }, needsWrite: true };
-  if (value.schemaVersion !== 7) throw new Error('Unknown settings file version.');
+  if (value.schemaVersion === 6 || value.schemaVersion === 7) return { value: { schemaVersion: 8, settings: validateSettings(value.settings, value.schemaVersion) }, needsWrite: true };
+  if (value.schemaVersion !== 8) throw new Error('Unknown settings file version.');
   return {
-    value: { schemaVersion: 7, settings: validateSettings(value.settings, 7) },
+    value: { schemaVersion: 8, settings: validateSettings(value.settings, 8) },
     needsWrite: false,
   };
 }
@@ -435,6 +441,7 @@ function validateSettingsPatch(value: unknown): SettingsPatch {
     } else if (key === 'defaultPermissionProfile') patch.defaultPermissionProfile = requirePermissionProfile(item);
     else if (key === 'defaultModelId') patch.defaultModelId = item === null ? null : requireModelId(item);
     else if (key === 'onboardingCompleted') patch.onboardingCompleted = requireBoolean(item, 'Статус первичной настройки');
+    else if (key === 'microphoneConsent' && (item === 'unasked' || item === 'allowed' || item === 'declined')) patch.microphoneConsent = item;
     else if (key === 'notifications') patch.notifications = validateNotificationSettings(item);
     else throw new Error('Недопустимое поле настроек.');
   }
@@ -494,7 +501,7 @@ export async function openStore(directory: string): Promise<LocalStore> {
   const [projectFile, settingsFile] = await Promise.all([
     loadVersioned<ProjectFile>(projectPath, { schemaVersion: 2, projects: [] }, parseProjectFile),
     loadVersioned<SettingsFile>(settingsPath, {
-      schemaVersion: 7,
+      schemaVersion: 8,
       settings: {
         theme: 'emerald',
         sidebarTransparent: false,
@@ -504,6 +511,7 @@ export async function openStore(directory: string): Promise<LocalStore> {
         defaultPermissionProfile: 'ask',
         defaultModelId: null,
         onboardingCompleted: false,
+        microphoneConsent: 'unasked',
         notifications: { ...DEFAULT_NOTIFICATION_SETTINGS },
       },
     }, parseSettingsFile),
@@ -608,7 +616,7 @@ export async function openStore(directory: string): Promise<LocalStore> {
     return chat;
   };
   const saveSettings = async (next: Settings): Promise<void> => {
-    await writeOwnedAtomic(settingsPath, { schemaVersion: 7, settings: next });
+    await writeOwnedAtomic(settingsPath, { schemaVersion: 8, settings: next });
     settings = next;
   };
   const projectInstructionsPath = (idInput: unknown): string => {

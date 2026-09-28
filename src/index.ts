@@ -1,7 +1,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { lstat, mkdir, mkdtemp, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { app, BrowserWindow, dialog, ipcMain, nativeTheme, Notification, safeStorage, screen, session, shell, WebContentsView, type IpcMainInvokeEvent, type MediaAccessPermissionRequest } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, nativeTheme, Notification, safeStorage, screen, session, shell, systemPreferences, WebContentsView, type IpcMainInvokeEvent, type MediaAccessPermissionRequest } from 'electron';
 import { openStore, type LocalStore } from './store';
 import { buildInstructionRequest } from './instructions';
 import { createLocalTools, createPowerShellHelper, resolvePowerShellHelperPath, type LocalTools } from './local-tools';
@@ -30,6 +30,7 @@ let currentTheme: Theme = 'emerald';
 let allowClose = false;
 let deletingAppData = false;
 let approvalBroker: ReturnType<typeof createPermissionApprovals> | null = null;
+let microphoneConsentGranted = false;
 
 function titleBarColors(): { color: string; symbolColor: string } {
   const theme = currentTheme === 'system'
@@ -730,6 +731,32 @@ async function registerIpcHandlers(
   handle('permissions:respond', (id, allowed) => approvals.respond(id, allowed));
 
   handle('voice:status', () => voiceAvailability);
+  let accessPrompt: Promise<boolean> | null = null;
+  handle('voice:request-access', () => {
+    if (accessPrompt) return accessPrompt;
+    accessPrompt = (async () => {
+      if (process.platform === 'win32') {
+        const status = systemPreferences.getMediaAccessStatus('microphone');
+        if (status === 'denied' || status === 'restricted') {
+          throw new Error('Windows запрещает доступ настольных приложений к микрофону. Приложение не может изменить этот общий запрет.');
+        }
+      }
+      const settings = await store.getSettings();
+      if (settings.microphoneConsent === 'allowed') return true;
+      if (!mainWindow || mainWindow.isDestroyed()) throw new Error('Окно запроса доступа к микрофону недоступно.');
+      const decision = await dialog.showMessageBox(mainWindow, {
+        type: 'question', title: 'Доступ к микрофону',
+        message: 'Разрешить GigaChat Agents использовать микрофон?',
+        detail: 'Голос распознаётся локально. Запись не отправляется автоматически.',
+        buttons: ['Разрешить', 'Не сейчас'], defaultId: 1, cancelId: 1, noLink: true,
+      });
+      const allowed = decision.response === 0;
+      await store.updateSettings({ microphoneConsent: allowed ? 'allowed' : 'declined' });
+      microphoneConsentGranted = allowed;
+      return allowed;
+    })().finally(() => { accessPrompt = null; });
+    return accessPrompt;
+  });
   handle('voice:transcribe', (requestId, audio, mediaType) => {
     if (!voiceRuntime) throw new Error(voiceAvailability.reason ?? 'Локальная диктовка недоступна.');
     return withLocalFailureNotification(
@@ -924,18 +951,18 @@ const createWindow = (): void => {
 
 function configureMainAudioPermission(): void {
   const mainSession = session.defaultSession;
-  const isAllowedMainAudio = (webContents: Electron.WebContents | null, origin: string, mediaType: string | undefined): boolean => {
-    if (!mainWindow || webContents !== mainWindow.webContents || mediaType !== 'audio') return false;
+  const isAllowedMainAudio = (webContents: Electron.WebContents | null, origin: string, requestingUrl: string | undefined): boolean => {
+    if (!microphoneConsentGranted || !mainWindow || webContents !== mainWindow.webContents) return false;
     try {
       const current = new URL(webContents.getURL());
-      const expectedOrigin = current.protocol === 'file:' ? 'file://' : current.origin;
-      return origin === expectedOrigin;
+      if (requestingUrl) return new URL(requestingUrl).href === current.href;
+      return current.protocol === 'file:' ? origin === 'file://' : origin === current.origin;
     } catch {
       return false;
     }
   };
   mainSession.setPermissionCheckHandler((webContents, permission, origin, details) =>
-    permission === 'media' && isAllowedMainAudio(webContents, origin, details.mediaType));
+    permission === 'media' && details.mediaType === 'audio' && isAllowedMainAudio(webContents, origin, details.requestingUrl));
   mainSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
     const media = details as MediaAccessPermissionRequest;
     const onlyAudio = media.mediaTypes?.length === 1 && media.mediaTypes[0] === 'audio';
@@ -946,7 +973,7 @@ function configureMainAudioPermission(): void {
         origin = requestUrl.protocol === 'file:' ? 'file://' : requestUrl.origin;
       } catch { /* malformed request URLs are denied */ }
     }
-    callback(permission === 'media' && onlyAudio && isAllowedMainAudio(webContents, origin, 'audio'));
+    callback(permission === 'media' && onlyAudio && isAllowedMainAudio(webContents, origin, media.requestingUrl));
   });
 }
 
@@ -954,6 +981,7 @@ void app.whenReady().then(async () => {
   try {
     configureMainAudioPermission();
     const store = await openStore(app.getPath('userData'));
+    microphoneConsentGranted = (await store.getSettings()).microphoneConsent === 'allowed';
     const customPermissions = await openCustomPermissions(app.getPath('userData'));
     const approvals = createPermissionApprovals((request) => {
       if (!mainWindow || mainWindow.isDestroyed()) throw new Error('Окно подтверждения недоступно.');

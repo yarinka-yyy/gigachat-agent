@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
 import {
   Archive,
   ArrowLeft,
@@ -79,7 +79,8 @@ import { GIGACHAT_MODELS, type GigaChatModelId } from './models';
 import gigaChatLogo from './assets/gigachat-logo.png';
 import { createInstructionAutosave, type SaveStatus } from './instruction-autosave';
 import ConnectionSetup from './components/ConnectionSetup';
-import VoiceCaptureControl from './components/VoiceCaptureControl';
+import VoiceCaptureControl, { getCaptureError } from './components/VoiceCaptureControl';
+import ContextRing from './components/ContextRing';
 
 type Page = 'home' | 'chat' | 'project' | 'settings' | 'onboarding' | 'images' | 'video' | 'podcasts' | 'archive' | 'profile';
 type Route = { page: Page; id?: string };
@@ -180,6 +181,7 @@ const DEFAULT_SETTINGS: Settings = {
   defaultPermissionProfile: 'ask',
   defaultModelId: null,
   onboardingCompleted: false,
+  microphoneConsent: 'unasked',
   notifications: { taskStarted: false, taskCompleted: true, failures: true },
 };
 
@@ -561,12 +563,34 @@ export default function App() {
   const skillSelectionSave = useRef<Promise<unknown>>(Promise.resolve());
   const draftRef = useRef('');
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
+  const mainPanelRef = useRef<HTMLElement>(null);
   const draftSave = useRef<Promise<unknown>>(Promise.resolve());
   const dialogRef = useRef<HTMLDialogElement>(null);
   const approvalDialogRef = useRef<HTMLDialogElement>(null);
   const routeRef = useRef<Route>({ page: 'home' });
   const settingsRevision = useRef(0);
   const sidebarButtonRef = useRef<HTMLButtonElement>(null);
+  const firstRunMicrophonePrompt = useRef(false);
+
+  function resizeComposer(): void {
+    const input = composerInputRef.current;
+    const panel = mainPanelRef.current;
+    const stack = input?.closest<HTMLElement>('.composer-stack');
+    if (!input || !panel || !stack) return;
+    const previous = input.style.height || `${input.getBoundingClientRect().height}px`;
+    input.style.transition = 'none';
+    input.style.height = 'auto';
+    const naturalHeight = input.scrollHeight;
+    const minimum = parseFloat(getComputedStyle(input).minHeight);
+    const maximum = Math.max(minimum, Math.min(panel.clientHeight * .55, panel.clientHeight - 180) - (stack.offsetHeight - input.offsetHeight));
+    const next = Math.max(minimum, Math.min(naturalHeight, maximum));
+    input.style.height = previous;
+    void input.offsetHeight;
+    input.style.transition = '';
+    input.style.height = `${next}px`;
+    input.style.overflowY = naturalHeight > maximum ? 'auto' : 'hidden';
+  }
+
   function setNotice(value: string): void {
     setNoticeText(value);
     setNoticeKind('error');
@@ -592,6 +616,15 @@ export default function App() {
     },
   ));
   const route = navigation.history[navigation.index] ?? { page: 'home' as const };
+  useLayoutEffect(resizeComposer, [draft, route.page, route.id, compactLayout]);
+  useEffect(() => {
+    const panel = mainPanelRef.current;
+    if (!panel || (route.page !== 'home' && route.page !== 'chat')) return;
+    const observer = new ResizeObserver(resizeComposer);
+    observer.observe(panel);
+    window.addEventListener('resize', resizeComposer);
+    return () => { observer.disconnect(); window.removeEventListener('resize', resizeComposer); };
+  }, [route.page]);
 
   useEffect(() => { settingsRef.current = settings; }, [settings]);
 
@@ -645,6 +678,21 @@ export default function App() {
     });
     return () => { cancelled = true; };
   }, []);
+
+  useEffect(() => {
+    if (loading || settings.onboardingCompleted || settings.microphoneConsent !== 'unasked' || firstRunMicrophonePrompt.current) return;
+    firstRunMicrophonePrompt.current = true;
+    const timer = window.setTimeout(() => {
+      void window.gigaChat.voice.requestAccess().then(async (granted) => {
+        setSettings((current) => ({ ...current, microphoneConsent: granted ? 'allowed' : 'declined' }));
+        if (!granted) return;
+        if (!navigator.mediaDevices?.getUserMedia) throw new Error('Запись микрофона недоступна в этой версии приложения.');
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((track) => track.stop());
+      }).catch((error: unknown) => setNotice(getCaptureError(error)));
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [loading, settings.onboardingCompleted, settings.microphoneConsent]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2000,7 +2048,7 @@ export default function App() {
           </div>
         </aside>}
 
-        <main className={route.page === 'settings' ? 'main-panel settings-panel' : 'main-panel'}>
+        <main ref={mainPanelRef} className={route.page === 'settings' ? 'main-panel settings-panel' : 'main-panel'}>
           <div className={route.page === 'home' ? 'view-area home-view' : route.page === 'settings' ? 'view-area settings-view' : route.page === 'onboarding' ? 'view-area onboarding-view' : 'view-area'}>{renderContent()}</div>
           {(route.page === 'home' || route.page === 'chat') && (
             <div className="composer-stack">
@@ -2015,7 +2063,7 @@ export default function App() {
                   className={index === completionIndex ? 'composer-suggestion active' : 'composer-suggestion'}
                   onMouseEnter={() => setCompletionIndex(index)}
                   onClick={() => insertComposerSuggestion(suggestion)}
-                ><strong>{suggestion.label}</strong><span>{suggestion.description}</span></button>)}
+                >{suggestion.id === 'compact' && <ContextRing compact />}<span className="composer-suggestion-copy"><strong>{suggestion.label}</strong><span>{suggestion.description}</span></span></button>)}
                 {composerCompletion.emptyMessage && <p className="composer-suggestions-empty" role="status">{composerCompletion.emptyMessage}</p>}
               </div>}
               <div className="project-picker">
@@ -2109,9 +2157,7 @@ export default function App() {
                       </button>)}
                     </div>
                   </ActionMenu>
-                  <span className="disabled-control" role="note" tabIndex={0} aria-label="Контекст станет доступен после загрузки модели" title="Контекст станет доступен после подключения API.">
-                    <button type="button" className="context-ring" disabled aria-label="Использование контекста"><i /></button>
-                  </span>
+                  <span className="context-indicator" role="img" tabIndex={0} aria-label="Использование контекста станет доступно после подключения API" title="Контекст станет доступен после подключения API."><ContextRing /></span>
                   <VoiceCaptureControl
                     key={route.page === 'chat' ? route.id ?? 'chat' : 'home'}
                     available={voiceAvailability.available}
@@ -2120,7 +2166,7 @@ export default function App() {
                     onError={setNotice}
                     onSuccess={showSuccess}
                   />
-                  <button type="button" className="send-button" disabled={!draft.trim() || sending} aria-label={draft.trim() ? 'Сохранить сообщение локально' : 'Голосовой чат пока недоступен'} title={draft.trim() ? 'Сохранить локально без отправки в API' : 'Голосовой чат пока недоступен'} onClick={() => void submitMessage()}><Icon name={draft.trim() ? 'send' : 'audio'} /></button>
+                  <span className="send-button-wrap" title={draft.trim() ? 'Сохранить локально без отправки в API' : 'Голосовой чат пока недоступен'}><button type="button" className="send-button" disabled={!draft.trim() || sending} aria-label={draft.trim() ? 'Сохранить сообщение локально' : 'Голосовой чат пока недоступен'} onClick={() => void submitMessage()}><Icon name={draft.trim() ? 'send' : 'audio'} /></button></span>
                   </div>
                 </div>
               </div>

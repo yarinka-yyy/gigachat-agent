@@ -28,7 +28,7 @@ const commandOptions: readonly ComposerSuggestion[] = [
     id: 'compact',
     label: '/compact',
     insertText: '/compact',
-    description: 'Сжать историю — станет доступно после подключения модели.',
+    description: 'Сжать контекст этого чата (после подключения API)',
     available: false,
   },
 ];

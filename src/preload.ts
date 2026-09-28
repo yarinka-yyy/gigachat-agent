@@ -92,6 +92,7 @@ const api: AppApi = {
   },
   voice: {
     getStatus: () => ipcRenderer.invoke('voice:status') as Promise<VoiceAvailability>,
+    requestAccess: () => ipcRenderer.invoke('voice:request-access') as Promise<boolean>,
     transcribe: (requestId: string, audio: Uint8Array, mediaType: string) =>
       ipcRenderer.invoke('voice:transcribe', requestId, audio, mediaType) as Promise<string>,
     cancel: (requestId: string) => ipcRenderer.invoke('voice:cancel', requestId) as Promise<boolean>,

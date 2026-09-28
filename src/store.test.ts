@@ -28,6 +28,7 @@ test('persists projects, chats, relationships, drafts, image kind, and settings'
     defaultPermissionProfile: 'approve',
     defaultModelId: 'GigaChat-2-Pro',
     onboardingCompleted: false,
+    microphoneConsent: 'allowed',
     notifications: { taskStarted: true, taskCompleted: false, failures: true },
   });
 
@@ -51,6 +52,7 @@ test('persists projects, chats, relationships, drafts, image kind, and settings'
     defaultPermissionProfile: 'approve',
     defaultModelId: 'GigaChat-2-Pro',
     onboardingCompleted: false,
+    microphoneConsent: 'allowed',
     notifications: { taskStarted: true, taskCompleted: false, failures: true },
   });
   await assert.rejects(store.updateSettings({ defaultPermissionProfile: 'unknown' } as never));
@@ -98,13 +100,14 @@ test('migrates v1 projects, chats, drafts, and theme without losing data', async
     defaultPermissionProfile: 'ask',
     defaultModelId: null,
     onboardingCompleted: true,
+    microphoneConsent: 'unasked',
     notifications: { taskStarted: false, taskCompleted: true, failures: true },
   });
   assert.equal(JSON.parse(await readFile(join(directory, 'projects.json'), 'utf8')).schemaVersion, 2);
   assert.equal(JSON.parse(await readFile(join(directory, 'chats.json'), 'utf8')).schemaVersion, 1);
   assert.equal(await readFile(join(directory, 'chats.json.bak'), 'utf8'), await readFile(join(directory, 'chats.json'), 'utf8'));
   assert.equal(JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')).schemaVersion, 6);
-  assert.equal(JSON.parse(await readFile(join(directory, 'settings.json'), 'utf8')).schemaVersion, 7);
+  assert.equal(JSON.parse(await readFile(join(directory, 'settings.json'), 'utf8')).schemaVersion, 8);
   await store.deleteChat(chat.id);
   assert.deepEqual(await (await openStore(directory)).listChats(), []);
 });
@@ -210,8 +213,9 @@ test('migrates previous settings and chat schemas with an empty model choice', a
   const restored = await openStore(directory);
   assert.equal((await restored.getChat(chat.id)).modelId, null);
   assert.equal((await restored.getSettings()).defaultModelId, null);
+  assert.equal((await restored.getSettings()).microphoneConsent, 'unasked');
   assert.equal(JSON.parse(await readFile(chatPath, 'utf8')).schemaVersion, 6);
-  assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).schemaVersion, 7);
+  assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).schemaVersion, 8);
 });
 
 test('imports copies, preserves originals and archived files, and removes only chat copies', async (t) => {
@@ -280,12 +284,13 @@ test('preserves the appearance of old dark settings and allows the new dark them
     defaultModelId: null,
     theme: 'emerald',
     onboardingCompleted: true,
+    microphoneConsent: 'unasked',
     notifications: { taskStarted: false, taskCompleted: true, failures: true },
   });
   await store.updateSettings({ theme: 'dark' });
   const restored = await openStore(directory);
   assert.equal((await restored.getSettings()).theme, 'dark');
-  assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).schemaVersion, 7);
+  assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).schemaVersion, 8);
 });
 
 test('new profile starts onboarding; migrated profiles do not restart it', async (t) => {
@@ -310,7 +315,24 @@ test('new profile starts onboarding; migrated profiles do not restart it', async
   }));
   const existing = await openStore(existingDirectory);
   assert.equal((await existing.getSettings()).onboardingCompleted, true);
-  assert.equal(JSON.parse(await readFile(join(existingDirectory, 'settings.json'), 'utf8')).schemaVersion, 7);
+  assert.equal((await existing.getSettings()).microphoneConsent, 'unasked');
+  assert.equal(JSON.parse(await readFile(join(existingDirectory, 'settings.json'), 'utf8')).schemaVersion, 8);
+});
+
+test('migrates microphone consent and preserves a later choice', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-microphone-consent-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const settingsPath = join(directory, 'settings.json');
+  await openStore(directory);
+  const previous = JSON.parse(await readFile(settingsPath, 'utf8')) as { schemaVersion: number; settings: Record<string, unknown> };
+  previous.schemaVersion = 7;
+  delete previous.settings.microphoneConsent;
+  await writeFile(settingsPath, JSON.stringify(previous));
+  const store = await openStore(directory);
+  assert.equal((await store.getSettings()).microphoneConsent, 'unasked');
+  await store.updateSettings({ microphoneConsent: 'declined' });
+  assert.equal((await (await openStore(directory)).getSettings()).microphoneConsent, 'declined');
+  await assert.rejects(store.updateSettings({ microphoneConsent: 'invalid' } as never));
 });
 
 test('counts real local chat, project, and message activity days without counting drafts', async (t) => {

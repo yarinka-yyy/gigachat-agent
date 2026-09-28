@@ -12,12 +12,13 @@ interface VoiceCaptureControlProps {
 
 type CapturePhase = 'idle' | 'starting' | 'recording' | 'transcribing' | 'cancelling';
 
-function getCaptureError(reason: unknown): string {
+export function getCaptureError(reason: unknown): string {
   if (reason instanceof DOMException) {
-    if (reason.name === 'NotAllowedError' || reason.name === 'SecurityError') return 'Разрешите доступ к микрофону в настройках Windows и повторите попытку.';
+    if (reason.name === 'NotAllowedError' || reason.name === 'SecurityError') return 'Доступ к микрофону отклонён при проверке записи.';
     if (reason.name === 'NotFoundError') return 'Микрофон не найден.';
     if (reason.name === 'NotReadableError') return 'Микрофон занят или недоступен.';
   }
+  if (reason instanceof Error && reason.message) return reason.message;
   return 'Не удалось начать запись. Проверьте микрофон и повторите попытку.';
 }
 
@@ -135,6 +136,11 @@ export default function VoiceCaptureControl({ available, reason, onTranscript, o
     setStatusText('Подключаем микрофон…');
     cancelledCapture.current = false;
     try {
+      if (!await window.gigaChat.voice.requestAccess()) {
+        setPhase('idle');
+        setStatusText('');
+        return;
+      }
       const acquired = await navigator.mediaDevices.getUserMedia({ audio: true });
       if (!mounted.current || cancelledCapture.current) {
         acquired.getTracks().forEach((track) => track.stop());

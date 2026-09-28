@@ -9,7 +9,7 @@ test('suggests the unavailable compact command without enabling it', () => {
   assert.ok(suggestion);
   assert.equal(suggestion.label, '/compact');
   assert.equal(suggestion.available, false);
-  assert.match(suggestion.description, /после подключения модели/);
+  assert.match(suggestion.description, /Сжать контекст этого чата \(после подключения API\)/);
   assert.equal(isUnavailableCompactCommand('  /COMPACT  '), true);
   assert.equal(isUnavailableCompactCommand('/compact now'), true);
   assert.throws(() => completeComposerSuggestion('/comp', 5, suggestion));
