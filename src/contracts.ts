@@ -1,4 +1,5 @@
-import type { PermissionProfile } from './permissions';
+import type { PermissionAction, PermissionProfile, PermissionResource } from './permissions';
+import type { GigaChatModelId } from './models';
 
 export type Theme = 'system' | 'emerald' | 'light' | 'dark' | 'warm';
 export type ChatKind = 'text' | 'image';
@@ -63,6 +64,7 @@ export interface ProviderTurnRequest {
   system: InstructionLayer[];
   messages: ChatMessage[];
   permissionProfile: PermissionProfile;
+  modelId: GigaChatModelId | null;
 }
 
 export type ProviderToolName = 'list' | 'search' | 'read' | 'write' | 'open' | 'powershell';
@@ -103,6 +105,15 @@ export interface RuntimeAvailability {
   helperUnavailableReason: string | null;
 }
 
+export interface PermissionApprovalRequest {
+  id: string;
+  resource: PermissionResource;
+  action: PermissionAction;
+  target: string;
+  reason: string;
+  expiresAt: string;
+}
+
 export interface VoiceAvailability {
   available: boolean;
   reason: string | null;
@@ -120,13 +131,14 @@ export interface ChatArtifact {
 export interface ChatDetail extends ChatSummary {
   draft: string;
   nextTurnPermissionProfile: PermissionProfile | null;
+  modelId: GigaChatModelId | null;
   nextTurnSkillId: string | null;
   messages: ChatMessage[];
   artifacts: ChatArtifact[];
 }
 
 export type ProjectPatch = Partial<Pick<Project, 'name' | 'pinned' | 'archived' | 'workingFolder'>>;
-export type ChatPatch = Partial<Pick<ChatDetail, 'title' | 'projectId' | 'pinned' | 'archived' | 'draft' | 'nextTurnPermissionProfile' | 'nextTurnSkillId'>>;
+export type ChatPatch = Partial<Pick<ChatDetail, 'title' | 'projectId' | 'pinned' | 'archived' | 'draft' | 'nextTurnPermissionProfile' | 'nextTurnSkillId' | 'modelId'>>;
 
 export type SkillScope = 'global' | 'project';
 
@@ -197,6 +209,7 @@ export interface Settings {
   defaultProjectsFolder: string | null;
   preferredOpener: PreferredOpener;
   defaultPermissionProfile: PermissionProfile;
+  defaultModelId: GigaChatModelId | null;
   onboardingCompleted: boolean;
   notifications: NotificationSettings;
 }
@@ -264,6 +277,12 @@ export interface AppApi {
     list(chatId: string): Promise<RuntimeTurnSnapshot[]>;
     cancel(chatId: string, turnId: string): Promise<boolean>;
     onUpdate(listener: (turn: RuntimeTurnSnapshot) => void): () => void;
+  };
+  permissions: {
+    readConfig(): Promise<{ contents: string; error: string | null }>;
+    saveConfig(contents: string, expectedContents: string): Promise<string>;
+    respond(id: string, allowed: boolean): Promise<boolean>;
+    onRequest(listener: (request: PermissionApprovalRequest) => void): () => void;
   };
   skills: {
     list(): Promise<SkillRegistrySnapshot>;

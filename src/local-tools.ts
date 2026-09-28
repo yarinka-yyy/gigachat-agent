@@ -2,8 +2,9 @@ import { spawn as spawnChild, type ChildProcessWithoutNullStreams, type SpawnOpt
 import { randomUUID } from 'node:crypto';
 import { lstat, realpath } from 'node:fs/promises';
 import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
-import type { Project } from './contracts';
-import { evaluatePermission, requirePermissionProfile, type PermissionProfile } from './permissions';
+import type { PermissionApprovalRequest, Project } from './contracts';
+import { evaluatePermission, requirePermissionProfile, type PermissionProfile, type PermissionResource } from './permissions';
+import type { CustomPolicy, LocalAction } from './custom-permissions';
 
 export const MAX_LOCAL_FILE_BYTES = 1024 * 1024;
 const MAX_LIST_ENTRIES = 500;
@@ -396,6 +397,9 @@ export function createPowerShellHelper(options: PowerShellHelperOptions): PowerS
 
 export interface LocalToolsOptions {
   resolveProject(id: string): Promise<Project | null>;
+  protectedDirectory?: string;
+  getCustomPolicy?(): Promise<CustomPolicy>;
+  requestApproval?(details: Omit<PermissionApprovalRequest, 'id' | 'expiresAt'>, signal?: AbortSignal): Promise<boolean>;
   openPath?(path: string): Promise<void>;
   runPowerShell?: PowerShellRunner;
   writeFile?: ProjectFileWriter;
@@ -682,26 +686,6 @@ function parseBase64Output(output: string, maxBytes: number): Buffer {
   return bytes;
 }
 
-function requirePermission(
-  profileInput: unknown,
-  projectId: string,
-  tool: 'project-files' | 'process' | 'application',
-  action: 'list' | 'search' | 'read' | 'write' | 'open' | 'execute',
-  available: boolean,
-): void {
-  const profile: PermissionProfile = requirePermissionProfile(profileInput);
-  const result = evaluatePermission({
-    profile,
-    resource: tool,
-    action,
-    projectId,
-    // The target is resolved by this main-side module from the trusted project store.
-    targetProjectId: projectId,
-    capabilityAvailable: available,
-  });
-  if (result.decision !== 'allow') throw new LocalToolError(result.reason);
-}
-
 async function assertNoReparseComponents(path: string): Promise<void> {
   const absolute = resolve(path);
   const root = parse(absolute).root;
@@ -780,19 +764,37 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
     }
   }
 
-  async function resolveRoot(projectIdInput: unknown, profileInput: unknown, action: 'list' | 'search' | 'read' | 'write' | 'open') {
-    const projectId = requireProjectId(projectIdInput);
-    requirePermission(profileInput, projectId, 'project-files', action, true);
-    const project = await options.resolveProject(projectId);
-    if (!project || project.id !== projectId || !project.workingFolder || !isAbsolute(project.workingFolder)) {
-      throw new LocalToolError('Для проекта не выбрана доступная рабочая папка.');
+  async function resolveRoot(referenceInput: unknown, profile: PermissionProfile) {
+    const rootName = typeof referenceInput === 'string' && /^root:[a-z][a-z0-9_-]{0,31}$/.test(referenceInput)
+      ? referenceInput.slice(5) : null;
+    const projectId = rootName ? null : requireProjectId(referenceInput);
+    let folder: string | null = null;
+    if (rootName) {
+      if (profile !== 'custom' || !options.getCustomPolicy) throw new LocalToolError('Дополнительный каталог недоступен для этого профиля.');
+      folder = (await options.getCustomPolicy()).roots.find((root) => root.name === rootName)?.path ?? null;
+    } else {
+      const project = await options.resolveProject(projectId as string);
+      folder = project?.id === projectId ? project.workingFolder : null;
     }
-    await assertNoReparseComponents(project.workingFolder);
-    const canonical = await realpath(project.workingFolder).catch(() => {
+    if (!folder || !isAbsolute(folder)) throw new LocalToolError('рабочая папка не найдена или недоступна.');
+    await assertNoReparseComponents(folder);
+    const canonical = await realpath(folder).catch(() => {
       throw new LocalToolError('Рабочая папка не найдена или недоступна.');
     });
     await assertNoReparseComponents(canonical);
-    return { projectId, root: canonical };
+    if (options.protectedDirectory) {
+      const protectedDirectory = await realpath(options.protectedDirectory).catch(() => {
+        throw new LocalToolError('Каталог данных приложения недоступен.');
+      });
+      const inside = (parent: string, child: string): boolean => {
+        const path = relative(parent, child);
+        return path === '' || path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path);
+      };
+      if (inside(canonical, protectedDirectory) || inside(protectedDirectory, canonical)) {
+        throw new LocalToolError('Каталог данных приложения недоступен локальным инструментам.');
+      }
+    }
+    return { projectId, rootName, root: canonical };
   }
 
   async function targetPath(root: string, pathInput: unknown, allowRoot = false, allowMissing = false): Promise<string> {
@@ -802,11 +804,56 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
     return target;
   }
 
+  async function authorize(
+    scope: Awaited<ReturnType<typeof resolveRoot>>,
+    profile: PermissionProfile,
+    resource: PermissionResource,
+    action: LocalAction,
+    target: string,
+    available: boolean,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const evaluate = async () => evaluatePermission({
+      profile, resource, action,
+      projectId: scope.projectId,
+      targetProjectId: scope.projectId,
+      targetRootName: scope.rootName,
+      capabilityAvailable: available,
+      customPolicy: profile === 'custom' ? await options.getCustomPolicy?.() : null,
+    });
+    const result = await evaluate();
+    if (result.decision === 'deny') throw new LocalToolError(result.reason);
+    if (result.decision === 'ask') {
+      if (!options.requestApproval || !await options.requestApproval({ resource, action, target, reason: result.reason }, signal)) {
+        throw new LocalToolError('Действие не подтверждено.');
+      }
+      const latest = await evaluate();
+      if (latest.decision === 'deny') throw new LocalToolError(latest.reason);
+    }
+    throwIfAborted(signal);
+  }
+
+  async function prepareTarget(
+    reference: unknown, profileInput: unknown, resource: PermissionResource, action: LocalAction,
+    pathInput: unknown, allowRoot: boolean, allowMissing: boolean, available: boolean, signal?: AbortSignal,
+    approvalDetails?: string,
+  ): Promise<{ root: string; target: string }> {
+    const profile = requirePermissionProfile(profileInput);
+    const scope = await resolveRoot(reference, profile);
+    const target = await targetPath(scope.root, pathInput, allowRoot, allowMissing);
+    await authorize(scope, profile, resource, action,
+      approvalDetails ? `${target}\n\n${approvalDetails}` : target, available, signal);
+    const latest = await resolveRoot(reference, profile);
+    if (latest.root !== scope.root) throw new LocalToolError('Рабочая папка изменилась во время подтверждения.');
+    await targetPath(latest.root, pathInput, allowRoot, allowMissing);
+    return { root: latest.root, target };
+  }
+
   return {
     list: (projectIdInput, profileInput, pathInput = '', listOptions = {}) => activity('list', async () => {
-      const { root } = await resolveRoot(projectIdInput, profileInput, 'list');
       const pathParts = requireRelativePath(pathInput, true);
-      await targetPath(root, pathParts.join(sep), true);
+      const { root } = await prepareTarget(projectIdInput, profileInput, 'project-files', 'list',
+        pathParts.join(sep), true, false, true, listOptions.signal);
       throwIfAborted(listOptions.signal);
       const output = await runBoundedFileScript(options.runPowerShell, root,
         buildListScript(root, pathParts), listOptions.signal, MAX_ENUMERATION_OUTPUT_BYTES);
@@ -815,18 +862,18 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
 
     search: (projectIdInput, profileInput, queryInput, pathInput = '', searchOptions = {}) => activity('search', async () => {
       throwIfAborted(searchOptions.signal);
-      const { root } = await resolveRoot(projectIdInput, profileInput, 'search');
       const query = requireText(queryInput, 'Поисковая строка', 256).toLocaleLowerCase();
       const pathParts = requireRelativePath(pathInput, true);
-      await targetPath(root, pathParts.join(sep), true);
+      const { root } = await prepareTarget(projectIdInput, profileInput, 'project-files', 'search',
+        pathParts.join(sep), true, false, true, searchOptions.signal);
       const output = await runBoundedFileScript(options.runPowerShell, root,
         buildSearchScript(root, pathParts, query), searchOptions.signal, MAX_ENUMERATION_OUTPUT_BYTES);
       return parseSearchRows(output, pathParts);
     }),
 
     read: (projectIdInput, profileInput, pathInput, readOptions = {}) => activity('read', async () => {
-      const { root } = await resolveRoot(projectIdInput, profileInput, 'read');
-      await targetPath(root, pathInput);
+      const { root } = await prepareTarget(projectIdInput, profileInput, 'project-files', 'read',
+        pathInput, false, false, true, readOptions.signal);
       throwIfAborted(readOptions.signal);
       const output = await runBoundedFileScript(options.runPowerShell, root, buildReadScript(root, requireRelativePath(pathInput, false)),
         readOptions.signal, 2 * 1024 * 1024);
@@ -834,8 +881,8 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
     }),
 
     write: (projectIdInput, profileInput, pathInput, contentsInput, writeOptions = {}) => activity('write', async () => {
-      const { root } = await resolveRoot(projectIdInput, profileInput, 'write');
-      await targetPath(root, pathInput, false, true);
+      const { root } = await prepareTarget(projectIdInput, profileInput, 'project-files', 'write',
+        pathInput, false, true, Boolean(options.writeFile), writeOptions.signal);
       throwIfAborted(writeOptions.signal);
       if (typeof contentsInput !== 'string' || contentsInput.includes('\0')) {
         throw new LocalToolError('Содержимое файла должно быть текстом без NUL.');
@@ -860,43 +907,24 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
 
     open: (projectIdInput, profileInput, pathInput = '') => activity('open', async () => {
       if (!options.openPath) throw new LocalToolError('Открытие файлов пока недоступно.');
-      const projectId = requireProjectId(projectIdInput);
-      const project = await options.resolveProject(projectId);
-      if (!project || project.id !== projectId || !project.workingFolder || !isAbsolute(project.workingFolder)) {
-        throw new LocalToolError('Для проекта не выбрана доступная рабочая папка.');
-      }
-      await assertNoReparseComponents(project.workingFolder);
-      const root = await realpath(project.workingFolder).catch(() => {
-        throw new LocalToolError('Рабочая папка не найдена или недоступна.');
-      });
-      await assertNoReparseComponents(root);
-      const target = await targetPath(root, pathInput, true);
+      const { target } = await prepareTarget(projectIdInput, profileInput, 'application', 'open',
+        pathInput, true, false, true);
       const targetInfo = await lstat(target).catch(() => null);
       if (!targetInfo || targetInfo.isSymbolicLink()) throw new LocalToolError('Файл или папка проекта недоступны.');
       // Shell opening can dispatch shortcuts or registered applications after this stat call.
-      requirePermission(profileInput, projectId, 'application', 'open', true);
       await options.openPath(target);
     }),
 
     runPowerShell: (projectIdInput, profileInput, scriptInput, runOptions = {}) => activity('powershell', async () => {
-      const projectId = requireProjectId(projectIdInput);
       const available = process.platform === 'win32' && Boolean(options.runPowerShell);
-      requirePermission(profileInput, projectId, 'process', 'execute', available);
-      if (!available || !options.runPowerShell) throw new LocalToolError('Ограниченный PowerShell helper пока не установлен.');
-      const project = await options.resolveProject(projectId);
-      if (!project || project.id !== projectId || !project.workingFolder || !isAbsolute(project.workingFolder)) {
-        throw new LocalToolError('Для проекта не выбрана доступная рабочая папка.');
-      }
-      await assertNoReparseComponents(project.workingFolder);
-      const root = await realpath(project.workingFolder).catch(() => {
-        throw new LocalToolError('Рабочая папка не найдена или недоступна.');
-      });
-      await assertNoReparseComponents(root);
+      if (!available || !options.runPowerShell) throw new LocalToolError('Ограниченный PowerShell helper пока недоступен.');
       const script = requireText(scriptInput, 'PowerShell script', MAX_SCRIPT_LENGTH);
       const timeoutMs = runOptions.timeoutMs === undefined ? 30_000 : runOptions.timeoutMs;
       if (typeof timeoutMs !== 'number' || !Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > MAX_RUN_TIMEOUT_MS) {
         throw new LocalToolError('Таймаут должен быть целым числом от 100 до 120000 мс.');
       }
+      const { root } = await prepareTarget(projectIdInput, profileInput, 'process', 'execute',
+        '', true, false, true, runOptions.signal, `PowerShell:\n${script}`);
       return options.runPowerShell({
         workingFolder: root,
         script,

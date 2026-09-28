@@ -5,12 +5,13 @@ import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, 
 import { basename, dirname, extname, isAbsolute, join, relative, sep } from 'node:path';
 import { DEFAULT_NOTIFICATION_SETTINGS, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type Settings, type SettingsPatch, type Theme } from './contracts';
 import { requirePermissionProfile } from './permissions';
+import { requireModelId } from './models';
 import { isSkillId } from './skills';
 
 type ProjectFile = { schemaVersion: 2; projects: Project[] };
 type LegacyChat = ChatSummary & { draft: string };
 type ChatFile = { schemaVersion: 2; chats: LegacyChat[] };
-type SettingsFile = { schemaVersion: 6; settings: Settings };
+type SettingsFile = { schemaVersion: 7; settings: Settings };
 
 const MAX_IMPORTED_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_INSTRUCTION_BYTES = 64 * 1024;
@@ -134,7 +135,7 @@ function validateNotificationSettings(value: unknown): NotificationSettings {
   return { taskStarted: value.taskStarted, taskCompleted: value.taskCompleted, failures: value.failures };
 }
 
-function validateSettings(value: unknown, version: 1 | 2 | 3 | 4 | 5 | 6): Settings {
+function validateSettings(value: unknown, version: 1 | 2 | 3 | 4 | 5 | 6 | 7): Settings {
   if (!isRecord(value)) throw new Error('Settings record is invalid.');
   const theme = validateTheme(value.theme);
   const migratedTheme = version < 3 && theme === 'dark' ? 'emerald' : theme;
@@ -146,6 +147,7 @@ function validateSettings(value: unknown, version: 1 | 2 | 3 | 4 | 5 | 6): Setti
       defaultProjectsFolder: null,
       preferredOpener: 'system',
       defaultPermissionProfile: 'ask',
+      defaultModelId: null,
       onboardingCompleted: true,
       notifications: { ...DEFAULT_NOTIFICATION_SETTINGS },
     };
@@ -160,6 +162,7 @@ function validateSettings(value: unknown, version: 1 | 2 | 3 | 4 | 5 | 6): Setti
     defaultProjectsFolder: requireFolderPath(value.defaultProjectsFolder, 'Папка проектов'),
     preferredOpener: value.preferredOpener,
     defaultPermissionProfile: version >= 4 ? requirePermissionProfile(value.defaultPermissionProfile) : 'ask',
+    defaultModelId: version >= 7 && value.defaultModelId !== null ? requireModelId(value.defaultModelId) : null,
     onboardingCompleted: version >= 5
       ? requireBoolean(value.onboardingCompleted, 'Статус первичной настройки')
       : true,
@@ -288,7 +291,7 @@ function parseChatFile(value: unknown): Loaded<ChatFile> {
 }
 
 function validateChatDetail(value: unknown): Loaded<ChatDetail> {
-  if (!isRecord(value) || (value.schemaVersion !== 3 && value.schemaVersion !== 4 && value.schemaVersion !== 5)
+  if (!isRecord(value) || (value.schemaVersion !== 3 && value.schemaVersion !== 4 && value.schemaVersion !== 5 && value.schemaVersion !== 6)
     || !Array.isArray(value.messages) || !Array.isArray(value.artifacts)) {
     throw new Error('Invalid chat detail.');
   }
@@ -321,13 +324,14 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
     ? null
     : value.nextTurnPermissionProfile === null ? null : requirePermissionProfile(value.nextTurnPermissionProfile);
   let nextTurnSkillId: string | null = null;
-  if (version === 5 && value.nextTurnSkillId !== null) {
+  if (version >= 5 && value.nextTurnSkillId !== null) {
     if (!isSkillId(value.nextTurnSkillId)) throw new Error('Invalid next-turn Skill.');
     nextTurnSkillId = value.nextTurnSkillId;
   }
   return {
-    value: { ...chat, messages, artifacts, nextTurnPermissionProfile, nextTurnSkillId },
-    needsWrite: version < 5,
+    value: { ...chat, messages, artifacts, nextTurnPermissionProfile, nextTurnSkillId,
+      modelId: version >= 6 && value.modelId !== null ? requireModelId(value.modelId) : null },
+    needsWrite: version < 6,
   };
 }
 
@@ -339,44 +343,45 @@ function summary(chat: ChatDetail): ChatSummary {
 }
 
 function detailFile(chat: ChatDetail): Record<string, unknown> {
-  return { schemaVersion: 5, ...chat };
+  return { schemaVersion: 6, ...chat };
 }
 
 function parseSettingsFile(value: unknown): Loaded<SettingsFile> {
   if (!isRecord(value)) throw new Error('Invalid settings file.');
   if (value.schemaVersion === 1) {
     return {
-      value: { schemaVersion: 6, settings: validateSettings(value.settings, 1) },
+      value: { schemaVersion: 7, settings: validateSettings(value.settings, 1) },
       needsWrite: true,
     };
   }
   if (value.schemaVersion === 2) {
     return {
-      value: { schemaVersion: 6, settings: validateSettings(value.settings, 2) },
+      value: { schemaVersion: 7, settings: validateSettings(value.settings, 2) },
       needsWrite: true,
     };
   }
   if (value.schemaVersion === 3) {
     return {
-      value: { schemaVersion: 6, settings: validateSettings(value.settings, 3) },
+      value: { schemaVersion: 7, settings: validateSettings(value.settings, 3) },
       needsWrite: true,
     };
   }
   if (value.schemaVersion === 4) {
     return {
-      value: { schemaVersion: 6, settings: validateSettings(value.settings, 4) },
+      value: { schemaVersion: 7, settings: validateSettings(value.settings, 4) },
       needsWrite: true,
     };
   }
   if (value.schemaVersion === 5) {
     return {
-      value: { schemaVersion: 6, settings: validateSettings(value.settings, 5) },
+      value: { schemaVersion: 7, settings: validateSettings(value.settings, 5) },
       needsWrite: true,
     };
   }
-  if (value.schemaVersion !== 6) throw new Error('Unknown settings file version.');
+  if (value.schemaVersion === 6) return { value: { schemaVersion: 7, settings: validateSettings(value.settings, 6) }, needsWrite: true };
+  if (value.schemaVersion !== 7) throw new Error('Unknown settings file version.');
   return {
-    value: { schemaVersion: 6, settings: validateSettings(value.settings, 6) },
+    value: { schemaVersion: 7, settings: validateSettings(value.settings, 7) },
     needsWrite: false,
   };
 }
@@ -410,6 +415,8 @@ function validateChatPatch(value: unknown): ChatPatch {
     } else if (key === 'nextTurnSkillId') {
       if (item !== null && !isSkillId(item)) throw new Error('Некорректный идентификатор Skill для следующего хода.');
       patch.nextTurnSkillId = item as string | null;
+    } else if (key === 'modelId') {
+      patch.modelId = item === null ? null : requireModelId(item);
     } else throw new Error('Недопустимое поле чата.');
   }
   return patch;
@@ -426,6 +433,7 @@ function validateSettingsPatch(value: unknown): SettingsPatch {
     else if (key === 'preferredOpener' && (item === 'system' || item === 'explorer' || item === 'detected-app')) {
       patch.preferredOpener = item;
     } else if (key === 'defaultPermissionProfile') patch.defaultPermissionProfile = requirePermissionProfile(item);
+    else if (key === 'defaultModelId') patch.defaultModelId = item === null ? null : requireModelId(item);
     else if (key === 'onboardingCompleted') patch.onboardingCompleted = requireBoolean(item, 'Статус первичной настройки');
     else if (key === 'notifications') patch.notifications = validateNotificationSettings(item);
     else throw new Error('Недопустимое поле настроек.');
@@ -486,7 +494,7 @@ export async function openStore(directory: string): Promise<LocalStore> {
   const [projectFile, settingsFile] = await Promise.all([
     loadVersioned<ProjectFile>(projectPath, { schemaVersion: 2, projects: [] }, parseProjectFile),
     loadVersioned<SettingsFile>(settingsPath, {
-      schemaVersion: 6,
+      schemaVersion: 7,
       settings: {
         theme: 'emerald',
         sidebarTransparent: false,
@@ -494,6 +502,7 @@ export async function openStore(directory: string): Promise<LocalStore> {
         defaultProjectsFolder: null,
         preferredOpener: 'system',
         defaultPermissionProfile: 'ask',
+        defaultModelId: null,
         onboardingCompleted: false,
         notifications: { ...DEFAULT_NOTIFICATION_SETTINGS },
       },
@@ -548,7 +557,7 @@ export async function openStore(directory: string): Promise<LocalStore> {
     }
     for (const legacy of legacyChats) {
       if (loadedChats.some((chat) => chat.id === legacy.id)) continue;
-      const detail: ChatDetail = { ...legacy, nextTurnPermissionProfile: null, nextTurnSkillId: null, messages: [], artifacts: [] };
+      const detail: ChatDetail = { ...legacy, nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [] };
       await writeOwnedAtomic(join(chatsDirectory, legacy.id, 'chat.json'), detailFile(detail));
       loadedChats.push(detail);
     }
@@ -593,13 +602,13 @@ export async function openStore(directory: string): Promise<LocalStore> {
     const chat: ChatDetail = {
       id: randomUUID(), title: kind === 'image' ? 'Новое изображение' : 'Новый чат', projectId,
       pinned: false, archived: false, createdAt: now, updatedAt: now, draft: '', kind,
-      nextTurnPermissionProfile: null, nextTurnSkillId: null, messages: [], artifacts: [],
+      nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: settings.defaultModelId, messages: [], artifacts: [],
     };
     await saveChat(chat);
     return chat;
   };
   const saveSettings = async (next: Settings): Promise<void> => {
-    await writeOwnedAtomic(settingsPath, { schemaVersion: 6, settings: next });
+    await writeOwnedAtomic(settingsPath, { schemaVersion: 7, settings: next });
     settings = next;
   };
   const projectInstructionsPath = (idInput: unknown): string => {

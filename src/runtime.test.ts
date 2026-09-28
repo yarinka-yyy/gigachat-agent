@@ -13,6 +13,7 @@ function makeProvider(stream: GigaChatProvider['stream']): GigaChatProvider {
 function requestFor(chatId: string): ProviderTurnRequest {
   return {
     system: [],
+    modelId: 'GigaChat-2-Pro',
     messages: [{ id: chatId, role: 'user', text: chatId, createdAt: '2026-09-27T00:00:00.000Z' }],
     permissionProfile: 'ask',
   };
@@ -157,6 +158,20 @@ test('does not create a fake local turn when no provider is configured', () => {
   assert.equal(runtime.enqueue('chat-one'), null);
   assert.deepEqual(runtime.list(), []);
   assert.deepEqual(updates, []);
+});
+
+test('never calls a provider with an unset model', async () => {
+  let called = false;
+  const runtime = createTurnRuntime({
+    provider: makeProvider(async function* () { called = true; yield { type: 'completed' }; }),
+    tools: testTools,
+    prepareTurn: async () => ({ ...requestFor('chat-one'), modelId: null }),
+    appendAssistant: async () => undefined,
+  });
+  runtime.enqueue('chat-one');
+  await runtime.whenIdle();
+  assert.equal(called, false);
+  assert.match(runtime.list('chat-one')[0]?.error ?? '', /Выберите модель/);
 });
 
 test('keeps observable activity metadata and omits provider text from timeline snapshots', async () => {

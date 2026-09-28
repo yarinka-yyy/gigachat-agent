@@ -33,6 +33,7 @@ import {
   Plus,
   Puzzle,
   Settings2,
+  Search,
   ShieldCheck,
   SquarePen,
   SlidersHorizontal,
@@ -68,11 +69,13 @@ import type {
   SkillSource,
   Settings,
   SettingsPatch,
+  PermissionApprovalRequest,
   NotificationSettings,
   Theme,
   VoiceAvailability,
 } from './contracts';
 import type { PermissionProfile } from './permissions';
+import { GIGACHAT_MODELS, type GigaChatModelId } from './models';
 import gigaChatLogo from './assets/gigachat-logo.png';
 import { createInstructionAutosave, type SaveStatus } from './instruction-autosave';
 import ConnectionSetup from './components/ConnectionSetup';
@@ -175,6 +178,7 @@ const DEFAULT_SETTINGS: Settings = {
   defaultProjectsFolder: null,
   preferredOpener: 'system',
   defaultPermissionProfile: 'ask',
+  defaultModelId: null,
   onboardingCompleted: false,
   notifications: { taskStarted: false, taskCompleted: true, failures: true },
 };
@@ -182,27 +186,40 @@ const DEFAULT_SETTINGS: Settings = {
 const AVAILABLE_PERMISSION_PROFILES = [
   {
     id: 'ask',
-    name: 'Спросить перед действием',
-    description: 'Всё вне выбранного проекта требует вашего решения. Ход не запускается без GigaChat API.',
+    name: 'Спросить',
+    description: 'Действия в проекте разрешены; спорные действия требуют вашего подтверждения.',
   },
   {
     id: 'approve',
     name: 'Подтверждать за меня',
-    description: 'Автопроверяющего пока нет, поэтому неопределённые действия требуют подтверждения.',
+    description: 'Автопроверяющего пока нет: спорные действия подтверждаете вы.',
   },
   {
     id: 'full',
     name: 'Полный доступ',
-    description: 'Разрешает доступные действия внутри проекта; доступа ко всей машине и сети не добавляет.',
+    description: 'Разрешает доступные локальные действия. Сеть и доступ ко всей машине пока недоступны.',
+  },
+  {
+    id: 'custom',
+    name: 'Пользовательский',
+    description: 'Правила allow, ask и deny из локального config.toml.',
   },
 ] as const;
+
+const APPROVAL_ACTION_LABELS = {
+  list: 'Список файлов', search: 'Поиск файлов', read: 'Чтение файла',
+  write: 'Запись файла', open: 'Открытие файла', execute: 'Команда PowerShell', connect: 'Подключение',
+} as const;
 
 function Icon({ name, className = '' }: { name: IconName; className?: string }) {
   const Component = ICONS[name];
   return <Component className={className ? `icon ${className}` : 'icon'} aria-hidden="true" focusable="false" strokeWidth={1.8} />;
 }
 
-function ActionMenu({ children, label, trigger, className = '', placement = 'side' }: { children: ReactNode; label: string; trigger?: ReactNode; className?: string; placement?: 'side' | 'below' }) {
+function ActionMenu({ children, label, trigger, className = '', placement = 'side', initialFocus, onOpen, disabled = false }: {
+  children: ReactNode; label: string; trigger?: ReactNode; className?: string;
+  placement?: 'side' | 'below' | 'below-start'; initialFocus?: string; onOpen?: () => void; disabled?: boolean;
+}) {
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
@@ -216,11 +233,11 @@ function ActionMenu({ children, label, trigger, className = '', placement = 'sid
     const edge = 8;
     const desiredLeft = placement === 'side'
       ? (anchor.right + gap + popup.offsetWidth + edge <= window.innerWidth ? anchor.right + gap : anchor.left - popup.offsetWidth - gap)
-      : anchor.right - popup.offsetWidth;
+      : placement === 'below-start' ? anchor.left : anchor.right - popup.offsetWidth;
     const left = Math.max(edge, Math.min(desiredLeft, window.innerWidth - popup.offsetWidth - edge));
     const below = window.innerHeight - anchor.bottom;
     const above = anchor.top;
-    const placeAbove = placement === 'below' && below < popup.offsetHeight + gap + edge && above > below;
+    const placeAbove = placement !== 'side' && below < popup.offsetHeight + gap + edge && above > below;
     const desiredTop = placement === 'side' ? anchor.top : placeAbove ? anchor.top - popup.offsetHeight - gap : anchor.bottom + gap;
     const top = Math.max(edge, Math.min(desiredTop, window.innerHeight - popup.offsetHeight - edge));
     popup.style.left = `${left}px`;
@@ -247,19 +264,22 @@ function ActionMenu({ children, label, trigger, className = '', placement = 'sid
 
   return (
     <div className={`action-menu ${className}`}>
-      <button ref={triggerRef} type="button" aria-label={label} aria-expanded={open} title={label} onClick={() => {
+      <button ref={triggerRef} type="button" aria-label={label} aria-expanded={open} title={label} disabled={disabled} onClick={() => {
         const popup = popupRef.current;
         if (!popup) return;
         if (popup.matches(':popover-open')) popup.hidePopover();
         else {
           document.querySelectorAll<HTMLDivElement>('.action-menu-content:popover-open').forEach((other) => other.hidePopover());
+          onOpen?.();
           popup.showPopover();
           positionPopup();
+          if (initialFocus) requestAnimationFrame(() => popup.querySelector<HTMLElement>(initialFocus)?.focus());
         }
       }}>{trigger ?? <MoreHorizontal className="icon" aria-hidden="true" />}</button>
       <div ref={popupRef} popover="auto" className="action-menu-content" onToggle={() => {
         const isOpen = popupRef.current?.matches(':popover-open') ?? false;
         if (!isOpen) popupRef.current?.querySelectorAll<HTMLDivElement>('.submenu-content:popover-open').forEach((submenu) => submenu.hidePopover());
+        if (!isOpen && popupRef.current?.contains(document.activeElement)) triggerRef.current?.focus();
         setOpen(isOpen);
       }} onClick={(event) => {
         const button = event.target instanceof Element ? event.target.closest('button') : null;
@@ -488,6 +508,7 @@ export default function App() {
   const [showAllProjects, setShowAllProjects] = useState(false);
   const [showAllChats, setShowAllChats] = useState(false);
   const [selectedProjectId, setSelectedProjectId] = useState('');
+  const [projectSearch, setProjectSearch] = useState('');
   const [draft, setDraft] = useState('');
   const [composerCaret, setComposerCaret] = useState(0);
   const [completionDismissed, setCompletionDismissed] = useState(false);
@@ -496,7 +517,7 @@ export default function App() {
   const [runtimeTurns, setRuntimeTurns] = useState<RuntimeTurnSnapshot[]>([]);
   const [pendingPermissionProfile, setPendingPermissionProfile] = useState<PermissionProfile | null>(null);
   const [sending, setSending] = useState(false);
-  const [dialogRequest, setDialogRequest] = useState<{ kind: 'create-project' | 'rename-project' | 'delete-project' | 'rename-chat' | 'delete-chat'; project?: Project; chat?: ChatSummary; hasFiles?: boolean } | null>(null);
+  const [dialogRequest, setDialogRequest] = useState<{ kind: 'create-project' | 'rename-project' | 'delete-project' | 'rename-chat' | 'delete-chat'; project?: Project; chat?: ChatSummary; hasFiles?: boolean; assignChatId?: string; createdProjectId?: string } | null>(null);
   const [dialogValue, setDialogValue] = useState('');
   const [dialogError, setDialogError] = useState('');
   const [dialogBusy, setDialogBusy] = useState(false);
@@ -517,6 +538,11 @@ export default function App() {
   const [skillSource, setSkillSource] = useState<SkillSource | null>(null);
   const [skillSourceLoading, setSkillSourceLoading] = useState<string | null>(null);
   const [skillBusyId, setSkillBusyId] = useState<string | null>(null);
+  const [configDraft, setConfigDraft] = useState('');
+  const [configSaved, setConfigSaved] = useState('');
+  const [configError, setConfigError] = useState('');
+  const [configBusy, setConfigBusy] = useState(false);
+  const [approvalRequest, setApprovalRequest] = useState<PermissionApprovalRequest | null>(null);
   const [globalInstructions, setGlobalInstructions] = useState('');
   const [globalInstructionsStatus, setGlobalInstructionsStatus] = useState<SaveStatus>('saved');
   const [integrationTab, setIntegrationTab] = useState<'skills' | 'plugins' | 'tools'>('skills');
@@ -537,6 +563,7 @@ export default function App() {
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const draftSave = useRef<Promise<unknown>>(Promise.resolve());
   const dialogRef = useRef<HTMLDialogElement>(null);
+  const approvalDialogRef = useRef<HTMLDialogElement>(null);
   const routeRef = useRef<Route>({ page: 'home' });
   const settingsRevision = useRef(0);
   const sidebarButtonRef = useRef<HTMLButtonElement>(null);
@@ -567,6 +594,22 @@ export default function App() {
   const route = navigation.history[navigation.index] ?? { page: 'home' as const };
 
   useEffect(() => { settingsRef.current = settings; }, [settings]);
+
+  useEffect(() => window.gigaChat.permissions.onRequest(setApprovalRequest), []);
+
+  useEffect(() => {
+    const dialog = approvalDialogRef.current;
+    if (!dialog) return;
+    if (approvalRequest && !dialog.open) dialog.showModal();
+    else if (!approvalRequest && dialog.open) dialog.close();
+  }, [approvalRequest]);
+
+  useEffect(() => {
+    if (!approvalRequest) return;
+    const remaining = Math.max(0, Date.parse(approvalRequest.expiresAt) - Date.now());
+    const timer = window.setTimeout(() => setApprovalRequest((current) => current?.id === approvalRequest.id ? null : current), remaining);
+    return () => window.clearTimeout(timer);
+  }, [approvalRequest]);
 
   useEffect(() => {
     let cancelled = false;
@@ -800,6 +843,18 @@ export default function App() {
     return () => { cancelled = true; };
   }, [route.page, settingsSection, globalSaver]);
 
+  useEffect(() => {
+    if (route.page !== 'settings' || settingsSection !== 'permissions') return;
+    let cancelled = false;
+    void window.gigaChat.permissions.readConfig().then(({ contents, error }) => {
+      if (cancelled) return;
+      setConfigDraft(contents);
+      setConfigSaved(contents);
+      setConfigError(error ?? '');
+    }).catch((error: unknown) => { if (!cancelled) setConfigError(getErrorMessage(error)); });
+    return () => { cancelled = true; };
+  }, [route.page, settingsSection]);
+
   const activeProjects = projects.filter((project) => !project.archived)
     .sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt.localeCompare(a.updatedAt));
   const activeChats = chats.filter((chat) => !chat.archived)
@@ -819,12 +874,13 @@ export default function App() {
   const canGoBack = navigation.index > 0;
   const canGoForward = navigation.index < navigation.history.length - 1;
   const settingTitle = SETTINGS_SECTIONS.find((item) => item.id === settingsSection)?.label ?? 'Настройки';
-  const disabledReason = 'Станет доступно после подключения GigaChat API.';
   const composerPermissionProfile = selectedChat && chatDetail?.id === selectedChat.id
     ? chatDetail.nextTurnPermissionProfile ?? (pendingPermissionChatIdRef.current === selectedChat.id ? pendingPermissionProfile : null) ?? settings.defaultPermissionProfile
     : pendingPermissionProfile ?? settings.defaultPermissionProfile;
   const canChangeComposerPermissionProfile = (route.page === 'home' && !selectedChat)
     || Boolean(selectedChat && chatDetail?.id === selectedChat.id);
+  const composerModelId = selectedChat && chatDetail?.id === selectedChat.id
+    ? chatDetail.modelId ?? settings.defaultModelId : settings.defaultModelId;
   const composerProjectId = route.page === 'chat' ? selectedChat?.projectId ?? null
     : route.page === 'home' ? selectedProjectId || null : null;
   const composerSkills = skillRegistry.skills
@@ -1048,7 +1104,7 @@ export default function App() {
     setDialogRequest(request);
   }
 
-  function createProject(): void { openDialog({ kind: 'create-project' }); }
+  function createProject(assignChatId?: string): void { openDialog({ kind: 'create-project', assignChatId }); }
   function renameProject(project: Project): void { openDialog({ kind: 'rename-project', project }, project.name); }
 
   async function updateProject(project: Project, patch: ProjectPatch): Promise<void> {
@@ -1102,9 +1158,21 @@ export default function App() {
     try {
       const { kind, chat, project } = dialogRequest;
       if (kind === 'create-project') {
-        const created = await window.gigaChat.projects.create(dialogValue);
-        setProjects((current) => [created, ...current]);
-        setSelectedProjectId(created.id);
+        const created = dialogRequest.createdProjectId
+          ? projects.find((item) => item.id === dialogRequest.createdProjectId)
+          : await window.gigaChat.projects.create(dialogValue);
+        if (!created) throw new Error('Созданный проект не найден.');
+        if (!dialogRequest.createdProjectId) {
+          setProjects((current) => [created, ...current]);
+          setDialogRequest((current) => current?.kind === 'create-project' ? { ...current, createdProjectId: created.id } : current);
+        }
+        if (dialogRequest.assignChatId) {
+          const updated = await window.gigaChat.chats.update(dialogRequest.assignChatId, { projectId: created.id }).catch((error: unknown) => {
+            throw new Error(`Проект создан, но чат не перемещён: ${getErrorMessage(error)}`);
+          });
+          setChats((current) => current.map((item) => item.id === updated.id ? updated : item));
+          setChatDetail((current) => current?.id === updated.id ? { ...current, projectId: created.id } : current);
+        } else setSelectedProjectId(created.id);
         showSuccess(`Проект «${created.name}» создан.`);
       } else if (kind === 'rename-project' && project) {
         const updated = await window.gigaChat.projects.update(project.id, { name: dialogValue });
@@ -1143,6 +1211,31 @@ export default function App() {
       projectId: nextProjectId,
       ...(projectSkill && projectSkill[1] !== nextProjectId ? { nextTurnSkillId: null } : {}),
     });
+  }
+
+  async function changeComposerModel(modelId: GigaChatModelId): Promise<void> {
+    if (route.page === 'chat' && selectedChat) await updateChat(selectedChat, { modelId });
+    else await updateLocalSettings({ defaultModelId: modelId });
+  }
+
+  async function saveCustomConfig(): Promise<void> {
+    if (configBusy) return;
+    setConfigBusy(true);
+    setConfigError('');
+    try {
+      const saved = await window.gigaChat.permissions.saveConfig(configDraft, configSaved);
+      setConfigSaved(saved);
+      showSuccess('Пользовательские разрешения сохранены.');
+    } catch (error) { setConfigError(getErrorMessage(error)); }
+    finally { setConfigBusy(false); }
+  }
+
+  async function answerApproval(allowed: boolean): Promise<void> {
+    const request = approvalRequest;
+    if (!request) return;
+    setApprovalRequest(null);
+    try { await window.gigaChat.permissions.respond(request.id, allowed); }
+    catch (error) { setNotice(getErrorMessage(error)); }
   }
 
   async function updateLocalSettings(patch: SettingsPatch): Promise<void> {
@@ -1262,7 +1355,6 @@ export default function App() {
   }
 
   async function changeComposerPermissionProfile(profile: PermissionProfile): Promise<void> {
-    if (profile === 'custom') return;
     if (!selectedChat || !chatDetail || chatDetail.id !== selectedChat.id) {
       if (route.page === 'home' && !selectedChat) {
         pendingPermissionProfileRef.current = profile;
@@ -1452,15 +1544,25 @@ export default function App() {
       case 'models':
         return (
           <>
-            <div className="settings-section-heading"><h2>Модели и лимиты</h2><p>Сведения появятся после подключения GigaChat API.</p></div>
+            <div className="settings-section-heading"><h2>Модели и лимиты</h2><p>Выбор модели сохранится для следующих ходов. Доступность проверим после подключения API.</p></div>
             <div className="settings-card connection-card"><div className="connection-mark">G</div><div><strong>GigaChat API</strong><p>Провайдер не подключён. Список моделей и их доступность пока не загружены.</p></div><span className="status-pill"><i />Не подключён</span></div>
-            <EmptyState title="Список моделей пока пуст" description="Здесь появятся доступные модели и подтверждённые данные о лимитах. Значения не подменяются нулями." icon="gauge" />
+            <div className="model-settings-list">
+              {GIGACHAT_MODELS.map((model) => <button type="button" key={model.id}
+                className={`permission-profile permission-profile-selectable${settings.defaultModelId === model.id ? ' selected' : ''}`}
+                aria-pressed={settings.defaultModelId === model.id} onClick={() => void updateLocalSettings({ defaultModelId: model.id })}>
+                <span className="model-mark">G</span>
+                <span className="permission-profile-copy"><strong>{model.name}</strong><span>{model.description} · Доступ не проверен</span></span>
+                <span className="status-label">{settings.defaultModelId === model.id ? 'По умолчанию' : 'Выбрать'}</span>
+              </button>)}
+              {settings.defaultModelId && <button type="button" className="quiet-button model-clear-button" onClick={() => void updateLocalSettings({ defaultModelId: null })}>Снять выбор модели по умолчанию</button>}
+            </div>
+            <EmptyState title="Лимиты пока неизвестны" description="Подтверждённые данные о лимитах появятся после подключения API." icon="gauge" />
           </>
         );
       case 'permissions':
         return (
           <>
-            <div className="settings-section-heading"><h2>Разрешения</h2><p>Профиль хранится локально для следующего хода. Пока API не подключён, ход не запускается.</p></div>
+            <div className="settings-section-heading"><h2>Разрешения</h2><p>Профиль хранится локально. Локальные действия проверяются перед выполнением; запросы к модели пока не отправляются.</p></div>
             <div className="permission-profile-list">
               {AVAILABLE_PERMISSION_PROFILES.map((profile) => {
                 const selected = settings.defaultPermissionProfile === profile.id;
@@ -1478,10 +1580,20 @@ export default function App() {
                   </button>
                 );
               })}
-              <article className="permission-profile disabled-card">
-                <Icon name="lock" /><div><strong>Настроить вручную</strong><p>Редактор профиля пока недоступен.</p></div><span className="status-label">Недоступно</span>
-              </article>
             </div>
+            <section className="settings-card custom-config-card">
+              <div className="setting-subheading"><div><h3>Пользовательский профиль</h3><p>Правила для доступных локальных инструментов. Дополнительные каталоги указываются абсолютными путями.</p></div></div>
+              <p className="config-path path-value">{appInfo?.dataPath ? `${appInfo.dataPath}\\config.toml` : 'config.toml в каталоге данных приложения'}</p>
+              <textarea className="config-editor" aria-label="Редактор config.toml" spellCheck={false} value={configDraft}
+                onChange={(event) => { setConfigDraft(event.target.value); setConfigError(''); }} />
+              <div className="config-actions">
+                <span className="config-status" role="status">{configError || (configDraft === configSaved ? 'Сохранено' : 'Есть несохранённые изменения')}</span>
+                <button type="button" className="quiet-button" onClick={() => void window.gigaChat.permissions.readConfig().then(({ contents, error }) => {
+                  setConfigDraft(contents); setConfigSaved(contents); setConfigError(error ?? '');
+                }).catch((error: unknown) => setConfigError(getErrorMessage(error)))}>Обновить с диска</button>
+                <button type="button" className="primary-button" disabled={configBusy || configDraft === configSaved} onClick={() => void saveCustomConfig()}>{configBusy ? 'Сохранение…' : 'Сохранить'}</button>
+              </div>
+            </section>
           </>
         );
       case 'personalization':
@@ -1906,18 +2018,45 @@ export default function App() {
                 ><strong>{suggestion.label}</strong><span>{suggestion.description}</span></button>)}
                 {composerCompletion.emptyMessage && <p className="composer-suggestions-empty" role="status">{composerCompletion.emptyMessage}</p>}
               </div>}
-              <label className="project-picker"><Icon name="folder" />
-                <span className="project-picker-select">
-                <select value={composerProjectId ?? ''} aria-label="Выбрать проект" onChange={(event) => {
-                  const projectId = event.target.value;
-                  if (route.page === 'chat' && selectedChat) void changeChatProject(selectedChat, projectId);
-                  else setSelectedProjectId(projectId);
-                }}>
-                  <option value="">Выбрать проект</option>
-                  {activeProjects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
-                </select><Icon name="chevron" className="picker-chevron" />
-                </span>
-              </label>
+              <div className="project-picker">
+                <ActionMenu className="composer-project-menu" placement="below-start" label="Выбрать проект"
+                  initialFocus=".project-search-input" onOpen={() => setProjectSearch('')}
+                  trigger={<><Icon name="folder" /><span>{activeProjects.find((project) => project.id === composerProjectId)?.name ?? 'Выбрать проект'}</span><Icon name="chevron" /></>}>
+                  <div className="project-picker-popup" onKeyDown={(event) => {
+                    if (event.key === 'Escape') {
+                      event.preventDefault();
+                      event.currentTarget.closest<HTMLDivElement>('.action-menu-content')?.hidePopover();
+                      return;
+                    }
+                    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+                    const buttons = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('.project-picker-option')];
+                    const active = document.activeElement;
+                    const index = buttons.indexOf(active as HTMLButtonElement);
+                    event.preventDefault();
+                    if (event.key === 'ArrowDown') buttons[Math.min(buttons.length - 1, index + 1)]?.focus();
+                    else if (index <= 0) event.currentTarget.querySelector<HTMLInputElement>('.project-search-input')?.focus();
+                    else buttons[index - 1]?.focus();
+                  }}>
+                    <div className="project-search"><Search className="icon" aria-hidden="true" />
+                      <input className="project-search-input" type="search" aria-label="Поиск проектов" placeholder="Поиск проектов" value={projectSearch} onChange={(event) => setProjectSearch(event.target.value)} />
+                    </div>
+                    <div className="project-picker-options">
+                      <button type="button" className="project-picker-option" aria-current={!composerProjectId} onClick={() => {
+                        if (route.page === 'chat' && selectedChat) void changeChatProject(selectedChat, '');
+                        else setSelectedProjectId('');
+                      }}><Icon name="folder" />Без проекта{!composerProjectId && <Icon name="check" />}</button>
+                      {activeProjects.filter((project) => project.name.toLocaleLowerCase().includes(projectSearch.trim().toLocaleLowerCase())).map((project) =>
+                        <button type="button" className="project-picker-option" key={project.id} aria-current={project.id === composerProjectId} onClick={() => {
+                          if (route.page === 'chat' && selectedChat) void changeChatProject(selectedChat, project.id);
+                          else setSelectedProjectId(project.id);
+                        }}><Icon name="folder" /><span>{project.name}</span>{project.id === composerProjectId && <Icon name="check" />}</button>)}
+                      {activeProjects.length === 0 && <p className="picker-empty">Пока нет проектов</p>}
+                      {activeProjects.length > 0 && !activeProjects.some((project) => project.name.toLocaleLowerCase().includes(projectSearch.trim().toLocaleLowerCase())) && <p className="picker-empty">Ничего не найдено</p>}
+                    </div>
+                    <button type="button" className="project-picker-option project-create-option" onClick={() => createProject(selectedChat?.id)}><Icon name="plus" />Новый проект</button>
+                  </div>
+                </ActionMenu>
+              </div>
               <div className="composer">
                 <label className="sr-only" htmlFor="chat-draft">Черновик сообщения</label>
                 <textarea
@@ -1942,25 +2081,34 @@ export default function App() {
                 <div className="composer-toolbar">
                   <div className="toolbar-leading">
                   <button type="button" className="attach-button" aria-label="Прикрепить файл" title="Прикрепить файл" onClick={() => void attachFile()}><Icon name="plus" /></button>
-                  <label className={`permission-select-control permission-control${canChangeComposerPermissionProfile ? '' : ' is-disabled'}`} title={canChangeComposerPermissionProfile ? 'Профиль для следующего локального хода. Инструменты не запускаются, API не вызывается.' : 'Откройте чат, чтобы задать для него профиль.'}>
-                    <Icon name="shield" />
-                    <select
-                      className="permission-select"
-                      aria-label={`Профиль разрешений для следующего хода: ${AVAILABLE_PERMISSION_PROFILES.find((profile) => profile.id === composerPermissionProfile)?.name ?? 'Настроить вручную'}`}
-                      value={composerPermissionProfile}
-                      disabled={!canChangeComposerPermissionProfile}
-                      onChange={(event) => void changeComposerPermissionProfile(event.target.value as PermissionProfile)}
-                    >
-                      {AVAILABLE_PERMISSION_PROFILES.map((profile) => <option key={profile.id} value={profile.id}>{profile.id === 'ask' ? 'Спросить' : profile.id === 'approve' ? 'Подтверждать' : 'Полный доступ'}</option>)}
-                      <option value="custom" disabled>Custom · недоступен</option>
-                    </select>
-                    <Icon name="chevron" />
-                  </label>
+                  <ActionMenu className="composer-permission-menu" placement="below-start"
+                    label={`Разрешения: ${AVAILABLE_PERMISSION_PROFILES.find((profile) => profile.id === composerPermissionProfile)?.name ?? 'Спросить'}`}
+                    disabled={!canChangeComposerPermissionProfile}
+                    trigger={<><Icon name="shield" /><span>{AVAILABLE_PERMISSION_PROFILES.find((profile) => profile.id === composerPermissionProfile)?.name ?? 'Спросить'}</span><Icon name="chevron" /></>}>
+                    <div className="permission-picker-popup"><p className="picker-heading">Как подтверждать действия GigaChat?</p>
+                      {AVAILABLE_PERMISSION_PROFILES.map((profile) => <button type="button" className="permission-picker-option" key={profile.id}
+                        aria-current={profile.id === composerPermissionProfile} onClick={() => void changeComposerPermissionProfile(profile.id)}>
+                        <Icon name={profile.id === 'custom' ? 'settings' : 'shield'} />
+                        <span><strong>{profile.name}</strong><small>{profile.description}</small></span>
+                        {profile.id === composerPermissionProfile && <Icon name="check" />}
+                      </button>)}
+                    </div>
+                  </ActionMenu>
+                  <span className="toolbar-mode-slot" aria-hidden="true" />
                   </div>
                   <div className="toolbar-trailing">
-                  <span className="disabled-control" role="note" tabIndex={0} aria-label={`Выбор модели: ${disabledReason}`} title={disabledReason}>
-                    <button type="button" className="model-button" disabled><span className="model-mark">G</span><span>Выбрать модель</span><Icon name="chevron" /></button>
-                  </span>
+                  <ActionMenu className="composer-model-menu" placement="below" label="Выбрать модель GigaChat"
+                    disabled={!canChangeComposerPermissionProfile}
+                    trigger={<><span className="model-mark">G</span><span>{GIGACHAT_MODELS.find((model) => model.id === composerModelId)?.name ?? 'Выбрать модель'}</span><Icon name="chevron" /></>}>
+                    <div className="model-picker-popup"><p className="picker-heading">Модель для следующих ходов</p>
+                      <p className="picker-caption">Доступность будет проверена после подключения API.</p>
+                      {GIGACHAT_MODELS.map((model) => <button type="button" className="model-picker-option" key={model.id}
+                        aria-current={model.id === composerModelId} onClick={() => void changeComposerModel(model.id)}>
+                        <span><strong>{model.name}</strong><small>{model.description}</small></span>
+                        {model.id === composerModelId && <Icon name="check" />}
+                      </button>)}
+                    </div>
+                  </ActionMenu>
                   <span className="disabled-control" role="note" tabIndex={0} aria-label="Контекст станет доступен после загрузки модели" title="Контекст станет доступен после подключения API.">
                     <button type="button" className="context-ring" disabled aria-label="Использование контекста"><i /></button>
                   </span>
@@ -1993,14 +2141,30 @@ export default function App() {
           {dialogRequest.kind === 'delete-chat' && dialogRequest.hasFiles && <p>Копии файлов внутри этого чата также будут удалены. Исходные файлы останутся на месте.</p>}
           {(dialogRequest.kind === 'create-project' || dialogRequest.kind === 'rename-project' || dialogRequest.kind === 'rename-chat') && <label className="dialog-label">
             {dialogRequest.kind === 'rename-chat' ? 'Название чата' : 'Название проекта'}
-            <input autoFocus value={dialogValue} onChange={(event) => setDialogValue(event.target.value)} maxLength={dialogRequest.kind === 'rename-chat' ? 160 : 120} />
+            <input autoFocus value={dialogValue} disabled={Boolean(dialogRequest.createdProjectId)} onChange={(event) => setDialogValue(event.target.value)} maxLength={dialogRequest.kind === 'rename-chat' ? 160 : 120} />
           </label>}
           {dialogError && <p className="dialog-error" role="alert">{dialogError}</p>}
           <div className="dialog-actions">
             <button type="button" className="secondary-button" disabled={dialogBusy} onClick={() => setDialogRequest(null)}>Отмена</button>
-            <button type="submit" className={dialogRequest.kind.startsWith('delete') ? 'danger-button' : 'primary-button'} disabled={dialogBusy}>{dialogBusy ? 'Подождите…' : dialogRequest.kind.startsWith('delete') ? 'Удалить' : dialogRequest.kind === 'create-project' ? 'Создать' : 'Сохранить'}</button>
+            <button type="submit" className={dialogRequest.kind.startsWith('delete') ? 'danger-button' : 'primary-button'} disabled={dialogBusy}>{dialogBusy ? 'Подождите…' : dialogRequest.kind.startsWith('delete') ? 'Удалить' : dialogRequest.createdProjectId ? 'Повторить перенос' : dialogRequest.kind === 'create-project' ? 'Создать' : 'Сохранить'}</button>
           </div>
         </form>}
+      </dialog>
+      <dialog ref={approvalDialogRef} className="app-dialog approval-dialog" onCancel={(event) => {
+        event.preventDefault();
+        void answerApproval(false);
+      }}>
+        {approvalRequest && <div>
+          <h2>Разрешить локальное действие?</h2>
+          <p>{approvalRequest.reason}</p>
+          <p className="approval-action">{APPROVAL_ACTION_LABELS[approvalRequest.action]}</p>
+          <p className="approval-target">{approvalRequest.target}</p>
+          <p>Без ответа запрос будет отклонён автоматически.</p>
+          <div className="dialog-actions">
+            <button type="button" className="secondary-button" onClick={() => void answerApproval(false)}>Отклонить</button>
+            <button type="button" className="primary-button" onClick={() => void answerApproval(true)}>Разрешить</button>
+          </div>
+        </div>}
       </dialog>
     </div>
   );

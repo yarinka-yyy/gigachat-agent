@@ -1,5 +1,6 @@
 import type { ChatMessage, InstructionLayer, ProviderTurnRequest } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
+import { requireModelId, type GigaChatModelId } from './models';
 
 export interface ProjectInstructionSource {
   scope: string;
@@ -12,6 +13,7 @@ export interface InstructionInput {
   selectedSkill?: { name: string; scope: string; text: string } | null;
   messages: readonly ChatMessage[];
   permissionProfile: PermissionProfile;
+  modelId?: GigaChatModelId | null;
 }
 
 export const APP_RUNTIME_RULES = [
@@ -37,6 +39,7 @@ export function buildInstructionRequest(input: InstructionInput): ProviderTurnRe
     throw new Error('Некорректные слои инструкций.');
   }
   const permissionProfile = requirePermissionProfile(input.permissionProfile);
+  const modelId = input.modelId === null || input.modelId === undefined ? null : requireModelId(input.modelId);
   const layers: InstructionLayer[] = [];
   addLayer(layers, 'runtime', 'Правила приложения', APP_RUNTIME_RULES);
   addLayer(layers, 'global', 'GIGACHAT.md', input.globalText);
@@ -57,5 +60,6 @@ export function buildInstructionRequest(input: InstructionInput): ProviderTurnRe
     system: layers,
     messages: input.messages.map((message) => ({ ...message })),
     permissionProfile,
+    modelId,
   };
 }

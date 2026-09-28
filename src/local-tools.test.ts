@@ -439,22 +439,24 @@ test('rejects traversal, malformed requests, oversized writes, and project symli
   await writeFile(join(fixture.projectFolder, 'keep.txt'), 'preserve');
   await writeFile(join(fixture.projectFolder, 'not-a-folder.txt'), 'still here');
   const events: LocalToolEvent[] = [];
-  const tools = makeTools(fixture.project, events, []);
+  const tools = makeTools(fixture.project, events, [], undefined, async () => {
+    throw new Error('Validation should reject the write before the helper runs.');
+  });
 
   await assert.rejects(tools.read(projectId, 'ask', '../outside/sentinel.txt'), /относительный путь|недопустимый компонент/);
   await assert.rejects(tools.read(projectId, 'ask', join(fixture.outsideFolder, 'sentinel.txt')), /относительный путь/);
   await assert.rejects(tools.read('missing-project', 'ask', 'keep.txt'), /рабочая папка/);
-  await assert.rejects(tools.read(projectId, 'custom', 'keep.txt'), /Custom/);
+  await assert.rejects(tools.read(projectId, 'custom', 'keep.txt'), /Конфигурация пользовательского профиля недоступна/);
   await assert.rejects(tools.write(projectId, 'ask', 'keep.txt', 'x'.repeat(MAX_LOCAL_FILE_BYTES + 1)), /1 МиБ/);
   await assert.rejects(tools.write(projectId, 'ask', 'not-a-folder.txt/child.txt', 'replacement'), /Компонент пути не является папкой/);
   assert.equal(await readFile(join(fixture.projectFolder, 'keep.txt'), 'utf8'), 'preserve');
   assert.equal(await readFile(join(fixture.projectFolder, 'not-a-folder.txt'), 'utf8'), 'still here');
-  await assert.rejects(tools.open(projectId, 'ask', 'keep.txt'), /требуется подтверждение/);
+  await tools.open(projectId, 'ask', 'keep.txt');
 
   const link = join(fixture.projectFolder, 'outside-link');
   await symlink(fixture.outsideFolder, link, 'junction');
   await assert.rejects(tools.read(projectId, 'ask', 'outside-link/sentinel.txt'), /ссыл|повторной обработки/);
-  assert.equal(events.filter((event) => event.phase === 'failed').length, 8);
+  assert.equal(events.filter((event) => event.phase === 'failed').length, 7);
 });
 
 test('rechecks the working-folder path on every request and keeps PowerShell disabled without a verified helper', async (t) => {

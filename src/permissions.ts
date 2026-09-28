@@ -1,3 +1,5 @@
+import type { CustomPolicy, LocalAction } from './custom-permissions';
+
 export type PermissionProfile = 'ask' | 'approve' | 'full' | 'custom';
 export type PermissionResource = 'project-files' | 'machine-files' | 'process' | 'network' | 'browser' | 'application';
 export type PermissionAction = 'list' | 'search' | 'read' | 'write' | 'open' | 'execute' | 'connect';
@@ -9,7 +11,9 @@ export interface PermissionRequest {
   projectId: string | null;
   /** Main resolves the requested target's canonical path to a project before calling this policy. */
   targetProjectId: string | null;
+  targetRootName?: string | null;
   capabilityAvailable: boolean;
+  customPolicy?: CustomPolicy | null;
 }
 
 export interface PermissionEvaluation {
@@ -39,7 +43,7 @@ export function requirePermissionProfile(value: unknown): PermissionProfile {
 }
 
 function isProjectAction(resource: PermissionResource): boolean {
-  return resource === 'project-files' || resource === 'process';
+  return resource === 'project-files' || resource === 'process' || resource === 'application';
 }
 
 export function evaluatePermission(request: PermissionRequest): PermissionEvaluation {
@@ -54,15 +58,27 @@ export function evaluatePermission(request: PermissionRequest): PermissionEvalua
     return { decision: 'deny', reason: 'Такое действие для указанного ресурса не поддерживается.' };
   }
 
-  if (profile === 'custom') {
-    return { decision: 'deny', reason: 'Профиль Custom пока недоступен.' };
+  if (!request.capabilityAvailable) {
+    return { decision: 'deny', reason: 'Инструмент для этого действия пока недоступен.' };
   }
+  if (profile === 'custom') {
+    if (!request.customPolicy) return { decision: 'deny', reason: 'Конфигурация пользовательского профиля недоступна.' };
+    const root = request.targetRootName
+      ? request.customPolicy.roots.find((item) => item.name === request.targetRootName) : null;
+    if (request.targetRootName && !root) return { decision: 'deny', reason: 'Каталог не указан в config.toml.' };
+    if (!root && (!request.projectId || request.targetProjectId !== request.projectId)) {
+      return { decision: 'deny', reason: 'Действие не относится к проекту текущего чата.' };
+    }
+    if (!isProjectAction(request.resource)) return { decision: 'deny', reason: 'Для этого ресурса пока нет локального инструмента.' };
+    const decision = (root?.rules ?? request.customPolicy.project)[request.action as LocalAction];
+    return { decision: decision ?? 'deny', reason: decision === 'ask'
+      ? 'Пользовательский профиль требует вашего подтверждения.'
+      : decision === 'allow' ? 'Разрешено пользовательским профилем.' : 'Запрещено пользовательским профилем.' };
+  }
+  if (request.targetRootName) return { decision: 'deny', reason: 'Дополнительные каталоги доступны только пользовательскому профилю.' };
   if (isProjectAction(request.resource)
     && (!request.projectId || request.targetProjectId !== request.projectId)) {
     return { decision: 'deny', reason: 'Действие не относится к проекту текущего чата.' };
-  }
-  if (!request.capabilityAvailable) {
-    return { decision: 'deny', reason: 'Инструмент для этого действия пока недоступен.' };
   }
   if (profile === 'full') {
     return { decision: 'allow', reason: 'Действие разрешено выбранным профилем Full access.' };

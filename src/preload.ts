@@ -12,6 +12,7 @@ import type {
   Project,
   RuntimeAvailability,
   RuntimeTurnSnapshot,
+  PermissionApprovalRequest,
   OnboardingBrowserStatus,
   SecureStoreStatus,
   SkillRegistrySnapshot,
@@ -53,6 +54,16 @@ const api: AppApi = {
       const handler = (_event: Electron.IpcRendererEvent, turn: RuntimeTurnSnapshot): void => listener(turn);
       ipcRenderer.on('runtime:update', handler);
       return () => ipcRenderer.removeListener('runtime:update', handler);
+    },
+  },
+  permissions: {
+    readConfig: () => ipcRenderer.invoke('permissions:read-config') as Promise<{ contents: string; error: string | null }>,
+    saveConfig: (contents, expectedContents) => ipcRenderer.invoke('permissions:save-config', contents, expectedContents) as Promise<string>,
+    respond: (id, allowed) => ipcRenderer.invoke('permissions:respond', id, allowed) as Promise<boolean>,
+    onRequest: (listener) => {
+      const handler = (_event: Electron.IpcRendererEvent, request: PermissionApprovalRequest): void => listener(request);
+      ipcRenderer.on('permissions:request', handler);
+      return () => ipcRenderer.removeListener('permissions:request', handler);
     },
   },
   skills: {

@@ -119,6 +119,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       const request = await options.prepareTurn(turn.chatId);
       if (controller.signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
       if (!options.provider) throw new Error('PROVIDER_UNAVAILABLE');
+      if (!request.modelId) throw new Error('MODEL_NOT_SELECTED');
       let answer = '';
       let completed = false;
       for await (const rawEvent of options.provider.stream(request, controller.signal)) {
@@ -153,7 +154,9 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       if (turn.status === 'failed') {
         turn.error = error instanceof Error && error.message === 'PROVIDER_UNAVAILABLE'
           ? 'GigaChat API пока не подключён.'
-          : 'Ход завершился ошибкой. Сообщение пользователя сохранено локально.';
+          : error instanceof Error && error.message === 'MODEL_NOT_SELECTED'
+            ? 'Выберите модель GigaChat для следующего хода.'
+            : 'Ход завершился ошибкой. Сообщение пользователя сохранено локально.';
       }
       publish(turn);
     } finally {

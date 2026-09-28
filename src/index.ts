@@ -8,6 +8,9 @@ import { createLocalTools, createPowerShellHelper, resolvePowerShellHelperPath, 
 import { createTurnRuntime, type TurnRuntime } from './runtime';
 import type { ChatPatch, FolderOpener, NotificationSettings, PreferredOpener, RuntimeAvailability, SettingsPatch, Theme, VoiceAvailability } from './contracts';
 import { requirePermissionProfile } from './permissions';
+import { requireModelId } from './models';
+import { openCustomPermissions, parseCustomConfig } from './custom-permissions';
+import { createPermissionApprovals } from './permission-approvals';
 import { createSkillRegistry, isSkillId } from './skills';
 import { createHookRegistry } from './hooks';
 import { createSecureStore } from './secure-store';
@@ -26,6 +29,7 @@ let onboardingBrowser: ReturnType<typeof createOnboardingBrowser> | null = null;
 let currentTheme: Theme = 'emerald';
 let allowClose = false;
 let deletingAppData = false;
+let approvalBroker: ReturnType<typeof createPermissionApprovals> | null = null;
 
 function titleBarColors(): { color: string; symbolColor: string } {
   const theme = currentTheme === 'system'
@@ -203,9 +207,10 @@ function requireId(value: unknown): string {
 
 function requireSettingsPatch(value: unknown): SettingsPatch {
   if (!isRecord(value)) throw new Error('Некорректные настройки.');
-  const allowedFields = ['theme', 'sidebarTransparent', 'sidebarVisible', 'defaultProjectsFolder', 'preferredOpener', 'defaultPermissionProfile', 'onboardingCompleted', 'notifications'];
+  const allowedFields = ['theme', 'sidebarTransparent', 'sidebarVisible', 'defaultProjectsFolder', 'preferredOpener', 'defaultPermissionProfile', 'defaultModelId', 'onboardingCompleted', 'notifications'];
   if (Object.keys(value).some((key) => !allowedFields.includes(key))) throw new Error('Недопустимое поле настроек.');
   if ('defaultPermissionProfile' in value) requirePermissionProfile(value.defaultPermissionProfile);
+  if ('defaultModelId' in value && value.defaultModelId !== null) requireModelId(value.defaultModelId);
   if ('onboardingCompleted' in value && typeof value.onboardingCompleted !== 'boolean') {
     throw new Error('Некорректный статус первичной настройки.');
   }
@@ -231,6 +236,7 @@ function requireBrowserBounds(value: unknown): BrowserBounds {
 
 function requireChatPatch(value: unknown): ChatPatch {
   if (!isRecord(value)) throw new Error('Некорректные изменения чата.');
+  if ('modelId' in value && value.modelId !== null) requireModelId(value.modelId);
   if ('nextTurnPermissionProfile' in value && value.nextTurnPermissionProfile !== null) {
     requirePermissionProfile(value.nextTurnPermissionProfile);
   }
@@ -486,7 +492,11 @@ async function createVoiceService(userDataPath: string): Promise<{ runtime: Voic
   }
 }
 
-async function createMainRuntime(store: LocalStore): Promise<MainRuntimeBundle> {
+async function createMainRuntime(
+  store: LocalStore,
+  customPermissions: Awaited<ReturnType<typeof openCustomPermissions>>,
+  approvals: ReturnType<typeof createPermissionApprovals>,
+): Promise<MainRuntimeBundle> {
   const skills = createSkillRegistry({ userDataPath: app.getPath('userData'), listProjects: () => store.listProjects() });
   const hooks = createHookRegistry({
     userDataPath: app.getPath('userData'),
@@ -520,6 +530,9 @@ async function createMainRuntime(store: LocalStore): Promise<MainRuntimeBundle> 
   let runtime: TurnRuntime | null = null;
   const tools: LocalTools = createLocalTools({
     resolveProject: async (id) => (await store.listProjects()).find((project) => project.id === id) ?? null,
+    protectedDirectory: app.getPath('userData'),
+    getCustomPolicy: customPermissions.policy,
+    requestApproval: approvals.request,
     openPath: async (path) => {
       const error = await shell.openPath(path);
       if (error) throw new Error('Не удалось открыть элемент проекта.');
@@ -541,6 +554,7 @@ async function createMainRuntime(store: LocalStore): Promise<MainRuntimeBundle> 
       const chat = await store.getChat(chatId);
       const settings = await store.getSettings();
       const permissionProfile = chat.nextTurnPermissionProfile ?? settings.defaultPermissionProfile;
+      const modelId = chat.modelId ?? settings.defaultModelId;
       const projects = await store.listProjects();
       const project = chat.projectId ? projects.find((item) => item.id === chat.projectId) : null;
       if (chat.projectId && !project) throw new Error('Проект чата больше недоступен.');
@@ -562,6 +576,7 @@ async function createMainRuntime(store: LocalStore): Promise<MainRuntimeBundle> 
         } : null,
         messages: chat.messages,
         permissionProfile,
+        modelId,
       });
       if (chat.nextTurnPermissionProfile !== null || chat.nextTurnSkillId !== null) {
         await store.updateChat(chat.id, { nextTurnPermissionProfile: null, nextTurnSkillId: null });
@@ -609,6 +624,8 @@ async function registerIpcHandlers(
   mainRuntime: MainRuntimeBundle,
   secureStore: ReturnType<typeof createSecureStore>,
   browser: ReturnType<typeof createOnboardingBrowser>,
+  customPermissions: Awaited<ReturnType<typeof openCustomPermissions>>,
+  approvals: ReturnType<typeof createPermissionApprovals>,
 ): Promise<void> {
   const { runtime, availability, voiceRuntime, voiceAvailability, skills, hooks } = mainRuntime;
   const handle = (channel: string, callback: (...args: unknown[]) => unknown): void => {
@@ -701,6 +718,16 @@ async function registerIpcHandlers(
     return runtime.cancel(requireId(turnIdInput), chatId);
   });
   handle('runtime:status', () => availability);
+  handle('permissions:read-config', async () => {
+    const contents = await customPermissions.read();
+    try { parseCustomConfig(contents); return { contents, error: null }; }
+    catch (error) { return { contents, error: error instanceof Error ? error.message : 'Неверный config.toml.' }; }
+  });
+  handle('permissions:save-config', (contents, expected) => {
+    if (typeof contents !== 'string' || typeof expected !== 'string') throw new Error('Некорректный текст config.toml.');
+    return customPermissions.save(contents, expected);
+  });
+  handle('permissions:respond', (id, allowed) => approvals.respond(id, allowed));
 
   handle('voice:status', () => voiceAvailability);
   handle('voice:transcribe', (requestId, audio, mediaType) => {
@@ -888,6 +915,7 @@ const createWindow = (): void => {
     window.webContents.send('app:close-requested');
   });
   window.on('closed', () => {
+    approvalBroker?.cancelAll();
     mainWindow = null;
     void onboardingBrowser?.close();
   });
@@ -926,6 +954,12 @@ void app.whenReady().then(async () => {
   try {
     configureMainAudioPermission();
     const store = await openStore(app.getPath('userData'));
+    const customPermissions = await openCustomPermissions(app.getPath('userData'));
+    const approvals = createPermissionApprovals((request) => {
+      if (!mainWindow || mainWindow.isDestroyed()) throw new Error('Окно подтверждения недоступно.');
+      mainWindow.webContents.send('permissions:request', request);
+    });
+    approvalBroker = approvals;
     const secureStore = createSecureStore(app.getPath('userData'), safeStorage);
     onboardingBrowser = createOnboardingBrowser(() => mainWindow, {
       createSession: (partition) => session.fromPartition(partition),
@@ -933,8 +967,8 @@ void app.whenReady().then(async () => {
     });
     currentTheme = (await store.getSettings()).theme;
     nativeTheme.on('updated', syncTitleBarOverlay);
-    const mainRuntime = await createMainRuntime(store);
-    await registerIpcHandlers(store, mainRuntime, secureStore, onboardingBrowser);
+    const mainRuntime = await createMainRuntime(store, customPermissions, approvals);
+    await registerIpcHandlers(store, mainRuntime, secureStore, onboardingBrowser, customPermissions, approvals);
     createWindow();
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Неизвестная ошибка локальных данных.';

@@ -26,6 +26,7 @@ test('persists projects, chats, relationships, drafts, image kind, and settings'
     defaultProjectsFolder: 'C:\\projects',
     preferredOpener: 'explorer',
     defaultPermissionProfile: 'approve',
+    defaultModelId: 'GigaChat-2-Pro',
     onboardingCompleted: false,
     notifications: { taskStarted: true, taskCompleted: false, failures: true },
   });
@@ -37,6 +38,9 @@ test('persists projects, chats, relationships, drafts, image kind, and settings'
   assert.equal((await restored.getChat(chat.id)).nextTurnPermissionProfile, 'full');
   assert.equal((await restored.getChat(chat.id)).nextTurnSkillId, 'global/review');
   assert.equal((await restored.getChat(chat.id)).projectId, project.id);
+  assert.equal((await restored.getChat(chat.id)).modelId, null);
+  await restored.updateChat(chat.id, { modelId: 'GigaChat-3-Ultra' });
+  assert.equal((await (await openStore(directory)).getChat(chat.id)).modelId, 'GigaChat-3-Ultra');
   assert.equal((await restored.getChat(imageChat.id)).kind, 'image');
   assert.deepEqual(await restored.getSettings(), {
     theme: 'warm',
@@ -45,6 +49,7 @@ test('persists projects, chats, relationships, drafts, image kind, and settings'
     defaultProjectsFolder: 'C:\\projects',
     preferredOpener: 'explorer',
     defaultPermissionProfile: 'approve',
+    defaultModelId: 'GigaChat-2-Pro',
     onboardingCompleted: false,
     notifications: { taskStarted: true, taskCompleted: false, failures: true },
   });
@@ -52,6 +57,7 @@ test('persists projects, chats, relationships, drafts, image kind, and settings'
   await assert.rejects(store.updateSettings({ notifications: { taskStarted: true, taskCompleted: false, failures: 'yes' } } as never));
   await assert.rejects(store.updateChat(chat.id, { nextTurnPermissionProfile: 'unknown' } as never));
   await assert.rejects(store.updateChat(chat.id, { nextTurnSkillId: 'global/../outside' } as never));
+  await assert.rejects(store.updateChat(chat.id, { modelId: 'not-a-model' } as never));
 });
 
 test('migrates v1 projects, chats, drafts, and theme without losing data', async (t) => {
@@ -82,7 +88,7 @@ test('migrates v1 projects, chats, drafts, and theme without losing data', async
   const store = await openStore(directory);
   assert.deepEqual(await store.listProjects(), [{ ...project, workingFolder: null }]);
   assert.equal((await store.listChats())[0]?.id, chat.id);
-  assert.deepEqual(await store.getChat(chat.id), { ...chat, kind: 'text', nextTurnPermissionProfile: null, nextTurnSkillId: null, messages: [], artifacts: [] });
+  assert.deepEqual(await store.getChat(chat.id), { ...chat, kind: 'text', nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [] });
   assert.deepEqual(await store.getSettings(), {
     theme: 'emerald',
     sidebarTransparent: false,
@@ -90,14 +96,15 @@ test('migrates v1 projects, chats, drafts, and theme without losing data', async
     defaultProjectsFolder: null,
     preferredOpener: 'system',
     defaultPermissionProfile: 'ask',
+    defaultModelId: null,
     onboardingCompleted: true,
     notifications: { taskStarted: false, taskCompleted: true, failures: true },
   });
   assert.equal(JSON.parse(await readFile(join(directory, 'projects.json'), 'utf8')).schemaVersion, 2);
   assert.equal(JSON.parse(await readFile(join(directory, 'chats.json'), 'utf8')).schemaVersion, 1);
   assert.equal(await readFile(join(directory, 'chats.json.bak'), 'utf8'), await readFile(join(directory, 'chats.json'), 'utf8'));
-  assert.equal(JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')).schemaVersion, 5);
-  assert.equal(JSON.parse(await readFile(join(directory, 'settings.json'), 'utf8')).schemaVersion, 6);
+  assert.equal(JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')).schemaVersion, 6);
+  assert.equal(JSON.parse(await readFile(join(directory, 'settings.json'), 'utf8')).schemaVersion, 7);
   await store.deleteChat(chat.id);
   assert.deepEqual(await (await openStore(directory)).listChats(), []);
 });
@@ -109,7 +116,7 @@ test('migrates v2 chats with archive and draft without changing their UUIDs', as
     pinned: true, archived: true, createdAt: timestamp, updatedAt: timestamp, draft: 'Текст', kind: 'image' };
   await writeFile(join(directory, 'chats.json'), JSON.stringify({ schemaVersion: 2, chats: [chat] }));
   const store = await openStore(directory);
-  assert.deepEqual(await store.getChat(chat.id), { ...chat, nextTurnPermissionProfile: null, nextTurnSkillId: null, messages: [], artifacts: [] });
+  assert.deepEqual(await store.getChat(chat.id), { ...chat, nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [] });
   assert.equal((await store.listChats())[0]?.id, chat.id);
   assert.equal((await (await openStore(directory)).getChat(chat.id)).draft, 'Текст');
 });
@@ -158,7 +165,7 @@ test('migrates existing chat detail schema 3 and preserves its draft', async (t)
   assert.equal((await restored.getChat(chat.id)).draft, 'Сохранённый черновик');
   assert.equal((await restored.getChat(chat.id)).nextTurnPermissionProfile, null);
   const migrated = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  assert.equal(migrated.schemaVersion, 5);
+  assert.equal(migrated.schemaVersion, 6);
   assert.equal(migrated.nextTurnPermissionProfile, null);
   assert.equal(migrated.nextTurnSkillId, null);
 });
@@ -182,7 +189,29 @@ test('migrates chat detail schema 4 to 5 without changing history or artifacts',
   assert.equal(detail.nextTurnSkillId, null);
   assert.equal(detail.draft, 'Черновик');
   assert.equal(detail.messages[0]?.text, 'Сохранённая история');
-  assert.equal(JSON.parse(await readFile(path, 'utf8')).schemaVersion, 5);
+  assert.equal(JSON.parse(await readFile(path, 'utf8')).schemaVersion, 6);
+});
+
+test('migrates previous settings and chat schemas with an empty model choice', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-model-migration-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const chatPath = join(directory, 'chats', chat.id, 'chat.json');
+  const settingsPath = join(directory, 'settings.json');
+  const oldChat = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown>;
+  const oldSettings = JSON.parse(await readFile(settingsPath, 'utf8')) as { schemaVersion: number; settings: Record<string, unknown> };
+  oldChat.schemaVersion = 5;
+  delete oldChat.modelId;
+  oldSettings.schemaVersion = 6;
+  delete oldSettings.settings.defaultModelId;
+  await writeFile(chatPath, JSON.stringify(oldChat));
+  await writeFile(settingsPath, JSON.stringify(oldSettings));
+  const restored = await openStore(directory);
+  assert.equal((await restored.getChat(chat.id)).modelId, null);
+  assert.equal((await restored.getSettings()).defaultModelId, null);
+  assert.equal(JSON.parse(await readFile(chatPath, 'utf8')).schemaVersion, 6);
+  assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).schemaVersion, 7);
 });
 
 test('imports copies, preserves originals and archived files, and removes only chat copies', async (t) => {
@@ -248,6 +277,7 @@ test('preserves the appearance of old dark settings and allows the new dark them
   const store = await openStore(directory);
   assert.deepEqual(await store.getSettings(), {
     ...oldSettings,
+    defaultModelId: null,
     theme: 'emerald',
     onboardingCompleted: true,
     notifications: { taskStarted: false, taskCompleted: true, failures: true },
@@ -255,7 +285,7 @@ test('preserves the appearance of old dark settings and allows the new dark them
   await store.updateSettings({ theme: 'dark' });
   const restored = await openStore(directory);
   assert.equal((await restored.getSettings()).theme, 'dark');
-  assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).schemaVersion, 6);
+  assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).schemaVersion, 7);
 });
 
 test('new profile starts onboarding; migrated profiles do not restart it', async (t) => {
@@ -280,7 +310,7 @@ test('new profile starts onboarding; migrated profiles do not restart it', async
   }));
   const existing = await openStore(existingDirectory);
   assert.equal((await existing.getSettings()).onboardingCompleted, true);
-  assert.equal(JSON.parse(await readFile(join(existingDirectory, 'settings.json'), 'utf8')).schemaVersion, 6);
+  assert.equal(JSON.parse(await readFile(join(existingDirectory, 'settings.json'), 'utf8')).schemaVersion, 7);
 });
 
 test('counts real local chat, project, and message activity days without counting drafts', async (t) => {

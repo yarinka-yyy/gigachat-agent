@@ -11,7 +11,7 @@
     "prepackage": "node scripts/build-local-runtime.mjs && node scripts/prepare-voice-resources.mjs",
     "package": "electron-forge package",
     "premake": "node scripts/build-local-runtime.mjs && node scripts/prepare-voice-resources.mjs && node scripts/prepare-squirrel-vendor.mjs",
-    "test": "tsx --test src/store.test.ts src/instruction-autosave.test.ts src/permissions.test.ts src/local-tools.test.ts src/instructions.test.ts src/commands.test.ts src/runtime.test.ts src/skills.test.ts src/hooks.test.ts src/secure-store.test.ts src/onboarding-browser.test.ts src/voice.test.ts",
+    "test": "tsx --test src/store.test.ts src/instruction-autosave.test.ts src/permissions.test.ts src/custom-permissions.test.ts src/local-tools.test.ts src/instructions.test.ts src/commands.test.ts src/runtime.test.ts src/skills.test.ts src/hooks.test.ts src/secure-store.test.ts src/onboarding-browser.test.ts src/voice.test.ts",
     "make": "electron-forge make",
     "prepublish": "node scripts/build-local-runtime.mjs && node scripts/prepare-voice-resources.mjs",
     "publish": "electron-forge publish",
@@ -46,6 +46,7 @@
     "typescript": "~6.0.3"
   },
   "dependencies": {
+    "@iarna/toml": "^2.2.5",
     "electron-squirrel-startup": "^1.0.1",
     "lucide-react": "^1.48.0",
     "react": "^19.3.0",
