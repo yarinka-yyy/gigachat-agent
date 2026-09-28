@@ -23,6 +23,10 @@ test('persists projects, chats, relationships, drafts, image kind, and settings'
     theme: 'warm',
     sidebarTransparent: true,
     sidebarVisible: false,
+    sidebarWidthPx: 320,
+    browserPaneOpen: true,
+    browserTabs: [{ id: 'tab-one', title: 'Пример', url: 'https://example.com/' }],
+    browserActiveTabId: 'tab-one',
     defaultProjectsFolder: 'C:\\projects',
     preferredOpener: 'explorer',
     defaultPermissionProfile: 'approve',
@@ -47,6 +51,10 @@ test('persists projects, chats, relationships, drafts, image kind, and settings'
     theme: 'warm',
     sidebarTransparent: true,
     sidebarVisible: false,
+    sidebarWidthPx: 320,
+    browserPaneOpen: true,
+    browserTabs: [{ id: 'tab-one', title: 'Пример', url: 'https://example.com/' }],
+    browserActiveTabId: 'tab-one',
     defaultProjectsFolder: 'C:\\projects',
     preferredOpener: 'explorer',
     defaultPermissionProfile: 'approve',
@@ -95,6 +103,10 @@ test('migrates v1 projects, chats, drafts, and theme without losing data', async
     theme: 'emerald',
     sidebarTransparent: false,
     sidebarVisible: true,
+    sidebarWidthPx: null,
+    browserPaneOpen: false,
+    browserTabs: [],
+    browserActiveTabId: null,
     defaultProjectsFolder: null,
     preferredOpener: 'system',
     defaultPermissionProfile: 'ask',
@@ -107,7 +119,7 @@ test('migrates v1 projects, chats, drafts, and theme without losing data', async
   assert.equal(JSON.parse(await readFile(join(directory, 'chats.json'), 'utf8')).schemaVersion, 1);
   assert.equal(await readFile(join(directory, 'chats.json.bak'), 'utf8'), await readFile(join(directory, 'chats.json'), 'utf8'));
   assert.equal(JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')).schemaVersion, 6);
-  assert.equal(JSON.parse(await readFile(join(directory, 'settings.json'), 'utf8')).schemaVersion, 8);
+  assert.equal(JSON.parse(await readFile(join(directory, 'settings.json'), 'utf8')).schemaVersion, 9);
   await store.deleteChat(chat.id);
   assert.deepEqual(await (await openStore(directory)).listChats(), []);
 });
@@ -215,7 +227,7 @@ test('migrates previous settings and chat schemas with an empty model choice', a
   assert.equal((await restored.getSettings()).defaultModelId, null);
   assert.equal((await restored.getSettings()).microphoneConsent, 'unasked');
   assert.equal(JSON.parse(await readFile(chatPath, 'utf8')).schemaVersion, 6);
-  assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).schemaVersion, 8);
+  assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).schemaVersion, 9);
 });
 
 test('imports copies, preserves originals and archived files, and removes only chat copies', async (t) => {
@@ -285,12 +297,16 @@ test('preserves the appearance of old dark settings and allows the new dark them
     theme: 'emerald',
     onboardingCompleted: true,
     microphoneConsent: 'unasked',
+    sidebarWidthPx: null,
+    browserPaneOpen: false,
+    browserTabs: [],
+    browserActiveTabId: null,
     notifications: { taskStarted: false, taskCompleted: true, failures: true },
   });
   await store.updateSettings({ theme: 'dark' });
   const restored = await openStore(directory);
   assert.equal((await restored.getSettings()).theme, 'dark');
-  assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).schemaVersion, 8);
+  assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).schemaVersion, 9);
 });
 
 test('new profile starts onboarding; migrated profiles do not restart it', async (t) => {
@@ -316,7 +332,7 @@ test('new profile starts onboarding; migrated profiles do not restart it', async
   const existing = await openStore(existingDirectory);
   assert.equal((await existing.getSettings()).onboardingCompleted, true);
   assert.equal((await existing.getSettings()).microphoneConsent, 'unasked');
-  assert.equal(JSON.parse(await readFile(join(existingDirectory, 'settings.json'), 'utf8')).schemaVersion, 8);
+  assert.equal(JSON.parse(await readFile(join(existingDirectory, 'settings.json'), 'utf8')).schemaVersion, 9);
 });
 
 test('migrates microphone consent and preserves a later choice', async (t) => {
@@ -333,6 +349,27 @@ test('migrates microphone consent and preserves a later choice', async (t) => {
   await store.updateSettings({ microphoneConsent: 'declined' });
   assert.equal((await (await openStore(directory)).getSettings()).microphoneConsent, 'declined');
   await assert.rejects(store.updateSettings({ microphoneConsent: 'invalid' } as never));
+});
+
+test('migrates settings schema 8 to browser and sidebar defaults', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-browser-settings-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const settingsPath = join(directory, 'settings.json');
+  await openStore(directory);
+  const previous = JSON.parse(await readFile(settingsPath, 'utf8')) as { schemaVersion: number; settings: Record<string, unknown> };
+  previous.schemaVersion = 8;
+  delete previous.settings.sidebarWidthPx;
+  delete previous.settings.browserPaneOpen;
+  delete previous.settings.browserTabs;
+  delete previous.settings.browserActiveTabId;
+  await writeFile(settingsPath, JSON.stringify(previous));
+  const store = await openStore(directory);
+  const settings = await store.getSettings();
+  assert.equal(settings.sidebarWidthPx, null);
+  assert.equal(settings.browserPaneOpen, false);
+  assert.deepEqual(settings.browserTabs, []);
+  assert.equal(settings.browserActiveTabId, null);
+  assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).schemaVersion, 9);
 });
 
 test('counts real local chat, project, and message activity days without counting drafts', async (t) => {

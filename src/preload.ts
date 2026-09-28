@@ -4,6 +4,7 @@ import type {
   AppInfo,
   LocalUsageStats,
   BrowserBounds,
+  EmbeddedBrowserStatus,
   ChatDetail,
   ChatSummary,
   ChatKind,
@@ -88,6 +89,22 @@ const api: AppApi = {
       const handler = (_event: Electron.IpcRendererEvent, status: OnboardingBrowserStatus): void => listener(status);
       ipcRenderer.on('onboarding:browser-status', handler);
       return () => ipcRenderer.removeListener('onboarding:browser-status', handler);
+    },
+  },
+  browser: {
+    getStatus: () => ipcRenderer.invoke('browser:status') as Promise<EmbeddedBrowserStatus>,
+    newTab: () => ipcRenderer.invoke('browser:new-tab') as Promise<EmbeddedBrowserStatus>,
+    closeTab: (id) => ipcRenderer.invoke('browser:close-tab', id) as Promise<EmbeddedBrowserStatus>,
+    activateTab: (id) => ipcRenderer.invoke('browser:activate-tab', id) as Promise<EmbeddedBrowserStatus>,
+    navigate: (input) => ipcRenderer.invoke('browser:navigate', input) as Promise<EmbeddedBrowserStatus>,
+    back: () => ipcRenderer.invoke('browser:back') as Promise<void>,
+    forward: () => ipcRenderer.invoke('browser:forward') as Promise<void>,
+    reload: () => ipcRenderer.invoke('browser:reload') as Promise<void>,
+    setBounds: (bounds: BrowserBounds | null) => ipcRenderer.invoke('browser:bounds', bounds) as Promise<void>,
+    onStatus: (listener) => {
+      const handler = (_event: Electron.IpcRendererEvent, status: EmbeddedBrowserStatus): void => listener(status);
+      ipcRenderer.on('browser:status', handler);
+      return () => ipcRenderer.removeListener('browser:status', handler);
     },
   },
   voice: {

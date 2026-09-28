@@ -15,6 +15,7 @@ import { createSkillRegistry, isSkillId } from './skills';
 import { createHookRegistry } from './hooks';
 import { createSecureStore } from './secure-store';
 import { createOnboardingBrowser, type BrowserBounds } from './onboarding-browser';
+import { createEmbeddedBrowser } from './embedded-browser';
 import { createVoiceRuntime, VOICE_MAX_OUTPUT_BYTES, type VoiceRuntime } from './voice';
 
 if (require('electron-squirrel-startup')) {
@@ -26,6 +27,7 @@ declare const MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY: string;
 
 let mainWindow: BrowserWindow | null = null;
 let onboardingBrowser: ReturnType<typeof createOnboardingBrowser> | null = null;
+let embeddedBrowser: ReturnType<typeof createEmbeddedBrowser> | null = null;
 let currentTheme: Theme = 'emerald';
 let allowClose = false;
 let deletingAppData = false;
@@ -208,7 +210,7 @@ function requireId(value: unknown): string {
 
 function requireSettingsPatch(value: unknown): SettingsPatch {
   if (!isRecord(value)) throw new Error('Некорректные настройки.');
-  const allowedFields = ['theme', 'sidebarTransparent', 'sidebarVisible', 'defaultProjectsFolder', 'preferredOpener', 'defaultPermissionProfile', 'defaultModelId', 'onboardingCompleted', 'notifications'];
+  const allowedFields = ['theme', 'sidebarTransparent', 'sidebarVisible', 'sidebarWidthPx', 'browserPaneOpen', 'defaultProjectsFolder', 'preferredOpener', 'defaultPermissionProfile', 'defaultModelId', 'onboardingCompleted', 'notifications'];
   if (Object.keys(value).some((key) => !allowedFields.includes(key))) throw new Error('Недопустимое поле настроек.');
   if ('defaultPermissionProfile' in value) requirePermissionProfile(value.defaultPermissionProfile);
   if ('defaultModelId' in value && value.defaultModelId !== null) requireModelId(value.defaultModelId);
@@ -625,6 +627,7 @@ async function registerIpcHandlers(
   mainRuntime: MainRuntimeBundle,
   secureStore: ReturnType<typeof createSecureStore>,
   browser: ReturnType<typeof createOnboardingBrowser>,
+  userBrowser: ReturnType<typeof createEmbeddedBrowser>,
   customPermissions: Awaited<ReturnType<typeof openCustomPermissions>>,
   approvals: ReturnType<typeof createPermissionApprovals>,
 ): Promise<void> {
@@ -792,6 +795,19 @@ async function registerIpcHandlers(
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('onboarding:browser-status', status);
   });
 
+  handle('browser:status', () => userBrowser.getStatus());
+  handle('browser:new-tab', () => userBrowser.newTab());
+  handle('browser:close-tab', (id) => userBrowser.closeTab(requireId(id)));
+  handle('browser:activate-tab', (id) => userBrowser.activateTab(requireId(id)));
+  handle('browser:navigate', (input) => userBrowser.navigate(requireText(input, 'Адрес или запрос', 4096)));
+  handle('browser:back', () => userBrowser.back());
+  handle('browser:forward', () => userBrowser.forward());
+  handle('browser:reload', () => userBrowser.reload());
+  handle('browser:bounds', (bounds) => userBrowser.setBounds(bounds === null ? null : requireBrowserBounds(bounds)));
+  userBrowser.onStatus((status) => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('browser:status', status);
+  });
+
   handle('settings:get', () => store.getSettings());
   handle('usage:local-stats', () => store.getLocalUsageStats());
   handle('settings:update', async (patchInput) => {
@@ -851,6 +867,8 @@ async function registerIpcHandlers(
   handle('app:close-ready', async () => {
     await runtime.cancelAll();
     await voiceRuntime?.cancelAll();
+    await userBrowser.flush();
+    userBrowser.destroy();
     await browser.close();
     allowClose = true;
     mainWindow?.close();
@@ -945,6 +963,7 @@ const createWindow = (): void => {
     approvalBroker?.cancelAll();
     mainWindow = null;
     void onboardingBrowser?.close();
+    embeddedBrowser?.destroy();
   });
   void window.loadURL(MAIN_WINDOW_WEBPACK_ENTRY);
 };
@@ -993,10 +1012,16 @@ void app.whenReady().then(async () => {
       createSession: (partition) => session.fromPartition(partition),
       createView: (options) => new WebContentsView(options),
     });
-    currentTheme = (await store.getSettings()).theme;
+    const initialSettings = await store.getSettings();
+    embeddedBrowser = createEmbeddedBrowser(() => mainWindow, {
+      createSession: (partition) => session.fromPartition(partition),
+      createView: (options) => new WebContentsView(options),
+      persist: (tabs, activeTabId) => store.updateSettings({ browserTabs: tabs, browserActiveTabId: activeTabId }),
+    }, initialSettings.browserTabs, initialSettings.browserActiveTabId);
+    currentTheme = initialSettings.theme;
     nativeTheme.on('updated', syncTitleBarOverlay);
     const mainRuntime = await createMainRuntime(store, customPermissions, approvals);
-    await registerIpcHandlers(store, mainRuntime, secureStore, onboardingBrowser, customPermissions, approvals);
+    await registerIpcHandlers(store, mainRuntime, secureStore, onboardingBrowser, embeddedBrowser, customPermissions, approvals);
     createWindow();
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Неизвестная ошибка локальных данных.';

@@ -3,7 +3,7 @@ import { Buffer } from 'node:buffer';
 import { constants } from 'node:fs';
 import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, sep } from 'node:path';
-import { DEFAULT_NOTIFICATION_SETTINGS, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type Settings, type SettingsPatch, type Theme } from './contracts';
+import { DEFAULT_NOTIFICATION_SETTINGS, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type Settings, type SettingsPatch, type Theme } from './contracts';
 import { requirePermissionProfile } from './permissions';
 import { requireModelId } from './models';
 import { isSkillId } from './skills';
@@ -11,7 +11,7 @@ import { isSkillId } from './skills';
 type ProjectFile = { schemaVersion: 2; projects: Project[] };
 type LegacyChat = ChatSummary & { draft: string };
 type ChatFile = { schemaVersion: 2; chats: LegacyChat[] };
-type SettingsFile = { schemaVersion: 8; settings: Settings };
+type SettingsFile = { schemaVersion: 9; settings: Settings };
 
 const MAX_IMPORTED_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_INSTRUCTION_BYTES = 64 * 1024;
@@ -135,10 +135,40 @@ function validateNotificationSettings(value: unknown): NotificationSettings {
   return { taskStarted: value.taskStarted, taskCompleted: value.taskCompleted, failures: value.failures };
 }
 
-function validateSettings(value: unknown, version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8): Settings {
+function requireSidebarWidth(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 242 || value > 440) {
+    throw new Error('Некорректная ширина боковой панели.');
+  }
+  return value;
+}
+
+function validateBrowserTabs(value: unknown): BrowserTabRecord[] {
+  if (!Array.isArray(value) || value.length > 20) throw new Error('Некорректные вкладки браузера.');
+  const tabs = value.map((item): BrowserTabRecord => {
+    if (!isRecord(item) || typeof item.id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(item.id)
+      || typeof item.title !== 'string' || item.title.length > 160 || typeof item.url !== 'string' || item.url.length > 4096) {
+      throw new Error('Некорректная вкладка браузера.');
+    }
+    if (item.url) {
+      let url: URL;
+      try { url = new URL(item.url); } catch { throw new Error('Некорректный адрес вкладки.'); }
+      if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('Недопустимый адрес вкладки.');
+    }
+    return { id: item.id, title: item.title, url: item.url };
+  });
+  if (new Set(tabs.map((tab) => tab.id)).size !== tabs.length) throw new Error('Повтор вкладки браузера.');
+  return tabs;
+}
+
+function validateSettings(value: unknown, version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9): Settings {
   if (!isRecord(value)) throw new Error('Settings record is invalid.');
-  if (version === 8 && value.microphoneConsent !== 'unasked' && value.microphoneConsent !== 'allowed' && value.microphoneConsent !== 'declined') {
+  if (version >= 8 && value.microphoneConsent !== 'unasked' && value.microphoneConsent !== 'allowed' && value.microphoneConsent !== 'declined') {
     throw new Error('Некорректное разрешение микрофона.');
+  }
+  const browserTabs = version >= 9 ? validateBrowserTabs(value.browserTabs) : [];
+  const activeTabId = version >= 9 ? value.browserActiveTabId : null;
+  if (activeTabId !== null && (typeof activeTabId !== 'string' || !browserTabs.some((tab) => tab.id === activeTabId))) {
+    throw new Error('Некорректная активная вкладка браузера.');
   }
   const theme = validateTheme(value.theme);
   const migratedTheme = version < 3 && theme === 'dark' ? 'emerald' : theme;
@@ -147,6 +177,10 @@ function validateSettings(value: unknown, version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8
       theme: migratedTheme,
       sidebarTransparent: false,
       sidebarVisible: true,
+      sidebarWidthPx: null,
+      browserPaneOpen: false,
+      browserTabs: [],
+      browserActiveTabId: null,
       defaultProjectsFolder: null,
       preferredOpener: 'system',
       defaultPermissionProfile: 'ask',
@@ -163,6 +197,10 @@ function validateSettings(value: unknown, version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8
     theme: migratedTheme,
     sidebarTransparent: requireBoolean(value.sidebarTransparent, 'Прозрачность боковой панели'),
     sidebarVisible: requireBoolean(value.sidebarVisible, 'Видимость боковой панели'),
+    sidebarWidthPx: version >= 9 && value.sidebarWidthPx !== null ? requireSidebarWidth(value.sidebarWidthPx) : null,
+    browserPaneOpen: version >= 9 ? requireBoolean(value.browserPaneOpen, 'Видимость браузера') : false,
+    browserTabs,
+    browserActiveTabId: activeTabId as string | null,
     defaultProjectsFolder: requireFolderPath(value.defaultProjectsFolder, 'Папка проектов'),
     preferredOpener: value.preferredOpener,
     defaultPermissionProfile: version >= 4 ? requirePermissionProfile(value.defaultPermissionProfile) : 'ask',
@@ -356,38 +394,38 @@ function parseSettingsFile(value: unknown): Loaded<SettingsFile> {
   if (!isRecord(value)) throw new Error('Invalid settings file.');
   if (value.schemaVersion === 1) {
     return {
-      value: { schemaVersion: 8, settings: validateSettings(value.settings, 1) },
+      value: { schemaVersion: 9, settings: validateSettings(value.settings, 1) },
       needsWrite: true,
     };
   }
   if (value.schemaVersion === 2) {
     return {
-      value: { schemaVersion: 8, settings: validateSettings(value.settings, 2) },
+      value: { schemaVersion: 9, settings: validateSettings(value.settings, 2) },
       needsWrite: true,
     };
   }
   if (value.schemaVersion === 3) {
     return {
-      value: { schemaVersion: 8, settings: validateSettings(value.settings, 3) },
+      value: { schemaVersion: 9, settings: validateSettings(value.settings, 3) },
       needsWrite: true,
     };
   }
   if (value.schemaVersion === 4) {
     return {
-      value: { schemaVersion: 8, settings: validateSettings(value.settings, 4) },
+      value: { schemaVersion: 9, settings: validateSettings(value.settings, 4) },
       needsWrite: true,
     };
   }
   if (value.schemaVersion === 5) {
     return {
-      value: { schemaVersion: 8, settings: validateSettings(value.settings, 5) },
+      value: { schemaVersion: 9, settings: validateSettings(value.settings, 5) },
       needsWrite: true,
     };
   }
-  if (value.schemaVersion === 6 || value.schemaVersion === 7) return { value: { schemaVersion: 8, settings: validateSettings(value.settings, value.schemaVersion) }, needsWrite: true };
-  if (value.schemaVersion !== 8) throw new Error('Unknown settings file version.');
+  if (value.schemaVersion === 6 || value.schemaVersion === 7 || value.schemaVersion === 8) return { value: { schemaVersion: 9, settings: validateSettings(value.settings, value.schemaVersion) }, needsWrite: true };
+  if (value.schemaVersion !== 9) throw new Error('Unknown settings file version.');
   return {
-    value: { schemaVersion: 8, settings: validateSettings(value.settings, 8) },
+    value: { schemaVersion: 9, settings: validateSettings(value.settings, 9) },
     needsWrite: false,
   };
 }
@@ -435,6 +473,10 @@ function validateSettingsPatch(value: unknown): SettingsPatch {
     if (key === 'theme') patch.theme = validateTheme(item);
     else if (key === 'sidebarTransparent') patch.sidebarTransparent = requireBoolean(item, 'Прозрачность боковой панели');
     else if (key === 'sidebarVisible') patch.sidebarVisible = requireBoolean(item, 'Видимость боковой панели');
+    else if (key === 'sidebarWidthPx') patch.sidebarWidthPx = item === null ? null : requireSidebarWidth(item);
+    else if (key === 'browserPaneOpen') patch.browserPaneOpen = requireBoolean(item, 'Видимость браузера');
+    else if (key === 'browserTabs') patch.browserTabs = validateBrowserTabs(item);
+    else if (key === 'browserActiveTabId') patch.browserActiveTabId = item === null ? null : requireId(item);
     else if (key === 'defaultProjectsFolder') patch.defaultProjectsFolder = requireFolderPath(item, 'Папка проектов');
     else if (key === 'preferredOpener' && (item === 'system' || item === 'explorer' || item === 'detected-app')) {
       patch.preferredOpener = item;
@@ -501,11 +543,15 @@ export async function openStore(directory: string): Promise<LocalStore> {
   const [projectFile, settingsFile] = await Promise.all([
     loadVersioned<ProjectFile>(projectPath, { schemaVersion: 2, projects: [] }, parseProjectFile),
     loadVersioned<SettingsFile>(settingsPath, {
-      schemaVersion: 8,
+      schemaVersion: 9,
       settings: {
         theme: 'emerald',
         sidebarTransparent: false,
         sidebarVisible: true,
+        sidebarWidthPx: null,
+        browserPaneOpen: false,
+        browserTabs: [],
+        browserActiveTabId: null,
         defaultProjectsFolder: null,
         preferredOpener: 'system',
         defaultPermissionProfile: 'ask',
@@ -616,7 +662,7 @@ export async function openStore(directory: string): Promise<LocalStore> {
     return chat;
   };
   const saveSettings = async (next: Settings): Promise<void> => {
-    await writeOwnedAtomic(settingsPath, { schemaVersion: 8, settings: next });
+    await writeOwnedAtomic(settingsPath, { schemaVersion: 9, settings: next });
     settings = next;
   };
   const projectInstructionsPath = (idInput: unknown): string => {
@@ -801,7 +847,7 @@ export async function openStore(directory: string): Promise<LocalStore> {
     getSettings: () => serialize(async () => ({ ...settings })),
     updateSettings: (patchInput) => serialize(async () => {
       const patch = validateSettingsPatch(patchInput);
-      const next = { ...settings, ...patch };
+      const next = validateSettings({ ...settings, ...patch }, 9);
       await saveSettings(next);
       return { ...settings };
     }),

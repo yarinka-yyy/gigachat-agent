@@ -1,4 +1,4 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
 import {
   Archive,
   ArrowLeft,
@@ -28,6 +28,7 @@ import {
   MoreHorizontal,
   Palette,
   PanelLeft,
+  PanelRight,
   Pin,
   PlugZap,
   Plus,
@@ -81,6 +82,8 @@ import { createInstructionAutosave, type SaveStatus } from './instruction-autosa
 import ConnectionSetup from './components/ConnectionSetup';
 import VoiceCaptureControl, { getCaptureError } from './components/VoiceCaptureControl';
 import ContextRing from './components/ContextRing';
+import BrowserPanel from './components/BrowserPanel';
+import { createPreviewExitTimer, maxSidebarWidth as computeMaxSidebarWidth } from './sidebar-behavior';
 
 type Page = 'home' | 'chat' | 'project' | 'settings' | 'onboarding' | 'images' | 'video' | 'podcasts' | 'archive' | 'profile';
 type Route = { page: Page; id?: string };
@@ -101,7 +104,7 @@ type SettingsSection =
   | 'advanced'
   | 'archive';
 type IconName =
-  | 'panel' | 'back' | 'forward' | 'plus' | 'image' | 'video' | 'podcast' | 'folder'
+  | 'panel' | 'panelRight' | 'back' | 'forward' | 'plus' | 'image' | 'video' | 'podcast' | 'folder'
   | 'chat' | 'settings' | 'archive' | 'send' | 'mic' | 'audio' | 'chevron' | 'sun'
   | 'moon' | 'system' | 'user' | 'sparkle' | 'x' | 'pin' | 'trash' | 'edit' | 'check'
   | 'external' | 'folderOpen' | 'shield' | 'gauge' | 'wrench' | 'puzzle' | 'globe'
@@ -111,6 +114,7 @@ type PageIcon = { id: SettingsSection; label: string; icon: IconName };
 
 const ICONS: Record<IconName, LucideIcon> = {
   panel: PanelLeft,
+  panelRight: PanelRight,
   back: ArrowLeft,
   forward: ArrowRight,
   plus: Plus,
@@ -176,6 +180,10 @@ const DEFAULT_SETTINGS: Settings = {
   theme: 'emerald',
   sidebarTransparent: false,
   sidebarVisible: true,
+  sidebarWidthPx: null,
+  browserPaneOpen: false,
+  browserTabs: [],
+  browserActiveTabId: null,
   defaultProjectsFolder: null,
   preferredOpener: 'system',
   defaultPermissionProfile: 'ask',
@@ -216,6 +224,26 @@ const APPROVAL_ACTION_LABELS = {
 function Icon({ name, className = '' }: { name: IconName; className?: string }) {
   const Component = ICONS[name];
   return <Component className={className ? `icon ${className}` : 'icon'} aria-hidden="true" focusable="false" strokeWidth={1.8} />;
+}
+
+function ScrollingRowTitle({ value, pinned = false }: { value: string; pinned?: boolean }) {
+  const viewportRef = useRef<HTMLSpanElement>(null);
+  const textRef = useRef<HTMLSpanElement>(null);
+  const [overflow, setOverflow] = useState(0);
+  useLayoutEffect(() => {
+    const viewport = viewportRef.current;
+    const text = textRef.current;
+    if (!viewport || !text) return;
+    const measure = () => setOverflow(Math.max(0, Math.ceil(text.scrollWidth - viewport.clientWidth + (pinned ? 0 : 60))));
+    const observer = new ResizeObserver(measure);
+    observer.observe(viewport);
+    observer.observe(text);
+    measure();
+    return () => observer.disconnect();
+  }, [value, pinned]);
+  return <span ref={viewportRef} className="list-row-title-viewport" title={value}>
+    <span ref={textRef} className="list-row-title" style={{ '--title-shift': `${overflow}px`, '--title-duration': `${Math.max(1.8, overflow / 40)}s` } as CSSProperties}>{value}</span>
+  </span>;
 }
 
 function ActionMenu({ children, label, trigger, className = '', placement = 'side', initialFocus, onOpen, disabled = false }: {
@@ -505,6 +533,8 @@ export default function App() {
   const [runtimeMode, setRuntimeMode] = useState<'api' | 'web'>('api');
   const [navigation, setNavigation] = useState<Navigation>({ history: [{ page: 'home' }], index: 0 });
   const [sidebarPreview, setSidebarPreview] = useState(false);
+  const [sidebarDragWidth, setSidebarDragWidth] = useState<number | null>(null);
+  const [sidebarDragging, setSidebarDragging] = useState(false);
   const [compactLayout, setCompactLayout] = useState(() => window.innerWidth <= 720);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>('general');
   const [showAllProjects, setShowAllProjects] = useState(false);
@@ -570,6 +600,9 @@ export default function App() {
   const routeRef = useRef<Route>({ page: 'home' });
   const settingsRevision = useRef(0);
   const sidebarButtonRef = useRef<HTMLButtonElement>(null);
+  const workspaceRef = useRef<HTMLDivElement>(null);
+  const sidebarRef = useRef<HTMLElement>(null);
+  const previewCloseTimer = useRef(createPreviewExitTimer(window.setTimeout.bind(window), window.clearTimeout.bind(window)));
   const firstRunMicrophonePrompt = useRef(false);
 
   function resizeComposer(): void {
@@ -589,6 +622,54 @@ export default function App() {
     input.style.transition = '';
     input.style.height = `${next}px`;
     input.style.overflowY = naturalHeight > maximum ? 'auto' : 'hidden';
+  }
+
+  function clearPreviewClose(): void {
+    previewCloseTimer.current.clear();
+  }
+
+  function closePreview(): void {
+    clearPreviewClose();
+    setSidebarPreview(false);
+  }
+
+  function schedulePreviewClose(): void {
+    previewCloseTimer.current.schedule(() => {
+      if (!sidebarRef.current?.contains(document.activeElement)) setSidebarPreview(false);
+    });
+  }
+
+  function maxSidebarWidth(): number {
+    const width = workspaceRef.current?.clientWidth ?? window.innerWidth;
+    const composerWidth = mainPanelRef.current?.querySelector<HTMLElement>('.composer')?.getBoundingClientRect().width ?? 0;
+    return computeMaxSidebarWidth(width, composerWidth);
+  }
+
+  function startSidebarDrag(event: React.PointerEvent<HTMLDivElement>): void {
+    if (event.button !== 0 || compactLayout || !settings.sidebarVisible) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = sidebarRef.current?.getBoundingClientRect().width ?? 264;
+    const maximum = maxSidebarWidth();
+    const divider = event.currentTarget;
+    divider.setPointerCapture(event.pointerId);
+    setSidebarDragging(true);
+    const move = (moveEvent: PointerEvent) => setSidebarDragWidth(Math.max(0, Math.min(maximum, startWidth + moveEvent.clientX - startX)));
+    const stop = (stopEvent: PointerEvent) => {
+      divider.removeEventListener('pointermove', move);
+      divider.removeEventListener('pointerup', stop);
+      divider.removeEventListener('pointercancel', stop);
+      if (divider.hasPointerCapture(stopEvent.pointerId)) divider.releasePointerCapture(stopEvent.pointerId);
+      const width = Math.max(0, Math.min(maximum, startWidth + stopEvent.clientX - startX));
+      setSidebarDragWidth(null);
+      setSidebarDragging(false);
+      if (stopEvent.type === 'pointercancel') return;
+      if (width <= 180) void updateLocalSettings({ sidebarVisible: false });
+      else void updateLocalSettings({ sidebarWidthPx: Math.max(242, Math.round(width)) });
+    };
+    divider.addEventListener('pointermove', move);
+    divider.addEventListener('pointerup', stop);
+    divider.addEventListener('pointercancel', stop);
   }
 
   function setNotice(value: string): void {
@@ -774,20 +855,27 @@ export default function App() {
   useEffect(() => {
     const update = () => {
       setCompactLayout(window.innerWidth <= 720);
-      setSidebarPreview(false);
+      closePreview();
     };
     window.addEventListener('resize', update);
     return () => window.removeEventListener('resize', update);
   }, []);
 
   useEffect(() => {
-    if (!compactLayout || !sidebarPreview) return;
+    if (!sidebarPreview) return;
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setSidebarPreview(false);
+      if (event.key === 'Escape') closePreview();
     };
+    const closeOnWindowBlur = () => closePreview();
     window.addEventListener('keydown', closeOnEscape);
-    return () => window.removeEventListener('keydown', closeOnEscape);
-  }, [compactLayout, sidebarPreview]);
+    window.addEventListener('blur', closeOnWindowBlur);
+    return () => {
+      window.removeEventListener('keydown', closeOnEscape);
+      window.removeEventListener('blur', closeOnWindowBlur);
+    };
+  }, [sidebarPreview]);
+
+  useEffect(() => () => clearPreviewClose(), []);
 
   useEffect(() => {
     if (route.page === 'settings') {
@@ -984,7 +1072,7 @@ export default function App() {
   function navigate(next: Route): void {
     routeRef.current = next;
     if (next.page !== 'chat') homeChatId.current = null;
-    setSidebarPreview(false);
+    closePreview();
     setNavigation((current) => {
       const entries = current.history.slice(0, current.index + 1);
       if (sameRoute(entries[entries.length - 1], next)) return current;
@@ -994,7 +1082,7 @@ export default function App() {
   }
 
   function openSettings(section: SettingsSection = 'general'): void {
-    setSidebarPreview(false);
+    closePreview();
     setSettingsSection(section);
     routeRef.current = { page: 'settings' };
     setNavigation((current) => {
@@ -1006,13 +1094,13 @@ export default function App() {
   }
 
   function moveHistory(delta: -1 | 1): void {
+    closePreview();
     setNavigation((current) => {
       const index = Math.max(0, Math.min(current.history.length - 1, current.index + delta));
       const next = current.history[index];
       if (!next) return current;
       routeRef.current = next;
       if (next.page !== 'chat') homeChatId.current = null;
-      setSidebarPreview(false);
       return { ...current, index };
     });
   }
@@ -1441,7 +1529,7 @@ export default function App() {
 
   async function toggleSidebar(): Promise<void> {
     const next = !settings.sidebarVisible;
-    setSidebarPreview(false);
+    closePreview();
     await updateLocalSettings({ sidebarVisible: next });
   }
 
@@ -1830,11 +1918,6 @@ export default function App() {
       case 'chat':
         return selectedChat ? (
           <section className="chat-view">
-            <div className="chat-intro">
-              <span className="eyebrow">{selectedChat.kind === 'image' ? 'Чат изображений · локально' : 'Локальная история'}</span>
-              <h1>{selectedChat.title}</h1>
-              <p>Сообщения и файлы хранятся на этом компьютере. GigaChat API пока не подключён.</p>
-            </div>
             {chatDetail?.messages.length ? <div className="chat-history" aria-label="История сообщений">
               {chatDetail.messages.map((message) => <article key={message.id} className={`chat-message message-${message.role}`}>
                 <span className="message-author">{message.role === 'user' ? 'Вы' : 'GigaChat · тестовый пример'}</span>
@@ -1958,8 +2041,14 @@ export default function App() {
     compactLayout ? 'compact-workspace' : '',
     compactLayout || !settings.sidebarVisible ? 'sidebar-hidden' : '',
     sidebarPreview ? 'sidebar-preview' : '',
+    sidebarDragging ? 'sidebar-dragging' : '',
   ].filter(Boolean).join(' ');
-  const sidebarShown = compactLayout ? sidebarPreview : settings.sidebarVisible;
+  const sidebarShown = compactLayout ? sidebarPreview : settings.sidebarVisible || sidebarPreview;
+  const sidebarWidthStyle = compactLayout ? undefined : sidebarDragWidth !== null
+    ? { '--sidebar-width': `${sidebarDragWidth}px` } as CSSProperties
+    : settings.sidebarWidthPx !== null
+      ? { '--sidebar-width': `min(${settings.sidebarWidthPx}px, max(242px, calc(100% - 580px)))` } as CSSProperties
+      : undefined;
 
   return (
     <div className={`app-frame theme-${resolvedTheme}${transparentSidebar ? ' sidebar-transparent' : ''}`}>
@@ -1974,13 +2063,16 @@ export default function App() {
             aria-controls="application-sidebar"
             title={sidebarShown ? 'Скрыть боковую панель' : 'Показать боковую панель'}
             onClick={() => { if (compactLayout) setSidebarPreview((value) => !value); else void toggleSidebar(); }}
-            onPointerEnter={() => { if (!compactLayout && !settings.sidebarVisible) setSidebarPreview(true); }}
-            onPointerLeave={() => { if (!compactLayout && !settings.sidebarVisible) setSidebarPreview(false); }}
-            onFocus={() => { if (!compactLayout && !settings.sidebarVisible) setSidebarPreview(true); }}
-            onBlur={() => { if (!compactLayout && !settings.sidebarVisible) setSidebarPreview(false); }}
+            onPointerEnter={() => { if (!compactLayout && !settings.sidebarVisible) { clearPreviewClose(); setSidebarPreview(true); } }}
+            onPointerLeave={() => { if (!compactLayout && !settings.sidebarVisible) schedulePreviewClose(); }}
             onKeyDown={(event) => {
+              if (event.key === 'ArrowDown' && !compactLayout && !settings.sidebarVisible) {
+                event.preventDefault();
+                clearPreviewClose();
+                setSidebarPreview(true);
+              }
               if (event.key === 'Escape' && sidebarPreview) {
-                setSidebarPreview(false);
+                closePreview();
                 sidebarButtonRef.current?.blur();
               }
             }}
@@ -1990,14 +2082,17 @@ export default function App() {
         </div>
       </header>
 
-      <div className={sidebarClasses}>
-        {compactLayout && sidebarPreview && <button type="button" className="compact-backdrop" aria-label="Закрыть боковую панель" onClick={() => setSidebarPreview(false)} />}
+      <div ref={workspaceRef} className={sidebarClasses} style={sidebarWidthStyle}>
+        {compactLayout && sidebarPreview && <button type="button" className="compact-backdrop" aria-label="Закрыть боковую панель" onClick={closePreview} />}
         {route.page !== 'settings' && route.page !== 'onboarding' && <aside
+          ref={sidebarRef}
           id="application-sidebar"
           className="sidebar"
           aria-label="Навигация"
           aria-hidden={!sidebarShown}
           inert={!sidebarShown}
+          onPointerEnter={clearPreviewClose}
+          onPointerLeave={() => { if (!settings.sidebarVisible && !compactLayout) schedulePreviewClose(); }}
         >
           <ActionMenu className="brand-menu" label="Выбрать режим GigaChat" placement="below" trigger={
             <><span className="brand-wordmark">ГИГАЧАТ <i>{runtimeMode === 'api' ? 'API' : 'WEB'}</i></span><Icon name="chevron" className="brand-chevron" /></>
@@ -2019,7 +2114,7 @@ export default function App() {
               ? <p className="sidebar-empty">Здесь появятся ваши проекты</p>
               : visibleProjects.map((project) => (
                   <div className={route.page === 'project' && route.id === project.id ? 'list-row selected' : 'list-row'} key={project.id}>
-                    <button type="button" className="list-row-main" onClick={() => navigate({ page: 'project', id: project.id })}><Icon name="folder" /><span>{project.name}</span></button>
+                    <button type="button" className="list-row-main" onClick={() => navigate({ page: 'project', id: project.id })}><Icon name="folder" /><ScrollingRowTitle value={project.name} pinned={project.pinned} /></button>
                     {project.pinned && <Icon name="pin" className="pin-mark" />}{projectMenu(project)}
                   </div>
                 ))}
@@ -2032,7 +2127,7 @@ export default function App() {
               ? <p className="sidebar-empty">Нет чатов</p>
               : visibleChats.map((chat) => (
                   <div className={route.page === 'chat' && route.id === chat.id ? 'list-row selected' : 'list-row'} key={chat.id}>
-                    <button type="button" className="list-row-main" onClick={() => navigate({ page: 'chat', id: chat.id })}><Icon name="chat" /><span>{chat.title}</span></button>
+                    <button type="button" className="list-row-main" onClick={() => navigate({ page: 'chat', id: chat.id })}><Icon name="chat" /><ScrollingRowTitle value={chat.title} pinned={chat.pinned} /></button>
                     {chat.pinned && <Icon name="pin" className="pin-mark" />}{chatMenu(chat)}
                   </div>
                 ))}
@@ -2048,7 +2143,28 @@ export default function App() {
           </div>
         </aside>}
 
+        {!compactLayout && settings.sidebarVisible && route.page !== 'settings' && route.page !== 'onboarding' && <div
+          className="sidebar-resizer" role="separator" tabIndex={0} aria-label="Ширина боковой панели" aria-orientation="vertical"
+          aria-valuemin={0} aria-valuemax={maxSidebarWidth()} aria-valuenow={Math.round(sidebarDragWidth ?? sidebarRef.current?.getBoundingClientRect().width ?? 264)}
+          onPointerDown={startSidebarDrag}
+          onKeyDown={(event) => {
+            if (event.key === 'Home') { event.preventDefault(); void updateLocalSettings({ sidebarVisible: false }); }
+            else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+              event.preventDefault();
+              const current = sidebarRef.current?.getBoundingClientRect().width ?? 264;
+              const next = Math.max(242, Math.min(maxSidebarWidth(), current + (event.key === 'ArrowRight' ? 16 : -16)));
+              void updateLocalSettings({ sidebarWidthPx: Math.round(next) });
+            }
+          }}
+        />}
+
         <main ref={mainPanelRef} className={route.page === 'settings' ? 'main-panel settings-panel' : 'main-panel'}>
+          {route.page === 'chat' && selectedChat && <div className="chat-header">
+            <span className="chat-header-title" title={selectedChat.title}>{selectedChat.title}</span>
+            <button type="button" className="chat-browser-toggle" aria-label={settings.browserPaneOpen ? 'Скрыть браузер' : 'Показать браузер'} aria-expanded={settings.browserPaneOpen} title={settings.browserPaneOpen ? 'Скрыть браузер' : 'Показать браузер'} onClick={() => void updateLocalSettings({ browserPaneOpen: !settings.browserPaneOpen })}><Icon name="panelRight" /></button>
+          </div>}
+          <div className={route.page === 'chat' ? `chat-workspace${settings.browserPaneOpen ? ' browser-open' : ''}` : 'content-workspace'}>
+          <div className="chat-column">
           <div className={route.page === 'home' ? 'view-area home-view' : route.page === 'settings' ? 'view-area settings-view' : route.page === 'onboarding' ? 'view-area onboarding-view' : 'view-area'}>{renderContent()}</div>
           {(route.page === 'home' || route.page === 'chat') && (
             <div className="composer-stack">
@@ -2172,6 +2288,9 @@ export default function App() {
               </div>
             </div>
           )}
+          </div>
+          {route.page === 'chat' && settings.browserPaneOpen && <BrowserPanel onClose={() => void updateLocalSettings({ browserPaneOpen: false })} suspended={sidebarPreview || Boolean(dialogRequest) || Boolean(approvalRequest)} />}
+          </div>
           {notice && <div className={`notice notice-${noticeKind}`} role={noticeKind === 'error' ? 'alert' : 'status'}><span>{notice}</span><button type="button" aria-label="Закрыть уведомление" onClick={() => setNotice('')}><Icon name="x" /></button></div>}
         </main>
       </div>

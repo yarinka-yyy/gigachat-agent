@@ -206,6 +206,10 @@ export interface Settings {
   theme: Theme;
   sidebarTransparent: boolean;
   sidebarVisible: boolean;
+  sidebarWidthPx: number | null;
+  browserPaneOpen: boolean;
+  browserTabs: BrowserTabRecord[];
+  browserActiveTabId: string | null;
   defaultProjectsFolder: string | null;
   preferredOpener: PreferredOpener;
   defaultPermissionProfile: PermissionProfile;
@@ -213,6 +217,25 @@ export interface Settings {
   onboardingCompleted: boolean;
   microphoneConsent: 'unasked' | 'allowed' | 'declined';
   notifications: NotificationSettings;
+}
+
+export interface BrowserTabRecord {
+  id: string;
+  title: string;
+  url: string;
+}
+
+export interface BrowserTabStatus extends BrowserTabRecord {
+  loading: boolean;
+  canGoBack: boolean;
+  canGoForward: boolean;
+  error: string | null;
+}
+
+export interface EmbeddedBrowserStatus {
+  tabs: BrowserTabStatus[];
+  activeTabId: string | null;
+  error: string | null;
 }
 
 export type SettingsPatch = Partial<Settings>;
@@ -304,6 +327,18 @@ export interface AppApi {
     back(): Promise<void>;
     reload(): Promise<void>;
     onBrowserStatus(listener: (status: OnboardingBrowserStatus) => void): () => void;
+  };
+  browser: {
+    getStatus(): Promise<EmbeddedBrowserStatus>;
+    newTab(): Promise<EmbeddedBrowserStatus>;
+    closeTab(id: string): Promise<EmbeddedBrowserStatus>;
+    activateTab(id: string): Promise<EmbeddedBrowserStatus>;
+    navigate(input: string): Promise<EmbeddedBrowserStatus>;
+    back(): Promise<void>;
+    forward(): Promise<void>;
+    reload(): Promise<void>;
+    setBounds(bounds: BrowserBounds | null): Promise<void>;
+    onStatus(listener: (status: EmbeddedBrowserStatus) => void): () => void;
   };
   voice: {
     getStatus(): Promise<VoiceAvailability>;
