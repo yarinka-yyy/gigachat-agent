@@ -518,7 +518,7 @@ test('reopens concurrent project and chat writes with the latest draft, history,
   assert.equal((await restored.getSettings()).theme, 'warm');
 });
 
-test('deletes only project instructions and preserves chats, their files, and the working folder', async (t) => {
+test('deleting a project preserves external AGENTS.md, chats, and source files', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-delete-project-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const dataDirectory = join(directory, 'data');
@@ -536,11 +536,13 @@ test('deletes only project instructions and preserves chats, their files, and th
   const importedArtifact = withFile.artifacts[0];
   assert.ok(importedArtifact);
   await store.saveProjectInstructions(project.id, 'Инструкция проекта');
+  assert.equal(await readFile(join(workingFolder, 'AGENTS.md'), 'utf8'), 'Инструкция проекта');
   const instructionsPath = join(dataDirectory, 'project-instructions', project.id, 'AGENTS.md');
 
   await store.deleteProject(project.id);
 
   await assert.rejects(stat(instructionsPath), { code: 'ENOENT' });
+  assert.equal(await readFile(join(workingFolder, 'AGENTS.md'), 'utf8'), 'Инструкция проекта');
   assert.equal(await readFile(join(workingFolder, 'keep.txt'), 'utf8'), 'keep');
   assert.equal(await readFile(source, 'utf8'), 'source');
   const restored = await openStore(dataDirectory);

@@ -10,6 +10,7 @@ export default function BrowserPanel({ onClose, onWidthChange, preferredWidth, s
   const [address, setAddress] = useState('');
   const [error, setError] = useState('');
   const [areaWidth, setAreaWidth] = useState(0);
+  const areaWidthRef = useRef(0);
   const [dragWidth, setDragWidth] = useState<number | null>(null);
   const [closing, setClosing] = useState(false);
   const panelRef = useRef<HTMLElement>(null);
@@ -18,12 +19,13 @@ export default function BrowserPanel({ onClose, onWidthChange, preferredWidth, s
   const viewportRef = useRef<HTMLDivElement>(null);
   const active = status.tabs.find((tab) => tab.id === status.activeTabId);
   const maximum = browserMaximumWidth(areaWidth);
-  const visibleWidth = dragWidth ?? browserVisibleWidth(areaWidth, preferredWidth);
+  const overlay = areaWidth < 880;
+  const visibleWidth = overlay ? browserVisibleWidth(areaWidth, preferredWidth) : dragWidth ?? browserVisibleWidth(areaWidth, preferredWidth);
 
   useLayoutEffect(() => {
     const area = panelRef.current?.parentElement;
     if (!area) return;
-    const update = () => setAreaWidth(area.clientWidth);
+    const update = () => { areaWidthRef.current = area.clientWidth; setAreaWidth(area.clientWidth); };
     const observer = new ResizeObserver(update);
     observer.observe(area);
     update();
@@ -40,7 +42,7 @@ export default function BrowserPanel({ onClose, onWidthChange, preferredWidth, s
   }
 
   function resizeStart(event: React.PointerEvent<HTMLDivElement>): void {
-    if (event.button !== 0 || closing) return;
+    if (event.button !== 0 || closing || overlay) return;
     const divider = event.currentTarget;
     const startX = event.clientX;
     const startWidth = panelRef.current?.getBoundingClientRect().width ?? visibleWidth;
@@ -54,8 +56,8 @@ export default function BrowserPanel({ onClose, onWidthChange, preferredWidth, s
       divider.removeEventListener('pointercancel', stop);
       if (divider.hasPointerCapture(next.pointerId)) divider.releasePointerCapture(next.pointerId);
       setDragWidth(null);
-      if (next.type === 'pointercancel') return;
-      const width = browserReleaseWidth(startWidth + startX - next.clientX, areaWidth);
+      if (next.type === 'pointercancel' || areaWidthRef.current < 880) return;
+      const width = browserReleaseWidth(startWidth + startX - next.clientX, areaWidthRef.current);
       if (width === null) collapse();
       else onWidthChange(width);
     };
@@ -65,6 +67,7 @@ export default function BrowserPanel({ onClose, onWidthChange, preferredWidth, s
   }
 
   function resizeKey(event: React.KeyboardEvent<HTMLDivElement>): void {
+    if (overlay) return;
     let width: number | null = null;
     if (event.key === 'ArrowLeft') width = Math.min(maximum, visibleWidth + (event.shiftKey ? 32 : 16));
     if (event.key === 'ArrowRight') width = Math.max(320, visibleWidth - (event.shiftKey ? 32 : 16));
@@ -127,8 +130,8 @@ export default function BrowserPanel({ onClose, onWidthChange, preferredWidth, s
     inputRef.current?.blur();
   }
 
-  return <aside ref={panelRef} className={`browser-pane${areaWidth < 880 ? ' is-overlay' : ''}${dragWidth !== null ? ' is-dragging' : ''}${closing ? ' is-closing' : ''}`} style={{ width: closing ? 0 : visibleWidth }} aria-label="Встроенный браузер">
-    <div className="browser-resizer" role="separator" tabIndex={0} aria-label="Ширина встроенного браузера" aria-orientation="vertical" aria-valuemin={320} aria-valuemax={maximum} aria-valuenow={Math.round(visibleWidth)} onPointerDown={resizeStart} onKeyDown={resizeKey} />
+  return <aside ref={panelRef} className={`browser-pane${overlay ? ' is-overlay' : ''}${dragWidth !== null ? ' is-dragging' : ''}${closing ? ' is-closing' : ''}`} style={{ width: closing ? 0 : visibleWidth }} aria-label="Встроенный браузер">
+    {!overlay && <div className="browser-resizer" role="separator" tabIndex={0} aria-label="Ширина встроенного браузера" aria-orientation="vertical" aria-valuemin={320} aria-valuemax={maximum} aria-valuenow={Math.round(visibleWidth)} onPointerDown={resizeStart} onKeyDown={resizeKey} />}
     <div className="browser-tabs" role="group" aria-label="Вкладки браузера">
       {status.tabs.map((tab) => <div className={tab.id === status.activeTabId ? 'browser-tab active' : 'browser-tab'} key={tab.id}>
         <button type="button" aria-current={tab.id === status.activeTabId ? 'page' : undefined} title={tab.title} onClick={() => void perform(() => window.gigaChat.browser.activateTab(tab.id))}>

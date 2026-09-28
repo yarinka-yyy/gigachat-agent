@@ -3,7 +3,8 @@ export function browserMaximumWidth(areaWidth: number): number {
 }
 
 export function browserVisibleWidth(areaWidth: number, preferredWidth: number | null): number {
-  const initial = preferredWidth ?? (areaWidth < 880 ? areaWidth : 420);
+  if (areaWidth < 880) return Math.max(0, areaWidth);
+  const initial = preferredWidth ?? 420;
   return Math.max(320, Math.min(initial, browserMaximumWidth(areaWidth)));
 }
 

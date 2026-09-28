@@ -84,8 +84,9 @@ import VoiceCaptureControl, { getCaptureError } from './components/VoiceCaptureC
 import ContextRing from './components/ContextRing';
 import BrowserPanel from './components/BrowserPanel';
 import { createPreviewExitTimer, maxSidebarWidth as computeMaxSidebarWidth } from './sidebar-behavior';
+import { sidebarSections } from './sidebar-sections';
 
-type Page = 'home' | 'chat' | 'project' | 'settings' | 'onboarding' | 'images' | 'video' | 'podcasts' | 'archive' | 'profile';
+type Page = 'home' | 'chat' | 'settings' | 'onboarding' | 'images' | 'video' | 'podcasts' | 'archive' | 'profile';
 type Route = { page: Page; id?: string };
 type Navigation = { history: Route[]; index: number };
 type SettingsSection =
@@ -540,6 +541,7 @@ export default function App() {
   const [settingsSection, setSettingsSection] = useState<SettingsSection>('general');
   const [showAllProjects, setShowAllProjects] = useState(false);
   const [showAllChats, setShowAllChats] = useState(false);
+  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set());
   const [selectedProjectId, setSelectedProjectId] = useState('');
   const [projectSearch, setProjectSearch] = useState('');
   const [draft, setDraft] = useState('');
@@ -550,8 +552,10 @@ export default function App() {
   const [runtimeTurns, setRuntimeTurns] = useState<RuntimeTurnSnapshot[]>([]);
   const [pendingPermissionProfile, setPendingPermissionProfile] = useState<PermissionProfile | null>(null);
   const [sending, setSending] = useState(false);
-  const [dialogRequest, setDialogRequest] = useState<{ kind: 'create-project' | 'rename-project' | 'delete-project' | 'rename-chat' | 'delete-chat'; project?: Project; chat?: ChatSummary; hasFiles?: boolean; assignChatId?: string; createdProjectId?: string } | null>(null);
+  const [dialogRequest, setDialogRequest] = useState<{ kind: 'create-project' | 'project-settings' | 'rename-project' | 'delete-project' | 'rename-chat' | 'delete-chat'; project?: Project; chat?: ChatSummary; hasFiles?: boolean; assignChatId?: string; createdProjectId?: string } | null>(null);
   const [dialogValue, setDialogValue] = useState('');
+  const [dialogFolder, setDialogFolder] = useState<string | null>(null);
+  const [projectInstructionsBackup, setProjectInstructionsBackup] = useState<string | null>(null);
   const [dialogError, setDialogError] = useState('');
   const [dialogBusy, setDialogBusy] = useState(false);
   const [systemDark, setSystemDark] = useState(() => window.matchMedia('(prefers-color-scheme: dark)').matches);
@@ -580,7 +584,6 @@ export default function App() {
   const [globalInstructionsStatus, setGlobalInstructionsStatus] = useState<SaveStatus>('saved');
   const [integrationTab, setIntegrationTab] = useState<'skills' | 'plugins' | 'tools'>('skills');
   const [projectInstructions, setProjectInstructions] = useState('');
-  const [projectInstructionsOpen, setProjectInstructionsOpen] = useState(false);
   const [projectInstructionsStatus, setProjectInstructionsStatus] = useState<SaveStatus>('saved');
   const pendingChat = useRef<Promise<ChatSummary> | null>(null);
   const homeChatId = useRef<string | null>(null);
@@ -692,8 +695,8 @@ export default function App() {
   ));
   const [projectSaver] = useState(() => createInstructionAutosave(
     (id, value) => window.gigaChat.projects.saveInstructions(id, value),
-    (id, status, error) => {
-      if (routeRef.current.page === 'project' && routeRef.current.id === id) setProjectInstructionsStatus(status);
+    (_id, status, error) => {
+      setProjectInstructionsStatus(status);
       if (error) setNotice(getErrorMessage(error));
     },
   ));
@@ -834,6 +837,10 @@ export default function App() {
   }, [route.page, route.id, settingsSection, globalSaver, projectSaver]);
 
   useEffect(() => {
+    if (!dialogRequest) void projectSaver.flushAll().catch((error: unknown) => setNotice(getErrorMessage(error)));
+  }, [dialogRequest, projectSaver]);
+
+  useEffect(() => {
     if (!notice || noticeKind === 'error') return;
     const timer = window.setTimeout(() => setNoticeText(''), 2000);
     return () => window.clearTimeout(timer);
@@ -842,7 +849,7 @@ export default function App() {
   useEffect(() => {
     if (dialogRequest) {
       dialogRef.current?.showModal();
-      (dialogRef.current?.querySelector('input') ?? dialogRef.current?.querySelector<HTMLButtonElement>('.dialog-actions .secondary-button'))?.focus();
+      (dialogRef.current?.querySelector('input') ?? dialogRef.current?.querySelector('textarea') ?? dialogRef.current?.querySelector<HTMLButtonElement>('.dialog-actions button'))?.focus();
     } else dialogRef.current?.close();
   }, [dialogRequest]);
 
@@ -886,10 +893,6 @@ export default function App() {
 
   useEffect(() => {
     routeRef.current = route;
-    if (route.page !== 'project') {
-      setProjectInstructionsOpen(false);
-      setProjectInstructions('');
-    }
     if (route.page === 'chat') {
       const id = route.id;
       if (!id) return;
@@ -992,20 +995,13 @@ export default function App() {
     return () => { cancelled = true; };
   }, [route.page, settingsSection]);
 
-  const activeProjects = projects.filter((project) => !project.archived)
-    .sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt.localeCompare(a.updatedAt));
-  const activeChats = chats.filter((chat) => !chat.archived)
-    .sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt.localeCompare(a.updatedAt));
-  const pinnedProjects = activeProjects.filter((project) => project.pinned);
-  const unpinnedProjects = activeProjects.filter((project) => !project.pinned);
-  const visibleProjects = showAllProjects ? activeProjects : [...pinnedProjects, ...unpinnedProjects.slice(0, 5)];
-  const pinnedChats = activeChats.filter((chat) => chat.pinned);
-  const unpinnedChats = activeChats.filter((chat) => !chat.pinned);
-  const visibleChats = showAllChats ? activeChats : [...pinnedChats, ...unpinnedChats.slice(0, 8)];
+  const library = sidebarSections(projects, chats);
+  const { activeProjects, activeChats, pinnedProjects, pinnedChats } = library;
+  const visibleProjects = showAllProjects ? library.projects : library.projects.slice(0, 5);
+  const visibleChats = showAllChats ? library.recentChats : library.recentChats.slice(0, 8);
   const archivedProjects = projects.filter((project) => project.archived);
   const archivedChats = chats.filter((chat) => chat.archived);
   const selectedChat = chats.find((chat) => chat.id === route.id);
-  const selectedProject = projects.find((project) => project.id === route.id);
   const resolvedTheme = settings.theme === 'system' ? (systemDark ? 'dark' : 'light') : settings.theme;
   const transparentSidebar = settings.sidebarTransparent;
   const canGoBack = navigation.index > 0;
@@ -1237,12 +1233,34 @@ export default function App() {
 
   function openDialog(request: NonNullable<typeof dialogRequest>, value = ''): void {
     setDialogValue(value);
+    setDialogFolder(null);
     setDialogError('');
     setDialogRequest(request);
   }
 
   function createProject(assignChatId?: string): void { openDialog({ kind: 'create-project', assignChatId }); }
   function renameProject(project: Project): void { openDialog({ kind: 'rename-project', project }, project.name); }
+
+  async function openProjectSettings(project: Project): Promise<void> {
+    openDialog({ kind: 'project-settings', project });
+    setProjectInstructions('');
+    setProjectInstructionsBackup(null);
+    try {
+      const [contents, backup] = await Promise.all([
+        window.gigaChat.projects.readInstructions(project.id),
+        window.gigaChat.projects.instructionsBackupPath(project.id),
+      ]);
+      setProjectInstructions(projectSaver.load(project.id, contents));
+      setProjectInstructionsBackup(backup);
+    } catch (error) { setDialogError(getErrorMessage(error)); }
+  }
+
+  async function pickProjectFolder(): Promise<void> {
+    try {
+      const folder = await window.gigaChat.projects.pickFolder();
+      if (folder) setDialogFolder(folder);
+    } catch (error) { setDialogError(getErrorMessage(error)); }
+  }
 
   async function updateProject(project: Project, patch: ProjectPatch): Promise<void> {
     try {
@@ -1255,10 +1273,16 @@ export default function App() {
 
   async function chooseProjectFolder(project: Project): Promise<void> {
     try {
+      await projectSaver.flushAll();
       const updated = await window.gigaChat.projects.chooseFolder(project.id);
       setProjects((current) => current.map((item) => item.id === project.id ? updated : item));
+      setDialogRequest((current) => current?.kind === 'project-settings' && current.project?.id === project.id ? { ...current, project: updated } : current);
+      if (updated.workingFolder !== project.workingFolder) {
+        setProjectInstructions(projectSaver.load(project.id, await window.gigaChat.projects.readInstructions(project.id)));
+        setProjectInstructionsBackup(await window.gigaChat.projects.instructionsBackupPath(project.id));
+      }
     } catch (error) {
-      setNotice(getErrorMessage(error));
+      setDialogError(getErrorMessage(error));
     }
   }
 
@@ -1294,10 +1318,12 @@ export default function App() {
     setDialogError('');
     try {
       const { kind, chat, project } = dialogRequest;
-      if (kind === 'create-project') {
+      if (kind === 'project-settings') {
+        await projectSaver.flushAll();
+      } else if (kind === 'create-project') {
         const created = dialogRequest.createdProjectId
           ? projects.find((item) => item.id === dialogRequest.createdProjectId)
-          : await window.gigaChat.projects.create(dialogValue);
+          : await window.gigaChat.projects.create(dialogValue, dialogFolder);
         if (!created) throw new Error('Созданный проект не найден.');
         if (!dialogRequest.createdProjectId) {
           setProjects((current) => [created, ...current]);
@@ -1319,7 +1345,6 @@ export default function App() {
         await window.gigaChat.projects.remove(project.id);
         setProjects((current) => current.filter((item) => item.id !== project.id));
         setChats((current) => current.map((item) => item.projectId === project.id ? { ...item, projectId: null } : item));
-        if (routeRef.current.page === 'project' && routeRef.current.id === project.id) navigate({ page: 'home' });
         showSuccess('Проект удалён. Его чаты сохранены.');
       } else if (kind === 'rename-chat' && chat) {
         const updated = await window.gigaChat.chats.update(chat.id, { title: dialogValue });
@@ -1534,33 +1559,16 @@ export default function App() {
     await updateLocalSettings({ sidebarVisible: next });
   }
 
-  async function setProjectInstructionsOpenState(open: boolean): Promise<void> {
-    setProjectInstructionsOpen(open);
-    if (!open) {
-      void projectSaver.flushAll().catch((error: unknown) => setNotice(getErrorMessage(error)));
-      return;
-    }
-    if (!selectedProject) return;
-    try {
-      const contents = await window.gigaChat.projects.readInstructions(selectedProject.id);
-      if (routeRef.current.page === 'project' && routeRef.current.id === selectedProject.id) {
-        setProjectInstructions(projectSaver.load(selectedProject.id, contents));
-      }
-    } catch (error) {
-      setNotice(getErrorMessage(error));
-    }
-  }
-
   function projectMenu(project: Project): ReactNode {
-    const currentProject = route.page === 'project' && route.id === project.id;
     return (
       <ActionMenu label={`Действия проекта ${project.name}`}>
         <button type="button" onClick={() => renameProject(project)}><Icon name="edit" />Переименовать</button>
         <button type="button" onClick={() => void updateProject(project, { pinned: !project.pinned })}>
           <Icon name="pin" />{project.pinned ? 'Открепить' : 'Закрепить'}
         </button>
-        {!currentProject && <button type="button" onClick={() => navigate({ page: 'project', id: project.id })}><Icon name="folderOpen" />Настройки проекта</button>}
-        {!currentProject && project.workingFolder && <button type="button" onClick={() => void window.gigaChat.projects.openFolder(project.id).catch((error: unknown) => setNotice(getErrorMessage(error)))}><Icon name="external" />Открыть папку</button>}
+        {!project.archived && <button type="button" onClick={() => void createChat(project.id)}><Icon name="plus" />Новый чат в проекте</button>}
+        <button type="button" onClick={() => void openProjectSettings(project)}><Icon name="folderOpen" />Настройки проекта</button>
+        {project.workingFolder && <button type="button" onClick={() => void window.gigaChat.projects.openFolder(project.id).catch((error: unknown) => setNotice(getErrorMessage(error)))}><Icon name="external" />Открыть папку</button>}
         <button type="button" onClick={() => void updateProject(project, { archived: !project.archived })}>
           <Icon name="archive" />{project.archived ? 'Восстановить из архива' : 'Архивировать'}
         </button>
@@ -1583,6 +1591,31 @@ export default function App() {
         <button type="button" className="danger-item" onClick={() => void removeChat(chat)}><Icon name="trash" />Удалить</button>
       </ActionMenu>
     );
+  }
+
+  function chatRow(chat: ChatSummary, nested = false): ReactNode {
+    return <div className={`list-row${nested ? ' nested-chat-row' : ''}${route.page === 'chat' && route.id === chat.id ? ' selected' : ''}`} key={chat.id}>
+      <button type="button" className="list-row-main" onClick={() => navigate({ page: 'chat', id: chat.id })}><Icon name="chat" /><ScrollingRowTitle value={chat.title} pinned={chat.pinned} /></button>
+      {chat.pinned && <Icon name="pin" className="pin-mark" />}{chatMenu(chat)}
+    </div>;
+  }
+
+  function projectRow(project: Project): ReactNode {
+    const expanded = expandedProjects.has(project.id);
+    return <div className="project-tree" key={project.id}>
+      <div className="list-row">
+        <button type="button" className="list-row-main" aria-expanded={expanded} aria-controls={expanded ? `project-chats-${project.id}` : undefined} onClick={() => setExpandedProjects((current) => {
+          const next = new Set(current);
+          if (next.has(project.id)) next.delete(project.id);
+          else next.add(project.id);
+          return next;
+        })}><Icon name={expanded ? 'folderOpen' : 'folder'} /><ScrollingRowTitle value={project.name} pinned={project.pinned} /></button>
+        {project.pinned && <Icon name="pin" className="pin-mark" />}{projectMenu(project)}
+      </div>
+      {expanded && <div id={`project-chats-${project.id}`} className="project-nested-chats">
+        {library.projectChats(project.id).map((chat) => chatRow(chat, true))}
+      </div>}
+    </div>;
   }
 
   function renderArchive(): ReactNode {
@@ -1621,7 +1654,7 @@ export default function App() {
               <SettingRow title="Язык интерфейса" description="Сейчас приложение доступно на русском языке.">
                 <span className="value-chip">Русский</span>
               </SettingRow>
-              <SettingRow title="Папка проектов и задач" description={settings.defaultProjectsFolder ?? 'Папка не выбрана.'}>
+              <SettingRow title="Дополнительная папка для открытия" description={`${settings.defaultProjectsFolder ?? 'Папка не выбрана.'} Новые проекты без выбранной папки создаются в Документах.`}>
                 <div className="inline-actions">
                   <button type="button" className="secondary-button" onClick={async () => {
                     try {
@@ -1849,7 +1882,7 @@ export default function App() {
           <>
             <div className="settings-section-heading"><h2>Проекты и файлы</h2><p>Папки открываются только после выбора и проверки существующего пути.</p></div>
             <div className="settings-card settings-list">
-              <SettingRow title="Папка по умолчанию" description={settings.defaultProjectsFolder ?? 'Не выбрана.'}>
+              <SettingRow title="Дополнительная папка для открытия" description={`${settings.defaultProjectsFolder ?? 'Не выбрана.'} Новые проекты без выбранной папки создаются в Документах.`}>
                 <div className="inline-actions"><button type="button" className="secondary-button" onClick={async () => {
                   try {
                     const updated = await window.gigaChat.settings.chooseProjectsFolder();
@@ -1950,39 +1983,6 @@ export default function App() {
             </section> : null}
           </section>
         ) : <section className="content-page"><h1>Чат не найден</h1><button type="button" className="secondary-button" onClick={() => navigate({ page: 'home' })}>На главный экран</button></section>;
-      case 'project':
-        return selectedProject ? (
-          <section className="content-page project-page">
-            <div className="page-heading"><span className="eyebrow">Проект</span><h1>{selectedProject.name}</h1><p>Чаты, папка и локальные инструкции этого проекта.</p></div>
-            <div className="project-toolbar">
-              <button type="button" className="primary-button" onClick={() => void createChat(selectedProject.id)}><Icon name="plus" />Новый чат в проекте</button>
-              <button type="button" className="secondary-button" onClick={() => void chooseProjectFolder(selectedProject)}><Icon name="folderOpen" />{selectedProject.workingFolder ? 'Изменить папку' : 'Выбрать папку'}</button>
-              <button type="button" className="icon-button" aria-label="Открыть рабочую папку" title="Открыть рабочую папку" disabled={!selectedProject.workingFolder} onClick={() => void window.gigaChat.projects.openFolder(selectedProject.id).catch((error: unknown) => setNotice(getErrorMessage(error)))}><Icon name="external" /></button>
-              {projectMenu(selectedProject)}
-            </div>
-            {selectedProject.workingFolder && <p className="project-path"><Icon name="folder" />{selectedProject.workingFolder}</p>}
-            <h2 className="section-title">Чаты проекта</h2>
-            {activeChats.filter((chat) => chat.projectId === selectedProject.id).length === 0
-              ? <EmptyState title="В проекте пока нет чатов" description="Создайте здесь первый локальный черновик." icon="chat" />
-              : <div className="project-chat-list">{activeChats.filter((chat) => chat.projectId === selectedProject.id).map((chat) => (
-                  <div className="project-chat-row" key={chat.id}>
-                    <button type="button" className="project-chat-main" onClick={() => navigate({ page: 'chat', id: chat.id })}>
-                      <Icon name="chat" /><span>{chat.title}<small>{chat.kind === 'image' ? 'Чат изображений' : 'Локальный чат'}</small></span>
-                    </button>
-                    {chatMenu(chat)}
-                  </div>
-                ))}</div>}
-            <section className="project-instructions">
-              <button type="button" className="project-instructions-toggle" aria-expanded={projectInstructionsOpen} onClick={() => void setProjectInstructionsOpenState(!projectInstructionsOpen)}>
-                <Icon name="book" /><span><strong>Инструкции проекта</strong><small>AGENTS.md хранится внутри данных приложения.</small></span><Icon name="chevron" className={projectInstructionsOpen ? 'rotated' : ''} />
-              </button>
-              {projectInstructionsOpen && <div className="project-instructions-editor"><textarea value={projectInstructions} onChange={(event) => {
-                setProjectInstructions(event.target.value);
-                projectSaver.edit(selectedProject.id, event.target.value);
-              }} onBlur={() => void projectSaver.flushAll().catch((error: unknown) => setNotice(getErrorMessage(error)))} maxLength={65536} aria-label="Инструкции проекта AGENTS.md" placeholder="Локальные правила для будущей работы в этом проекте…" /><div className="editor-footer"><span>Не записывается в выбранную рабочую папку.</span><span role="status" className={`save-status status-${projectInstructionsStatus}`}>{saveStatusLabel(projectInstructionsStatus)}</span></div></div>}
-            </section>
-          </section>
-        ) : <section className="content-page"><h1>Проект не найден</h1><button type="button" className="secondary-button" onClick={() => navigate({ page: 'home' })}>На главный экран</button></section>;
       case 'settings':
         return (
           <section className="settings-layout">
@@ -2027,7 +2027,6 @@ export default function App() {
   const title = route.page === 'home' ? 'Новый чат'
     : route.page === 'onboarding' ? 'Первый запуск'
     : route.page === 'chat' ? selectedChat?.title ?? 'Чат'
-    : route.page === 'project' ? selectedProject?.name ?? 'Проект'
     : route.page === 'images' ? 'Изображения'
     : route.page === 'video' ? 'Видео'
     : route.page === 'podcasts' ? 'Подкасты'
@@ -2102,38 +2101,35 @@ export default function App() {
             <span className="brand-menu-note">Web: подключение появится позже.</span>
           </ActionMenu>
           <nav className="sidebar-actions" aria-label="Основные действия">
-            <button type="button" className={route.page === 'home' ? 'nav-action active' : 'nav-action'} onClick={() => void createChat()}><Icon name="edit" /><span>Новый чат</span></button>
+            <button type="button" className={route.page === 'home' ? 'nav-action active' : 'nav-action'} onClick={() => { setSelectedProjectId(''); navigate({ page: 'home' }); }}><Icon name="edit" /><span>Новый чат</span></button>
             <button type="button" className={route.page === 'chat' && selectedChat?.kind === 'image' ? 'nav-action active' : 'nav-action'} onClick={() => void createChat(null, 'image')}><Icon name="image" /><span>Сгенерировать изображение</span></button>
             <button type="button" className={route.page === 'video' ? 'nav-action active' : 'nav-action'} onClick={() => navigate({ page: 'video' })}><Icon name="video" /><span>Создать видео</span></button>
             <button type="button" className={route.page === 'podcasts' ? 'nav-action active' : 'nav-action'} onClick={() => navigate({ page: 'podcasts' })}><Icon name="podcast" /><span>Подкасты</span></button>
           </nav>
 
+          <div className="sidebar-library">
+          {(pinnedProjects.length > 0 || pinnedChats.length > 0) && <section className="sidebar-section pinned-section">
+            <div className="section-heading"><h2>Закреплённые</h2></div>
+            {pinnedProjects.map(projectRow)}
+            {pinnedChats.map((chat) => chatRow(chat))}
+          </section>}
           <section className="sidebar-section project-section">
             <div className="section-heading"><h2>Проекты</h2><button type="button" className="small-icon-button" aria-label="Создать проект" title="Создать проект" onClick={() => void createProject()}><Icon name="plus" /></button></div>
-            {activeProjects.length === 0
-              ? <p className="sidebar-empty">Здесь появятся ваши проекты</p>
-              : visibleProjects.map((project) => (
-                  <div className={route.page === 'project' && route.id === project.id ? 'list-row selected' : 'list-row'} key={project.id}>
-                    <button type="button" className="list-row-main" onClick={() => navigate({ page: 'project', id: project.id })}><Icon name="folder" /><ScrollingRowTitle value={project.name} pinned={project.pinned} /></button>
-                    {project.pinned && <Icon name="pin" className="pin-mark" />}{projectMenu(project)}
-                  </div>
-                ))}
-            {unpinnedProjects.length > 5 && <button type="button" className="show-more" onClick={() => setShowAllProjects((value) => !value)}>{showAllProjects ? 'Свернуть' : 'Показать больше'}<Icon name="chevron" /></button>}
+            {library.projects.length === 0
+              ? <p className="sidebar-empty">{activeProjects.length === 0 ? 'Здесь появятся ваши проекты' : 'Все проекты закреплены'}</p>
+              : visibleProjects.map(projectRow)}
+            {library.projects.length > 5 && <button type="button" className="show-more" onClick={() => setShowAllProjects((value) => !value)}>{showAllProjects ? 'Свернуть' : 'Показать больше'}<Icon name="chevron" /></button>}
           </section>
 
           <section className={activeProjects.length === 0 && activeChats.length === 0 ? 'sidebar-section history-section empty-library' : 'sidebar-section history-section'}>
             <div className="section-heading"><h2>Недавние</h2></div>
-            {activeChats.length === 0
-              ? <p className="sidebar-empty">Нет чатов</p>
-              : visibleChats.map((chat) => (
-                  <div className={route.page === 'chat' && route.id === chat.id ? 'list-row selected' : 'list-row'} key={chat.id}>
-                    <button type="button" className="list-row-main" onClick={() => navigate({ page: 'chat', id: chat.id })}><Icon name="chat" /><ScrollingRowTitle value={chat.title} pinned={chat.pinned} /></button>
-                    {chat.pinned && <Icon name="pin" className="pin-mark" />}{chatMenu(chat)}
-                  </div>
-                ))}
-            {unpinnedChats.length > 8 && <button type="button" className="show-more" onClick={() => setShowAllChats((value) => !value)}>{showAllChats ? 'Свернуть' : 'Показать больше'}<Icon name="chevron" /></button>}
+            {library.recentChats.length === 0
+              ? <p className="sidebar-empty">{activeChats.length === 0 ? 'Нет чатов' : 'Здесь появятся чаты без проекта'}</p>
+              : visibleChats.map((chat) => chatRow(chat))}
+            {library.recentChats.length > 8 && <button type="button" className="show-more" onClick={() => setShowAllChats((value) => !value)}>{showAllChats ? 'Свернуть' : 'Показать больше'}<Icon name="chevron" /></button>}
             <button type="button" className="archive-link" onClick={() => navigate({ page: 'archive' })}><Icon name="archive" /><span>Архив</span></button>
           </section>
+          </div>
 
           <div className="profile-area">
             <button type="button" className="profile-button" onClick={() => navigate({ page: 'profile' })}>
@@ -2182,7 +2178,7 @@ export default function App() {
                 >{suggestion.id === 'compact' && <ContextRing compact />}<span className="composer-suggestion-copy"><strong>{suggestion.label}</strong><span>{suggestion.description}</span></span></button>)}
                 {composerCompletion.emptyMessage && <p className="composer-suggestions-empty" role="status">{composerCompletion.emptyMessage}</p>}
               </div>}
-              <div className="project-picker">
+              {route.page === 'home' && <div className="project-picker">
                 <ActionMenu className="composer-project-menu" placement="below-start" label="Выбрать проект"
                   initialFocus=".project-search-input" onOpen={() => setProjectSearch('')}
                   trigger={<><Icon name="folder" /><span>{activeProjects.find((project) => project.id === composerProjectId)?.name ?? 'Выбрать проект'}</span><Icon name="chevron" /></>}>
@@ -2206,21 +2202,19 @@ export default function App() {
                     </div>
                     <div className="project-picker-options">
                       <button type="button" className="project-picker-option" aria-current={!composerProjectId} onClick={() => {
-                        if (route.page === 'chat' && selectedChat) void changeChatProject(selectedChat, '');
-                        else setSelectedProjectId('');
+                        setSelectedProjectId('');
                       }}><Icon name="folder" />Без проекта{!composerProjectId && <Icon name="check" />}</button>
                       {activeProjects.filter((project) => project.name.toLocaleLowerCase().includes(projectSearch.trim().toLocaleLowerCase())).map((project) =>
                         <button type="button" className="project-picker-option" key={project.id} aria-current={project.id === composerProjectId} onClick={() => {
-                          if (route.page === 'chat' && selectedChat) void changeChatProject(selectedChat, project.id);
-                          else setSelectedProjectId(project.id);
+                          setSelectedProjectId(project.id);
                         }}><Icon name="folder" /><span>{project.name}</span>{project.id === composerProjectId && <Icon name="check" />}</button>)}
                       {activeProjects.length === 0 && <p className="picker-empty">Пока нет проектов</p>}
                       {activeProjects.length > 0 && !activeProjects.some((project) => project.name.toLocaleLowerCase().includes(projectSearch.trim().toLocaleLowerCase())) && <p className="picker-empty">Ничего не найдено</p>}
                     </div>
-                    <button type="button" className="project-picker-option project-create-option" onClick={() => createProject(selectedChat?.id)}><Icon name="plus" />Новый проект</button>
+                    <button type="button" className="project-picker-option project-create-option" onClick={() => createProject()}><Icon name="plus" />Новый проект</button>
                   </div>
                 </ActionMenu>
-              </div>
+              </div>}
               <div className="composer">
                 <label className="sr-only" htmlFor="chat-draft">Черновик сообщения</label>
                 <textarea
@@ -2294,10 +2288,11 @@ export default function App() {
           {notice && <div className={`notice notice-${noticeKind}`} role={noticeKind === 'error' ? 'alert' : 'status'}><span>{notice}</span><button type="button" aria-label="Закрыть уведомление" onClick={() => setNotice('')}><Icon name="x" /></button></div>}
         </main>
       </div>
-      <dialog ref={dialogRef} className="app-dialog" onClose={() => setDialogRequest(null)} onCancel={(event) => { if (dialogBusy) event.preventDefault(); }}>
+      <dialog ref={dialogRef} className={`app-dialog${dialogRequest?.kind === 'project-settings' ? ' project-settings-dialog' : ''}`} onClose={() => setDialogRequest(null)} onCancel={(event) => { if (dialogBusy) event.preventDefault(); }}>
         {dialogRequest && <form onSubmit={(event) => { event.preventDefault(); void submitDialog(); }}>
           <button type="button" className="dialog-close" aria-label="Закрыть" disabled={dialogBusy} onClick={() => setDialogRequest(null)}><Icon name="x" /></button>
           <h2>{dialogRequest.kind === 'create-project' ? 'Создать проект'
+            : dialogRequest.kind === 'project-settings' ? `Настройки проекта «${dialogRequest.project?.name}»`
             : dialogRequest.kind === 'rename-project' ? 'Переименовать проект'
               : dialogRequest.kind === 'delete-project' ? `Удалить проект «${dialogRequest.project?.name}»?`
                 : dialogRequest.kind === 'rename-chat' ? 'Переименовать чат'
@@ -2308,10 +2303,36 @@ export default function App() {
             {dialogRequest.kind === 'rename-chat' ? 'Название чата' : 'Название проекта'}
             <input autoFocus value={dialogValue} disabled={Boolean(dialogRequest.createdProjectId)} onChange={(event) => setDialogValue(event.target.value)} maxLength={dialogRequest.kind === 'rename-chat' ? 160 : 120} />
           </label>}
+          {dialogRequest.kind === 'create-project' && <div className="project-folder-choice">
+            <strong>Папка проекта</strong>
+            <p>{dialogFolder ?? 'Если не выбрать папку, проект получит новую папку GigaChat Project N в Документах.'}</p>
+            <button type="button" className="secondary-button" disabled={dialogBusy} onClick={() => void pickProjectFolder()}><Icon name="folder" />Выбрать папку</button>
+          </div>}
+          {dialogRequest.kind === 'project-settings' && dialogRequest.project && <>
+            <div className="project-folder-choice">
+              <strong>Рабочая папка</strong>
+              <p>{dialogRequest.project.workingFolder ?? 'Папка не назначена.'}</p>
+              <div className="inline-actions"><button type="button" className="secondary-button" onClick={() => { if (dialogRequest.project) void chooseProjectFolder(dialogRequest.project); }}>Изменить папку</button>
+                <button type="button" className="secondary-button" disabled={!dialogRequest.project.workingFolder} onClick={() => { if (dialogRequest.project) void window.gigaChat.projects.openFolder(dialogRequest.project.id).catch((error: unknown) => setDialogError(getErrorMessage(error))); }}>Открыть</button></div>
+            </div>
+            {!dialogRequest.project.archived && <button type="button" className="secondary-button project-new-chat" onClick={() => {
+              if (!dialogRequest.project) return;
+              setDialogRequest(null);
+              void createChat(dialogRequest.project.id);
+            }}><Icon name="plus" />Новый чат в проекте</button>}
+            <label className="dialog-label project-instructions-label">Инструкции проекта · AGENTS.md
+              <textarea value={projectInstructions} onChange={(event) => {
+                setProjectInstructions(event.target.value);
+                if (dialogRequest.project) projectSaver.edit(dialogRequest.project.id, event.target.value);
+              }} onBlur={() => void projectSaver.flushAll().catch((error: unknown) => setDialogError(getErrorMessage(error)))} aria-label="Инструкции проекта AGENTS.md" placeholder="Правила для всех чатов этого проекта…" />
+            </label>
+            <span role="status" className={`save-status status-${projectInstructionsStatus}`}>{saveStatusLabel(projectInstructionsStatus)}</span>
+            {projectInstructionsBackup && <p className="project-backup-note">Прежняя инструкция сохранена: <span>{projectInstructionsBackup}</span></p>}
+          </>}
           {dialogError && <p className="dialog-error" role="alert">{dialogError}</p>}
           <div className="dialog-actions">
-            <button type="button" className="secondary-button" disabled={dialogBusy} onClick={() => setDialogRequest(null)}>Отмена</button>
-            <button type="submit" className={dialogRequest.kind.startsWith('delete') ? 'danger-button' : 'primary-button'} disabled={dialogBusy}>{dialogBusy ? 'Подождите…' : dialogRequest.kind.startsWith('delete') ? 'Удалить' : dialogRequest.createdProjectId ? 'Повторить перенос' : dialogRequest.kind === 'create-project' ? 'Создать' : 'Сохранить'}</button>
+            {dialogRequest.kind !== 'project-settings' && <button type="button" className="secondary-button" disabled={dialogBusy} onClick={() => setDialogRequest(null)}>Отмена</button>}
+            <button type="submit" className={dialogRequest.kind.startsWith('delete') ? 'danger-button' : 'primary-button'} disabled={dialogBusy}>{dialogBusy ? 'Подождите…' : dialogRequest.kind.startsWith('delete') ? 'Удалить' : dialogRequest.kind === 'project-settings' ? 'Готово' : dialogRequest.createdProjectId ? 'Повторить перенос' : dialogRequest.kind === 'create-project' ? 'Создать' : 'Сохранить'}</button>
           </div>
         </form>}
       </dialog>

@@ -16,6 +16,7 @@ import { createHookRegistry } from './hooks';
 import { createSecureStore } from './secure-store';
 import { createOnboardingBrowser, type BrowserBounds } from './onboarding-browser';
 import { createEmbeddedBrowser } from './embedded-browser';
+import { createNumberedProjectFolder, prepareProjectFolders, removeEmptyCreatedFolder } from './project-folders';
 import { createVoiceRuntime, VOICE_MAX_OUTPUT_BYTES, type VoiceRuntime } from './voice';
 
 if (require('electron-squirrel-startup')) {
@@ -259,6 +260,12 @@ async function requireDirectory(value: unknown): Promise<string> {
   } catch {
     throw new Error('Папка не найдена или недоступна.');
   }
+  return path;
+}
+
+async function requireProjectDirectory(value: unknown): Promise<string> {
+  const path = await requireDirectory(value);
+  if ((await lstat(path)).isSymbolicLink()) throw new Error('Папка проекта не может быть ссылкой.');
   return path;
 }
 
@@ -640,10 +647,19 @@ async function registerIpcHandlers(
   };
 
   handle('projects:list', () => store.listProjects());
-  handle('projects:create', (name) => withLocalFailureNotification(store, () => store.createProject(name)));
+  handle('projects:pick-folder', () => chooseDirectory(app.getPath('documents')));
+  handle('projects:create', async (name, folderInput) => withLocalFailureNotification(store, async () => {
+    const selected = folderInput === null || folderInput === undefined ? null : await requireProjectDirectory(folderInput);
+    const createdFolder = selected ? null : await createNumberedProjectFolder(await requireDirectory(app.getPath('documents')));
+    try { return await store.createProject(name, selected ?? createdFolder); }
+    catch (error) {
+      if (createdFolder) await removeEmptyCreatedFolder(createdFolder);
+      throw error;
+    }
+  }));
   handle('projects:update', async (id, patch) => {
     if (isRecord(patch) && Object.prototype.hasOwnProperty.call(patch, 'workingFolder') && patch.workingFolder !== null) {
-      await requireDirectory(patch.workingFolder);
+      await requireProjectDirectory(patch.workingFolder);
     }
     return withLocalFailureNotification(store, () => store.updateProject(id, patch));
   });
@@ -654,7 +670,7 @@ async function registerIpcHandlers(
     if (!project) throw new Error('Проект не найден.');
     const selected = await chooseDirectory(project.workingFolder);
     return selected
-      ? withLocalFailureNotification(store, () => store.updateProject(id, { workingFolder: selected }))
+      ? withLocalFailureNotification(store, async () => store.updateProject(id, { workingFolder: await requireProjectDirectory(selected) }))
       : project;
   });
   handle('projects:open-folder', async (idInput) => {
@@ -665,6 +681,7 @@ async function registerIpcHandlers(
   });
   handle('projects:read-instructions', (id) => store.readProjectInstructions(requireId(id)));
   handle('projects:save-instructions', (id, contents) => withLocalFailureNotification(store, () => store.saveProjectInstructions(requireId(id), contents)));
+  handle('projects:instructions-backup-path', (id) => store.projectInstructionsBackupPath(requireId(id)));
 
   handle('chats:list', () => store.listChats());
   handle('chats:get', (id) => store.getChat(id));
@@ -1000,6 +1017,7 @@ void app.whenReady().then(async () => {
   try {
     configureMainAudioPermission();
     const store = await openStore(app.getPath('userData'));
+    const projectFolderIssues = await prepareProjectFolders(store, app.getPath('documents'));
     microphoneConsentGranted = (await store.getSettings()).microphoneConsent === 'allowed';
     const customPermissions = await openCustomPermissions(app.getPath('userData'));
     const approvals = createPermissionApprovals((request) => {
@@ -1023,6 +1041,7 @@ void app.whenReady().then(async () => {
     const mainRuntime = await createMainRuntime(store, customPermissions, approvals);
     await registerIpcHandlers(store, mainRuntime, secureStore, onboardingBrowser, embeddedBrowser, customPermissions, approvals);
     createWindow();
+    if (projectFolderIssues.length) dialog.showErrorBox('Папки проектов', `Не удалось подготовить некоторые проекты:\n${projectFolderIssues.join('\n')}`);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Неизвестная ошибка локальных данных.';
     dialog.showErrorBox('Не удалось загрузить локальные данные', message);

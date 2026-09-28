@@ -27,7 +27,9 @@ import type {
 const api: AppApi = {
   projects: {
     list: () => ipcRenderer.invoke('projects:list') as Promise<Project[]>,
-    create: (name) => ipcRenderer.invoke('projects:create', name) as Promise<Project>,
+    create: (name, workingFolder = null) => ipcRenderer.invoke('projects:create', name, workingFolder) as Promise<Project>,
+    pickFolder: () => ipcRenderer.invoke('projects:pick-folder') as Promise<string | null>,
+    instructionsBackupPath: (id) => ipcRenderer.invoke('projects:instructions-backup-path', id) as Promise<string | null>,
     update: (id, patch) => ipcRenderer.invoke('projects:update', id, patch) as Promise<Project>,
     remove: (id) => ipcRenderer.invoke('projects:delete', id) as Promise<void>,
     chooseFolder: (id) => ipcRenderer.invoke('projects:choose-folder', id) as Promise<Project>,

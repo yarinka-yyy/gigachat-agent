@@ -278,7 +278,9 @@ export interface OnboardingBrowserStatus {
 export interface AppApi {
   projects: {
     list(): Promise<Project[]>;
-    create(name: string): Promise<Project>;
+    create(name: string, workingFolder?: string | null): Promise<Project>;
+    pickFolder(): Promise<string | null>;
+    instructionsBackupPath(id: string): Promise<string | null>;
     update(id: string, patch: ProjectPatch): Promise<Project>;
     remove(id: string): Promise<void>;
     chooseFolder(id: string): Promise<Project>;

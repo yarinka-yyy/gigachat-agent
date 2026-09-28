@@ -18,8 +18,10 @@ const MAX_INSTRUCTION_BYTES = 64 * 1024;
 
 export interface LocalStore {
   listProjects(): Promise<Project[]>;
-  createProject(name: unknown): Promise<Project>;
+  createProject(name: unknown, workingFolder?: unknown): Promise<Project>;
   updateProject(id: unknown, patch: unknown): Promise<Project>;
+  migrateProjectInstructions(id: unknown): Promise<void>;
+  projectInstructionsBackupPath(id: unknown): Promise<string | null>;
   deleteProject(id: unknown): Promise<void>;
   listChats(): Promise<ChatSummary[]>;
   getChat(id: unknown): Promise<ChatDetail>;
@@ -529,6 +531,9 @@ export async function openStore(directory: string): Promise<LocalStore> {
   };
   const readOwnedInstructions = async (filePath: string): Promise<string> => {
     await assertOwnedPath(storageRoot, filePath);
+    return readInstructionsFile(filePath);
+  };
+  const readInstructionsFile = async (filePath: string): Promise<string> => {
     const file = await lstat(filePath).catch((error: unknown) => {
       if (isMissingFile(error)) return null;
       throw error;
@@ -539,6 +544,30 @@ export async function openStore(directory: string): Promise<LocalStore> {
       throw new Error('Инструкция должна быть текстом размером не более 64 КБ.');
     }
     return requireInstructions(await readFile(filePath, 'utf8'));
+  };
+  const externalInstructionsPath = async (project: Project): Promise<string | null> => {
+    if (!project.workingFolder) return null;
+    if (!isAbsolute(project.workingFolder)) throw new Error('Путь к папке проекта должен быть абсолютным.');
+    const folder = await lstat(project.workingFolder);
+    if (!folder.isDirectory() || folder.isSymbolicLink()) throw new Error('Рабочая папка проекта недоступна или является ссылкой.');
+    return join(project.workingFolder, 'AGENTS.md');
+  };
+  const copyLegacyInstructions = async (project: Project): Promise<void> => {
+    const legacy = await readOwnedInstructions(projectInstructionsPath(project.id));
+    if (!legacy) return;
+    const target = await externalInstructionsPath(project);
+    if (!target) return;
+    try { await writeFile(target, legacy, { encoding: 'utf8', flag: 'wx' }); }
+    catch (error) { if (!isRecord(error) || error.code !== 'EEXIST') throw error; }
+  };
+  const copyInstructionsOnFolderChange = async (previous: Project, next: Project): Promise<void> => {
+    const source = await externalInstructionsPath(previous);
+    const text = source ? await readInstructionsFile(source) : await readOwnedInstructions(projectInstructionsPath(previous.id));
+    if (!text) return;
+    const target = await externalInstructionsPath(next);
+    if (!target) return;
+    try { await writeFile(target, text, { encoding: 'utf8', flag: 'wx' }); }
+    catch (error) { if (!isRecord(error) || error.code !== 'EEXIST') throw error; }
   };
 
   await Promise.all([
@@ -684,7 +713,7 @@ export async function openStore(directory: string): Promise<LocalStore> {
 
   return {
     listProjects: () => serialize(async () => projects.map((project) => ({ ...project }))),
-    createProject: (nameInput) => serialize(async () => {
+    createProject: (nameInput, folderInput = null) => serialize(async () => {
       const now = new Date().toISOString();
       const project: Project = {
         id: randomUUID(),
@@ -693,7 +722,7 @@ export async function openStore(directory: string): Promise<LocalStore> {
         archived: false,
         createdAt: now,
         updatedAt: now,
-        workingFolder: null,
+        workingFolder: requireFolderPath(folderInput, 'Рабочая папка проекта'),
       };
       await saveProjects([...projects, project]);
       return { ...project };
@@ -704,8 +733,31 @@ export async function openStore(directory: string): Promise<LocalStore> {
       const project = projects.find((item) => item.id === id);
       if (!project) throw new Error('Проект не найден.');
       const updated = { ...project, ...patch, updatedAt: new Date().toISOString() };
+      if (patch.workingFolder && patch.workingFolder !== project.workingFolder) await copyInstructionsOnFolderChange(project, updated);
       await saveProjects(projects.map((item) => item.id === id ? updated : item));
       return { ...updated };
+    }),
+    migrateProjectInstructions: (idInput) => serialize(async () => {
+      const project = projects.find((item) => item.id === requireId(idInput));
+      if (!project) throw new Error('Проект не найден.');
+      await externalInstructionsPath(project);
+      await copyLegacyInstructions(project);
+    }),
+    projectInstructionsBackupPath: (idInput) => serialize(async () => {
+      const project = projects.find((item) => item.id === requireId(idInput));
+      if (!project) throw new Error('Проект не найден.');
+      const target = await externalInstructionsPath(project);
+      if (!target) return null;
+      const legacyPath = projectInstructionsPath(project.id);
+      const legacy = await readOwnedInstructions(legacyPath);
+      if (!legacy) return null;
+      const current = await lstat(target).catch((error: unknown) => {
+        if (isMissingFile(error)) return null;
+        throw error;
+      });
+      if (!current) return null;
+      await readInstructionsFile(target);
+      return legacyPath;
     }),
     deleteProject: (idInput) => serialize(async () => {
       const id = requireId(idInput);
@@ -882,12 +934,24 @@ export async function openStore(directory: string): Promise<LocalStore> {
     saveGlobalInstructions: (contents) => serialize(() => writeOwnedTextAtomic(join(storageRoot, 'GIGACHAT.md'), requireInstructions(contents))),
     readProjectInstructions: (id) => {
       const validatedId = requireId(id);
-      return serialize(() => readOwnedInstructions(projectInstructionsPath(validatedId)));
+      return serialize(async () => {
+        const project = projects.find((item) => item.id === validatedId);
+        if (!project) throw new Error('Проект не найден.');
+        const target = await externalInstructionsPath(project);
+        return target ? readInstructionsFile(target) : readOwnedInstructions(projectInstructionsPath(project.id));
+      });
     },
     saveProjectInstructions: (id, contents) => {
       const validatedId = requireId(id);
       const validatedContents = requireInstructions(contents);
-      return serialize(() => writeOwnedTextAtomic(projectInstructionsPath(validatedId), validatedContents));
+      return serialize(async () => {
+        const project = projects.find((item) => item.id === validatedId);
+        if (!project) throw new Error('Проект не найден.');
+        const target = await externalInstructionsPath(project);
+        if (!target) return writeOwnedTextAtomic(projectInstructionsPath(validatedId), validatedContents);
+        await readInstructionsFile(target);
+        await writeTextAtomic(target, validatedContents);
+      });
     },
   };
 }
