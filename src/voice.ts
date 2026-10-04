@@ -94,10 +94,20 @@ function buildTranscriptionArgs(filePath: string, paths: VoiceRuntimePaths): str
 }
 
 export function createVoiceRuntime(paths: VoiceRuntimePaths, host: VoiceRuntimeHost): VoiceRuntime {
-  const active = new Map<string, { controller: AbortController; task: Promise<string> | null }>();
+  const active = new Map<string, {
+    controller: AbortController;
+    task: Promise<string> | null;
+    retryCleanup: (() => Promise<void>) | null;
+    cleanupAttempt: Promise<void> | null;
+    cleanupFailed: boolean;
+    cleanupError: unknown;
+  }>();
 
   async function transcribe(requestIdInput: string, audio: Uint8Array, mediaType: string): Promise<string> {
     const requestId = requireRequestId(requestIdInput);
+    if ([...active.values()].some((entry) => entry.cleanupFailed)) {
+      throw new Error('Не удалось очистить временную запись. Повторите отмену перед новой записью.');
+    }
     if (active.has(requestId)) throw new Error('Диктовка с таким идентификатором уже выполняется.');
     if (active.size > 0) throw new Error('Другая запись уже распознаётся.');
     if (!(audio instanceof Uint8Array) || audio.byteLength === 0 || audio.byteLength > VOICE_MAX_AUDIO_BYTES) {
@@ -110,12 +120,23 @@ export function createVoiceRuntime(paths: VoiceRuntimePaths, host: VoiceRuntimeH
       throw new Error('Браузер создал неподдерживаемый формат записи.');
     }
 
-    const entry = { controller: new AbortController(), task: null as Promise<string> | null };
+    const entry = {
+      controller: new AbortController(),
+      task: null as Promise<string> | null,
+      retryCleanup: null as (() => Promise<void>) | null,
+      cleanupAttempt: null as Promise<void> | null,
+      cleanupFailed: false,
+      cleanupError: undefined as unknown,
+    };
     active.set(requestId, entry);
     const task = (async () => {
       let prepared: VoicePreparedAudio | null = null;
+      let result: string | undefined;
+      let failed = false;
+      let failure: unknown;
       try {
         prepared = await host.prepareAudio(audio);
+        entry.retryCleanup = prepared.cleanup.bind(prepared);
         if (entry.controller.signal.aborted) throw new Error('Распознавание отменено.');
         const stdout = await host.run(
           paths.executable,
@@ -124,14 +145,25 @@ export function createVoiceRuntime(paths: VoiceRuntimePaths, host: VoiceRuntimeH
           entry.controller.signal,
         );
         if (entry.controller.signal.aborted) throw new Error('Распознавание отменено.');
-        return parseVoiceTranscript(stdout);
-      } finally {
-        try {
-          await prepared?.cleanup();
-        } finally {
-          active.delete(requestId);
-        }
+        result = parseVoiceTranscript(stdout);
+      } catch (error) {
+        failed = true;
+        failure = error;
       }
+      try {
+        await entry.retryCleanup?.();
+      } catch (error) {
+        entry.cleanupFailed = true;
+        entry.cleanupError = error;
+        throw error;
+      }
+      entry.retryCleanup = null;
+      entry.cleanupError = undefined;
+      entry.cleanupFailed = false;
+      if (active.get(requestId) === entry) active.delete(requestId);
+      if (failed) throw failure;
+      if (result === undefined) throw new Error('Не удалось получить текст локального распознавания.');
+      return result;
     })();
     entry.task = task;
     return task;
@@ -142,14 +174,53 @@ export function createVoiceRuntime(paths: VoiceRuntimePaths, host: VoiceRuntimeH
     const entry = active.get(requestId);
     if (!entry) return false;
     entry.controller.abort();
+    if (entry.cleanupFailed) {
+      await retryFailedCleanup(requestId, entry);
+      return true;
+    }
     await entry.task?.catch(() => undefined);
+    if (entry.cleanupFailed) throw entry.cleanupError;
     return true;
   }
 
+  async function retryFailedCleanup(requestId: string, entry: NonNullable<ReturnType<typeof active.get>>): Promise<void> {
+    if (entry.cleanupAttempt) return entry.cleanupAttempt;
+    const retryCleanup = entry.retryCleanup;
+    if (!retryCleanup) throw entry.cleanupError ?? new Error('Не удалось подтвердить очистку временной записи.');
+    const attempt = (async () => {
+      try {
+        await retryCleanup();
+      } catch (error) {
+        entry.cleanupError = error;
+        entry.cleanupFailed = true;
+        throw error;
+      }
+      entry.retryCleanup = null;
+      entry.cleanupError = undefined;
+      entry.cleanupFailed = false;
+      if (active.get(requestId) === entry) active.delete(requestId);
+    })();
+    entry.cleanupAttempt = attempt;
+    void attempt.then(
+      () => { if (entry.cleanupAttempt === attempt) entry.cleanupAttempt = null; },
+      () => { if (entry.cleanupAttempt === attempt) entry.cleanupAttempt = null; },
+    );
+    return attempt;
+  }
+
   async function cancelAll(): Promise<void> {
-    const entries = [...active.values()];
-    for (const entry of entries) entry.controller.abort();
-    await Promise.all(entries.map((entry) => entry.task?.catch(() => undefined)));
+    const entries = [...active.entries()];
+    for (const [, entry] of entries) entry.controller.abort();
+    const results = await Promise.allSettled(entries.map(async ([requestId, entry]) => {
+      if (entry.cleanupFailed) {
+        await retryFailedCleanup(requestId, entry);
+        return;
+      }
+      await entry.task?.catch(() => undefined);
+      if (entry.cleanupFailed) throw entry.cleanupError;
+    }));
+    const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (failed) throw failed.reason;
   }
 
   return { transcribe, cancel, cancelAll };

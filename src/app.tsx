@@ -52,6 +52,8 @@ import {
 import { completeComposerSuggestion, getComposerCompletion, isUnavailableCompactCommand, type ComposerSuggestion } from './commands';
 import type {
   AppInfo,
+  CloseAttemptResult,
+  CloseFailure,
   ChatDetail,
   ChatSummary,
   ChatKind,
@@ -59,6 +61,7 @@ import type {
   FolderOpener,
   HookEvent,
   HookRegistrySnapshot,
+  InstructionSaveResult,
   LocalUsageStats,
   Project,
   ProjectPatch,
@@ -79,6 +82,7 @@ import type { PermissionProfile } from './permissions';
 import { GIGACHAT_MODELS, type GigaChatModelId } from './models';
 import gigaChatLogo from './assets/gigachat-logo.png';
 import { createInstructionAutosave, type SaveStatus } from './instruction-autosave';
+import { createChatForDraftSession, createNewChatDraftSession, createRendererOperationTracker, persistDraftSession, shouldOpenCreatedDraftChat, type NewChatDraftSession } from './renderer-operations';
 import ConnectionSetup from './components/ConnectionSetup';
 import VoiceCaptureControl, { getCaptureError } from './components/VoiceCaptureControl';
 import ContextRing from './components/ContextRing';
@@ -88,6 +92,13 @@ import { sidebarSections } from './sidebar-sections';
 
 type Page = 'home' | 'chat' | 'settings' | 'onboarding' | 'images' | 'video' | 'podcasts' | 'archive' | 'profile';
 type Route = { page: Page; id?: string };
+type HomeDraftSession = NewChatDraftSession<PermissionProfile> & {
+  creation: Promise<ChatSummary> | null;
+  chatId: string | null;
+  chat: ChatSummary | null;
+  error: string;
+};
+type ChatLoadState = { chatId: string; status: 'loading' | 'ready' | 'error'; error?: string };
 type Navigation = { history: Route[]; index: number };
 type SettingsSection =
   | 'general'
@@ -248,13 +259,24 @@ function ScrollingRowTitle({ value, pinned = false }: { value: string; pinned?: 
   </span>;
 }
 
-function ActionMenu({ children, label, trigger, className = '', placement = 'side', initialFocus, onOpen, disabled = false }: {
+function ActionMenu({ children, label, trigger, className = '', placement = 'side', initialFocus, onOpen, onVisibilityChange, disabled = false }: {
   children: ReactNode; label: string; trigger?: ReactNode; className?: string;
-  placement?: 'side' | 'below' | 'below-start'; initialFocus?: string; onOpen?: () => void; disabled?: boolean;
+  placement?: 'side' | 'below' | 'below-start'; initialFocus?: string; onOpen?: () => void;
+  onVisibilityChange?: (id: string, open: boolean) => void; disabled?: boolean;
 }) {
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
+  const overlayId = useId();
+  const overlayOpen = useRef(false);
+  const visibilityCallback = useRef(onVisibilityChange);
+  visibilityCallback.current = onVisibilityChange;
+
+  useEffect(() => () => {
+    if (!overlayOpen.current) return;
+    overlayOpen.current = false;
+    visibilityCallback.current?.(overlayId, false);
+  }, [overlayId]);
 
   function positionPopup(): void {
     const trigger = triggerRef.current;
@@ -312,6 +334,10 @@ function ActionMenu({ children, label, trigger, className = '', placement = 'sid
         const isOpen = popupRef.current?.matches(':popover-open') ?? false;
         if (!isOpen) popupRef.current?.querySelectorAll<HTMLDivElement>('.submenu-content:popover-open').forEach((submenu) => submenu.hidePopover());
         if (!isOpen && popupRef.current?.contains(document.activeElement)) triggerRef.current?.focus();
+        if (overlayOpen.current !== isOpen) {
+          overlayOpen.current = isOpen;
+          visibilityCallback.current?.(overlayId, isOpen);
+        }
         setOpen(isOpen);
       }} onClick={(event) => {
         const button = event.target instanceof Element ? event.target.closest('button') : null;
@@ -321,13 +347,25 @@ function ActionMenu({ children, label, trigger, className = '', placement = 'sid
   );
 }
 
-function ProjectSubmenu({ chat, projects, onSelect }: { chat: ChatSummary; projects: Project[]; onSelect: (projectId: string) => void }) {
+function ProjectSubmenu({ chat, projects, onSelect, onVisibilityChange }: {
+  chat: ChatSummary; projects: Project[]; onSelect: (projectId: string) => void;
+  onVisibilityChange?: (id: string, open: boolean) => void;
+}) {
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
   const openTimer = useRef<number | null>(null);
   const closeTimer = useRef<number | null>(null);
   const [open, setOpen] = useState(false);
   const popupId = useId();
+  const overlayOpen = useRef(false);
+  const visibilityCallback = useRef(onVisibilityChange);
+  visibilityCallback.current = onVisibilityChange;
+
+  useEffect(() => () => {
+    if (!overlayOpen.current) return;
+    overlayOpen.current = false;
+    visibilityCallback.current?.(`${popupId}-submenu`, false);
+  }, [popupId]);
 
   function cancelOpen(): void {
     if (openTimer.current !== null) window.clearTimeout(openTimer.current);
@@ -405,7 +443,14 @@ function ProjectSubmenu({ chat, projects, onSelect }: { chat: ChatSummary; proje
         onKeyDown={(event) => { if (event.key === 'ArrowRight') { event.preventDefault(); showPopup(true); } }}>
         <Icon name="folder" />Переместить в проект<ChevronRight className="icon submenu-chevron" aria-hidden="true" />
       </button>
-      <div ref={popupRef} id={popupId} popover="auto" className="submenu-content" onToggle={() => setOpen(popupRef.current?.matches(':popover-open') ?? false)}
+      <div ref={popupRef} id={popupId} popover="auto" className="submenu-content" onToggle={() => {
+        const isOpen = popupRef.current?.matches(':popover-open') ?? false;
+        if (overlayOpen.current !== isOpen) {
+          overlayOpen.current = isOpen;
+          visibilityCallback.current?.(`${popupId}-submenu`, isOpen);
+        }
+        setOpen(isOpen);
+      }}
         onPointerEnter={cancelClose} onPointerLeave={scheduleClose}
         onKeyDown={(event) => {
           if (event.key === 'Escape' || event.key === 'ArrowLeft') {
@@ -524,7 +569,14 @@ function themeLabel(theme: Theme): string {
 function saveStatusLabel(status: SaveStatus): string {
   return status === 'saved' ? 'Сохранено автоматически'
     : status === 'saving' ? 'Сохранение…'
-      : status === 'error' ? 'Не сохранено — исправьте ошибку и продолжите ввод' : 'Есть несохранённые изменения';
+      : status === 'error' ? 'Не сохранено — исправьте ошибку и продолжите ввод'
+        : status === 'conflict' ? 'Обнаружено изменение файла — выберите версию'
+          : 'Есть несохранённые изменения';
+}
+
+function isInstructionConflict(value: unknown): value is Extract<InstructionSaveResult, { kind: 'conflict' }> {
+  return typeof value === 'object' && value !== null && 'kind' in value && value.kind === 'conflict'
+    && 'current' in value;
 }
 
 export default function App() {
@@ -542,6 +594,8 @@ export default function App() {
   const [showAllProjects, setShowAllProjects] = useState(false);
   const [showAllChats, setShowAllChats] = useState(false);
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set());
+  const [nativeOverlayOpen, setNativeOverlayOpen] = useState(false);
+  const nativeOverlayIds = useRef(new Set<string>());
   const [selectedProjectId, setSelectedProjectId] = useState('');
   const [projectSearch, setProjectSearch] = useState('');
   const [draft, setDraft] = useState('');
@@ -549,6 +603,11 @@ export default function App() {
   const [completionDismissed, setCompletionDismissed] = useState(false);
   const [completionIndex, setCompletionIndex] = useState(0);
   const [chatDetail, setChatDetail] = useState<ChatDetail | null>(null);
+  const [chatLoadState, setChatLoadState] = useState<ChatLoadState>({ chatId: '', status: 'ready' });
+  const [chatLoadRetry, setChatLoadRetry] = useState(0);
+  const [chatDraftSaveError, setChatDraftSaveError] = useState<{ chatId: string; message: string } | null>(null);
+  const [homeDraftError, setHomeDraftError] = useState('');
+  const [detachedDraftSessions, setDetachedDraftSessions] = useState<HomeDraftSession[]>([]);
   const [runtimeTurns, setRuntimeTurns] = useState<RuntimeTurnSnapshot[]>([]);
   const [pendingPermissionProfile, setPendingPermissionProfile] = useState<PermissionProfile | null>(null);
   const [sending, setSending] = useState(false);
@@ -568,6 +627,7 @@ export default function App() {
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [localUsageStats, setLocalUsageStats] = useState<LocalUsageStats | null>(null);
   const [voiceAvailability, setVoiceAvailability] = useState<VoiceAvailability>({ available: false, reason: 'Проверяем локальный runtime диктовки…' });
+  const [homeVoiceGeneration, setHomeVoiceGeneration] = useState(0);
   const [skillRegistry, setSkillRegistry] = useState<SkillRegistrySnapshot>({ skills: [], issues: [] });
   const [hookRegistry, setHookRegistry] = useState<HookRegistrySnapshot>({ hooks: [], issues: [] });
   const [skillProjectId, setSkillProjectId] = useState('');
@@ -579,14 +639,42 @@ export default function App() {
   const [configSaved, setConfigSaved] = useState('');
   const [configError, setConfigError] = useState('');
   const [configBusy, setConfigBusy] = useState(false);
+  const closeUiState = useRef({ configDraft, configSaved, configBusy, chatDraftSaveError });
+  closeUiState.current = { configDraft, configSaved, configBusy, chatDraftSaveError };
   const [approvalRequest, setApprovalRequest] = useState<PermissionApprovalRequest | null>(null);
+  const [closeFailure, setCloseFailure] = useState<CloseFailure | null>(null);
+  const [closePending, setClosePending] = useState(false);
+  const [closeRetrying, setCloseRetrying] = useState(false);
   const [globalInstructions, setGlobalInstructions] = useState('');
   const [globalInstructionsStatus, setGlobalInstructionsStatus] = useState<SaveStatus>('saved');
+  const [globalInstructionsLoading, setGlobalInstructionsLoading] = useState(false);
+  const [globalInstructionsReady, setGlobalInstructionsReady] = useState(false);
+  const [globalInstructionsLoadError, setGlobalInstructionsLoadError] = useState('');
+  const [globalInstructionRetry, setGlobalInstructionRetry] = useState(0);
+  const [globalInstructionsConflict, setGlobalInstructionsConflict] = useState<Extract<InstructionSaveResult, { kind: 'conflict' }> | null>(null);
+  const [globalPreservedInstruction, setGlobalPreservedInstruction] = useState<Extract<InstructionSaveResult, { kind: 'conflict' }>['preservedVersion']>(undefined);
   const [integrationTab, setIntegrationTab] = useState<'skills' | 'plugins' | 'tools'>('skills');
   const [projectInstructions, setProjectInstructions] = useState('');
   const [projectInstructionsStatus, setProjectInstructionsStatus] = useState<SaveStatus>('saved');
+  const [projectInstructionsLoading, setProjectInstructionsLoading] = useState(false);
+  const [projectInstructionsReady, setProjectInstructionsReady] = useState(false);
+  const [projectInstructionsLoadError, setProjectInstructionsLoadError] = useState('');
+  const [projectInstructionsConflict, setProjectInstructionsConflict] = useState<Extract<InstructionSaveResult, { kind: 'conflict' }> | null>(null);
+  const [projectPreservedInstruction, setProjectPreservedInstruction] = useState<Extract<InstructionSaveResult, { kind: 'conflict' }>['preservedVersion']>(undefined);
+  const globalInstructionLoadGeneration = useRef(0);
+  const projectInstructionLoadGeneration = useRef(0);
+  const chatDetailLoadGeneration = useRef(0);
+  const routeGeneration = useRef(0);
+  const draftRevision = useRef(0);
+  const dialogGeneration = useRef(0);
+  const projectFolderChangeRevision = useRef(new Map<string, number>());
+  const activeProjectInstructionId = useRef<string | null>(null);
   const pendingChat = useRef<Promise<ChatSummary> | null>(null);
+  const homeDraftSession = useRef<HomeDraftSession | null>(null);
+  const detachedDraftSessionSet = useRef(new Set<HomeDraftSession>());
   const homeChatId = useRef<string | null>(null);
+  const retainedChatDrafts = useRef(new Map<string, { text: string; message: string }>());
+  const chatDraftMutationRevision = useRef(new Map<string, number>());
   const pendingPermissionProfileRef = useRef<PermissionProfile | null>(null);
   const pendingPermissionChatIdRef = useRef<string | null>(null);
   const permissionProfileRevision = useRef(0);
@@ -601,6 +689,11 @@ export default function App() {
   const draftSave = useRef<Promise<unknown>>(Promise.resolve());
   const dialogRef = useRef<HTMLDialogElement>(null);
   const approvalDialogRef = useRef<HTMLDialogElement>(null);
+  const closeDialogRef = useRef<HTMLDialogElement>(null);
+  const closePendingDialogRef = useRef<HTMLDialogElement>(null);
+  const closeActionInFlight = useRef(false);
+  const rendererOperations = useRef(createRendererOperationTracker());
+  const connectionKeySaveFailed = useRef(false);
   const routeRef = useRef<Route>({ page: 'home' });
   const settingsRevision = useRef(0);
   const sidebarButtonRef = useRef<HTMLButtonElement>(null);
@@ -608,6 +701,10 @@ export default function App() {
   const sidebarRef = useRef<HTMLElement>(null);
   const previewCloseTimer = useRef(createPreviewExitTimer(window.setTimeout.bind(window), window.clearTimeout.bind(window)));
   const firstRunMicrophonePrompt = useRef(false);
+
+  function trackRendererOperation<T>(operation: () => T | Promise<T>): Promise<T> {
+    return rendererOperations.current.track(operation);
+  }
 
   function resizeComposer(): void {
     const input = composerInputRef.current;
@@ -635,6 +732,13 @@ export default function App() {
   function closePreview(): void {
     clearPreviewClose();
     setSidebarPreview(false);
+  }
+
+  function trackNativeOverlay(id: string, open: boolean): void {
+    const openOverlays = nativeOverlayIds.current;
+    if (open) openOverlays.add(id);
+    else openOverlays.delete(id);
+    setNativeOverlayOpen(openOverlays.size > 0);
   }
 
   function schedulePreviewClose(): void {
@@ -687,17 +791,26 @@ export default function App() {
     setNoticeSequence((sequence) => sequence + 1);
   }
   const [globalSaver] = useState(() => createInstructionAutosave(
-    (_key, value) => window.gigaChat.settings.saveInstructions(value),
+    (_key, value, expectedRevision) => window.gigaChat.settings.saveInstructions(value, expectedRevision),
     (_key, status, error) => {
       setGlobalInstructionsStatus(status);
-      if (error) setNotice(getErrorMessage(error));
+      if (isInstructionConflict(error)) {
+        setGlobalInstructionsConflict(error);
+        if (error.preservedVersion) setGlobalPreservedInstruction(error.preservedVersion);
+      } else if (status === 'saved') setGlobalInstructionsConflict(null);
+      if (error && !isInstructionConflict(error)) setNotice(getErrorMessage(error));
     },
   ));
   const [projectSaver] = useState(() => createInstructionAutosave(
-    (id, value) => window.gigaChat.projects.saveInstructions(id, value),
-    (_id, status, error) => {
+    (id, value, expectedRevision) => window.gigaChat.projects.saveInstructions(id, value, expectedRevision),
+    (id, status, error) => {
+      if (activeProjectInstructionId.current !== id) return;
       setProjectInstructionsStatus(status);
-      if (error) setNotice(getErrorMessage(error));
+      if (isInstructionConflict(error)) {
+        setProjectInstructionsConflict(error);
+        if (error.preservedVersion) setProjectPreservedInstruction(error.preservedVersion);
+      } else if (status === 'saved') setProjectInstructionsConflict(null);
+      if (error && !isInstructionConflict(error)) setNotice(getErrorMessage(error));
     },
   ));
   const route = navigation.history[navigation.index] ?? { page: 'home' as const };
@@ -718,9 +831,10 @@ export default function App() {
   useEffect(() => {
     const dialog = approvalDialogRef.current;
     if (!dialog) return;
+    if (rendererOperations.current.frozen) return;
     if (approvalRequest && !dialog.open) dialog.showModal();
     else if (!approvalRequest && dialog.open) dialog.close();
-  }, [approvalRequest]);
+  }, [approvalRequest, closeFailure, closePending]);
 
   useEffect(() => {
     if (!approvalRequest) return;
@@ -742,6 +856,7 @@ export default function App() {
       setSettings(loadedSettings);
       if (!loadedSettings.onboardingCompleted) {
         const onboardingRoute: Route = { page: 'onboarding' };
+        routeGeneration.current += 1;
         routeRef.current = onboardingRoute;
         setNavigation({ history: [onboardingRoute], index: 0 });
       }
@@ -765,19 +880,29 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (loading || settings.onboardingCompleted || settings.microphoneConsent !== 'unasked' || firstRunMicrophonePrompt.current) return;
+    if (loading || closePending || closeFailure || settings.onboardingCompleted || settings.microphoneConsent !== 'unasked' || firstRunMicrophonePrompt.current) return;
     firstRunMicrophonePrompt.current = true;
+    let cancelled = false;
     const timer = window.setTimeout(() => {
-      void window.gigaChat.voice.requestAccess().then(async (granted) => {
-        setSettings((current) => ({ ...current, microphoneConsent: granted ? 'allowed' : 'declined' }));
-        if (!granted) return;
+      void (async () => {
+        const granted = await window.gigaChat.voice.requestAccess();
+        if (cancelled || rendererOperations.current.frozen) return;
+        if (!granted) {
+          setSettings((current) => ({ ...current, microphoneConsent: 'declined' }));
+          return;
+        }
         if (!navigator.mediaDevices?.getUserMedia) throw new Error('Запись микрофона недоступна в этой версии приложения.');
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        if (cancelled || rendererOperations.current.frozen) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
         stream.getTracks().forEach((track) => track.stop());
-      }).catch((error: unknown) => setNotice(getCaptureError(error)));
+        setSettings((current) => ({ ...current, microphoneConsent: 'allowed' }));
+      })().catch((error: unknown) => { if (!cancelled) setNotice(getCaptureError(error)); });
     }, 300);
-    return () => window.clearTimeout(timer);
-  }, [loading, settings.onboardingCompleted, settings.microphoneConsent]);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [loading, settings.onboardingCompleted, settings.microphoneConsent, closePending, Boolean(closeFailure)]);
 
   useEffect(() => {
     let cancelled = false;
@@ -820,16 +945,64 @@ export default function App() {
   }, [route.page, chats.length, projects.length]);
 
   useEffect(() => window.gigaChat.onCloseRequested(async () => {
-    try {
-      await Promise.all([
-        globalSaver.flushAll(), projectSaver.flushAll(), draftSave.current,
-        permissionProfileSave.current, skillSelectionSave.current,
-      ]);
-    } catch (error) {
-      setNotice(getErrorMessage(error));
-      throw error;
+    setCloseFailure(null);
+    setClosePending(true);
+    let operationFailure: unknown;
+    let operationFailed = false;
+    try { await rendererOperations.current.freezeAndDrain(); }
+    catch (error) { operationFailure = error; operationFailed = true; }
+    const results = await Promise.allSettled([
+      globalSaver.flushAll(), projectSaver.flushAll(), draftSave.current,
+      permissionProfileSave.current, skillSelectionSave.current,
+    ]);
+    if (operationFailed) throw operationFailure;
+    const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (failed) throw failed.reason;
+    if (connectionKeySaveFailed.current) {
+      throw new Error('Не удалось сохранить значение локально. Вернитесь к подключению API и повторите сохранение либо очистите поле перед закрытием.');
     }
+    const draftSessionFailed = homeDraftSession.current?.error
+      || [...detachedDraftSessionSet.current].some((session) => session.error);
+    if (closeUiState.current.chatDraftSaveError || retainedChatDrafts.current.size > 0 || draftSessionFailed) {
+      throw new Error('Есть несохранённый текст. Вернитесь к работе, чтобы повторить сохранение; окно останется открытым.');
+    }
+    if (closeUiState.current.configBusy || closeUiState.current.configDraft !== closeUiState.current.configSaved) {
+      throw new Error('Изменения config.toml ещё не сохранены. Вернитесь к настройкам, сохраните файл и повторите закрытие.');
+    }
+  }, (failure) => {
+    setClosePending(false);
+    setCloseFailure(failure);
   }), [globalSaver, projectSaver]);
+
+  function runCloseAction(action: () => Promise<CloseAttemptResult>): void {
+    if (closeActionInFlight.current) return;
+    closeActionInFlight.current = true;
+    setCloseRetrying(true);
+    void action().then((result) => {
+      setCloseFailure(result.status === 'failed' ? result : null);
+    }).catch((error: unknown) => {
+      setCloseFailure({ status: 'failed', reason: 'close', message: getErrorMessage(error) });
+    }).finally(() => {
+      closeActionInFlight.current = false;
+      setCloseRetrying(false);
+    });
+  }
+
+  function returnFromCloseFailure(): void {
+    if (closeActionInFlight.current) return;
+    closeActionInFlight.current = true;
+    setCloseRetrying(true);
+    void window.gigaChat.returnFromClose().then(() => {
+      rendererOperations.current.resume();
+      setClosePending(false);
+      setCloseFailure(null);
+    }).catch((error: unknown) => {
+      setCloseFailure({ status: 'failed', reason: 'close', message: getErrorMessage(error) });
+    }).finally(() => {
+      closeActionInFlight.current = false;
+      setCloseRetrying(false);
+    });
+  }
 
   useEffect(() => () => {
     void Promise.all([globalSaver.flushAll(), projectSaver.flushAll()])
@@ -848,10 +1021,43 @@ export default function App() {
 
   useEffect(() => {
     if (dialogRequest) {
+      if (rendererOperations.current.frozen) return;
       dialogRef.current?.showModal();
       (dialogRef.current?.querySelector('input') ?? dialogRef.current?.querySelector('textarea') ?? dialogRef.current?.querySelector<HTMLButtonElement>('.dialog-actions button'))?.focus();
     } else dialogRef.current?.close();
-  }, [dialogRequest]);
+  }, [dialogRequest, closeFailure]);
+
+  useEffect(() => {
+    const dialogContains = (target: EventTarget | null): boolean => target instanceof Node
+      && (Boolean(closePendingDialogRef.current?.contains(target)) || Boolean(closeDialogRef.current?.contains(target)));
+    const blockBackgroundInput = (event: Event): void => {
+      if (!rendererOperations.current.frozen || dialogContains(event.target)) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    };
+    const eventNames = ['beforeinput', 'change', 'click', 'input', 'keydown', 'pointerdown', 'submit'] as const;
+    for (const eventName of eventNames) document.addEventListener(eventName, blockBackgroundInput, true);
+    return () => {
+      for (const eventName of eventNames) document.removeEventListener(eventName, blockBackgroundInput, true);
+    };
+  }, []);
+
+  useEffect(() => {
+    const dialog = closePendingDialogRef.current;
+    if (closePending) {
+      if (dialog && !dialog.open) dialog.showModal();
+    } else if (dialog?.open) dialog.close();
+  }, [closePending]);
+
+  useEffect(() => {
+    const dialog = closeDialogRef.current;
+    if (closeFailure) {
+      if (dialog && !dialog.open) {
+        dialog.showModal();
+        dialog.querySelector<HTMLButtonElement>('.close-retry-button')?.focus();
+      }
+    } else if (dialog?.open) dialog.close();
+  }, [closeFailure]);
 
   useEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)');
@@ -896,6 +1102,8 @@ export default function App() {
     if (route.page === 'chat') {
       const id = route.id;
       if (!id) return;
+      const routeRevision = routeGeneration.current;
+      const generation = ++chatDetailLoadGeneration.current;
       const fromHome = homeChatId.current === id;
       if (fromHome) homeChatId.current = null;
       if (!fromHome) {
@@ -903,58 +1111,116 @@ export default function App() {
         draftRef.current = '';
         draftSave.current = Promise.resolve();
       }
+      setChatDraftSaveError(null);
+      setChatLoadState({ chatId: id, status: 'loading' });
       let cancelled = false;
       setChatDetail(null);
       void window.gigaChat.chats.get(id).then((detail) => {
-        if (cancelled) return;
+        if (cancelled || generation !== chatDetailLoadGeneration.current
+          || routeRevision !== routeGeneration.current
+          || routeRef.current.page !== 'chat' || routeRef.current.id !== id) return;
         setChatDetail(detail);
         if (!fromHome) {
-          setDraft(detail.draft);
-          draftRef.current = detail.draft;
+          const retained = retainedChatDrafts.current.get(id);
+          const loadedDraft = retained?.text ?? detail.draft;
+          setDraft(loadedDraft);
+          draftRef.current = loadedDraft;
+          if (retained?.message) setChatDraftSaveError({ chatId: id, message: retained.message });
         }
-      }).catch((error: unknown) => { if (!cancelled) setNotice(getErrorMessage(error)); });
+        setChatLoadState({ chatId: id, status: 'ready' });
+      }).catch((error: unknown) => {
+        if (cancelled || generation !== chatDetailLoadGeneration.current
+          || routeRevision !== routeGeneration.current
+          || routeRef.current.page !== 'chat' || routeRef.current.id !== id) return;
+        setChatLoadState({ chatId: id, status: 'error', error: getErrorMessage(error) });
+      });
       return () => { cancelled = true; };
     } else if (route.page === 'home') {
+      chatDetailLoadGeneration.current += 1;
       setDraft('');
       draftRef.current = '';
       draftSave.current = Promise.resolve();
       homeChatId.current = null;
       setChatDetail(null);
+      setChatLoadState({ chatId: '', status: 'ready' });
+      setChatDraftSaveError(null);
     }
-  }, [route.page, route.id]);
+  }, [route.page, route.id, chatLoadRetry]);
 
   useEffect(() => {
     const chatId = route.page === 'chat' ? route.id : undefined;
     setRuntimeTurns([]);
     if (!chatId) return undefined;
     let cancelled = false;
+    const routeRevision = routeGeneration.current;
+    const generation = chatDetailLoadGeneration.current;
     const merge = (turn: RuntimeTurnSnapshot): void => {
-      if (turn.chatId !== chatId) return;
+      if (cancelled || generation !== chatDetailLoadGeneration.current
+        || routeRevision !== routeGeneration.current
+        || routeRef.current.page !== 'chat' || routeRef.current.id !== chatId || turn.chatId !== chatId) return;
       setRuntimeTurns((current) => {
         const byId = new Map(current.map((item) => [item.id, item]));
         byId.set(turn.id, turn);
         return [...byId.values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt)).slice(-12);
       });
-      if (turn.status === 'completed') {
-        void window.gigaChat.chats.get(chatId).then((detail) => {
-          if (!cancelled && routeRef.current.page === 'chat' && routeRef.current.id === chatId) setChatDetail(detail);
-        }).catch((error: unknown) => { if (!cancelled) setNotice(getErrorMessage(error)); });
+      if (turn.status === 'completed' || turn.status === 'failed' || turn.status === 'cancelled') {
+        const profileRevision = permissionProfileRevision.current;
+        const skillRevision = skillSelectionRevision.current;
+        const profileSave = permissionProfileSave.current;
+        const skillSave = skillSelectionSave.current;
+        void Promise.all([profileSave.catch(() => undefined), skillSave.catch(() => undefined)])
+          .then(() => window.gigaChat.chats.get(chatId)).then((detail) => {
+            if (cancelled || generation !== chatDetailLoadGeneration.current
+              || routeRevision !== routeGeneration.current
+              || routeRef.current.page !== 'chat' || routeRef.current.id !== chatId) return;
+            if (profileRevision === permissionProfileRevision.current
+              && pendingPermissionChatIdRef.current === chatId && detail.nextTurnPermissionProfile === null) {
+              pendingPermissionProfileRef.current = null;
+              pendingPermissionChatIdRef.current = null;
+              setPendingPermissionProfile(null);
+            }
+            if (skillRevision === skillSelectionRevision.current
+              && pendingSkillChatIdRef.current === chatId && detail.nextTurnSkillId === null) {
+              pendingSkillIdRef.current = null;
+              pendingSkillChatIdRef.current = null;
+              setPendingSkillId(null);
+            }
+            setChatDetail((current) => current?.id === chatId ? {
+              ...detail,
+              ...(profileRevision === permissionProfileRevision.current ? {} : {
+                nextTurnPermissionProfile: current.nextTurnPermissionProfile,
+              }),
+              ...(skillRevision === skillSelectionRevision.current ? {} : {
+                nextTurnSkillId: current.nextTurnSkillId,
+              }),
+            } : detail);
+          }).catch((error: unknown) => {
+            if (!cancelled && generation === chatDetailLoadGeneration.current
+              && routeRevision === routeGeneration.current
+              && routeRef.current.page === 'chat' && routeRef.current.id === chatId) setNotice(getErrorMessage(error));
+          });
       }
     };
     const unsubscribe = window.gigaChat.runtime.onUpdate(merge);
     void window.gigaChat.runtime.list(chatId).then((turns) => {
-      if (cancelled) return;
+      if (cancelled || generation !== chatDetailLoadGeneration.current
+        || routeRevision !== routeGeneration.current
+        || routeRef.current.page !== 'chat' || routeRef.current.id !== chatId) return;
       setRuntimeTurns((current) => {
         const byId = new Map(turns.map((turn) => [turn.id, turn]));
         for (const turn of current) if (!byId.has(turn.id)) byId.set(turn.id, turn);
         return [...byId.values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt)).slice(-12);
       });
-    }).catch((error: unknown) => { if (!cancelled) setNotice(getErrorMessage(error)); });
+    }).catch((error: unknown) => {
+      if (!cancelled && generation === chatDetailLoadGeneration.current
+        && routeRevision === routeGeneration.current
+        && routeRef.current.page === 'chat' && routeRef.current.id === chatId) setNotice(getErrorMessage(error));
+    });
     return () => {
       cancelled = true;
       unsubscribe();
     };
-  }, [route.page, route.id]);
+  }, [route.page, route.id, chatLoadRetry]);
 
   useEffect(() => {
     if (route.page !== 'settings') return;
@@ -977,21 +1243,49 @@ export default function App() {
   useEffect(() => {
     if (route.page !== 'settings' || settingsSection !== 'personalization') return;
     let cancelled = false;
+    const generation = ++globalInstructionLoadGeneration.current;
+    setGlobalInstructionsLoading(true);
+    setGlobalInstructionsReady(false);
+    setGlobalInstructionsLoadError('');
     void window.gigaChat.settings.readInstructions()
-      .then((contents) => { if (!cancelled) setGlobalInstructions(globalSaver.load('global', contents)); })
-      .catch((error: unknown) => { if (!cancelled) setNotice(getErrorMessage(error)); });
-    return () => { cancelled = true; };
-  }, [route.page, settingsSection, globalSaver]);
+      .then((document) => {
+        if (!cancelled && generation === globalInstructionLoadGeneration.current) {
+          setGlobalInstructions(globalSaver.load('global', document));
+          setGlobalInstructionsReady(true);
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled && generation === globalInstructionLoadGeneration.current) {
+          setGlobalInstructionsStatus('error');
+          setGlobalInstructionsLoadError(getErrorMessage(error));
+        }
+      })
+      .finally(() => {
+        if (!cancelled && generation === globalInstructionLoadGeneration.current) setGlobalInstructionsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+      if (generation === globalInstructionLoadGeneration.current) globalInstructionLoadGeneration.current += 1;
+    };
+  }, [route.page, settingsSection, globalSaver, globalInstructionRetry]);
 
   useEffect(() => {
     if (route.page !== 'settings' || settingsSection !== 'permissions') return;
     let cancelled = false;
-    void window.gigaChat.permissions.readConfig().then(({ contents, error }) => {
-      if (cancelled) return;
-      setConfigDraft(contents);
-      setConfigSaved(contents);
-      setConfigError(error ?? '');
-    }).catch((error: unknown) => { if (!cancelled) setConfigError(getErrorMessage(error)); });
+    void trackRendererOperation(async () => {
+      try {
+        const { contents, error } = await window.gigaChat.permissions.readConfig();
+        if (cancelled) return;
+        closeUiState.current.configDraft = contents;
+        closeUiState.current.configSaved = contents;
+        setConfigDraft(contents);
+        setConfigSaved(contents);
+        setConfigError(error ?? '');
+      } catch (error) {
+        if (!cancelled) setConfigError(getErrorMessage(error));
+        rendererOperations.current.reportFailure(error);
+      }
+    });
     return () => { cancelled = true; };
   }, [route.page, settingsSection]);
 
@@ -1002,14 +1296,18 @@ export default function App() {
   const archivedProjects = projects.filter((project) => project.archived);
   const archivedChats = chats.filter((chat) => chat.archived);
   const selectedChat = chats.find((chat) => chat.id === route.id);
+  const chatComposerReady = route.page !== 'chat' || (chatLoadState.chatId === route.id
+    && chatLoadState.status === 'ready' && chatDetail?.id === route.id);
   const resolvedTheme = settings.theme === 'system' ? (systemDark ? 'dark' : 'light') : settings.theme;
   const transparentSidebar = settings.sidebarTransparent;
   const canGoBack = navigation.index > 0;
   const canGoForward = navigation.index < navigation.history.length - 1;
   const settingTitle = SETTINGS_SECTIONS.find((item) => item.id === settingsSection)?.label ?? 'Настройки';
+  const activeHomeDraftSession = route.page === 'home' ? homeDraftSession.current : null;
   const composerPermissionProfile = selectedChat && chatDetail?.id === selectedChat.id
     ? chatDetail.nextTurnPermissionProfile ?? (pendingPermissionChatIdRef.current === selectedChat.id ? pendingPermissionProfile : null) ?? settings.defaultPermissionProfile
-    : pendingPermissionProfile ?? settings.defaultPermissionProfile;
+    : activeHomeDraftSession ? activeHomeDraftSession.permissionProfile ?? settings.defaultPermissionProfile
+      : pendingPermissionProfile ?? settings.defaultPermissionProfile;
   const canChangeComposerPermissionProfile = (route.page === 'home' && !selectedChat)
     || Boolean(selectedChat && chatDetail?.id === selectedChat.id);
   const composerModelId = selectedChat && chatDetail?.id === selectedChat.id
@@ -1025,7 +1323,8 @@ export default function App() {
     }));
   const selectedComposerSkillId = selectedChat && chatDetail?.id === selectedChat.id
     ? (pendingSkillChatIdRef.current === selectedChat.id ? pendingSkillId : null) ?? chatDetail.nextTurnSkillId
-    : route.page === 'home' && pendingSkillChatIdRef.current === null ? pendingSkillId : null;
+    : activeHomeDraftSession ? activeHomeDraftSession.skillId
+      : route.page === 'home' && pendingSkillChatIdRef.current === null ? pendingSkillId : null;
   const selectedComposerSkill = skillRegistry.skills.find((skill) => skill.id === selectedComposerSkillId && skill.enabled) ?? null;
   const composerCompletion = completionDismissed ? null : getComposerCompletion(draft, composerCaret, composerSkills, composerProjectId);
 
@@ -1067,6 +1366,8 @@ export default function App() {
   }
 
   function navigate(next: Route): void {
+    detachHomeDraftForNavigation(next);
+    if (!sameRoute(routeRef.current, next)) routeGeneration.current += 1;
     routeRef.current = next;
     if (next.page !== 'chat') homeChatId.current = null;
     closePreview();
@@ -1078,14 +1379,79 @@ export default function App() {
     });
   }
 
+  function preserveHomeDraftSession(session: HomeDraftSession): void {
+    if (!session.text && !session.creation && !session.error) return;
+    if (detachedDraftSessionSet.current.has(session)) return;
+    detachedDraftSessionSet.current.add(session);
+    setDetachedDraftSessions((current) => [...current, session]);
+  }
+
+  function detachHomeDraftForNavigation(next: Route): void {
+    const current = routeRef.current;
+    const session = homeDraftSession.current;
+    if (current.page === 'home' && next.page !== 'home'
+      && !(next.page === 'chat' && next.id && next.id === session?.chatId)) {
+      if (session) preserveHomeDraftSession(session);
+      homeDraftSession.current = null;
+    }
+    if (next.page === 'home' && current.page !== 'home') {
+      if (session) preserveHomeDraftSession(session);
+      homeDraftSession.current = null;
+    }
+  }
+
+  function resumeDetachedDraftSession(session: HomeDraftSession): void {
+    const current = homeDraftSession.current;
+    if (current && current !== session) preserveHomeDraftSession(current);
+    homeDraftSession.current = null;
+    detachedDraftSessionSet.current.delete(session);
+    setDetachedDraftSessions((current) => current.filter((item) => item !== session));
+    navigate({ page: 'home' });
+    homeDraftSession.current = session;
+    setSelectedProjectId(session.projectId ?? '');
+    setDraft(session.text);
+    draftRef.current = session.text;
+    setHomeDraftError(session.error);
+    void startHomeDraftSession(session).catch((error: unknown) => setHomeDraftError(getErrorMessage(error)));
+  }
+
+  function startNewHomeChat(): void {
+    routeGeneration.current += 1;
+    setHomeVoiceGeneration((current) => current + 1);
+    draftRevision.current += 1;
+    const previous = homeDraftSession.current;
+    if (previous) preserveHomeDraftSession(previous);
+    homeDraftSession.current = null;
+    if (previous && pendingChat.current === previous.creation) pendingChat.current = null;
+    homeChatId.current = null;
+    permissionProfileRevision.current += 1;
+    pendingPermissionProfileRef.current = null;
+    pendingPermissionChatIdRef.current = null;
+    setPendingPermissionProfile(null);
+    skillSelectionRevision.current += 1;
+    pendingSkillIdRef.current = null;
+    pendingSkillChatIdRef.current = null;
+    setPendingSkillId(null);
+    setDraft('');
+    draftRef.current = '';
+    setComposerCaret(0);
+    setCompletionDismissed(false);
+    setHomeDraftError('');
+    setSelectedProjectId('');
+    navigate({ page: 'home' });
+  }
+
   function openSettings(section: SettingsSection = 'general'): void {
+    detachHomeDraftForNavigation({ page: 'settings' });
     closePreview();
     setSettingsSection(section);
-    routeRef.current = { page: 'settings' };
+    const next = { page: 'settings' as const };
+    if (!sameRoute(routeRef.current, next)) routeGeneration.current += 1;
+    routeRef.current = next;
     setNavigation((current) => {
       const entries = current.history.slice(0, current.index + 1);
-      if (sameRoute(entries[entries.length - 1], { page: 'settings' })) return current;
-      entries.push({ page: 'settings' });
+      if (sameRoute(entries[entries.length - 1], next)) return current;
+      entries.push(next);
       return { history: entries, index: entries.length - 1 };
     });
   }
@@ -1096,127 +1462,347 @@ export default function App() {
       const index = Math.max(0, Math.min(current.history.length - 1, current.index + delta));
       const next = current.history[index];
       if (!next) return current;
+      detachHomeDraftForNavigation(next);
+      if (index !== current.index && !sameRoute(routeRef.current, next)) routeGeneration.current += 1;
       routeRef.current = next;
       if (next.page !== 'chat') homeChatId.current = null;
       return { ...current, index };
     });
   }
 
-  async function createChat(projectId: string | null = null, kind: ChatKind = 'text'): Promise<void> {
+  function createChat(projectId: string | null = null, kind: ChatKind = 'text'): Promise<void> {
+    return trackRendererOperation(() => createChatOperation(projectId, kind));
+  }
+
+  async function createChatOperation(projectId: string | null, kind: ChatKind): Promise<void> {
+    const origin = routeRef.current;
+    const originGeneration = routeGeneration.current;
+    const oldSession = homeDraftSession.current;
+    if (origin.page === 'home') {
+      if (oldSession) preserveHomeDraftSession(oldSession);
+      homeDraftSession.current = null;
+      if (oldSession && pendingChat.current === oldSession.creation) pendingChat.current = null;
+    }
     try {
       const chat = await window.gigaChat.chats.create(projectId, kind);
       setChats((current) => [chat, ...current]);
-      if (routeRef.current.page === 'home' && pendingPermissionProfileRef.current) {
+      if (origin.page === 'home' && originGeneration === routeGeneration.current && sameRoute(routeRef.current, origin)
+        && pendingPermissionProfileRef.current) {
+        const profile = pendingPermissionProfileRef.current;
+        const nextTurnPermissionProfile = profile === settings.defaultPermissionProfile ? null : profile;
+        const revision = permissionProfileRevision.current;
         pendingPermissionChatIdRef.current = chat.id;
+        void savePermissionProfileForChat(chat.id, profile).then(() => {
+          if (revision !== permissionProfileRevision.current || pendingPermissionChatIdRef.current !== chat.id
+            || pendingPermissionProfileRef.current !== profile) return;
+          setChatDetail((current) => current?.id === chat.id
+            ? { ...current, nextTurnPermissionProfile } : current);
+        }).catch((error: unknown) => {
+          if (revision === permissionProfileRevision.current && pendingPermissionChatIdRef.current === chat.id) {
+            setNotice(getErrorMessage(error));
+          }
+        });
       }
-      if (routeRef.current.page === 'home' && pendingSkillIdRef.current) {
+      if (origin.page === 'home' && originGeneration === routeGeneration.current && sameRoute(routeRef.current, origin) && pendingSkillIdRef.current) {
         pendingSkillChatIdRef.current = chat.id;
         void saveSkillSelectionForChat(chat.id, pendingSkillIdRef.current, skillSelectionRevision.current);
       }
-      draftRef.current = '';
-      setDraft('');
-      setSelectedProjectId('');
-      navigate({ page: 'chat', id: chat.id });
+      if (originGeneration === routeGeneration.current && sameRoute(routeRef.current, origin)) {
+        draftRef.current = '';
+        setDraft('');
+        setSelectedProjectId('');
+        navigate({ page: 'chat', id: chat.id });
+      }
     } catch (error) {
+      rendererOperations.current.reportFailure(error);
       setNotice(getErrorMessage(error));
     }
   }
 
   function saveChatDraft(chatId: string, value: string): void {
+    const revision = (chatDraftMutationRevision.current.get(chatId) ?? 0) + 1;
+    chatDraftMutationRevision.current.set(chatId, revision);
+    const current = retainedChatDrafts.current.get(chatId);
+    retainedChatDrafts.current.set(chatId, { text: value, message: current?.text === value ? current.message : '' });
     draftSave.current = window.gigaChat.chats.update(chatId, { draft: value });
-    void draftSave.current.catch((error: unknown) => setNotice(getErrorMessage(error)));
+    void draftSave.current.then(() => {
+      if (chatDraftMutationRevision.current.get(chatId) !== revision) return;
+      retainedChatDrafts.current.delete(chatId);
+      setChatDraftSaveError((previous) => previous?.chatId === chatId ? null : previous);
+    }).catch((error: unknown) => {
+      const message = getErrorMessage(error);
+      if (chatDraftMutationRevision.current.get(chatId) === revision) {
+        retainedChatDrafts.current.set(chatId, { text: value, message });
+        if (routeRef.current.page === 'chat' && routeRef.current.id === chatId) setChatDraftSaveError({ chatId, message });
+      }
+    });
   }
 
-  async function submitMessage(): Promise<void> {
+  function selectHomeProject(projectId: string): void {
+    const nextProjectId = projectId || null;
+    const scopedSkill = pendingSkillIdRef.current ? /^project\/([^/]+)\//.exec(pendingSkillIdRef.current) : null;
+    if (scopedSkill && scopedSkill[1] !== nextProjectId) {
+      pendingSkillIdRef.current = null;
+      pendingSkillChatIdRef.current = null;
+      skillSelectionRevision.current += 1;
+      setPendingSkillId(null);
+    }
+    setSelectedProjectId(projectId);
+    const session = homeDraftSession.current;
+    if (!session) return;
+    session.projectId = nextProjectId;
+    const sessionSkillScope = session.skillId ? /^project\/([^/]+)\//.exec(session.skillId) : null;
+    if (sessionSkillScope && sessionSkillScope[1] !== nextProjectId) session.skillId = null;
+    if (session.chatId && !session.creation) {
+      void startHomeDraftSession(session).catch((error: unknown) => setHomeDraftError(getErrorMessage(error)));
+    }
+  }
+
+  async function moveDraftChat(chatId: string, projectId: string | null): Promise<ChatSummary> {
+    return window.gigaChat.chats.update(chatId, { projectId });
+  }
+
+  async function saveDraftSession(chatId: string, text: string): Promise<unknown> {
+    return window.gigaChat.chats.update(chatId, { draft: text });
+  }
+
+  async function saveDraftSessionSelection(chatId: string, snapshot: Readonly<NewChatDraftSession<PermissionProfile>>): Promise<unknown> {
+    return window.gigaChat.chats.update(chatId, {
+      nextTurnPermissionProfile: snapshot.permissionProfile,
+      nextTurnSkillId: snapshot.skillId,
+    });
+  }
+
+  function savePermissionProfileForChat(chatId: string, profile: PermissionProfile): Promise<ChatSummary> {
+    const nextTurnPermissionProfile = profile === settings.defaultPermissionProfile ? null : profile;
+    const save = permissionProfileSave.current.catch(() => undefined).then(() =>
+      window.gigaChat.chats.update(chatId, { nextTurnPermissionProfile }),
+    );
+    permissionProfileSave.current = save;
+    return save;
+  }
+
+  function startHomeDraftSession(session: HomeDraftSession): Promise<ChatSummary> {
+    if (session.creation) return session.creation;
+    session.error = '';
+    setHomeDraftError('');
+    const operation = trackRendererOperation(() => session.chat
+      ? persistDraftSession(session, session.chat, moveDraftChat, saveDraftSession, saveDraftSessionSelection)
+      : createChatForDraftSession(
+        session,
+        (projectId) => window.gigaChat.chats.create(projectId),
+        moveDraftChat,
+        saveDraftSession,
+        saveDraftSessionSelection,
+        (chat) => {
+          session.chat = chat;
+          session.chatId = chat.id;
+          setChats((current) => current.some((item) => item.id === chat.id)
+            ? current.map((item) => item.id === chat.id ? chat : item)
+            : [chat, ...current]);
+        },
+      ));
+    session.creation = operation;
+    pendingChat.current = operation;
+    void operation.then((chat) => {
+      session.chat = chat;
+      session.chatId = chat.id;
+      session.error = '';
+      setChats((current) => current.some((item) => item.id === chat.id)
+        ? current.map((item) => item.id === chat.id ? chat : item)
+        : [chat, ...current]);
+      if (!shouldOpenCreatedDraftChat(session, homeDraftSession.current, routeRef.current.page === 'home')) {
+        detachedDraftSessionSet.current.delete(session);
+        setDetachedDraftSessions((current) => current.filter((item) => item !== session));
+        return;
+      }
+      homeChatId.current = chat.id;
+      if (pendingPermissionChatIdRef.current === null
+        && pendingPermissionProfileRef.current === session.permissionProfile) {
+        pendingPermissionProfileRef.current = null;
+        setPendingPermissionProfile(null);
+      }
+      if (pendingSkillChatIdRef.current === null && pendingSkillIdRef.current === session.skillId) {
+        pendingSkillIdRef.current = null;
+        setPendingSkillId(null);
+      }
+      navigate({ page: 'chat', id: chat.id });
+      homeDraftSession.current = null;
+      setHomeDraftError('');
+    }).catch((error: unknown) => {
+      session.error = getErrorMessage(error);
+      if (session.chatId) retainedChatDrafts.current.set(session.chatId, { text: session.text, message: session.error });
+      if (homeDraftSession.current === session) setHomeDraftError(session.error);
+      if (detachedDraftSessionSet.current.has(session)) setDetachedDraftSessions((current) => [...current]);
+    }).finally(() => {
+      if (session.creation === operation) session.creation = null;
+      if (pendingChat.current === operation) pendingChat.current = null;
+    }).catch(() => undefined);
+    return operation;
+  }
+
+  function submitMessage(): Promise<void> {
+    return trackRendererOperation(() => submitMessageOperation());
+  }
+
+  async function submitMessageOperation(): Promise<void> {
     const value = draftRef.current.trim();
     if (!value || sending) return;
     if (isUnavailableCompactCommand(value)) {
       showSuccess('/compact станет доступна после подключения модели. История не изменена.');
       return;
     }
+    const sourceRoute = routeRef.current;
+    const sourceRouteGeneration = routeGeneration.current;
+    const sourceDraftRevision = draftRevision.current;
+    const sourceSession = sourceRoute.page === 'home' ? homeDraftSession.current : null;
+    const acceptedDraftSave = draftSave.current;
+    const acceptedPermissionSave = permissionProfileSave.current;
+    const acceptedSkillSave = skillSelectionSave.current;
+    const acceptedPermissionProfile = pendingPermissionProfileRef.current;
+    const acceptedPermissionChatId = pendingPermissionChatIdRef.current;
+    const acceptedPermissionRevision = permissionProfileRevision.current;
+    const acceptedSkillId = pendingSkillIdRef.current;
+    const acceptedSkillChatId = pendingSkillChatIdRef.current;
+    const acceptedSkillRevision = skillSelectionRevision.current;
     setSending(true);
     try {
-      const chatId = routeRef.current.page === 'chat' ? routeRef.current.id
-        : homeChatId.current ?? (await pendingChat.current)?.id;
+      let acceptedRouteGeneration = sourceRouteGeneration;
+      let chatId: string | undefined;
+      if (sourceRoute.page === 'chat') chatId = sourceRoute.id;
+      else if (sourceSession) {
+        chatId = (await startHomeDraftSession(sourceSession)).id;
+        if (routeRef.current.page === 'chat' && routeRef.current.id === chatId && homeChatId.current === chatId) {
+          acceptedRouteGeneration = routeGeneration.current;
+        }
+      } else chatId = homeChatId.current ?? (await pendingChat.current)?.id;
       if (!chatId) throw new Error('Не удалось создать чат. Попробуйте снова.');
-      await draftSave.current;
-      await permissionProfileSave.current;
-      await skillSelectionSave.current;
-      const pendingProfile = pendingPermissionChatIdRef.current === chatId ? pendingPermissionProfileRef.current : null;
+      await acceptedDraftSave;
+      await acceptedPermissionSave;
+      await acceptedSkillSave;
+      const pendingProfile = !sourceSession && sourceRoute.page === 'home'
+        && acceptedPermissionChatId === null ? acceptedPermissionProfile : null;
       if (pendingProfile) await window.gigaChat.chats.update(chatId, { nextTurnPermissionProfile: pendingProfile });
-      if (pendingSkillChatIdRef.current !== chatId && pendingSkillIdRef.current) {
-        pendingSkillChatIdRef.current = chatId;
-        await saveSkillSelectionForChat(chatId, pendingSkillIdRef.current, skillSelectionRevision.current);
+      const unboundHomeSkill = !sourceSession && sourceRoute.page === 'home'
+        && acceptedSkillChatId === null ? acceptedSkillId : null;
+      if (unboundHomeSkill) {
+        await window.gigaChat.chats.update(chatId, { nextTurnSkillId: unboundHomeSkill });
       }
       const detail = await window.gigaChat.chats.appendLocalMessage(chatId, value);
-      if (routeRef.current.page === 'chat' && routeRef.current.id === chatId) {
-        setChatDetail(detail);
+      const stillCurrent = acceptedRouteGeneration === routeGeneration.current
+        && sourceDraftRevision === draftRevision.current
+        && ((routeRef.current.page === 'chat' && routeRef.current.id === chatId)
+          || (sourceSession !== null && homeDraftSession.current === sourceSession && routeRef.current.page === 'home'));
+      if (stillCurrent && routeRef.current.page === 'chat') {
+        draftRevision.current += 1;
+        setChatDetail((current) => current?.id === chatId ? {
+          ...detail,
+          ...(acceptedPermissionRevision === permissionProfileRevision.current ? {} : {
+            nextTurnPermissionProfile: current.nextTurnPermissionProfile,
+          }),
+          ...(acceptedSkillRevision === skillSelectionRevision.current ? {} : {
+            nextTurnSkillId: current.nextTurnSkillId,
+          }),
+        } : detail);
         setDraft('');
         draftRef.current = '';
+        retainedChatDrafts.current.delete(chatId);
+        setChatDraftSaveError(null);
       }
-      if (pendingProfile) {
+      if (pendingProfile && acceptedPermissionRevision === permissionProfileRevision.current
+        && acceptedPermissionChatId === pendingPermissionChatIdRef.current
+        && acceptedPermissionProfile === pendingPermissionProfileRef.current) {
         pendingPermissionProfileRef.current = null;
         pendingPermissionChatIdRef.current = null;
         setPendingPermissionProfile(null);
       }
+      if (unboundHomeSkill && acceptedSkillRevision === skillSelectionRevision.current
+        && acceptedSkillChatId === pendingSkillChatIdRef.current && acceptedSkillId === pendingSkillIdRef.current) {
+        pendingSkillChatIdRef.current = chatId;
+      }
       setChats(await window.gigaChat.chats.list());
-      showSuccess('Не отправлено в GigaChat API. Сообщение сохранено локально.');
+      if (stillCurrent) showSuccess('Не отправлено в GigaChat API. Сообщение сохранено локально.');
     } catch (error) {
+      rendererOperations.current.reportFailure(error);
       setNotice(getErrorMessage(error));
     } finally {
       setSending(false);
     }
   }
 
-  async function attachFile(): Promise<void> {
+  function attachFile(): Promise<void> {
+    return trackRendererOperation(() => attachFileOperation());
+  }
+
+  async function attachFileOperation(): Promise<void> {
+    const sourceRoute = routeRef.current;
+    const sourceRouteGeneration = routeGeneration.current;
+    const sourceSession = sourceRoute.page === 'home' ? homeDraftSession.current : null;
+    const sourceProjectId = selectedProjectId || null;
     try {
-      const chatId = routeRef.current.page === 'chat' ? routeRef.current.id
-        : homeChatId.current ?? (await pendingChat.current)?.id ?? null;
-      const detail = await window.gigaChat.chats.importFile(chatId ?? null, selectedProjectId || null);
+      const chatId = sourceRoute.page === 'chat' ? sourceRoute.id
+        : sourceSession ? (await startHomeDraftSession(sourceSession)).id
+          : homeChatId.current ?? (await pendingChat.current)?.id ?? null;
+      const detail = await window.gigaChat.chats.importFile(chatId ?? null, sourceProjectId);
       if (!detail) return;
       setChats(await window.gigaChat.chats.list());
-      setChatDetail(detail);
-      if (routeRef.current.page === 'home') navigate({ page: 'chat', id: detail.id });
-      showSuccess('Файл скопирован в чат.');
+      const currentRoute = routeRef.current;
+      const sameView = sourceRouteGeneration === routeGeneration.current;
+      const stillTargetChat = sameView && currentRoute.page === 'chat' && currentRoute.id === detail.id;
+      const stillSourceHome = sameView && sourceSession !== null && homeDraftSession.current === sourceSession && currentRoute.page === 'home';
+      const unchangedRoute = sameView && sameRoute(currentRoute, sourceRoute);
+      if (stillTargetChat || stillSourceHome || unchangedRoute) {
+        setChatDetail(detail);
+        if (currentRoute.page === 'home') navigate({ page: 'chat', id: detail.id });
+        showSuccess('Файл скопирован в чат.');
+      }
     } catch (error) {
+      rendererOperations.current.reportFailure(error);
       setNotice(getErrorMessage(error));
     }
   }
 
   function changeDraft(value: string, caret = value.length): void {
+    draftRevision.current += 1;
     setDraft(value);
     setComposerCaret(Math.max(0, Math.min(value.length, caret)));
     setCompletionDismissed(false);
     setCompletionIndex(0);
     draftRef.current = value;
-    if (route.page === 'chat' && route.id) {
-      saveChatDraft(route.id, value);
+    const currentRoute = routeRef.current;
+    if (currentRoute.page === 'chat' && currentRoute.id) {
+      saveChatDraft(currentRoute.id, value);
       return;
     }
-    if (route.page !== 'home') return;
-    if (homeChatId.current) {
-      saveChatDraft(homeChatId.current, value);
-      return;
-    }
-    if (!value || pendingChat.current) return;
-
-    const creation = window.gigaChat.chats.create(selectedProjectId || null);
-    pendingChat.current = creation;
-    void creation.then((chat) => {
-      homeChatId.current = chat.id;
-      if (pendingPermissionProfileRef.current) pendingPermissionChatIdRef.current = chat.id;
-      if (pendingSkillIdRef.current) {
-        pendingSkillChatIdRef.current = chat.id;
-        void saveSkillSelectionForChat(chat.id, pendingSkillIdRef.current, skillSelectionRevision.current);
+    if (currentRoute.page !== 'home') return;
+    let session = homeDraftSession.current;
+    if (!session) {
+      const projectId = selectedProjectId || null;
+      const selectedSkillId = pendingSkillIdRef.current;
+      const selectedSkillScope = selectedSkillId ? /^project\/([^/]+)\//.exec(selectedSkillId) : null;
+      const validSkillId = selectedSkillScope && selectedSkillScope[1] !== projectId ? null : selectedSkillId;
+      if (selectedSkillId && !validSkillId) {
+        pendingSkillIdRef.current = null;
+        pendingSkillChatIdRef.current = null;
+        skillSelectionRevision.current += 1;
+        setPendingSkillId(null);
       }
-      setChats((current) => [chat, ...current]);
-      if (routeRef.current.page === 'home') navigate({ page: 'chat', id: chat.id });
-      saveChatDraft(chat.id, draftRef.current);
-    }).catch((error: unknown) => {
-      setNotice(getErrorMessage(error));
-    }).finally(() => {
-      if (pendingChat.current === creation) pendingChat.current = null;
-    });
+      session = {
+        ...createNewChatDraftSession({
+          text: value,
+          projectId,
+          permissionProfile: pendingPermissionProfileRef.current,
+          skillId: validSkillId,
+        }),
+        creation: null,
+        chatId: null,
+        chat: null,
+        error: '',
+      };
+      homeDraftSession.current = session;
+    }
+    session.text = value;
+    if (session.chatId || value) void startHomeDraftSession(session).catch(() => undefined);
   }
 
   function insertVoiceTranscript(text: string): void {
@@ -1232,6 +1818,12 @@ export default function App() {
   }
 
   function openDialog(request: NonNullable<typeof dialogRequest>, value = ''): void {
+    dialogGeneration.current += 1;
+    if (activeProjectInstructionId.current !== null) {
+      activeProjectInstructionId.current = null;
+      projectInstructionLoadGeneration.current += 1;
+      setProjectInstructionsReady(false);
+    }
     setDialogValue(value);
     setDialogFolder(null);
     setDialogError('');
@@ -1243,46 +1835,242 @@ export default function App() {
 
   async function openProjectSettings(project: Project): Promise<void> {
     openDialog({ kind: 'project-settings', project });
+    activeProjectInstructionId.current = project.id;
+    const generation = ++projectInstructionLoadGeneration.current;
     setProjectInstructions('');
     setProjectInstructionsBackup(null);
+    setProjectInstructionsLoading(true);
+    setProjectInstructionsReady(false);
+    setProjectInstructionsLoadError('');
+    setProjectInstructionsStatus('saved');
+    setProjectInstructionsConflict(null);
+    setProjectPreservedInstruction(undefined);
+    setDialogError('');
     try {
-      const [contents, backup] = await Promise.all([
-        window.gigaChat.projects.readInstructions(project.id),
-        window.gigaChat.projects.instructionsBackupPath(project.id),
-      ]);
-      setProjectInstructions(projectSaver.load(project.id, contents));
-      setProjectInstructionsBackup(backup);
-    } catch (error) { setDialogError(getErrorMessage(error)); }
+      const document = await window.gigaChat.projects.readInstructions(project.id);
+      if (generation !== projectInstructionLoadGeneration.current || activeProjectInstructionId.current !== project.id) return;
+      setProjectInstructions(projectSaver.load(project.id, document));
+      setProjectInstructionsReady(true);
+      setProjectInstructionsLoading(false);
+      try {
+        const backup = await window.gigaChat.projects.instructionsBackupPath(project.id);
+        if (generation === projectInstructionLoadGeneration.current && activeProjectInstructionId.current === project.id) setProjectInstructionsBackup(backup);
+      } catch (error) {
+        if (generation === projectInstructionLoadGeneration.current && activeProjectInstructionId.current === project.id) setDialogError(getErrorMessage(error));
+      }
+    } catch (error) {
+      if (generation === projectInstructionLoadGeneration.current && activeProjectInstructionId.current === project.id) {
+        setProjectInstructionsLoadError(getErrorMessage(error));
+        setProjectInstructionsStatus('error');
+      }
+    } finally {
+      if (generation === projectInstructionLoadGeneration.current && activeProjectInstructionId.current === project.id) setProjectInstructionsLoading(false);
+    }
   }
 
-  async function pickProjectFolder(): Promise<void> {
+  async function retryProjectInstructions(): Promise<void> {
+    const projectId = activeProjectInstructionId.current;
+    if (!projectId) return;
+    const generation = ++projectInstructionLoadGeneration.current;
+    setProjectInstructionsLoading(true);
+    setProjectInstructionsLoadError('');
+    try {
+      const document = await window.gigaChat.projects.readInstructions(projectId);
+      if (generation !== projectInstructionLoadGeneration.current || activeProjectInstructionId.current !== projectId) return;
+      setProjectInstructions(projectSaver.load(projectId, document));
+      setProjectInstructionsReady(true);
+      setProjectInstructionsLoading(false);
+      try {
+        const backup = await window.gigaChat.projects.instructionsBackupPath(projectId);
+        if (generation === projectInstructionLoadGeneration.current && activeProjectInstructionId.current === projectId) setProjectInstructionsBackup(backup);
+      } catch (error) {
+        if (generation === projectInstructionLoadGeneration.current && activeProjectInstructionId.current === projectId) setDialogError(getErrorMessage(error));
+      }
+    } catch (error) {
+      if (generation === projectInstructionLoadGeneration.current && activeProjectInstructionId.current === projectId) {
+        setProjectInstructionsLoadError(getErrorMessage(error));
+      }
+    } finally {
+      if (generation === projectInstructionLoadGeneration.current && activeProjectInstructionId.current === projectId) setProjectInstructionsLoading(false);
+    }
+  }
+
+  async function closeProjectSettings(): Promise<boolean> {
+    const projectId = dialogRequest?.kind === 'project-settings' ? dialogRequest.project?.id : undefined;
+    if (!projectId || activeProjectInstructionId.current !== projectId) return false;
+    let generation = projectInstructionLoadGeneration.current;
+    if (projectInstructionsLoading) {
+      projectInstructionLoadGeneration.current += 1;
+      setProjectInstructionsLoading(false);
+      generation = projectInstructionLoadGeneration.current;
+      if (!projectInstructionsReady) {
+        activeProjectInstructionId.current = null;
+        setDialogRequest(null);
+        return true;
+      }
+    }
+    try {
+      await projectSaver.flush(projectId);
+      if (generation !== projectInstructionLoadGeneration.current || activeProjectInstructionId.current !== projectId) return false;
+      activeProjectInstructionId.current = null;
+      projectInstructionLoadGeneration.current += 1;
+      setDialogRequest(null);
+      return true;
+    } catch (error) {
+      if (generation === projectInstructionLoadGeneration.current && activeProjectInstructionId.current === projectId) setDialogError(getErrorMessage(error));
+      return false;
+    }
+  }
+
+  async function reloadGlobalInstructions(): Promise<void> {
+    const conflict = globalInstructionsConflict;
+    if (!conflict) return;
+    const generation = ++globalInstructionLoadGeneration.current;
+    setGlobalInstructionsLoading(true);
+    try {
+      const current = await window.gigaChat.settings.readInstructions();
+      if (generation !== globalInstructionLoadGeneration.current) return;
+      setGlobalInstructions(globalSaver.reload('global', current));
+      setGlobalInstructionsConflict(null);
+    } catch (error) {
+      if (generation === globalInstructionLoadGeneration.current) setNotice(getErrorMessage(error));
+    } finally {
+      if (generation === globalInstructionLoadGeneration.current) setGlobalInstructionsLoading(false);
+    }
+  }
+
+  function saveGlobalInstructionsCopy(): Promise<void> {
+    return trackRendererOperation(() => saveGlobalInstructionsCopyOperation());
+  }
+
+  async function saveGlobalInstructionsCopyOperation(): Promise<void> {
+    if (!globalInstructionsReady) return;
+    try {
+      const path = await window.gigaChat.settings.saveInstructionsCopy(globalInstructions);
+      showSuccess(`Текст сохранён отдельной копией: ${path}`);
+    } catch (error) { rendererOperations.current.reportFailure(error); setNotice(getErrorMessage(error)); }
+  }
+
+  async function reloadProjectInstructions(): Promise<void> {
+    const conflict = projectInstructionsConflict;
+    const projectId = dialogRequest?.kind === 'project-settings' ? dialogRequest.project?.id : undefined;
+    if (!conflict || !projectId || activeProjectInstructionId.current !== projectId) return;
+    const generation = ++projectInstructionLoadGeneration.current;
+    setProjectInstructionsLoading(true);
+    try {
+      const current = await window.gigaChat.projects.readInstructions(projectId);
+      if (generation !== projectInstructionLoadGeneration.current || activeProjectInstructionId.current !== projectId) return;
+      setProjectInstructions(projectSaver.reload(projectId, current));
+      setProjectInstructionsConflict(null);
+      setDialogError('');
+    } catch (error) {
+      if (generation === projectInstructionLoadGeneration.current && activeProjectInstructionId.current === projectId) setDialogError(getErrorMessage(error));
+    } finally {
+      if (generation === projectInstructionLoadGeneration.current && activeProjectInstructionId.current === projectId) setProjectInstructionsLoading(false);
+    }
+  }
+
+  function saveProjectInstructionsCopy(): Promise<void> {
+    return trackRendererOperation(() => saveProjectInstructionsCopyOperation());
+  }
+
+  async function saveProjectInstructionsCopyOperation(): Promise<void> {
+    const projectId = dialogRequest?.kind === 'project-settings' ? dialogRequest.project?.id : undefined;
+    if (!projectId || !projectInstructionsReady || activeProjectInstructionId.current !== projectId) return;
+    const generation = projectInstructionLoadGeneration.current;
+    const operationGeneration = dialogGeneration.current;
+    try {
+      const path = await window.gigaChat.projects.saveInstructionsCopy(projectId, projectInstructions);
+      if (generation === projectInstructionLoadGeneration.current && operationGeneration === dialogGeneration.current
+        && activeProjectInstructionId.current === projectId) showSuccess(`Текст сохранён отдельной копией: ${path}`);
+    } catch (error) {
+      rendererOperations.current.reportFailure(error);
+      if (generation === projectInstructionLoadGeneration.current && operationGeneration === dialogGeneration.current
+        && activeProjectInstructionId.current === projectId) setDialogError(getErrorMessage(error));
+    }
+  }
+
+  function pickProjectFolder(): Promise<void> {
+    return trackRendererOperation(() => pickProjectFolderOperation());
+  }
+
+  async function pickProjectFolderOperation(): Promise<void> {
+    const operationGeneration = dialogGeneration.current;
     try {
       const folder = await window.gigaChat.projects.pickFolder();
-      if (folder) setDialogFolder(folder);
-    } catch (error) { setDialogError(getErrorMessage(error)); }
+      if (operationGeneration === dialogGeneration.current && dialogRequest?.kind === 'create-project' && folder) setDialogFolder(folder);
+    } catch (error) {
+      rendererOperations.current.reportFailure(error);
+      if (operationGeneration === dialogGeneration.current && dialogRequest?.kind === 'create-project') setDialogError(getErrorMessage(error));
+    }
   }
 
-  async function updateProject(project: Project, patch: ProjectPatch): Promise<void> {
+  function updateProject(project: Project, patch: ProjectPatch): Promise<void> {
+    return trackRendererOperation(() => updateProjectOperation(project, patch));
+  }
+
+  async function updateProjectOperation(project: Project, patch: ProjectPatch): Promise<void> {
     try {
-      const updated = await window.gigaChat.projects.update(project.id, patch);
+      const result = await window.gigaChat.projects.update(project.id, patch);
+      const updated = result.project;
       setProjects((current) => current.map((item) => item.id === project.id ? updated : item));
+      if (result.warning) setNotice(result.warning);
     } catch (error) {
+      rendererOperations.current.reportFailure(error);
       setNotice(getErrorMessage(error));
     }
   }
 
-  async function chooseProjectFolder(project: Project): Promise<void> {
+  function chooseProjectFolder(project: Project): Promise<void> {
+    return trackRendererOperation(() => chooseProjectFolderOperation(project));
+  }
+
+  async function chooseProjectFolderOperation(project: Project): Promise<void> {
+    const requestRevision = (projectFolderChangeRevision.current.get(project.id) ?? 0) + 1;
+    projectFolderChangeRevision.current.set(project.id, requestRevision);
+    const isLatestRequest = () => projectFolderChangeRevision.current.get(project.id) === requestRevision;
+    const generation = projectInstructionLoadGeneration.current;
+    const editorIsActive = activeProjectInstructionId.current === project.id;
+    let reloadingInstructions = false;
     try {
-      await projectSaver.flushAll();
-      const updated = await window.gigaChat.projects.chooseFolder(project.id);
+      await projectSaver.flush(project.id);
+      if (!isLatestRequest() || (editorIsActive && (generation !== projectInstructionLoadGeneration.current || activeProjectInstructionId.current !== project.id))) return;
+      const result = await window.gigaChat.projects.chooseFolder(project.id);
+      if (!isLatestRequest()) return;
+      const updated = result.project;
       setProjects((current) => current.map((item) => item.id === project.id ? updated : item));
-      setDialogRequest((current) => current?.kind === 'project-settings' && current.project?.id === project.id ? { ...current, project: updated } : current);
-      if (updated.workingFolder !== project.workingFolder) {
-        setProjectInstructions(projectSaver.load(project.id, await window.gigaChat.projects.readInstructions(project.id)));
-        setProjectInstructionsBackup(await window.gigaChat.projects.instructionsBackupPath(project.id));
+      const stillActive = editorIsActive && generation === projectInstructionLoadGeneration.current
+        && activeProjectInstructionId.current === project.id && isLatestRequest();
+      if (stillActive) setDialogRequest((current) => current?.kind === 'project-settings' && current.project?.id === project.id ? { ...current, project: updated } : current);
+      if (result.warning) setNotice(result.warning);
+      if (stillActive && updated.workingFolder !== project.workingFolder) {
+        reloadingInstructions = true;
+        setProjectInstructionsLoading(true);
+        setProjectInstructionsReady(false);
+        setProjectInstructionsLoadError('');
+        const document = await window.gigaChat.projects.readInstructions(project.id);
+        if (!isLatestRequest() || generation !== projectInstructionLoadGeneration.current || activeProjectInstructionId.current !== project.id) return;
+        setProjectInstructions(projectSaver.load(project.id, document));
+        setProjectInstructionsReady(true);
+        reloadingInstructions = false;
+        try {
+          const backup = await window.gigaChat.projects.instructionsBackupPath(project.id);
+          if (!isLatestRequest() || generation !== projectInstructionLoadGeneration.current || activeProjectInstructionId.current !== project.id) return;
+          setProjectInstructionsBackup(backup);
+        } catch (error) {
+          if (isLatestRequest() && generation === projectInstructionLoadGeneration.current && activeProjectInstructionId.current === project.id) setDialogError(getErrorMessage(error));
+        }
       }
     } catch (error) {
-      setDialogError(getErrorMessage(error));
+      rendererOperations.current.reportFailure(error);
+      if (isLatestRequest() && editorIsActive && generation === projectInstructionLoadGeneration.current && activeProjectInstructionId.current === project.id) {
+        if (reloadingInstructions) {
+          setProjectInstructionsLoadError(getErrorMessage(error));
+          setProjectInstructionsReady(false);
+        } else setDialogError(getErrorMessage(error));
+      } else if (isLatestRequest() && dialogRequest?.kind !== 'project-settings') setNotice(getErrorMessage(error));
+    } finally {
+      if (isLatestRequest() && editorIsActive && generation === projectInstructionLoadGeneration.current && activeProjectInstructionId.current === project.id) setProjectInstructionsLoading(false);
     }
   }
 
@@ -1290,36 +2078,57 @@ export default function App() {
 
   function renameChat(chat: ChatSummary): void { openDialog({ kind: 'rename-chat', chat }, chat.title); }
 
-  async function updateChat(chat: ChatSummary, patch: ChatPatch): Promise<void> {
+  function updateChat(chat: ChatSummary, patch: ChatPatch): Promise<void> {
+    return trackRendererOperation(() => updateChatOperation(chat, patch));
+  }
+
+  async function updateChatOperation(chat: ChatSummary, patch: ChatPatch): Promise<void> {
+    const routeRevision = routeGeneration.current;
     try {
       const updated = await window.gigaChat.chats.update(chat.id, patch);
       setChats((current) => current.map((item) => item.id === chat.id ? updated : item));
-      setChatDetail((current) => current?.id === chat.id ? { ...current, ...patch } : current);
-      if (patch.projectId !== undefined && routeRef.current.page === 'chat' && routeRef.current.id === chat.id) {
-        setChatDetail(await window.gigaChat.chats.get(chat.id));
+      if (routeRevision === routeGeneration.current) {
+        setChatDetail((current) => current?.id === chat.id ? { ...current, ...patch } : current);
+      }
+      if (routeRevision === routeGeneration.current && patch.projectId !== undefined
+        && routeRef.current.page === 'chat' && routeRef.current.id === chat.id) {
+        const generation = chatDetailLoadGeneration.current;
+        const detail = await window.gigaChat.chats.get(chat.id);
+        if (routeRevision === routeGeneration.current && generation === chatDetailLoadGeneration.current
+          && routeRef.current.page === 'chat' && routeRef.current.id === chat.id) setChatDetail(detail);
       }
     } catch (error) {
+      rendererOperations.current.reportFailure(error);
       setNotice(getErrorMessage(error));
     }
   }
 
-  async function removeChat(chat: ChatSummary): Promise<void> {
+  function removeChat(chat: ChatSummary): Promise<void> {
+    return trackRendererOperation(() => removeChatOperation(chat));
+  }
+
+  async function removeChatOperation(chat: ChatSummary): Promise<void> {
     try {
       const detail = await window.gigaChat.chats.get(chat.id);
       openDialog({ kind: 'delete-chat', chat, hasFiles: detail.artifacts.length > 0 });
     } catch (error) {
+      rendererOperations.current.reportFailure(error);
       setNotice(getErrorMessage(error));
     }
   }
 
-  async function submitDialog(): Promise<void> {
+  function submitDialog(): Promise<void> {
+    return trackRendererOperation(() => submitDialogOperation());
+  }
+
+  async function submitDialogOperation(): Promise<void> {
     if (!dialogRequest || dialogBusy) return;
     setDialogBusy(true);
     setDialogError('');
     try {
       const { kind, chat, project } = dialogRequest;
       if (kind === 'project-settings') {
-        await projectSaver.flushAll();
+        if (project) await projectSaver.flush(project.id);
       } else if (kind === 'create-project') {
         const created = dialogRequest.createdProjectId
           ? projects.find((item) => item.id === dialogRequest.createdProjectId)
@@ -1338,7 +2147,7 @@ export default function App() {
         } else setSelectedProjectId(created.id);
         showSuccess(`Проект «${created.name}» создан.`);
       } else if (kind === 'rename-project' && project) {
-        const updated = await window.gigaChat.projects.update(project.id, { name: dialogValue });
+        const updated = (await window.gigaChat.projects.update(project.id, { name: dialogValue })).project;
         setProjects((current) => current.map((item) => item.id === project.id ? updated : item));
         showSuccess('Название проекта сохранено.');
       } else if (kind === 'delete-project' && project) {
@@ -1359,6 +2168,7 @@ export default function App() {
       }
       setDialogRequest(null);
     } catch (error) {
+      rendererOperations.current.reportFailure(error);
       setDialogError(getErrorMessage(error));
     } finally {
       setDialogBusy(false);
@@ -1380,16 +2190,44 @@ export default function App() {
     else await updateLocalSettings({ defaultModelId: modelId });
   }
 
-  async function saveCustomConfig(): Promise<void> {
+  function saveCustomConfig(): Promise<void> {
+    return trackRendererOperation(() => saveCustomConfigOperation());
+  }
+
+  async function saveCustomConfigOperation(): Promise<void> {
     if (configBusy) return;
+    closeUiState.current.configBusy = true;
     setConfigBusy(true);
     setConfigError('');
     try {
       const saved = await window.gigaChat.permissions.saveConfig(configDraft, configSaved);
+      closeUiState.current.configSaved = saved;
       setConfigSaved(saved);
       showSuccess('Пользовательские разрешения сохранены.');
-    } catch (error) { setConfigError(getErrorMessage(error)); }
-    finally { setConfigBusy(false); }
+    } catch (error) {
+      rendererOperations.current.reportFailure(error);
+      setConfigError(getErrorMessage(error));
+    }
+    finally {
+      closeUiState.current.configBusy = false;
+      setConfigBusy(false);
+    }
+  }
+
+  function reloadCustomConfig(): Promise<void> {
+    return trackRendererOperation(async () => {
+      try {
+        const { contents, error } = await window.gigaChat.permissions.readConfig();
+        closeUiState.current.configDraft = contents;
+        closeUiState.current.configSaved = contents;
+        setConfigDraft(contents);
+        setConfigSaved(contents);
+        setConfigError(error ?? '');
+      } catch (error) {
+        rendererOperations.current.reportFailure(error);
+        setConfigError(getErrorMessage(error));
+      }
+    });
   }
 
   async function answerApproval(allowed: boolean): Promise<void> {
@@ -1400,7 +2238,11 @@ export default function App() {
     catch (error) { setNotice(getErrorMessage(error)); }
   }
 
-  async function updateLocalSettings(patch: SettingsPatch): Promise<void> {
+  function updateLocalSettings(patch: SettingsPatch): Promise<void> {
+    return trackRendererOperation(() => updateLocalSettingsOperation(patch));
+  }
+
+  async function updateLocalSettingsOperation(patch: SettingsPatch): Promise<void> {
     const revision = ++settingsRevision.current;
     const optimisticSettings = { ...settingsRef.current, ...patch };
     settingsRef.current = optimisticSettings;
@@ -1412,6 +2254,7 @@ export default function App() {
         setSettings(updated);
       }
     } catch (error) {
+      rendererOperations.current.reportFailure(error);
       setNotice(getErrorMessage(error));
       if (revision === settingsRevision.current) {
         try {
@@ -1428,13 +2271,19 @@ export default function App() {
     void updateLocalSettings({ notifications: { ...settingsRef.current.notifications, [category]: enabled } });
   }
 
-  async function finishOnboarding(): Promise<void> {
+  function finishOnboarding(): Promise<void> {
+    return trackRendererOperation(() => finishOnboardingOperation());
+  }
+
+  async function finishOnboardingOperation(): Promise<void> {
     const updated = await window.gigaChat.settings.update({ onboardingCompleted: true });
     setSettings(updated);
     navigate({ page: 'home' });
   }
 
   async function saveSkillSelectionForChat(chatId: string, skillId: string | null, revision: number): Promise<void> {
+    const routeRevision = routeGeneration.current;
+    const detailGeneration = chatDetailLoadGeneration.current;
     const save = skillSelectionSave.current.catch(() => undefined).then(() =>
       window.gigaChat.chats.update(chatId, { nextTurnSkillId: skillId }),
     );
@@ -1442,7 +2291,10 @@ export default function App() {
     try {
       await save;
       if (revision !== skillSelectionRevision.current) return;
-      setChatDetail((current) => current?.id === chatId ? { ...current, nextTurnSkillId: skillId } : current);
+      if (routeRevision === routeGeneration.current && detailGeneration === chatDetailLoadGeneration.current
+        && routeRef.current.page === 'chat' && routeRef.current.id === chatId) {
+        setChatDetail((current) => current?.id === chatId ? { ...current, nextTurnSkillId: skillId } : current);
+      }
       if (pendingSkillChatIdRef.current === chatId) {
         pendingSkillIdRef.current = null;
         pendingSkillChatIdRef.current = null;
@@ -1452,7 +2304,11 @@ export default function App() {
       if (revision !== skillSelectionRevision.current) return;
       try {
         const latest = await window.gigaChat.chats.get(chatId);
-        setChatDetail((current) => current?.id === chatId ? latest : current);
+        if (revision === skillSelectionRevision.current && routeRevision === routeGeneration.current
+          && detailGeneration === chatDetailLoadGeneration.current
+          && routeRef.current.page === 'chat' && routeRef.current.id === chatId) {
+          setChatDetail((current) => current?.id === chatId ? latest : current);
+        }
       } catch (readError) {
         setNotice(getErrorMessage(readError));
       }
@@ -1475,6 +2331,12 @@ export default function App() {
     setPendingSkillId(skillId);
     if (route.page === 'home' && !selectedChat) {
       pendingSkillChatIdRef.current = null;
+      const session = homeDraftSession.current;
+      if (session) {
+        session.skillId = skillId;
+        if (session.chatId && !session.creation) void startHomeDraftSession(session).catch(() => undefined);
+        return;
+      }
       const chatId = homeChatId.current ?? (await pendingChat.current)?.id ?? null;
       if (chatId) {
         pendingSkillChatIdRef.current = chatId;
@@ -1493,10 +2355,14 @@ export default function App() {
     catch (error) { setNotice(getErrorMessage(error)); }
   }
 
-  async function setSkillEnabled(skill: SkillRecord, enabled: boolean): Promise<void> {
+  function setSkillEnabled(skill: SkillRecord, enabled: boolean): Promise<void> {
+    return trackRendererOperation(() => setSkillEnabledOperation(skill, enabled));
+  }
+
+  async function setSkillEnabledOperation(skill: SkillRecord, enabled: boolean): Promise<void> {
     setSkillBusyId(skill.id);
     try { setSkillRegistry(await window.gigaChat.skills.setEnabled(skill.id, enabled)); }
-    catch (error) { setNotice(getErrorMessage(error)); }
+    catch (error) { rendererOperations.current.reportFailure(error); setNotice(getErrorMessage(error)); }
     finally { setSkillBusyId(null); }
   }
 
@@ -1519,20 +2385,28 @@ export default function App() {
   async function changeComposerPermissionProfile(profile: PermissionProfile): Promise<void> {
     if (!selectedChat || !chatDetail || chatDetail.id !== selectedChat.id) {
       if (route.page === 'home' && !selectedChat) {
+        permissionProfileRevision.current += 1;
         pendingPermissionProfileRef.current = profile;
         pendingPermissionChatIdRef.current = null;
         setPendingPermissionProfile(profile);
+        const session = homeDraftSession.current;
+        if (session) {
+          session.permissionProfile = profile;
+          if (session.chatId && !session.creation) void startHomeDraftSession(session).catch(() => undefined);
+        }
       }
       return;
     }
 
     const next = profile === settings.defaultPermissionProfile ? null : profile;
     const revision = ++permissionProfileRevision.current;
+    const routeRevision = routeGeneration.current;
+    const detailGeneration = chatDetailLoadGeneration.current;
+    pendingPermissionProfileRef.current = profile;
+    pendingPermissionChatIdRef.current = selectedChat.id;
+    setPendingPermissionProfile(profile);
     setChatDetail((current) => current?.id === selectedChat.id ? { ...current, nextTurnPermissionProfile: next } : current);
-    const save = permissionProfileSave.current.catch(() => undefined).then(() =>
-      window.gigaChat.chats.update(selectedChat.id, { nextTurnPermissionProfile: next }),
-    );
-    permissionProfileSave.current = save;
+    const save = savePermissionProfileForChat(selectedChat.id, profile);
     try {
       await save;
       if (revision === permissionProfileRevision.current && pendingPermissionChatIdRef.current === selectedChat.id) {
@@ -1544,7 +2418,18 @@ export default function App() {
       if (revision === permissionProfileRevision.current) {
         try {
           const latest = await window.gigaChat.chats.get(selectedChat.id);
-          setChatDetail((current) => current?.id === selectedChat.id ? latest : current);
+          if (revision === permissionProfileRevision.current && routeRevision === routeGeneration.current
+            && detailGeneration === chatDetailLoadGeneration.current
+            && routeRef.current.page === 'chat' && routeRef.current.id === selectedChat.id) {
+            setChatDetail((current) => current?.id === selectedChat.id
+              ? { ...current, nextTurnPermissionProfile: latest.nextTurnPermissionProfile } : current);
+            if (pendingPermissionChatIdRef.current === selectedChat.id
+              && pendingPermissionProfileRef.current === profile) {
+              pendingPermissionProfileRef.current = null;
+              pendingPermissionChatIdRef.current = null;
+              setPendingPermissionProfile(null);
+            }
+          }
         } catch (readError) {
           setNotice(getErrorMessage(readError));
         }
@@ -1561,7 +2446,7 @@ export default function App() {
 
   function projectMenu(project: Project): ReactNode {
     return (
-      <ActionMenu label={`Действия проекта ${project.name}`}>
+      <ActionMenu label={`Действия проекта ${project.name}`} onVisibilityChange={trackNativeOverlay}>
         <button type="button" onClick={() => renameProject(project)}><Icon name="edit" />Переименовать</button>
         <button type="button" onClick={() => void updateProject(project, { pinned: !project.pinned })}>
           <Icon name="pin" />{project.pinned ? 'Открепить' : 'Закрепить'}
@@ -1579,12 +2464,12 @@ export default function App() {
 
   function chatMenu(chat: ChatSummary): ReactNode {
     return (
-      <ActionMenu label={`Действия чата ${chat.title}`}>
+      <ActionMenu label={`Действия чата ${chat.title}`} onVisibilityChange={trackNativeOverlay}>
         <button type="button" onClick={() => renameChat(chat)}><Icon name="edit" />Переименовать</button>
         <button type="button" onClick={() => void updateChat(chat, { pinned: !chat.pinned })}>
           <Icon name="pin" />{chat.pinned ? 'Открепить' : 'Закрепить'}
         </button>
-        <ProjectSubmenu chat={chat} projects={activeProjects} onSelect={(projectId) => void changeChatProject(chat, projectId)} />
+        <ProjectSubmenu chat={chat} projects={activeProjects} onSelect={(projectId) => void changeChatProject(chat, projectId)} onVisibilityChange={trackNativeOverlay} />
         <button type="button" onClick={() => void updateChat(chat, { archived: !chat.archived })}>
           <Icon name="archive" />{chat.archived ? 'Восстановить из архива' : 'Архивировать'}
         </button>
@@ -1654,24 +2539,31 @@ export default function App() {
               <SettingRow title="Язык интерфейса" description="Сейчас приложение доступно на русском языке.">
                 <span className="value-chip">Русский</span>
               </SettingRow>
-              <SettingRow title="Дополнительная папка для открытия" description={`${settings.defaultProjectsFolder ?? 'Папка не выбрана.'} Новые проекты без выбранной папки создаются в Документах.`}>
+              <SettingRow title="Дополнительная папка для открытия" description={`${settings.defaultProjectsFolder ?? 'Папка не выбрана.'} Автопапки проектов создаются в «Документы\\GigaChat Agent\\Projects» и не зависят от этой настройки.`}>
                 <div className="inline-actions">
                   <button type="button" className="secondary-button" onClick={async () => {
                     try {
-                      const updated = await window.gigaChat.settings.chooseProjectsFolder();
+                      const updated = await trackRendererOperation(() => window.gigaChat.settings.chooseProjectsFolder());
                       setSettings((current) => ({ ...current, defaultProjectsFolder: updated.defaultProjectsFolder }));
-                    } catch (error) { setNotice(getErrorMessage(error)); }
+                    } catch (error) { rendererOperations.current.reportFailure(error); setNotice(getErrorMessage(error)); }
                   }}>Выбрать папку</button>
                   <button type="button" className="icon-button" disabled={!settings.defaultProjectsFolder} aria-label="Открыть папку проектов" title="Открыть папку" onClick={() => void window.gigaChat.settings.openProjectsFolder().catch((error: unknown) => setNotice(getErrorMessage(error)))}><Icon name="external" /></button>
                 </div>
               </SettingRow>
-              <SettingRow title="Запускать вместе с Windows" description={appInfo?.packaged ? 'Состояние читается непосредственно из Windows.' : 'Доступно в установленной версии приложения.'}>
-                <label className="switch-control"><input type="checkbox" checked={autoStart} disabled={!appInfo?.packaged || appInfo.platform !== 'win32'} onChange={(event) => {
+              <SettingRow title="Запускать вместе с Windows" description={appInfo?.autoStartMigrationIssue ?? (!appInfo ? 'Проверяем установленную версию приложения.' : appInfo.platform !== 'win32' ? 'Доступно только в Windows.' : appInfo.installedLauncherAvailable ? 'Путь запуска сохраняется при обновлении приложения.' : 'Недоступно в переносной версии приложения.')}>
+                <label className="switch-control"><input type="checkbox" checked={autoStart} disabled={!appInfo?.installedLauncherAvailable || appInfo.platform !== 'win32'} onChange={(event) => {
                   setAutoStart(event.target.checked);
-                  void window.gigaChat.settings.setAutoStart(event.target.checked).then(setAutoStart).catch(async (error: unknown) => {
-                    setNotice(getErrorMessage(error));
-                    try { setAutoStart(await window.gigaChat.settings.getAutoStart()); }
-                    catch (readError) { setNotice(getErrorMessage(readError)); }
+                  void trackRendererOperation(async () => {
+                    try {
+                      setAutoStart(await window.gigaChat.settings.setAutoStart(event.target.checked));
+                      setAppInfo(await window.gigaChat.settings.getAppInfo());
+                    }
+                    catch (error: unknown) {
+                      rendererOperations.current.reportFailure(error);
+                      setNotice(getErrorMessage(error));
+                      try { setAutoStart(await window.gigaChat.settings.getAutoStart()); }
+                      catch (readError) { setNotice(getErrorMessage(readError)); }
+                    }
                   });
                 }} /><span /></label>
               </SettingRow>
@@ -1696,7 +2588,7 @@ export default function App() {
               <div className="setting-subheading"><div><h3>Тема</h3><p>Выберите палитру приложения.</p></div></div>
               <div className="theme-options">
                 {(['emerald', 'dark', 'light', 'warm'] as const).map((theme) => (
-                  <button key={theme} type="button" className={settings.theme === theme ? 'theme-option selected' : 'theme-option'} aria-pressed={settings.theme === theme} onClick={() => void updateLocalSettings({ theme })}>
+                    <button key={theme} type="button" className={settings.theme === theme ? 'theme-option selected' : 'theme-option'} aria-pressed={settings.theme === theme} onClick={() => void updateLocalSettings({ theme })}>
                     <ThemePreview theme={theme} transparent={settings.sidebarTransparent} /><span>{themeLabel(theme)}</span>
                   </button>
                 ))}
@@ -1754,12 +2646,10 @@ export default function App() {
               <div className="setting-subheading"><div><h3>Пользовательский профиль</h3><p>Правила для доступных локальных инструментов. Дополнительные каталоги указываются абсолютными путями.</p></div></div>
               <p className="config-path path-value">{appInfo?.dataPath ? `${appInfo.dataPath}\\config.toml` : 'config.toml в каталоге данных приложения'}</p>
               <textarea className="config-editor" aria-label="Редактор config.toml" spellCheck={false} value={configDraft}
-                onChange={(event) => { setConfigDraft(event.target.value); setConfigError(''); }} />
+                onChange={(event) => { closeUiState.current.configDraft = event.target.value; setConfigDraft(event.target.value); setConfigError(''); }} />
               <div className="config-actions">
                 <span className="config-status" role="status">{configError || (configDraft === configSaved ? 'Сохранено' : 'Есть несохранённые изменения')}</span>
-                <button type="button" className="quiet-button" onClick={() => void window.gigaChat.permissions.readConfig().then(({ contents, error }) => {
-                  setConfigDraft(contents); setConfigSaved(contents); setConfigError(error ?? '');
-                }).catch((error: unknown) => setConfigError(getErrorMessage(error)))}>Обновить с диска</button>
+                <button type="button" className="quiet-button" onClick={() => void reloadCustomConfig()}>Обновить с диска</button>
                 <button type="button" className="primary-button" disabled={configBusy || configDraft === configSaved} onClick={() => void saveCustomConfig()}>{configBusy ? 'Сохранение…' : 'Сохранить'}</button>
               </div>
             </section>
@@ -1776,11 +2666,37 @@ export default function App() {
                   {appInfo?.dataPath ? `${appInfo.dataPath}\\GIGACHAT.md` : 'Загрузка…'}
                 </span>
               </SettingRow>
-              <textarea className="instructions-editor" value={globalInstructions} onChange={(event) => {
+              <textarea className="instructions-editor" value={globalInstructions} disabled={globalInstructionsLoading || !globalInstructionsReady} onChange={(event) => {
                 setGlobalInstructions(event.target.value);
                 globalSaver.edit('global', event.target.value);
-              }} onBlur={() => void globalSaver.flushAll().catch((error: unknown) => setNotice(getErrorMessage(error)))} placeholder="Добавьте общие инструкции для будущих задач…" maxLength={65536} aria-label="Глобальная инструкция GIGACHAT.md" />
-              <div className="editor-footer"><span>До 64 КБ · сохраняется в каталоге приложения</span><span role="status" className={`save-status status-${globalInstructionsStatus}`}>{saveStatusLabel(globalInstructionsStatus)}</span></div>
+              }} onBlur={() => {
+                if (globalInstructionsConflict) return;
+                void globalSaver.flush('global').catch((error: unknown) => setNotice(getErrorMessage(error)));
+              }} placeholder={globalInstructionsLoading ? 'Чтение GIGACHAT.md…' : 'Добавьте общие инструкции для будущих задач…'} maxLength={65536} aria-label="Глобальная инструкция GIGACHAT.md" />
+              <div className="editor-footer"><span>До 64 КБ · сохраняется в каталоге приложения</span><span role="status" className={`save-status status-${globalInstructionsStatus}`}>{globalInstructionsLoading ? 'Чтение…' : globalInstructionsReady ? saveStatusLabel(globalInstructionsStatus) : 'Ожидание загрузки'}</span></div>
+              {globalInstructionsLoadError && <div className="project-folder-choice" role="alert">
+                <strong>Не удалось прочитать GIGACHAT.md</strong><p>{globalInstructionsLoadError} Редактор останется заблокирован, пока файл не будет прочитан.</p>
+                <button type="button" className="secondary-button" disabled={globalInstructionsLoading} onClick={() => setGlobalInstructionRetry((value) => value + 1)}>Повторить чтение</button>
+              </div>}
+              {globalInstructionsConflict && <div className="project-folder-choice" role="alert">
+                <strong>{globalInstructionsConflict.phase === 'after-commit' ? 'Найдены две версии инструкции' : 'Файл изменился вне приложения'}</strong>
+                <p>Ваш текст остался в редакторе. Перечитайте текущую версию или сохраните свой текст отдельной копией.</p>
+                {globalInstructionsConflict.phase === 'before-commit' && <details>
+                  <summary>Показать версию на диске</summary>
+                  <pre className="approval-target">{globalInstructionsConflict.current.text || 'Файл отсутствует или пуст.'}</pre>
+                </details>}
+                <div className="inline-actions">
+                  <button type="button" className="secondary-button" disabled={globalInstructionsLoading} onClick={() => void reloadGlobalInstructions()}>Перечитать файл</button>
+                  <button type="button" className="secondary-button" disabled={globalInstructionsLoading} onClick={() => void saveGlobalInstructionsCopy()}>Сохранить черновик отдельно</button>
+                </div>
+              </div>}
+              {globalPreservedInstruction && <div className="project-backup-note" role="status">
+                <strong>Вытесненная версия сохранена</strong>
+                <span>{globalPreservedInstruction.path}</span>
+                {globalPreservedInstruction.text === null
+                  ? <p>Содержимое пока нельзя безопасно прочитать; файл и журнал сохранены.</p>
+                  : <details><summary>Показать сохранённый текст</summary><pre className="approval-target">{globalPreservedInstruction.text || 'Файл пуст.'}</pre></details>}
+              </div>}
             </section>
             <EmptyState title="Долгосрочная память пока недоступна" description="Её управление появится вместе с подключением API." icon="book" />
           </>
@@ -1848,7 +2764,9 @@ export default function App() {
           </>
         );
       case 'browser':
-        return <ConnectionSetup firstRun={false} />;
+        return <ConnectionSetup firstRun={false} suspended={sidebarPreview || nativeOverlayOpen || Boolean(dialogRequest) || Boolean(approvalRequest) || closePending || Boolean(closeFailure)} runAcceptedOperation={trackRendererOperation}
+          reportOperationFailure={(error) => rendererOperations.current.reportFailure(error)}
+          onKeySaveFailureChange={(failed) => { connectionKeySaveFailed.current = failed; }} />;
       case 'voice':
         return (
           <>
@@ -1882,13 +2800,13 @@ export default function App() {
           <>
             <div className="settings-section-heading"><h2>Проекты и файлы</h2><p>Папки открываются только после выбора и проверки существующего пути.</p></div>
             <div className="settings-card settings-list">
-              <SettingRow title="Дополнительная папка для открытия" description={`${settings.defaultProjectsFolder ?? 'Не выбрана.'} Новые проекты без выбранной папки создаются в Документах.`}>
-                <div className="inline-actions"><button type="button" className="secondary-button" onClick={async () => {
+              <SettingRow title="Дополнительная папка для открытия" description={`${settings.defaultProjectsFolder ?? 'Не выбрана.'} Автопапки проектов создаются в «Документы\\GigaChat Agent\\Projects» и не зависят от этой настройки.`}>
+                <div className="inline-actions"><button type="button" className="secondary-button" onClick={() => void trackRendererOperation(async () => {
                   try {
                     const updated = await window.gigaChat.settings.chooseProjectsFolder();
                     setSettings((current) => ({ ...current, defaultProjectsFolder: updated.defaultProjectsFolder }));
-                  } catch (error) { setNotice(getErrorMessage(error)); }
-                }}>Выбрать</button><button type="button" className="icon-button" disabled={!settings.defaultProjectsFolder} aria-label="Открыть папку" onClick={() => void window.gigaChat.settings.openProjectsFolder().catch((error: unknown) => setNotice(getErrorMessage(error)))}><Icon name="external" /></button></div>
+                  } catch (error) { rendererOperations.current.reportFailure(error); setNotice(getErrorMessage(error)); }
+                })}>Выбрать</button><button type="button" className="icon-button" disabled={!settings.defaultProjectsFolder} aria-label="Открыть папку" onClick={() => void window.gigaChat.settings.openProjectsFolder().catch((error: unknown) => setNotice(getErrorMessage(error)))}><Icon name="external" /></button></div>
               </SettingRow>
               <SettingRow title="Программа для открытия" description="Применяется при открытии папки проекта.">
                 <span className="value-chip">{openers.find((opener) => opener.id === settings.preferredOpener || (settings.preferredOpener === 'detected-app' && opener.id === 'vscode'))?.name ?? 'Не обнаружена'}</span>
@@ -1939,7 +2857,9 @@ export default function App() {
     if (loading) return <div className="loading-state" role="status">Загрузка локальных данных…</div>;
     switch (route.page) {
       case 'onboarding':
-        return <ConnectionSetup firstRun onContinue={finishOnboarding} />;
+        return <ConnectionSetup firstRun suspended={sidebarPreview || nativeOverlayOpen || Boolean(dialogRequest) || Boolean(approvalRequest) || closePending || Boolean(closeFailure)} onContinue={finishOnboarding} runAcceptedOperation={trackRendererOperation}
+          reportOperationFailure={(error) => rendererOperations.current.reportFailure(error)}
+          onKeySaveFailureChange={(failed) => { connectionKeySaveFailed.current = failed; }} />;
       case 'home':
         return (
           <section className="empty-state">
@@ -1951,7 +2871,16 @@ export default function App() {
       case 'chat':
         return selectedChat ? (
           <section className="chat-view">
-            {chatDetail?.messages.length ? <div className="chat-history" aria-label="История сообщений">
+            {chatLoadState.chatId === route.id && chatLoadState.status === 'loading' && <div className="loading-state" role="status">Загрузка истории чата…</div>}
+            {chatLoadState.chatId === route.id && chatLoadState.status === 'error' && <div className="project-folder-choice" role="alert">
+              <strong>Не удалось загрузить этот чат</strong><p>{chatLoadState.error}</p>
+              <button type="button" className="secondary-button" onClick={() => setChatLoadRetry((value) => value + 1)}>Повторить загрузку</button>
+            </div>}
+            {chatDraftSaveError?.chatId === route.id && <div className="project-folder-choice" role="alert">
+              <strong>Черновик не сохранён</strong><p>{chatDraftSaveError?.message} Текст оставлен в редакторе.</p>
+              <button type="button" className="secondary-button" onClick={() => saveChatDraft(selectedChat.id, draftRef.current)}>Повторить сохранение</button>
+            </div>}
+            {chatDetail?.id === selectedChat.id && chatLoadState.status === 'ready' && chatDetail.messages.length ? <div className="chat-history" aria-label="История сообщений">
               {chatDetail.messages.map((message) => <article key={message.id} className={`chat-message message-${message.role}`}>
                 <span className="message-author">{message.role === 'user' ? 'Вы' : 'GigaChat · тестовый пример'}</span>
                 <p>{message.text}</p>
@@ -2093,7 +3022,7 @@ export default function App() {
           onPointerEnter={clearPreviewClose}
           onPointerLeave={() => { if (!settings.sidebarVisible && !compactLayout) schedulePreviewClose(); }}
         >
-          <ActionMenu className="brand-menu" label="Выбрать режим GigaChat" placement="below" trigger={
+          <ActionMenu className="brand-menu" label="Выбрать режим GigaChat" placement="below" onVisibilityChange={trackNativeOverlay} trigger={
             <><span className="brand-wordmark">ГИГАЧАТ <i>{runtimeMode === 'api' ? 'API' : 'WEB'}</i></span><Icon name="chevron" className="brand-chevron" /></>
           }>
             <button type="button" aria-pressed={runtimeMode === 'api'} onClick={() => setRuntimeMode('api')}>GigaChat API{runtimeMode === 'api' && <Icon name="check" />}</button>
@@ -2101,7 +3030,7 @@ export default function App() {
             <span className="brand-menu-note">Web: подключение появится позже.</span>
           </ActionMenu>
           <nav className="sidebar-actions" aria-label="Основные действия">
-            <button type="button" className={route.page === 'home' ? 'nav-action active' : 'nav-action'} onClick={() => { setSelectedProjectId(''); navigate({ page: 'home' }); }}><Icon name="edit" /><span>Новый чат</span></button>
+            <button type="button" className={route.page === 'home' ? 'nav-action active' : 'nav-action'} onClick={startNewHomeChat}><Icon name="edit" /><span>Новый чат</span></button>
             <button type="button" className={route.page === 'chat' && selectedChat?.kind === 'image' ? 'nav-action active' : 'nav-action'} onClick={() => void createChat(null, 'image')}><Icon name="image" /><span>Сгенерировать изображение</span></button>
             <button type="button" className={route.page === 'video' ? 'nav-action active' : 'nav-action'} onClick={() => navigate({ page: 'video' })}><Icon name="video" /><span>Создать видео</span></button>
             <button type="button" className={route.page === 'podcasts' ? 'nav-action active' : 'nav-action'} onClick={() => navigate({ page: 'podcasts' })}><Icon name="podcast" /><span>Подкасты</span></button>
@@ -2179,7 +3108,7 @@ export default function App() {
                 {composerCompletion.emptyMessage && <p className="composer-suggestions-empty" role="status">{composerCompletion.emptyMessage}</p>}
               </div>}
               {route.page === 'home' && <div className="project-picker">
-                <ActionMenu className="composer-project-menu" placement="below-start" label="Выбрать проект"
+                <ActionMenu className="composer-project-menu" placement="below-start" label="Выбрать проект" onVisibilityChange={trackNativeOverlay}
                   initialFocus=".project-search-input" onOpen={() => setProjectSearch('')}
                   trigger={<><Icon name="folder" /><span>{activeProjects.find((project) => project.id === composerProjectId)?.name ?? 'Выбрать проект'}</span><Icon name="chevron" /></>}>
                   <div className="project-picker-popup" onKeyDown={(event) => {
@@ -2201,19 +3130,27 @@ export default function App() {
                       <input className="project-search-input" type="search" aria-label="Поиск проектов" placeholder="Поиск проектов" value={projectSearch} onChange={(event) => setProjectSearch(event.target.value)} />
                     </div>
                     <div className="project-picker-options">
-                      <button type="button" className="project-picker-option" aria-current={!composerProjectId} onClick={() => {
-                        setSelectedProjectId('');
-                      }}><Icon name="folder" />Без проекта{!composerProjectId && <Icon name="check" />}</button>
+                      <button type="button" className="project-picker-option" aria-current={!composerProjectId} onClick={() => selectHomeProject('')}><Icon name="folder" />Без проекта{!composerProjectId && <Icon name="check" />}</button>
                       {activeProjects.filter((project) => project.name.toLocaleLowerCase().includes(projectSearch.trim().toLocaleLowerCase())).map((project) =>
-                        <button type="button" className="project-picker-option" key={project.id} aria-current={project.id === composerProjectId} onClick={() => {
-                          setSelectedProjectId(project.id);
-                        }}><Icon name="folder" /><span>{project.name}</span>{project.id === composerProjectId && <Icon name="check" />}</button>)}
+                        <button type="button" className="project-picker-option" key={project.id} aria-current={project.id === composerProjectId} onClick={() => selectHomeProject(project.id)}><Icon name="folder" /><span>{project.name}</span>{project.id === composerProjectId && <Icon name="check" />}</button>)}
                       {activeProjects.length === 0 && <p className="picker-empty">Пока нет проектов</p>}
                       {activeProjects.length > 0 && !activeProjects.some((project) => project.name.toLocaleLowerCase().includes(projectSearch.trim().toLocaleLowerCase())) && <p className="picker-empty">Ничего не найдено</p>}
                     </div>
                     <button type="button" className="project-picker-option project-create-option" onClick={() => createProject()}><Icon name="plus" />Новый проект</button>
                   </div>
                 </ActionMenu>
+              </div>}
+              {route.page === 'home' && detachedDraftSessions.map((session, index) => <div className="project-folder-choice" role="status" key={`detached-draft-${index}`}>
+                <strong>Есть отложенный черновик</strong><p>{session.text ? `${session.text.slice(0, 120)}${session.text.length > 120 ? '…' : ''}` : 'Текст появится после восстановления сессии.'}</p>
+                {session.error && <p role="alert">{session.error}</p>}
+                <button type="button" className="secondary-button" onClick={() => resumeDetachedDraftSession(session)}>Восстановить черновик</button>
+              </div>)}
+              {route.page === 'home' && homeDraftError && <div className="project-folder-choice" role="alert">
+                <strong>Черновик пока не сохранён</strong><p>{homeDraftError} Текст сохранён в этой сессии.</p>
+                <button type="button" className="secondary-button" disabled={Boolean(homeDraftSession.current?.creation)} onClick={() => {
+                  const session = homeDraftSession.current;
+                  if (session) void startHomeDraftSession(session).catch((error: unknown) => setHomeDraftError(getErrorMessage(error)));
+                }}>Повторить сохранение</button>
               </div>}
               <div className="composer">
                 <label className="sr-only" htmlFor="chat-draft">Черновик сообщения</label>
@@ -2228,7 +3165,7 @@ export default function App() {
                   onSelect={(event) => setComposerCaret(event.currentTarget.selectionStart)}
                   onClick={(event) => setComposerCaret(event.currentTarget.selectionStart)}
                   onKeyDown={handleComposerKeyDown}
-                  disabled={sending}
+                  disabled={sending || !chatComposerReady}
                   placeholder={selectedChat?.kind === 'image' ? 'Опишите изображение' : 'Поручите что угодно'}
                   rows={2}
                 />
@@ -2238,8 +3175,8 @@ export default function App() {
                 </div>}
                 <div className="composer-toolbar">
                   <div className="toolbar-leading">
-                  <button type="button" className="attach-button" aria-label="Прикрепить файл" title="Прикрепить файл" onClick={() => void attachFile()}><Icon name="plus" /></button>
-                  <ActionMenu className="composer-permission-menu" placement="below-start"
+                  <button type="button" className="attach-button" disabled={sending || !chatComposerReady} aria-label="Прикрепить файл" title="Прикрепить файл" onClick={() => void attachFile()}><Icon name="plus" /></button>
+                  <ActionMenu className="composer-permission-menu" placement="below-start" onVisibilityChange={trackNativeOverlay}
                     label={`Разрешения: ${AVAILABLE_PERMISSION_PROFILES.find((profile) => profile.id === composerPermissionProfile)?.name ?? 'Спросить'}`}
                     disabled={!canChangeComposerPermissionProfile}
                     trigger={<><Icon name="shield" /><span>{AVAILABLE_PERMISSION_PROFILES.find((profile) => profile.id === composerPermissionProfile)?.name ?? 'Спросить'}</span><Icon name="chevron" /></>}>
@@ -2255,7 +3192,7 @@ export default function App() {
                   <span className="toolbar-mode-slot" aria-hidden="true" />
                   </div>
                   <div className="toolbar-trailing">
-                  <ActionMenu className="composer-model-menu" placement="below" label="Выбрать модель GigaChat"
+                  <ActionMenu className="composer-model-menu" placement="below" label="Выбрать модель GigaChat" onVisibilityChange={trackNativeOverlay}
                     disabled={!canChangeComposerPermissionProfile}
                     trigger={<><span>{GIGACHAT_MODELS.find((model) => model.id === composerModelId)?.name ?? 'Выбрать модель'}</span><Icon name="chevron" /></>}>
                     <div className="model-picker-popup"><p className="picker-heading">Модель для следующих ходов</p>
@@ -2269,28 +3206,47 @@ export default function App() {
                   </ActionMenu>
                   <span className="context-indicator" role="img" tabIndex={0} aria-label="Использование контекста станет доступно после подключения API" title="Контекст станет доступен после подключения API."><ContextRing /></span>
                   <VoiceCaptureControl
-                    key={route.page === 'chat' ? route.id ?? 'chat' : 'home'}
-                    available={voiceAvailability.available}
-                    reason={voiceAvailability.reason}
+                    key={route.page === 'chat' ? route.id ?? 'chat' : `home-${homeVoiceGeneration}`}
+                    available={voiceAvailability.available && chatComposerReady && !sending}
+                    reason={!chatComposerReady ? (chatLoadState.error ?? 'Загрузка чата…') : voiceAvailability.reason}
+                    canContinue={() => !rendererOperations.current.frozen}
+                    suspended={closePending || Boolean(closeFailure)}
                     onTranscript={insertVoiceTranscript}
                     onError={setNotice}
                     onSuccess={showSuccess}
                   />
-                  <span className="send-button-wrap" title={draft.trim() ? 'Сохранить локально без отправки в API' : 'Голосовой чат пока недоступен'}><button type="button" className="send-button" disabled={!draft.trim() || sending} aria-label={draft.trim() ? 'Сохранить сообщение локально' : 'Голосовой чат пока недоступен'} onClick={() => void submitMessage()}><Icon name={draft.trim() ? 'send' : 'audio'} /></button></span>
+                  <span className="send-button-wrap" title={draft.trim() ? 'Сохранить локально без отправки в API' : 'Голосовой чат пока недоступен'}><button type="button" className="send-button" disabled={!draft.trim() || sending || !chatComposerReady} aria-label={draft.trim() ? 'Сохранить сообщение локально' : 'Голосовой чат пока недоступен'} onClick={() => void submitMessage()}><Icon name={draft.trim() ? 'send' : 'audio'} /></button></span>
                   </div>
                 </div>
               </div>
             </div>
           )}
           </div>
-          {route.page === 'chat' && settings.browserPaneOpen && <BrowserPanel onClose={() => void updateLocalSettings({ browserPaneOpen: false })} onWidthChange={(browserWidthPx) => void updateLocalSettings({ browserWidthPx })} preferredWidth={settings.browserWidthPx} suspended={sidebarPreview || Boolean(dialogRequest) || Boolean(approvalRequest)} />}
+          {route.page === 'chat' && settings.browserPaneOpen && <BrowserPanel onClose={() => void updateLocalSettings({ browserPaneOpen: false })} onWidthChange={(browserWidthPx) => void updateLocalSettings({ browserWidthPx })} preferredWidth={settings.browserWidthPx} suspended={sidebarPreview || nativeOverlayOpen || Boolean(dialogRequest) || Boolean(approvalRequest) || closePending || Boolean(closeFailure)} />}
           </div>
           {notice && <div className={`notice notice-${noticeKind}`} role={noticeKind === 'error' ? 'alert' : 'status'}><span>{notice}</span><button type="button" aria-label="Закрыть уведомление" onClick={() => setNotice('')}><Icon name="x" /></button></div>}
         </main>
       </div>
-      <dialog ref={dialogRef} className={`app-dialog${dialogRequest?.kind === 'project-settings' ? ' project-settings-dialog' : ''}`} onClose={() => setDialogRequest(null)} onCancel={(event) => { if (dialogBusy) event.preventDefault(); }}>
+      <dialog ref={dialogRef} className={`app-dialog${dialogRequest?.kind === 'project-settings' ? ' project-settings-dialog' : ''}`} onClose={(event) => {
+        if (event.currentTarget.open) return;
+        dialogGeneration.current += 1;
+        if (activeProjectInstructionId.current !== null) {
+          activeProjectInstructionId.current = null;
+          projectInstructionLoadGeneration.current += 1;
+          setProjectInstructionsReady(false);
+        }
+        setDialogRequest(null);
+      }} onCancel={(event) => {
+        if (dialogBusy || dialogRequest?.kind === 'project-settings') {
+          event.preventDefault();
+          if (!dialogBusy && dialogRequest?.kind === 'project-settings') void closeProjectSettings();
+        }
+      }}>
         {dialogRequest && <form onSubmit={(event) => { event.preventDefault(); void submitDialog(); }}>
-          <button type="button" className="dialog-close" aria-label="Закрыть" disabled={dialogBusy} onClick={() => setDialogRequest(null)}><Icon name="x" /></button>
+          <button type="button" className="dialog-close" aria-label="Закрыть" disabled={dialogBusy} onClick={() => {
+            if (dialogRequest.kind === 'project-settings') void closeProjectSettings();
+            else setDialogRequest(null);
+          }}><Icon name="x" /></button>
           <h2>{dialogRequest.kind === 'create-project' ? 'Создать проект'
             : dialogRequest.kind === 'project-settings' ? `Настройки проекта «${dialogRequest.project?.name}»`
             : dialogRequest.kind === 'rename-project' ? 'Переименовать проект'
@@ -2305,7 +3261,7 @@ export default function App() {
           </label>}
           {dialogRequest.kind === 'create-project' && <div className="project-folder-choice">
             <strong>Папка проекта</strong>
-            <p>{dialogFolder ?? 'Если не выбрать папку, проект получит новую папку GigaChat Project N в Документах.'}</p>
+            <p>{dialogFolder ?? 'Если не выбрать папку, приложение создаст её в «Документы\\GigaChat Agent\\Projects» с именем «GigaChat Project N».'}</p>
             <button type="button" className="secondary-button" disabled={dialogBusy} onClick={() => void pickProjectFolder()}><Icon name="folder" />Выбрать папку</button>
           </div>}
           {dialogRequest.kind === 'project-settings' && dialogRequest.project && <>
@@ -2317,24 +3273,74 @@ export default function App() {
             </div>
             {!dialogRequest.project.archived && <button type="button" className="secondary-button project-new-chat" onClick={() => {
               if (!dialogRequest.project) return;
-              setDialogRequest(null);
-              void createChat(dialogRequest.project.id);
+              const projectId = dialogRequest.project.id;
+              void closeProjectSettings().then((closed) => { if (closed) void createChat(projectId); });
             }}><Icon name="plus" />Новый чат в проекте</button>}
+            {projectInstructionsLoadError && <div className="project-folder-choice" role="alert">
+              <strong>Не удалось прочитать AGENTS.md</strong><p>{projectInstructionsLoadError} Редактор останется заблокирован, чтобы не заменить файл пустым текстом.</p>
+              <button type="button" className="secondary-button" disabled={projectInstructionsLoading} onClick={() => void retryProjectInstructions()}>Повторить чтение</button>
+            </div>}
             <label className="dialog-label project-instructions-label">Инструкции проекта · AGENTS.md
-              <textarea value={projectInstructions} onChange={(event) => {
+              <textarea value={projectInstructions} disabled={projectInstructionsLoading || !projectInstructionsReady} onChange={(event) => {
                 setProjectInstructions(event.target.value);
                 if (dialogRequest.project) projectSaver.edit(dialogRequest.project.id, event.target.value);
-              }} onBlur={() => void projectSaver.flushAll().catch((error: unknown) => setDialogError(getErrorMessage(error)))} aria-label="Инструкции проекта AGENTS.md" placeholder="Правила для всех чатов этого проекта…" />
+              }} onBlur={() => {
+                const id = dialogRequest.project?.id;
+                if (projectInstructionsConflict) return;
+                const generation = projectInstructionLoadGeneration.current;
+                if (id) void projectSaver.flush(id).catch((error: unknown) => {
+                  if (activeProjectInstructionId.current === id && generation === projectInstructionLoadGeneration.current) setDialogError(getErrorMessage(error));
+                });
+              }} aria-label="Инструкции проекта AGENTS.md" placeholder={projectInstructionsLoading ? 'Чтение AGENTS.md…' : 'Правила для всех чатов этого проекта…'} />
             </label>
-            <span role="status" className={`save-status status-${projectInstructionsStatus}`}>{saveStatusLabel(projectInstructionsStatus)}</span>
+            <span role="status" className={`save-status status-${projectInstructionsStatus}`}>{projectInstructionsLoading ? 'Чтение…' : projectInstructionsReady ? saveStatusLabel(projectInstructionsStatus) : 'Ожидание загрузки'}</span>
+            {projectInstructionsConflict && <div className="project-folder-choice" role="alert">
+              <strong>{projectInstructionsConflict.phase === 'after-commit' ? 'Найдены две версии AGENTS.md' : 'AGENTS.md изменён вне приложения'}</strong>
+              <p>Ваш текст остался в редакторе. Перечитайте текущую версию или сохраните свой текст отдельной копией.</p>
+              {projectInstructionsConflict.phase === 'before-commit' && <details>
+                <summary>Показать версию в рабочей папке</summary>
+                <pre className="approval-target">{projectInstructionsConflict.current.text || 'Файл отсутствует или пуст.'}</pre>
+              </details>}
+              <div className="inline-actions">
+                <button type="button" className="secondary-button" disabled={projectInstructionsLoading} onClick={() => void reloadProjectInstructions()}>Перечитать файл</button>
+                <button type="button" className="secondary-button" disabled={projectInstructionsLoading} onClick={() => void saveProjectInstructionsCopy()}>Сохранить черновик отдельно</button>
+              </div>
+            </div>}
+            {projectPreservedInstruction && <div className="project-backup-note" role="status">
+              <strong>Вытесненная версия сохранена</strong>
+              <span>{projectPreservedInstruction.path}</span>
+              {projectPreservedInstruction.text === null
+                ? <p>Содержимое пока нельзя безопасно прочитать; файл и журнал сохранены.</p>
+                : <details><summary>Показать сохранённый текст</summary><pre className="approval-target">{projectPreservedInstruction.text || 'Файл пуст.'}</pre></details>}
+            </div>}
             {projectInstructionsBackup && <p className="project-backup-note">Прежняя инструкция сохранена: <span>{projectInstructionsBackup}</span></p>}
           </>}
           {dialogError && <p className="dialog-error" role="alert">{dialogError}</p>}
           <div className="dialog-actions">
             {dialogRequest.kind !== 'project-settings' && <button type="button" className="secondary-button" disabled={dialogBusy} onClick={() => setDialogRequest(null)}>Отмена</button>}
-            <button type="submit" className={dialogRequest.kind.startsWith('delete') ? 'danger-button' : 'primary-button'} disabled={dialogBusy}>{dialogBusy ? 'Подождите…' : dialogRequest.kind.startsWith('delete') ? 'Удалить' : dialogRequest.kind === 'project-settings' ? 'Готово' : dialogRequest.createdProjectId ? 'Повторить перенос' : dialogRequest.kind === 'create-project' ? 'Создать' : 'Сохранить'}</button>
+            <button type="submit" className={dialogRequest.kind.startsWith('delete') ? 'danger-button' : 'primary-button'} disabled={dialogBusy || (dialogRequest.kind === 'project-settings' && projectInstructionsLoading)}>{dialogBusy ? 'Подождите…' : dialogRequest.kind.startsWith('delete') ? 'Удалить' : dialogRequest.kind === 'project-settings' ? 'Готово' : dialogRequest.createdProjectId ? 'Повторить перенос' : dialogRequest.kind === 'create-project' ? 'Создать' : 'Сохранить'}</button>
           </div>
         </form>}
+      </dialog>
+      <dialog ref={closePendingDialogRef} className="app-dialog close-pending-dialog" aria-labelledby="close-pending-title" aria-describedby="close-pending-description" onCancel={(event) => event.preventDefault()}>
+        <section>
+          <h2 id="close-pending-title">Сохраняем перед закрытием</h2>
+          <p id="close-pending-description" role="status" aria-live="polite">Завершаются уже начатые действия и сохранение текста. Окно останется открытым до их завершения.</p>
+        </section>
+      </dialog>
+      <dialog ref={closeDialogRef} className="app-dialog close-error-dialog" role="alertdialog" aria-labelledby="close-error-title" aria-describedby="close-error-description" onCancel={(event) => event.preventDefault()}>
+        {closeFailure && <section>
+          <h2 id="close-error-title">Не удалось закрыть приложение</h2>
+          <p className="close-error-message" role="alert">{closeFailure.message}</p>
+          <p id="close-error-description">{closeFailure.reason === 'browser-metadata'
+            ? 'Вкладки браузера останутся открытыми. Повторите сохранение или вернитесь к работе.'
+            : 'Окно останется открытым, чтобы принятые изменения можно было сохранить или проверить.'}</p>
+          <div className="dialog-actions">
+            <button type="button" className="secondary-button" disabled={closeRetrying} onClick={returnFromCloseFailure}>Вернуться к работе</button>
+            <button type="button" className="primary-button close-retry-button" disabled={closeRetrying} onClick={() => runCloseAction(() => window.gigaChat.retryClose(false))}>{closeRetrying ? 'Повторяем…' : 'Повторить'}</button>
+            {closeFailure.reason === 'browser-metadata' && <button type="button" className="danger-button" disabled={closeRetrying} onClick={() => runCloseAction(() => window.gigaChat.retryClose(true))}>Закрыть без сохранения вкладок</button>}
+          </div>
+        </section>}
       </dialog>
       <dialog ref={approvalDialogRef} className="app-dialog approval-dialog" onCancel={(event) => {
         event.preventDefault();

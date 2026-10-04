@@ -1,11 +1,30 @@
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rename, rm, stat, symlink, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
-import { openStore } from './store';
+import { openStore as openStoreProduction, type StoreFaultStage, type StoreOpenOptions } from './store';
+import type { InstructionCommitRequest, InstructionCommitResult } from './contracts';
+import { instructionFileHash } from './instruction-documents';
 
 const timestamp = '2026-09-24T10:00:00.000Z';
+
+const syntheticInstructionCommitter = async (request: InstructionCommitRequest): Promise<InstructionCommitResult> => {
+  const target = join(request.workingFolder, request.relativePath);
+  const currentBytes = await readFile(target).catch((error: unknown) => {
+    if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') return null;
+    throw error;
+  });
+  const currentText = currentBytes === null ? null : new TextDecoder('utf-8', { fatal: true }).decode(currentBytes);
+  if (instructionFileHash(currentText) !== request.expectedHash) return { kind: 'conflict-before', currentText };
+  await mkdir(dirname(target), { recursive: true });
+  await writeFile(target, request.contents, 'utf8');
+  return { kind: 'saved' };
+};
+
+function openStore(directory: string, options: StoreOpenOptions = {}) {
+  return openStoreProduction(directory, { instructionCommitter: syntheticInstructionCommitter, ...options });
+}
 
 test('persists projects, chats, relationships, drafts, image kind, and settings', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-store-'));
@@ -13,7 +32,9 @@ test('persists projects, chats, relationships, drafts, image kind, and settings'
 
   const store = await openStore(directory);
   const project = await store.createProject('Локальный проект');
-  const updatedProject = await store.updateProject(project.id, { workingFolder: 'C:\\work' });
+  const workingFolder = join(directory, 'work');
+  await mkdir(workingFolder);
+  const updatedProject = (await store.updateProject(project.id, { workingFolder })).project;
   const chat = await store.createChat(project.id);
   const imageChat = await store.createChat(project.id, 'image');
   const savedChat = await store.updateChat(chat.id, {
@@ -152,6 +173,130 @@ test('saves a local message and clears its draft in one chat file, then reopens 
   assert.equal(onDisk.draft, '');
   assert.equal(onDisk.messages[0].text, 'Привет');
   assert.deepEqual(await (await openStore(directory)).getChat(chat.id), detail);
+});
+
+test('accepts an immutable turn snapshot with the local message and its project binding', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-turn-acceptance-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const project = await store.createProject('Проект хода');
+  const workingFolder = join(directory, 'working');
+  await mkdir(workingFolder);
+  await store.updateProject(project.id, { workingFolder });
+  const chat = await store.createChat(project.id);
+  await store.appendLocalMessage(chat.id, 'Первая реплика');
+  await store.updateSettings({ defaultPermissionProfile: 'approve', defaultModelId: 'GigaChat-3-Ultra' });
+  await store.updateChat(chat.id, {
+    modelId: 'GigaChat-2-Pro',
+    nextTurnPermissionProfile: 'full',
+    nextTurnSkillId: `project/${project.id}/review`,
+  });
+
+  const accepted = await store.acceptLocalMessage(chat.id, 'Ответьте на первую реплику', 'turn-b1');
+  await store.appendLocalMessage(chat.id, 'Это уже следующий ход');
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Ultra', nextTurnPermissionProfile: 'ask', nextTurnSkillId: null });
+
+  assert.equal(accepted.detail.messages[accepted.detail.messages.length - 1]?.text, 'Ответьте на первую реплику');
+  assert.equal(accepted.detail.draft, '');
+  assert.equal(accepted.turn.turnId, 'turn-b1');
+  assert.equal(accepted.turn.chatId, chat.id);
+  assert.equal(accepted.turn.projectId, project.id);
+  assert.equal(accepted.turn.projectWorkingFolder, workingFolder);
+  assert.equal(accepted.turn.messageId, accepted.detail.messages[accepted.detail.messages.length - 1]?.id);
+  assert.equal(accepted.turn.historyBoundary, 2);
+  assert.deepEqual(accepted.turn.messages.map(({ text }) => text), ['Первая реплика', 'Ответьте на первую реплику']);
+  assert.equal(accepted.turn.modelId, 'GigaChat-2-Pro');
+  assert.equal(accepted.turn.permissionProfile, 'full');
+  assert.equal(accepted.turn.skillId, `project/${project.id}/review`);
+});
+
+test('reserves one-shot profile and Skill independently and preserves a same-value reselection', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-turn-reservation-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { nextTurnPermissionProfile: 'full', nextTurnSkillId: 'global/review' });
+
+  const first = await store.acceptLocalMessage(chat.id, 'B1', 'turn-b1');
+  await store.updateChat(chat.id, { nextTurnPermissionProfile: 'approve' });
+  const second = await store.acceptLocalMessage(chat.id, 'B2', 'turn-b2');
+  assert.equal(first.turn.permissionProfile, 'full');
+  assert.equal(first.turn.skillId, 'global/review');
+  assert.equal(second.turn.permissionProfile, 'approve');
+  assert.equal(second.turn.skillId, null);
+
+  await store.consumeTurnReservation(first.turn);
+  let current = await store.getChat(chat.id);
+  assert.equal(current.nextTurnPermissionProfile, 'approve');
+  assert.equal(current.nextTurnSkillId, null);
+
+  await store.updateChat(chat.id, { nextTurnPermissionProfile: 'approve' });
+  await store.consumeTurnReservation(second.turn);
+  current = await store.getChat(chat.id);
+  assert.equal(current.nextTurnPermissionProfile, 'approve');
+});
+
+test('rejects reservation consumption when the accepted project folder or chat binding changes', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-accepted-binding-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const oldFolder = join(directory, 'project-old');
+  const newFolder = join(directory, 'project-new');
+  await mkdir(oldFolder);
+  await mkdir(newFolder);
+  const store = await openStore(join(directory, 'profile'));
+  const project = await store.createProject('Связанный проект', oldFolder);
+  const chat = await store.createChat(project.id);
+  await store.updateChat(chat.id, { nextTurnSkillId: 'global/review' });
+  const accepted = await store.acceptLocalMessage(chat.id, 'Принятый запрос', 'turn-binding');
+
+  await store.updateProject(project.id, { workingFolder: newFolder });
+  await assert.rejects(store.validateAcceptedTurn(accepted.turn), /рабочая папка проекта изменилась/i);
+  await assert.rejects(store.consumeTurnReservation(accepted.turn), /рабочая папка проекта изменилась/i);
+  assert.equal((await store.getChat(chat.id)).nextTurnSkillId, 'global/review');
+
+  await store.updateChat(chat.id, { projectId: null });
+  await assert.rejects(store.validateAcceptedTurn(accepted.turn), /чат перемещён/i);
+});
+
+test('does not consume a reservation aborted while queued behind an instruction commit', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-accepted-abort-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const workingFolder = join(directory, 'workspace');
+  await mkdir(workingFolder);
+  let releaseCommit!: () => void;
+  const commitGate = new Promise<void>((resolve) => { releaseCommit = resolve; });
+  let announceCommit!: () => void;
+  const commitStarted = new Promise<void>((resolve) => { announceCommit = resolve; });
+  const store = await openStore(join(directory, 'profile'), {
+    instructionCommitter: async (request) => {
+      if (request.contents === 'hold store queue') {
+        announceCommit();
+        await commitGate;
+      }
+      return syntheticInstructionCommitter(request);
+    },
+  });
+  const project = await store.createProject('Очередь записи', workingFolder);
+  const chat = await store.createChat(project.id);
+  await store.updateChat(chat.id, {
+    nextTurnPermissionProfile: 'full',
+    nextTurnSkillId: 'global/review',
+  });
+  const accepted = await store.acceptLocalMessage(chat.id, 'Принятый запрос', 'turn-abort-queued');
+  const document = await store.readProjectInstructionDocument(project.id);
+  const writing = store.saveProjectInstructions(project.id, 'hold store queue', document.revision);
+  await commitStarted;
+
+  const controller = new AbortController();
+  const consuming = store.consumeTurnReservation(accepted.turn, controller.signal);
+  controller.abort();
+  releaseCommit();
+  await writing;
+  await assert.rejects(consuming, /отменена/i);
+
+  const current = await store.getChat(chat.id);
+  assert.equal(current.nextTurnPermissionProfile, 'full');
+  assert.equal(current.nextTurnSkillId, 'global/review');
 });
 
 test('trusted runtime assistant append preserves draft and writes only a supplied completed response', async (t) => {
@@ -461,8 +606,8 @@ test('keeps app and project instructions inside app-owned storage', async (t) =>
   const store = await openStore(directory);
   const project = await store.createProject('Рабочая папка');
 
-  await store.saveGlobalInstructions('Глобальные правила');
-  await store.saveProjectInstructions(project.id, 'Правила проекта');
+  await store.saveGlobalInstructions('Глобальные правила', (await store.readGlobalInstructionDocument()).revision);
+  await store.saveProjectInstructions(project.id, 'Правила проекта', (await store.readProjectInstructionDocument(project.id)).revision);
   assert.equal(await store.readGlobalInstructions(), 'Глобальные правила');
   assert.equal(await store.readProjectInstructions(project.id), 'Правила проекта');
   assert.match(await readFile(join(directory, 'project-instructions', project.id, 'AGENTS.md'), 'utf8'), /Правила проекта/);
@@ -474,12 +619,10 @@ test('serializes rapid instruction saves so the last edit wins', async (t) => {
   t.after(() => rm(directory, { recursive: true, force: true }));
   const store = await openStore(directory);
   const project = await store.createProject('Проверка');
-  await Promise.all([
-    store.saveGlobalInstructions('первая'),
-    store.saveGlobalInstructions('последняя'),
-    store.saveProjectInstructions(project.id, 'сначала'),
-    store.saveProjectInstructions(project.id, 'потом'),
-  ]);
+  await store.saveGlobalInstructions('первая', (await store.readGlobalInstructionDocument()).revision);
+  await store.saveGlobalInstructions('последняя', (await store.readGlobalInstructionDocument()).revision);
+  await store.saveProjectInstructions(project.id, 'сначала', (await store.readProjectInstructionDocument(project.id)).revision);
+  await store.saveProjectInstructions(project.id, 'потом', (await store.readProjectInstructionDocument(project.id)).revision);
   assert.equal(await store.readGlobalInstructions(), 'последняя');
   assert.equal(await store.readProjectInstructions(project.id), 'потом');
 });
@@ -535,7 +678,10 @@ test('deleting a project preserves external AGENTS.md, chats, and source files',
   const withFile = await store.importFile(chat.id, source);
   const importedArtifact = withFile.artifacts[0];
   assert.ok(importedArtifact);
-  await store.saveProjectInstructions(project.id, 'Инструкция проекта');
+  await store.saveProjectInstructions(project.id, 'Инструкция проекта', (await store.readProjectInstructionDocument(project.id)).revision);
+  await store.updateChat(chat.id, { nextTurnSkillId: `project/${project.id}/review` });
+  const globalSkillChat = await store.createChat();
+  await store.updateChat(globalSkillChat.id, { nextTurnSkillId: 'global/review' });
   assert.equal(await readFile(join(workingFolder, 'AGENTS.md'), 'utf8'), 'Инструкция проекта');
   const instructionsPath = join(dataDirectory, 'project-instructions', project.id, 'AGENTS.md');
 
@@ -549,9 +695,288 @@ test('deleting a project preserves external AGENTS.md, chats, and source files',
   assert.equal((await restored.listProjects()).length, 0);
   const preservedChat = await restored.getChat(chat.id);
   assert.equal(preservedChat.projectId, null);
+  assert.equal(preservedChat.nextTurnSkillId, null);
   assert.equal(preservedChat.messages[0]?.text, 'История');
   assert.equal(preservedChat.artifacts[0]?.id, importedArtifact.id);
   assert.equal(await readFile(await restored.getArtifactPath(chat.id, importedArtifact.id), 'utf8'), 'source');
+  assert.equal((await restored.getChat(globalSkillChat.id)).nextTurnSkillId, 'global/review');
+});
+
+test('rebinds a project when its old folder is missing and preserves instructions in the new folder', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-project-rebind-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const oldFolder = join(directory, 'old-project');
+  const newFolder = join(directory, 'new-project');
+  await mkdir(oldFolder);
+  await mkdir(newFolder);
+  await writeFile(join(newFolder, 'AGENTS.md'), 'new folder rules');
+  const store = await openStore(join(directory, 'profile'));
+  const project = await store.createProject('Перепривязка', oldFolder);
+  await rm(oldFolder, { recursive: true });
+
+  const result = await store.updateProject(project.id, { workingFolder: newFolder });
+
+  assert.equal(result.project.workingFolder, newFolder);
+  assert.match(result.warning ?? '', /старые инструкции не перенесены/i);
+  assert.equal(await readFile(join(newFolder, 'AGENTS.md'), 'utf8'), 'new folder rules');
+  assert.equal((await store.listProjects()).find((item) => item.id === project.id)?.workingFolder, newFolder);
+});
+
+test('rebinds when the native instruction writer is unavailable and leaves the old AGENTS file intact', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-project-rebind-no-writer-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const oldFolder = join(directory, 'old-project');
+  const newFolder = join(directory, 'new-project');
+  await mkdir(oldFolder);
+  await mkdir(newFolder);
+  const oldInstructions = join(oldFolder, 'AGENTS.md');
+  await writeFile(oldInstructions, 'original project rules');
+  const store = await openStoreProduction(join(directory, 'profile'));
+  const project = await store.createProject('Перепривязка', oldFolder);
+
+  const result = await store.updateProject(project.id, { workingFolder: newFolder });
+
+  assert.equal(result.project.workingFolder, newFolder);
+  assert.match(result.warning ?? '', /writer недоступен/i);
+  assert.equal(await readFile(oldInstructions, 'utf8'), 'original project rules');
+  await assert.rejects(readFile(join(newFolder, 'AGENTS.md'), 'utf8'), { code: 'ENOENT' });
+  assert.equal((await store.listProjects()).find((item) => item.id === project.id)?.workingFolder, newFolder);
+});
+
+test('does not write project instructions through a linked parent directory', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-project-linked-parent-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const outside = join(directory, 'outside');
+  const linkedRoot = join(directory, 'linked-root');
+  const outsideProject = join(outside, 'project');
+  await mkdir(outsideProject, { recursive: true });
+  await symlink(outside, linkedRoot, 'junction');
+  const store = await openStore(join(directory, 'profile'));
+  const project = await store.createProject('Проект за ссылкой');
+
+  await assert.rejects(store.updateProject(project.id, { workingFolder: join(linkedRoot, 'project') }));
+  assert.equal((await store.listProjects()).find((item) => item.id === project.id)?.workingFolder, null);
+  await assert.rejects(stat(join(outsideProject, 'AGENTS.md')), { code: 'ENOENT' });
+});
+
+test('revalidates the project path immediately before committing AGENTS.md', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-project-path-swap-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const workingFolder = join(directory, 'working');
+  const movedFolder = join(directory, 'working-moved');
+  const outside = join(directory, 'outside');
+  await mkdir(workingFolder);
+  await mkdir(outside);
+  await writeFile(join(outside, 'sentinel.txt'), 'outside sentinel');
+  let swapped = false;
+  const store = await openStore(join(directory, 'profile'), {
+    testFaults: {
+      beforeProjectInstructionCommit: async () => {
+        if (swapped) return;
+        swapped = true;
+        await rename(workingFolder, movedFolder);
+        await symlink(outside, workingFolder, 'junction');
+      },
+    },
+  });
+  const project = await store.createProject('Подмена пути');
+  await store.updateProject(project.id, { workingFolder });
+
+  const current = await store.readProjectInstructionDocument(project.id);
+  await assert.rejects(store.saveProjectInstructions(project.id, 'не записывать наружу', current.revision), /ссылка|junction/i);
+  assert.equal(await readFile(join(outside, 'sentinel.txt'), 'utf8'), 'outside sentinel');
+  await assert.rejects(stat(join(outside, 'AGENTS.md')), { code: 'ENOENT' });
+  await assert.rejects(stat(join(movedFolder, 'AGENTS.md')), { code: 'ENOENT' });
+});
+
+test('rolls a prepared project deletion forward after a partial durable write', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-delete-recovery-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const project = await store.createProject('Восстанавливаемый проект');
+  const firstChat = await store.createChat(project.id);
+  const secondChat = await store.createChat(project.id);
+  await store.appendLocalMessage(firstChat.id, 'История первого чата');
+  await store.appendLocalMessage(secondChat.id, 'История второго чата');
+  await store.saveProjectInstructions(project.id, 'Старые правила', (await store.readProjectInstructionDocument(project.id)).revision);
+
+  const projectsPath = join(directory, 'projects.json');
+  const beforeProjects = JSON.parse(await readFile(projectsPath, 'utf8')) as {
+    schemaVersion: number;
+    projects: Array<Record<string, unknown>>;
+  };
+  const afterProjects = { ...beforeProjects, projects: beforeProjects.projects.filter((item) => item.id !== project.id) };
+  const firstChatPath = join(directory, 'chats', firstChat.id, 'chat.json');
+  const secondChatPath = join(directory, 'chats', secondChat.id, 'chat.json');
+  const beforeFirst = JSON.parse(await readFile(firstChatPath, 'utf8')) as Record<string, unknown>;
+  const beforeSecond = JSON.parse(await readFile(secondChatPath, 'utf8')) as Record<string, unknown>;
+  const afterFirst = { ...beforeFirst, projectId: null };
+  const afterSecond = { ...beforeSecond, projectId: null };
+  const before = {
+    projects: beforeProjects,
+    chats: [beforeFirst, beforeSecond],
+    instructionText: 'Старые правила',
+  };
+  const after = {
+    projects: afterProjects,
+    chats: [afterSecond, afterFirst],
+    instructionText: null,
+  };
+  await writeFile(firstChatPath, `${JSON.stringify(afterFirst, null, 2)}\n`, 'utf8');
+  await writeFile(join(directory, 'project-delete.journal.json'), JSON.stringify({
+    schemaVersion: 1,
+    operationId: 'delete-recovery-test',
+    projectId: project.id,
+    before,
+    after,
+  }), 'utf8');
+
+  const recovered = await openStore(directory);
+  assert.deepEqual(await recovered.listProjects(), []);
+  assert.equal((await recovered.getChat(firstChat.id)).projectId, null);
+  assert.equal((await recovered.getChat(firstChat.id)).messages[0]?.text, 'История первого чата');
+  assert.equal((await recovered.getChat(secondChat.id)).projectId, null);
+  assert.equal((await recovered.getChat(secondChat.id)).messages[0]?.text, 'История второго чата');
+  await assert.rejects(stat(join(directory, 'project-instructions', project.id, 'AGENTS.md')), { code: 'ENOENT' });
+  await assert.rejects(stat(join(directory, 'project-delete.journal.json')), { code: 'ENOENT' });
+});
+
+test('rejects duplicate chats in a project deletion journal without changing source data', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-delete-duplicate-journal-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const project = await store.createProject('Проект с повреждённым журналом');
+  const chat = await store.createChat(project.id);
+  const projects = JSON.parse(await readFile(join(directory, 'projects.json'), 'utf8')) as {
+    schemaVersion: number; projects: Array<Record<string, unknown>>;
+  };
+  const chatDetail = JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')) as Record<string, unknown>;
+  const duplicate = { ...chatDetail, projectId: null };
+  const afterProjects = { ...projects, projects: projects.projects.filter((item) => item.id !== project.id) };
+  const journalPath = join(directory, 'project-delete.journal.json');
+  await writeFile(journalPath, JSON.stringify({
+    schemaVersion: 1,
+    operationId: 'duplicate-chat-test',
+    projectId: project.id,
+    before: { projects, chats: [chatDetail], instructionText: null },
+    after: { projects: afterProjects, chats: [duplicate, duplicate], instructionText: null },
+  }), 'utf8');
+
+  await assert.rejects(openStore(directory));
+  assert.equal((await store.listProjects()).some((item) => item.id === project.id), true);
+  assert.equal((await store.getChat(chat.id)).projectId, project.id);
+  assert.equal(await readFile(journalPath, 'utf8').then(() => true), true);
+});
+
+test('recovers project deletion after every durable journal stage', async (t) => {
+  const cases: Array<{ stage: StoreFaultStage; index?: number }> = [
+    { stage: 'journal' },
+    { stage: 'chat', index: 0 },
+    { stage: 'chat', index: 1 },
+    { stage: 'projects' },
+    { stage: 'instructions' },
+    { stage: 'journal-cleared' },
+  ];
+  for (const { stage, index } of cases) {
+    const directory = await mkdtemp(join(tmpdir(), 'gigachat-delete-fault-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const dataDirectory = join(directory, 'profile');
+    const workingFolder = join(directory, 'external-project');
+    await mkdir(workingFolder);
+    await writeFile(join(workingFolder, 'keep.txt'), 'external sentinel');
+    let injected = false;
+    const store = await openStore(dataDirectory, {
+      testFaults: {
+        afterProjectDeleteStage: (actualStage, actualIndex) => {
+          if (!injected && actualStage === stage && actualIndex === index) {
+            injected = true;
+            throw new Error(`synthetic ${actualStage}`);
+          }
+        },
+      },
+    });
+    const project = await store.createProject(`Fault at ${stage}:${index ?? '-'}`);
+    await store.saveProjectInstructions(project.id, 'project rules', (await store.readProjectInstructionDocument(project.id)).revision);
+    await store.updateProject(project.id, { workingFolder });
+    const firstChat = await store.createChat(project.id);
+    const secondChat = await store.createChat(project.id);
+    await store.appendLocalMessage(firstChat.id, 'first history');
+    await store.appendLocalMessage(secondChat.id, 'second history');
+
+    await assert.rejects(store.deleteProject(project.id), new RegExp(`synthetic ${stage}`),
+      `fault injection did not reject at ${stage}:${index ?? '-'} (callback reached: ${injected})`);
+    const recovered = await openStore(dataDirectory);
+    assert.deepEqual(await recovered.listProjects(), [], `${stage}:${index ?? '-'} project`);
+    assert.equal((await recovered.getChat(firstChat.id)).projectId, null, `${stage}:${index ?? '-'} first chat`);
+    assert.equal((await recovered.getChat(firstChat.id)).messages[0]?.text, 'first history');
+    assert.equal((await recovered.getChat(secondChat.id)).projectId, null, `${stage}:${index ?? '-'} second chat`);
+    assert.equal((await recovered.getChat(secondChat.id)).messages[0]?.text, 'second history');
+    await assert.rejects(stat(join(dataDirectory, 'project-delete.journal.json')), { code: 'ENOENT' });
+    assert.equal(await readFile(join(workingFolder, 'keep.txt'), 'utf8'), 'external sentinel');
+    assert.equal(await readFile(join(workingFolder, 'AGENTS.md'), 'utf8'), 'project rules');
+    assert.deepEqual(await store.listProjects(), [], `${stage}:${index ?? '-'} same-store retry`);
+    const repeated = await openStore(dataDirectory);
+    assert.deepEqual(await repeated.listProjects(), []);
+    assert.equal((await repeated.getChat(firstChat.id)).messages[0]?.text, 'first history');
+  }
+});
+
+test('keeps a chat intact when its deletion quarantine cannot be prepared', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-delete-quarantine-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { draft: 'Оставить до успешного удаления' });
+  await writeFile(join(directory, 'deleted-chats'), 'block quarantine directory');
+
+  await assert.rejects(store.deleteChat(chat.id));
+  assert.equal((await store.listChats()).some((item) => item.id === chat.id), true);
+  assert.equal((await store.getChat(chat.id)).draft, 'Оставить до успешного удаления');
+  assert.equal(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8').then(() => true), true);
+  const reopened = await openStore(directory);
+  assert.equal((await reopened.getChat(chat.id)).draft, 'Оставить до успешного удаления');
+  assert.match((await reopened.getStorageIssues()).join('\n'), /Карантин удаления чатов недоступен/);
+});
+
+test('retains only a project Skill that matches the chat destination and keeps global Skills', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-skill-detach-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const first = await store.createProject('Первый проект');
+  const second = await store.createProject('Второй проект');
+  const chat = await store.createChat(first.id);
+  await store.updateChat(chat.id, { nextTurnSkillId: `project/${first.id}/review` });
+
+  await store.updateChat(chat.id, { projectId: first.id });
+  assert.equal((await store.getChat(chat.id)).nextTurnSkillId, `project/${first.id}/review`);
+  await store.updateChat(chat.id, { projectId: second.id });
+  assert.equal((await store.getChat(chat.id)).nextTurnSkillId, null);
+  await store.updateChat(chat.id, { nextTurnSkillId: `project/${second.id}/review` });
+  await store.updateChat(chat.id, { projectId: null });
+  assert.equal((await store.getChat(chat.id)).nextTurnSkillId, null);
+  await store.updateChat(chat.id, { nextTurnSkillId: 'global/review' });
+  await store.updateChat(chat.id, { projectId: first.id });
+  assert.equal((await store.getChat(chat.id)).nextTurnSkillId, 'global/review');
+});
+
+test('keeps healthy chats available and reports a damaged chat folder after partial deletion', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-partial-chat-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const damagedChat = await store.createChat();
+  const healthyChat = await store.createChat();
+  await store.appendLocalMessage(healthyChat.id, 'Здоровая история');
+  await rm(join(directory, 'chats', damagedChat.id, 'chat.json'));
+
+  const recovered = await openStore(directory);
+  assert.equal((await recovered.getChat(healthyChat.id)).messages[0]?.text, 'Здоровая история');
+  assert.equal((await stat(join(directory, 'chats', damagedChat.id))).isDirectory(), true);
+  const diagnostics = await (recovered as typeof recovered & { getStorageIssues(): Promise<string[]> }).getStorageIssues();
+  assert.equal(diagnostics.some((issue) => issue.includes(damagedChat.id)), true);
+
+  const reopened = await openStore(directory);
+  const repeatedDiagnostics = await (reopened as typeof reopened & { getStorageIssues(): Promise<string[]> }).getStorageIssues();
+  assert.deepEqual(repeatedDiagnostics, diagnostics);
 });
 
 test('rejects oversized imports and checks instruction size before reading', async (t) => {
@@ -593,7 +1018,7 @@ test('refuses symlinked app-owned paths after the store has opened', async (t) =
   const projectInstructions = join(dataDirectory, 'project-instructions');
   await mkdir(projectInstructions);
   await symlink(outside, join(projectInstructions, project.id), 'junction');
-  await assert.rejects(store.saveProjectInstructions(project.id, 'не писать наружу'), /символическую ссылку/);
+  await assert.rejects(store.saveProjectInstructions(project.id, 'не писать наружу', '0'.repeat(64)), /символическую ссылку/);
   await assert.rejects(store.deleteProject(project.id), /символическую ссылку/);
   assert.equal((await store.listProjects()).some((item) => item.id === project.id), true);
 

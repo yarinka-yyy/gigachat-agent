@@ -2,6 +2,8 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type {
   AppApi,
   AppInfo,
+  CloseFailure,
+  CloseAttemptResult,
   LocalUsageStats,
   BrowserBounds,
   EmbeddedBrowserStatus,
@@ -11,6 +13,7 @@ import type {
   FolderOpener,
   HookRegistrySnapshot,
   Project,
+  ProjectUpdateResult,
   RuntimeAvailability,
   RuntimeTurnSnapshot,
   PermissionApprovalRequest,
@@ -24,18 +27,47 @@ import type {
   VoiceAvailability,
 } from './contracts';
 
+let closeFlush: (() => Promise<void>) | null = null;
+let closeFailureHandler: ((result: CloseFailure) => void) | null = null;
+let closeAttempt: Promise<CloseAttemptResult> | null = null;
+
+const runCloseAttempt = (discardBrowserMetadata = false): Promise<CloseAttemptResult> => {
+  if (closeAttempt) return closeAttempt;
+  const attempt = (async (): Promise<CloseAttemptResult> => {
+    try {
+      if (!closeFlush) throw new Error('Сохранение данных перед закрытием недоступно.');
+      await closeFlush();
+      const result = await ipcRenderer.invoke('app:close-ready', discardBrowserMetadata) as CloseAttemptResult;
+      if (result.status === 'failed') closeFailureHandler?.(result);
+      return result;
+    } catch (error) {
+      const result: CloseAttemptResult = {
+        status: 'failed',
+        reason: 'close',
+        message: error instanceof Error ? error.message : 'Не удалось сохранить данные перед закрытием.',
+      };
+      closeFailureHandler?.(result);
+      return result;
+    }
+  })();
+  const wrapped = attempt.finally(() => { if (closeAttempt === wrapped) closeAttempt = null; });
+  closeAttempt = wrapped;
+  return wrapped;
+};
+
 const api: AppApi = {
   projects: {
     list: () => ipcRenderer.invoke('projects:list') as Promise<Project[]>,
     create: (name, workingFolder = null) => ipcRenderer.invoke('projects:create', name, workingFolder) as Promise<Project>,
     pickFolder: () => ipcRenderer.invoke('projects:pick-folder') as Promise<string | null>,
     instructionsBackupPath: (id) => ipcRenderer.invoke('projects:instructions-backup-path', id) as Promise<string | null>,
-    update: (id, patch) => ipcRenderer.invoke('projects:update', id, patch) as Promise<Project>,
+    update: (id, patch) => ipcRenderer.invoke('projects:update', id, patch) as Promise<ProjectUpdateResult>,
     remove: (id) => ipcRenderer.invoke('projects:delete', id) as Promise<void>,
-    chooseFolder: (id) => ipcRenderer.invoke('projects:choose-folder', id) as Promise<Project>,
+    chooseFolder: (id) => ipcRenderer.invoke('projects:choose-folder', id) as Promise<ProjectUpdateResult>,
     openFolder: (id) => ipcRenderer.invoke('projects:open-folder', id) as Promise<void>,
-    readInstructions: (id) => ipcRenderer.invoke('projects:read-instructions', id) as Promise<string>,
-    saveInstructions: (id, contents) => ipcRenderer.invoke('projects:save-instructions', id, contents) as Promise<void>,
+    readInstructions: (id) => ipcRenderer.invoke('projects:read-instructions', id) as ReturnType<AppApi['projects']['readInstructions']>,
+    saveInstructions: (id, contents, expectedRevision) => ipcRenderer.invoke('projects:save-instructions', id, contents, expectedRevision) as ReturnType<AppApi['projects']['saveInstructions']>,
+    saveInstructionsCopy: (id, contents) => ipcRenderer.invoke('projects:save-instructions-copy', id, contents) as ReturnType<AppApi['projects']['saveInstructionsCopy']>,
   },
   chats: {
     list: () => ipcRenderer.invoke('chats:list') as Promise<ChatSummary[]>,
@@ -84,7 +116,7 @@ const api: AppApi = {
     getBrowserStatus: () => ipcRenderer.invoke('onboarding:browser-status') as Promise<OnboardingBrowserStatus>,
     openStudio: () => ipcRenderer.invoke('onboarding:browser-open') as Promise<OnboardingBrowserStatus>,
     closeBrowser: () => ipcRenderer.invoke('onboarding:browser-close') as Promise<void>,
-    setBrowserBounds: (bounds: BrowserBounds) => ipcRenderer.invoke('onboarding:browser-bounds', bounds) as Promise<void>,
+    setBrowserBounds: (bounds: BrowserBounds | null) => ipcRenderer.invoke('onboarding:browser-bounds', bounds) as Promise<void>,
     back: () => ipcRenderer.invoke('onboarding:browser-back') as Promise<void>,
     reload: () => ipcRenderer.invoke('onboarding:browser-reload') as Promise<void>,
     onBrowserStatus: (listener) => {
@@ -125,20 +157,31 @@ const api: AppApi = {
     getAppInfo: () => ipcRenderer.invoke('settings:app-info') as Promise<AppInfo>,
     getAutoStart: () => ipcRenderer.invoke('settings:get-auto-start') as Promise<boolean>,
     setAutoStart: (enabled) => ipcRenderer.invoke('settings:set-auto-start', enabled) as Promise<boolean>,
-    readInstructions: () => ipcRenderer.invoke('settings:read-instructions') as Promise<string>,
-    saveInstructions: (contents) => ipcRenderer.invoke('settings:save-instructions', contents) as Promise<void>,
+    readInstructions: () => ipcRenderer.invoke('settings:read-instructions') as ReturnType<AppApi['settings']['readInstructions']>,
+    saveInstructions: (contents, expectedRevision) => ipcRenderer.invoke('settings:save-instructions', contents, expectedRevision) as ReturnType<AppApi['settings']['saveInstructions']>,
+    saveInstructionsCopy: (contents) => ipcRenderer.invoke('settings:save-instructions-copy', contents) as ReturnType<AppApi['settings']['saveInstructionsCopy']>,
     deleteAppData: () => ipcRenderer.invoke('settings:delete-app-data') as Promise<boolean>,
   },
   usage: {
     getLocalStats: () => ipcRenderer.invoke('usage:local-stats') as Promise<LocalUsageStats>,
   },
-  onCloseRequested: (flush) => {
+  onCloseRequested: (flush, onFailure) => {
+    closeFlush = flush;
+    closeFailureHandler = onFailure;
     const listener = (): void => {
-      void flush().then(() => ipcRenderer.invoke('app:close-ready')).catch(() => undefined);
+      void runCloseAttempt(false);
     };
     ipcRenderer.on('app:close-requested', listener);
-    return () => ipcRenderer.removeListener('app:close-requested', listener);
+    return () => {
+      ipcRenderer.removeListener('app:close-requested', listener);
+      if (closeFlush === flush) {
+        closeFlush = null;
+        closeFailureHandler = null;
+      }
+    };
   },
+  retryClose: (discardBrowserMetadata = false) => runCloseAttempt(discardBrowserMetadata),
+  returnFromClose: async () => { await ipcRenderer.invoke('app:close-return'); },
 };
 
 contextBridge.exposeInMainWorld('gigaChat', api);

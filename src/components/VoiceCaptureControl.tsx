@@ -1,10 +1,12 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { LoaderCircle, Mic, Square, X } from 'lucide-react';
 import { createRecordingLimitTimer, VOICE_MAX_AUDIO_BYTES } from '../voice';
 
 interface VoiceCaptureControlProps {
   available: boolean;
   reason: string | null;
+  canContinue(): boolean;
+  suspended: boolean;
   onTranscript(text: string): void;
   onError(message: string): void;
   onSuccess(message: string): void;
@@ -27,8 +29,10 @@ function formatElapsed(milliseconds: number): string {
   return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
 }
 
-export default function VoiceCaptureControl({ available, reason, onTranscript, onError, onSuccess }: VoiceCaptureControlProps) {
+export default function VoiceCaptureControl({ available, reason, canContinue, suspended, onTranscript, onError, onSuccess }: VoiceCaptureControlProps) {
   const [phase, setPhase] = useState<CapturePhase>('idle');
+  const phaseRef = useRef<CapturePhase>(phase);
+  phaseRef.current = phase;
   const [elapsed, setElapsed] = useState(0);
   const [statusText, setStatusText] = useState('');
   const recorder = useRef<MediaRecorder | null>(null);
@@ -38,6 +42,8 @@ export default function VoiceCaptureControl({ available, reason, onTranscript, o
   const requestId = useRef<string | null>(null);
   const cancelledRequestId = useRef<string | null>(null);
   const cancelledCapture = useRef(false);
+  const captureGeneration = useRef(0);
+  const suspensionHandled = useRef(false);
   const mounted = useRef(true);
   const starting = useRef(false);
   const startedAt = useRef(0);
@@ -58,6 +64,7 @@ export default function VoiceCaptureControl({ available, reason, onTranscript, o
 
   useEffect(() => () => {
     mounted.current = false;
+    captureGeneration.current += 1;
     clearRecordingTimers();
     cancelledCapture.current = true;
     if (recorder.current?.state === 'recording') recorder.current.stop();
@@ -74,8 +81,8 @@ export default function VoiceCaptureControl({ available, reason, onTranscript, o
     current.stop();
   }
 
-  async function finishRecording(current: MediaRecorder): Promise<void> {
-    if (recorder.current !== current) return;
+  async function finishRecording(current: MediaRecorder, generation: number): Promise<void> {
+    if (recorder.current !== current || generation !== captureGeneration.current) return;
     stopStream();
     recorder.current = null;
     if (cancelledCapture.current || !mounted.current) {
@@ -103,10 +110,19 @@ export default function VoiceCaptureControl({ available, reason, onTranscript, o
     setPhase('transcribing');
     try {
       const bytes = new Uint8Array(await audio.arrayBuffer());
+      if (requestId.current !== activeRequestId || !mounted.current
+        || generation !== captureGeneration.current || cancelledRequestId.current === activeRequestId || !canContinue()) {
+        if (requestId.current === activeRequestId && mounted.current && generation === captureGeneration.current) {
+          requestId.current = null;
+          setPhase('idle');
+          setStatusText('');
+        }
+        return;
+      }
       const transcript = await window.gigaChat.voice.transcribe(activeRequestId, bytes, audio.type || current.mimeType);
-      if (requestId.current !== activeRequestId || !mounted.current) return;
+      if (requestId.current !== activeRequestId || !mounted.current || generation !== captureGeneration.current) return;
       requestId.current = null;
-      if (cancelledRequestId.current === activeRequestId) {
+      if (cancelledRequestId.current === activeRequestId || !canContinue()) {
         setPhase('idle');
         setStatusText('');
         return;
@@ -116,11 +132,11 @@ export default function VoiceCaptureControl({ available, reason, onTranscript, o
       onTranscript(transcript);
       onSuccess('Текст добавлен в черновик. Проверьте его перед отправкой.');
     } catch (error) {
-      if (requestId.current !== activeRequestId || !mounted.current) return;
+      if (requestId.current !== activeRequestId || !mounted.current || generation !== captureGeneration.current) return;
       requestId.current = null;
       setPhase('idle');
       setStatusText('');
-      if (cancelledRequestId.current === activeRequestId) return;
+      if (cancelledRequestId.current === activeRequestId || !canContinue()) return;
       onError(error instanceof Error ? error.message : 'Не удалось распознать запись локально.');
     }
   }
@@ -132,19 +148,28 @@ export default function VoiceCaptureControl({ available, reason, onTranscript, o
       return;
     }
     starting.current = true;
+    const generation = ++captureGeneration.current;
     setPhase('starting');
     setStatusText('Подключаем микрофон…');
     cancelledCapture.current = false;
+    cancelledRequestId.current = null;
     try {
-      if (!await window.gigaChat.voice.requestAccess()) {
+      const granted = await window.gigaChat.voice.requestAccess();
+      if (!mounted.current || generation !== captureGeneration.current || cancelledCapture.current) return;
+      if (!canContinue()) {
+        setPhase('idle');
+        setStatusText('');
+        return;
+      }
+      if (!granted) {
         setPhase('idle');
         setStatusText('');
         return;
       }
       const acquired = await navigator.mediaDevices.getUserMedia({ audio: true });
-      if (!mounted.current || cancelledCapture.current) {
+      if (!mounted.current || generation !== captureGeneration.current || cancelledCapture.current || !canContinue()) {
         acquired.getTracks().forEach((track) => track.stop());
-        if (mounted.current) {
+        if (mounted.current && generation === captureGeneration.current) {
           setPhase('idle');
           setStatusText('');
         }
@@ -162,7 +187,8 @@ export default function VoiceCaptureControl({ available, reason, onTranscript, o
       const current = new MediaRecorder(acquired, { mimeType });
       recorder.current = current;
       current.ondataavailable = (event) => {
-        if (event.data.size === 0) return;
+        if (!mounted.current || recorder.current !== current || generation !== captureGeneration.current
+          || cancelledCapture.current || event.data.size === 0) return;
         chunkBytes.current += event.data.size;
         if (chunkBytes.current > VOICE_MAX_AUDIO_BYTES) {
           cancelledCapture.current = true;
@@ -190,36 +216,48 @@ export default function VoiceCaptureControl({ available, reason, onTranscript, o
           onError('Запись прервалась. Проверьте микрофон и попробуйте ещё раз.');
         }
       };
-      current.onstop = () => { void finishRecording(current); };
+      current.onstop = () => { void finishRecording(current, generation); };
       startedAt.current = Date.now();
       current.start(1000);
       setElapsed(0);
       setStatusText('Запись 00:00 / 10:00');
       setPhase('recording');
       elapsedInterval.current = window.setInterval(() => {
+        if (!mounted.current || recorder.current !== current || generation !== captureGeneration.current || cancelledCapture.current) return;
         const value = Date.now() - startedAt.current;
         setElapsed(value);
         setStatusText(`Запись ${formatElapsed(value)} / 10:00`);
       }, 250);
       timerCancel.current = createRecordingLimitTimer(stopRecording);
     } catch (error) {
+      if (!mounted.current || generation !== captureGeneration.current || cancelledCapture.current) return;
+      if (!canContinue()) {
+        setPhase('idle');
+        setStatusText('');
+        return;
+      }
       stopStream();
       recorder.current = null;
       setPhase('idle');
       setStatusText('');
       onError(error instanceof Error && error.message.startsWith('Запись WebM') ? error.message : getCaptureError(error));
     } finally {
-      starting.current = false;
+      if (generation === captureGeneration.current) starting.current = false;
     }
   }
 
-  function cancelRecording(): void {
-    if (phase === 'recording' || phase === 'starting') {
+  const cancelRecording = useCallback(() => {
+    const currentPhase = phaseRef.current;
+    if (currentPhase === 'recording' || currentPhase === 'starting') {
       cancelledCapture.current = true;
+      if (currentPhase === 'starting') {
+        captureGeneration.current += 1;
+        starting.current = false;
+      }
       clearRecordingTimers();
       stopStream();
       if (recorder.current?.state === 'recording') recorder.current.stop();
-      else if (phase === 'starting') {
+      else if (currentPhase === 'starting') {
         setPhase('idle');
         setStatusText('');
       }
@@ -228,6 +266,7 @@ export default function VoiceCaptureControl({ available, reason, onTranscript, o
     const activeRequestId = requestId.current;
     if (!activeRequestId) return;
     cancelledRequestId.current = activeRequestId;
+    captureGeneration.current += 1;
     setPhase('cancelling');
     setStatusText('Останавливаем распознавание…');
     void window.gigaChat.voice.cancel(activeRequestId).then(() => {
@@ -238,12 +277,22 @@ export default function VoiceCaptureControl({ available, reason, onTranscript, o
       }
     }).catch(() => {
       if (mounted.current && requestId.current === activeRequestId) {
-        onError('Не удалось подтвердить остановку. Закройте приложение, если распознавание не завершится.');
+        onError('Не удалось очистить временную запись. Повторите отмену, чтобы попробовать ещё раз.');
         setPhase('transcribing');
-        setStatusText('Остановка не подтверждена — ждём завершения…');
+        setStatusText('Очистка не подтверждена — повторите отмену.');
       }
     });
-  }
+  }, [onError]);
+
+  useEffect(() => {
+    if (!suspended) {
+      suspensionHandled.current = false;
+      return;
+    }
+    if (suspensionHandled.current) return;
+    suspensionHandled.current = true;
+    cancelRecording();
+  }, [cancelRecording, suspended]);
 
   const isBusy = phase !== 'idle';
   const micLabel = !available ? 'Диктовка недоступна'

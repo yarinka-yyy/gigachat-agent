@@ -1,8 +1,8 @@
 import { spawn as spawnChild, type ChildProcessWithoutNullStreams, type SpawnOptions } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { lstat, realpath } from 'node:fs/promises';
-import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
-import type { PermissionApprovalRequest, Project } from './contracts';
+import { extname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
+import type { InstructionCommitRequest, InstructionCommitResult, PermissionApprovalRequest, Project } from './contracts';
 import { evaluatePermission, requirePermissionProfile, type PermissionProfile, type PermissionResource } from './permissions';
 import type { CustomPolicy, LocalAction } from './custom-permissions';
 
@@ -19,6 +19,7 @@ const MAX_SCRIPT_LENGTH = 16 * 1024;
 const MAX_RUN_TIMEOUT_MS = 120_000;
 const LOCAL_TOOL_TIMEOUT_MS = 30_000;
 const LOCAL_FILE_WRITE_TIMEOUT_MS = 30_000;
+const OPEN_TEXT_EXTENSIONS = new Set(['.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.jsonl', '.yaml', '.yml', '.toml', '.ini', '.log']);
 
 export type LocalToolName = 'list' | 'search' | 'read' | 'write' | 'open' | 'powershell';
 export type LocalToolPhase = 'started' | 'completed' | 'failed' | 'cancelled';
@@ -73,6 +74,7 @@ const MAX_HELPER_INPUT_BASE64_CHARS = Math.ceil(MAX_LOCAL_FILE_BYTES / 3) * 4;
 export interface PowerShellHelperOptions {
   helperPath: string;
   recoveryDirectory: string;
+  instructionRecoveryDirectory?: string;
   spawnProcess?: (command: string, args: string[], options: SpawnOptions) => ChildProcessWithoutNullStreams;
 }
 
@@ -80,6 +82,8 @@ export interface PowerShellHelper {
   run: PowerShellRunner;
   writeFile: ProjectFileWriter;
   recover(): Promise<void>;
+  writeInstruction?: (request: InstructionCommitRequest) => Promise<InstructionCommitResult>;
+  recoverInstructions?: () => Promise<string[]>;
 }
 
 interface HelperProcessResult {
@@ -208,11 +212,15 @@ function requirePowerShellResult(value: unknown, maxOutputBytes: number): PowerS
 }
 
 export function createPowerShellHelper(options: PowerShellHelperOptions): PowerShellHelper {
-  if (!isAbsolute(options.helperPath) || !isAbsolute(options.recoveryDirectory)) {
+  if (!isAbsolute(options.helperPath) || !isAbsolute(options.recoveryDirectory)
+    || (options.instructionRecoveryDirectory !== undefined && !isAbsolute(options.instructionRecoveryDirectory))) {
     throw new LocalToolError('Пути PowerShell helper должны быть абсолютными.');
   }
   const helperPath = resolve(options.helperPath);
   const recoveryDirectory = resolve(options.recoveryDirectory);
+  const instructionRecoveryDirectory = options.instructionRecoveryDirectory
+    ? resolve(options.instructionRecoveryDirectory)
+    : undefined;
   const spawnProcess = options.spawnProcess ?? ((command, args, spawnOptions) =>
     spawnChild(command, args, spawnOptions) as ChildProcessWithoutNullStreams);
   let helperTail: Promise<void> = Promise.resolve();
@@ -392,7 +400,64 @@ export function createPowerShellHelper(options: PowerShellHelperOptions): PowerS
     return { bytes: response.Bytes as number, replacedExisting: response.ReplacedExisting };
   };
   const writeFile: ProjectFileWriter = (request) => withHelperLock(() => writeFileUnlocked(request));
-  return { run, writeFile, recover };
+  const writeInstruction: PowerShellHelper['writeInstruction'] = instructionRecoveryDirectory
+    ? (request: InstructionCommitRequest) => withHelperLock(async () => {
+      if (!isAbsolute(request.workingFolder) || request.workingFolder.includes('\0')
+        || typeof request.relativePath !== 'string' || request.relativePath.length > MAX_TOOL_PATH_LENGTH
+        || request.relativePath.includes('\0') || isAbsolute(request.relativePath)
+        || request.relativePath.split(/[\\/]/).some((part) => !part || part === '.' || part === '..' || part.includes(':'))
+        || (request.expectedHash !== null && !/^[0-9a-f]{64}$/.test(request.expectedHash))) {
+        throw new LocalToolError('Некорректные параметры записи инструкции.');
+      }
+      const bytes = Buffer.from(request.contents, 'utf8');
+      if (bytes.byteLength > 64 * 1024 || new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) !== request.contents
+        || request.contents.includes('\0')) throw new LocalToolError('Инструкция превышает лимит 64 КБ.');
+      const input = JSON.stringify({
+        WorkingFolder: resolve(request.workingFolder),
+        RelativePath: request.relativePath.replace(/[\\/]/g, '\\'),
+        ContentsBase64: bytes.toString('base64'),
+        ExpectedHash: request.expectedHash,
+      });
+      const result = await invokePowerShellHelper(helperPath,
+        ['--write-instruction', instructionRecoveryDirectory], input, LOCAL_FILE_WRITE_TIMEOUT_MS, spawnProcess);
+      if (result.processError || result.code !== 0 || result.timedOut || result.responseLimit) {
+        throw new LocalToolError('Writer инструкций остановился; путь и версии сохранены для проверки.');
+      }
+      const response = parseHelperJson(result.stdout);
+      if (!isRecord(response) || typeof response.Kind !== 'string')
+        throw new LocalToolError('Writer инструкций вернул некорректный ответ.');
+      if (response.Kind === 'saved') return { kind: 'saved' };
+      if (response.Kind === 'conflict-before' && (response.CurrentText === null || typeof response.CurrentText === 'string')) {
+        return { kind: 'conflict-before', currentText: response.CurrentText as string | null };
+      }
+      if (response.Kind === 'conflict-after' && typeof response.CurrentText === 'string'
+        && typeof response.PreservedPath === 'string'
+        && (response.PreservedText === null || typeof response.PreservedText === 'string')) {
+        return {
+          kind: 'conflict-after',
+          currentText: response.CurrentText,
+          preservedPath: response.PreservedPath,
+          preservedText: response.PreservedText as string | null,
+        };
+      }
+      throw new LocalToolError('Writer инструкций вернул некорректное состояние конфликта.');
+    })
+    : undefined;
+  const recoverInstructions = instructionRecoveryDirectory
+    ? () => withHelperLock(async () => {
+      const result = await invokePowerShellHelper(helperPath,
+        ['--recover-instructions', instructionRecoveryDirectory], undefined,
+        HELPER_RECOVERY_TIMEOUT_MS, spawnProcess);
+      if (result.processError || result.code !== 0 || result.timedOut || result.responseLimit)
+        throw new LocalToolError('Не удалось восстановить журнал инструкций.');
+      const response = parseHelperJson(result.stdout);
+      if (!isRecord(response) || typeof response.Recovered !== 'boolean' || !Array.isArray(response.Conflicts)
+        || response.Conflicts.some((path) => typeof path !== 'string'))
+        throw new LocalToolError('Восстановление инструкций вернуло некорректный ответ.');
+      return response.Conflicts as string[];
+    })
+    : undefined;
+  return { run, writeFile, recover, ...(writeInstruction ? { writeInstruction } : {}), ...(recoverInstructions ? { recoverInstructions } : {}) };
 }
 
 export interface LocalToolsOptions {
@@ -400,7 +465,8 @@ export interface LocalToolsOptions {
   protectedDirectory?: string;
   getCustomPolicy?(): Promise<CustomPolicy>;
   requestApproval?(details: Omit<PermissionApprovalRequest, 'id' | 'expiresAt'>, signal?: AbortSignal): Promise<boolean>;
-  openPath?(path: string): Promise<void>;
+  revealItem?(path: string): Promise<void>;
+  openTextFile?(path: string): Promise<void>;
   runPowerShell?: PowerShellRunner;
   writeFile?: ProjectFileWriter;
   onEvent?(event: LocalToolEvent): void;
@@ -906,13 +972,27 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
     }),
 
     open: (projectIdInput, profileInput, pathInput = '') => activity('open', async () => {
-      if (!options.openPath) throw new LocalToolError('Открытие файлов пока недоступно.');
-      const { target } = await prepareTarget(projectIdInput, profileInput, 'application', 'open',
-        pathInput, true, false, true);
+      const { root, target } = await prepareTarget(projectIdInput, profileInput, 'application', 'open',
+        pathInput, true, false, Boolean(options.revealItem || options.openTextFile));
       const targetInfo = await lstat(target).catch(() => null);
       if (!targetInfo || targetInfo.isSymbolicLink()) throw new LocalToolError('Файл или папка проекта недоступны.');
-      // Shell opening can dispatch shortcuts or registered applications after this stat call.
-      await options.openPath(target);
+      if (targetInfo.isDirectory()) {
+        if (!options.revealItem) throw new LocalToolError('Показ папки в Проводнике пока недоступен.');
+        await options.revealItem(target);
+        return;
+      }
+      if (!targetInfo.isFile() || !OPEN_TEXT_EXTENSIONS.has(extname(target).toLowerCase())) {
+        throw new LocalToolError('Этот тип файла нельзя безопасно открыть для просмотра.');
+      }
+      if (!options.openTextFile) throw new LocalToolError('Просмотр текста пока недоступен.');
+
+      const readTarget = await prepareTarget(projectIdInput, profileInput, 'project-files', 'read',
+        pathInput, false, false, Boolean(options.runPowerShell));
+      if (readTarget.root !== root) throw new LocalToolError('Рабочая папка изменилась во время открытия файла.');
+      const output = await runBoundedFileScript(options.runPowerShell, root,
+        buildReadScript(root, requireRelativePath(pathInput, false)), undefined, 2 * 1024 * 1024);
+      decodeText(parseBase64Output(output, MAX_LOCAL_FILE_BYTES));
+      await options.openTextFile(target);
     }),
 
     runPowerShell: (projectIdInput, profileInput, scriptInput, runOptions = {}) => activity('powershell', async () => {

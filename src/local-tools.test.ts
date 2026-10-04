@@ -6,6 +6,7 @@ import { join, relative, resolve, sep } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
 import type { Project } from './contracts';
+import { DEFAULT_CUSTOM_CONFIG, parseCustomConfig } from './custom-permissions';
 import {
   createLocalTools,
   createPowerShellHelper,
@@ -74,7 +75,8 @@ function makeTools(project: Project, events: LocalToolEvent[], opened: string[],
   writeFile?: (request: ProjectFileWriteRequest) => Promise<{ bytes: number; replacedExisting: boolean }>) {
   return createLocalTools({
     resolveProject: async (id) => id === project.id ? project : null,
-    openPath: async (path) => { opened.push(path); },
+    revealItem: async (path) => { opened.push(path); },
+    openTextFile: async (path) => { opened.push(path); },
     ...(runPowerShell ? { runPowerShell } : {}),
     ...(writeFile ? { writeFile } : {}),
     onEvent: (event) => { events.push(event); },
@@ -188,6 +190,36 @@ test('sends project writes as structured JSON without a script or payload in arg
   });
   assert.equal(calls[0]?.options.shell, false);
   assert.deepEqual(calls[0]?.options.stdio, ['pipe', 'pipe', 'pipe']);
+});
+
+test('preserves a valid UTF-8 BOM when forwarding instruction text to the native writer', async () => {
+  const calls: Array<{ args: string[]; input: string }> = [];
+  const spawnProcess = (_command: string, args: string[]): ChildProcessWithoutNullStreams => {
+    const child = fakeChild();
+    const call = { args, input: '' };
+    calls.push(call);
+    child.stdin.on('data', (chunk: Buffer) => { call.input += chunk.toString('utf8'); });
+    child.stdin.once('finish', () => finishFakeChild(child, '{"Kind":"saved"}\n'));
+    return child;
+  };
+  const helper = createPowerShellHelper({
+    helperPath: join(process.cwd(), 'resources', 'native', 'LocalPowerShell.exe'),
+    recoveryDirectory: join(process.cwd(), '.qa', 'pre-api', 'runtime'),
+    instructionRecoveryDirectory: join(process.cwd(), '.qa', 'pre-api', 'instruction-runtime'),
+    spawnProcess,
+  });
+  const contents = '\uFEFFproject rules';
+
+  assert.deepEqual(await helper.writeInstruction?.({
+    workingFolder: join(process.cwd(), '.qa', 'pre-api', 'project'),
+    relativePath: 'AGENTS.md',
+    contents,
+    expectedHash: null,
+  }), { kind: 'saved' });
+  assert.equal(calls.length, 1, 'valid BOM text must reach the native writer');
+  assert.deepEqual(calls[0]?.args, ['--write-instruction', join(process.cwd(), '.qa', 'pre-api', 'instruction-runtime')]);
+  const input = JSON.parse(calls[0]?.input ?? '') as { ContentsBase64: string };
+  assert.equal(Buffer.from(input.ContentsBase64, 'base64').toString('utf8'), contents);
 });
 
 test('serializes project writes with PowerShell through the same helper queue', async () => {
@@ -405,9 +437,105 @@ test('lists, searches, reads, sends structured writes, and opens files inside a 
   await tools.open(projectId, 'full', 'docs/readme.md');
   const canonicalProject = await realpath(fixture.projectFolder);
   assert.deepEqual(opened, [join(canonicalProject, 'docs'), join(canonicalProject, 'docs', 'readme.md')]);
+  assert.equal(requests.length, 4);
+  assert.match(requests[3]?.script ?? '', /\$stream = \[IO\.File\]::Open/);
   assert.equal(events.filter((event) => event.phase === 'started').length, 6);
   assert.equal(events.filter((event) => event.phase === 'completed').length, 6);
   assert.ok(events.every((event) => !('script' in event) && !('path' in event)));
+});
+
+test('does not dispatch a project command through the operating-system file association', async (t) => {
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  const deniedNames = ['setup.cmd', 'program.exe', 'run.bat', 'script.ps1', 'shortcut.lnk', 'link.url', 'file.txt.exe', 'unknown.bin'];
+  await Promise.all(deniedNames.map((name) => writeFile(join(fixture.projectFolder, name), 'unsafe')));
+  const opened: string[] = [];
+  const tools = makeTools(fixture.project, [], opened);
+
+  for (const name of deniedNames) {
+    await assert.rejects(tools.open(projectId, 'full', name), /просмотр|недоступ|поддерж/i);
+  }
+  assert.deepEqual(opened, []);
+});
+
+test('reveals directories and opens only bounded UTF-8 documents through the fixed text viewer', async (t) => {
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  await mkdir(join(fixture.projectFolder, 'docs'));
+  await writeFile(join(fixture.projectFolder, 'docs', 'readme.md'), 'safe text');
+  await writeFile(join(fixture.projectFolder, 'setup.cmd'), 'echo unsafe');
+  await writeFile(join(fixture.projectFolder, 'unknown.bin'), Buffer.from([0xff, 0x00]));
+  await writeFile(join(fixture.projectFolder, 'broken.txt'), 'invalid utf8');
+  await writeFile(join(fixture.projectFolder, 'too-large.txt'), Buffer.alloc(MAX_LOCAL_FILE_BYTES + 1, 0x61));
+  const revealed: string[] = [];
+  const viewed: string[] = [];
+  const reads: PowerShellRequest[] = [];
+  let nextRead = Buffer.from('safe text', 'utf8');
+  const tools = createLocalTools({
+    resolveProject: async (id) => id === fixture.project.id ? fixture.project : null,
+    revealItem: async (path) => { revealed.push(path); },
+    openTextFile: async (path) => { viewed.push(path); },
+    runPowerShell: async (request) => {
+      reads.push(request);
+      return { exitCode: 0, stdout: `${nextRead.toString('base64')}\n`, stderr: '', timedOut: false, outputLimited: false };
+    },
+  });
+
+  await tools.open(projectId, 'full', 'docs');
+  await tools.open(projectId, 'full', 'docs/readme.md');
+  assert.deepEqual(revealed, [join(fixture.projectFolder, 'docs')]);
+  assert.deepEqual(viewed, [join(fixture.projectFolder, 'docs', 'readme.md')]);
+  assert.equal(reads.length, 1);
+  assert.equal(reads[0]?.maxOutputBytes, 2 * 1024 * 1024);
+  await assert.rejects(tools.open(projectId, 'full', 'setup.cmd'), /нельзя безопасно открыть/);
+  await assert.rejects(tools.open(projectId, 'full', 'unknown.bin'), /нельзя безопасно открыть/);
+
+  nextRead = Buffer.from([0xff, 0x00]);
+  await assert.rejects(tools.open(projectId, 'full', 'broken.txt'), /Бинарный файл|корректный UTF-8/);
+  nextRead = Buffer.alloc(MAX_LOCAL_FILE_BYTES + 1, 0x61);
+  await assert.rejects(tools.open(projectId, 'full', 'too-large.txt'), /превышает лимит|больше данных/);
+  assert.equal(reads.length, 3);
+  assert.equal(viewed.length, 1);
+});
+
+test('checks custom open and project-read rules before revealing or viewing a file', async (t) => {
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  await writeFile(join(fixture.projectFolder, 'notes.md'), 'safe text');
+  const reads: PowerShellRequest[] = [];
+  const viewed: string[] = [];
+  const approvals: Array<[string, string]> = [];
+  const tools = createLocalTools({
+    resolveProject: async (id) => id === fixture.project.id ? fixture.project : null,
+    getCustomPolicy: async () => parseCustomConfig(DEFAULT_CUSTOM_CONFIG.replace('read = "allow"', 'read = "ask"')),
+    requestApproval: async ({ resource, action }) => {
+      approvals.push([resource, action]);
+      return resource === 'application';
+    },
+    openTextFile: async (path) => { viewed.push(path); },
+    runPowerShell: async (request) => {
+      reads.push(request);
+      return { exitCode: 0, stdout: `${Buffer.from('safe text').toString('base64')}\n`, stderr: '', timedOut: false, outputLimited: false };
+    },
+  });
+
+  await assert.rejects(tools.open(projectId, 'custom', 'notes.md'), /Действие не подтверждено/);
+  assert.deepEqual(approvals, [['application', 'open'], ['project-files', 'read']]);
+  assert.equal(reads.length, 0);
+  assert.deepEqual(viewed, []);
+
+  const deniedViewed: string[] = [];
+  const denied = createLocalTools({
+    resolveProject: async (id) => id === fixture.project.id ? fixture.project : null,
+    getCustomPolicy: async () => parseCustomConfig(DEFAULT_CUSTOM_CONFIG
+      .replace('open = "ask"', 'open = "allow"').replace('read = "allow"', 'read = "deny"')),
+    openTextFile: async (path) => { deniedViewed.push(path); },
+    runPowerShell: async () => {
+      throw new Error('Read policy must deny before the file helper runs.');
+    },
+  });
+  await assert.rejects(denied.open(projectId, 'custom', 'notes.md'), /Запрещено пользовательским профилем/);
+  assert.deepEqual(deniedViewed, []);
 });
 
 test('keeps existing file contents when structured broker rejects a write', async (t) => {
@@ -439,7 +567,10 @@ test('rejects traversal, malformed requests, oversized writes, and project symli
   await writeFile(join(fixture.projectFolder, 'keep.txt'), 'preserve');
   await writeFile(join(fixture.projectFolder, 'not-a-folder.txt'), 'still here');
   const events: LocalToolEvent[] = [];
-  const tools = makeTools(fixture.project, events, [], undefined, async () => {
+  const reader: PowerShellRunner = async () => ({
+    exitCode: 0, stdout: `${Buffer.from('preserve').toString('base64')}\n`, stderr: '', timedOut: false, outputLimited: false,
+  });
+  const tools = makeTools(fixture.project, events, [], reader, async () => {
     throw new Error('Validation should reject the write before the helper runs.');
   });
 

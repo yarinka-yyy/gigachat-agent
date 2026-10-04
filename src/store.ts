@@ -2,24 +2,52 @@ import { randomUUID } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import { constants } from 'node:fs';
 import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
-import { basename, dirname, extname, isAbsolute, join, relative, sep } from 'node:path';
-import { DEFAULT_NOTIFICATION_SETTINGS, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type Settings, type SettingsPatch, type Theme } from './contracts';
-import { requirePermissionProfile } from './permissions';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { DEFAULT_NOTIFICATION_SETTINGS, type AcceptedTurnInput, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type Settings, type SettingsPatch, type Theme } from './contracts';
+import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { requireModelId } from './models';
 import { isSkillId } from './skills';
+import { validateProjectFolder, validateProjectInstructionsPath } from './project-paths';
+import { createInstructionDocument, instructionFileHash } from './instruction-documents';
 
 type ProjectFile = { schemaVersion: 2; projects: Project[] };
 type LegacyChat = ChatSummary & { draft: string };
 type ChatFile = { schemaVersion: 2; chats: LegacyChat[] };
 type SettingsFile = { schemaVersion: 10; settings: Settings };
+type ProjectDeleteState = { projects: ProjectFile; chats: ChatDetail[]; instructionText: string | null };
+type ProjectDeleteJournal = {
+  schemaVersion: 1;
+  operationId: string;
+  projectId: string;
+  before: ProjectDeleteState;
+  after: ProjectDeleteState;
+};
+export type StoreFaultStage = 'journal' | 'chat' | 'projects' | 'instructions' | 'journal-cleared';
+export interface StoreTestFaults {
+  afterProjectDeleteStage?: (stage: StoreFaultStage, chatIndex?: number) => void | Promise<void>;
+  beforeProjectInstructionCommit?: (targetPath: string) => void | Promise<void>;
+}
+
+export type InstructionCommitter = (request: InstructionCommitRequest) => Promise<InstructionCommitResult>;
+
+export interface StoreOpenOptions {
+  documentsDirectory?: string | null;
+  testFaults?: StoreTestFaults;
+  instructionCommitter?: InstructionCommitter;
+}
 
 const MAX_IMPORTED_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_INSTRUCTION_BYTES = 64 * 1024;
 
+interface InstructionSnapshot {
+  document: InstructionDocument;
+  exists: boolean;
+}
+
 export interface LocalStore {
   listProjects(): Promise<Project[]>;
   createProject(name: unknown, workingFolder?: unknown): Promise<Project>;
-  updateProject(id: unknown, patch: unknown): Promise<Project>;
+  updateProject(id: unknown, patch: unknown): Promise<ProjectUpdateResult>;
   migrateProjectInstructions(id: unknown): Promise<void>;
   projectInstructionsBackupPath(id: unknown): Promise<string | null>;
   deleteProject(id: unknown): Promise<void>;
@@ -28,7 +56,11 @@ export interface LocalStore {
   createChat(projectId?: unknown, kind?: unknown): Promise<ChatSummary>;
   updateChat(id: unknown, patch: unknown): Promise<ChatSummary>;
   appendLocalMessage(id: unknown, text: unknown): Promise<ChatDetail>;
-  appendAssistantMessageFromRuntime(id: unknown, text: unknown): Promise<ChatDetail>;
+  acceptLocalMessage(id: unknown, text: unknown, turnId: unknown): Promise<{ detail: ChatDetail; turn: AcceptedTurnInput }>;
+  releaseTurnReservation(turnId: unknown): void;
+  consumeTurnReservation(turn: AcceptedTurnInput, signal?: AbortSignal): Promise<void>;
+  validateAcceptedTurn(turn: AcceptedTurnInput): Promise<void>;
+  appendAssistantMessageFromRuntime(id: unknown, text: unknown, signal?: AbortSignal): Promise<ChatDetail>;
   importFile(id: unknown, sourcePath: string, projectId?: unknown): Promise<ChatDetail>;
   getArtifactPath(id: unknown, artifactId: unknown): Promise<string>;
   getChatFolder(id: unknown): Promise<string>;
@@ -36,10 +68,15 @@ export interface LocalStore {
   getSettings(): Promise<Settings>;
   updateSettings(patch: unknown): Promise<Settings>;
   getLocalUsageStats(): Promise<LocalUsageStats>;
+  getStorageIssues(): Promise<string[]>;
   readGlobalInstructions(): Promise<string>;
-  saveGlobalInstructions(contents: unknown): Promise<void>;
-  readProjectInstructions(id: unknown): Promise<string>;
-  saveProjectInstructions(id: unknown, contents: unknown): Promise<void>;
+  readGlobalInstructionDocument(): Promise<InstructionDocument>;
+  saveGlobalInstructions(contents: unknown, expectedRevision: unknown): Promise<InstructionSaveResult>;
+  saveGlobalInstructionsCopy(contents: unknown): Promise<string>;
+  readProjectInstructions(id: unknown, expectedWorkingFolder?: unknown): Promise<string>;
+  readProjectInstructionDocument(id: unknown): Promise<InstructionDocument>;
+  saveProjectInstructions(id: unknown, contents: unknown, expectedRevision: unknown): Promise<InstructionSaveResult>;
+  saveProjectInstructionsCopy(id: unknown, contents: unknown): Promise<string>;
 }
 
 type Loaded<T> = { value: T; needsWrite: boolean };
@@ -244,6 +281,10 @@ function isMissingFile(error: unknown): boolean {
   return isRecord(error) && error.code === 'ENOENT';
 }
 
+function isUnavailableProjectFolder(error: unknown): boolean {
+  return isRecord(error) && ['ENOENT', 'EACCES', 'EPERM', 'ENODEV', 'ESTALE', 'ENXIO'].includes(String(error.code));
+}
+
 function isOutside(root: string, path: string): boolean {
   const pathFromRoot = relative(root, path);
   return pathFromRoot === '..' || pathFromRoot.startsWith(`..${sep}`) || isAbsolute(pathFromRoot);
@@ -273,11 +314,16 @@ async function assertOwnedPath(root: string, targetPath: string): Promise<void> 
   }
 }
 
-async function writeAtomic(filePath: string, value: unknown): Promise<void> {
+function createAbortError(): Error {
+  return Object.assign(new Error('Операция отменена.'), { name: 'AbortError' });
+}
+
+async function writeAtomic(filePath: string, value: unknown, signal?: AbortSignal): Promise<void> {
   const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
   await mkdir(dirname(filePath), { recursive: true });
   try {
     await writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
+    if (signal?.aborted) throw createAbortError();
     await rename(temporaryPath, filePath);
   } catch (error) {
     await unlink(temporaryPath).catch(() => undefined);
@@ -401,6 +447,64 @@ function detailFile(chat: ChatDetail): Record<string, unknown> {
   return { schemaVersion: 6, ...chat };
 }
 
+function sameJson(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function detachProjectSkill(skillId: string | null, projectId: string): string | null {
+  const match = skillId ? /^project\/([^/]+)\//.exec(skillId) : null;
+  return match?.[1] === projectId ? null : skillId;
+}
+
+function skillForProject(skillId: string | null, projectId: string | null): string | null {
+  const match = skillId ? /^project\/([^/]+)\//.exec(skillId) : null;
+  return match && match[1] !== projectId ? null : skillId;
+}
+
+function validateProjectDeleteJournal(value: unknown): ProjectDeleteJournal {
+  if (!isRecord(value) || value.schemaVersion !== 1 || !isRecord(value.before) || !isRecord(value.after)) {
+    throw new Error('Invalid project deletion journal.');
+  }
+  const operationId = requireId(value.operationId);
+  const projectId = requireId(value.projectId);
+  const readState = (input: Record<string, unknown>): ProjectDeleteState => {
+    if (!isRecord(input.projects) || !Array.isArray(input.chats)
+      || (input.instructionText !== null && typeof input.instructionText !== 'string')) {
+      throw new Error('Invalid project deletion state.');
+    }
+    const projects = parseProjectFile(input.projects).value;
+    const chats = input.chats.map((chat) => validateChatDetail(chat).value);
+    return {
+      projects,
+      chats,
+      instructionText: input.instructionText === null ? null : requireInstructions(input.instructionText),
+    };
+  };
+  const before = readState(value.before);
+  const after = readState(value.after);
+  if (!before.projects.projects.some((project) => project.id === projectId)
+    || after.projects.projects.some((project) => project.id === projectId)
+    || !sameJson(before.projects.projects.filter((project) => project.id !== projectId), after.projects.projects)) {
+    throw new Error('Project deletion journal has inconsistent project snapshots.');
+  }
+  const beforeById = new Map(before.chats.map((chat) => [chat.id, chat]));
+  const afterById = new Map(after.chats.map((chat) => [chat.id, chat]));
+  if (beforeById.size !== before.chats.length || afterById.size !== after.chats.length
+    || beforeById.size !== afterById.size) {
+    throw new Error('Project deletion journal has inconsistent chat snapshots.');
+  }
+  for (const [id, previous] of beforeById) {
+    const next = afterById.get(id);
+    if (!next || previous.projectId !== projectId || next.projectId !== null
+      || !sameJson({ ...previous, projectId: null, updatedAt: next.updatedAt,
+        nextTurnSkillId: detachProjectSkill(previous.nextTurnSkillId, projectId) }, next)) {
+      throw new Error('Project deletion journal has inconsistent chat snapshots.');
+    }
+  }
+  if (after.instructionText !== null) throw new Error('Project deletion journal has an invalid instruction target.');
+  return { schemaVersion: 1, operationId, projectId, before, after };
+}
+
 function parseSettingsFile(value: unknown): Loaded<SettingsFile> {
   if (!isRecord(value)) throw new Error('Invalid settings file.');
   if (value.schemaVersion === 1) {
@@ -509,19 +613,38 @@ function requireInstructions(value: unknown): string {
   return value;
 }
 
-export async function openStore(directory: string): Promise<LocalStore> {
+function requireInstructionRevision(value: unknown): string {
+  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value)) {
+    throw new Error('Ревизия инструкции устарела или некорректна. Перечитайте файл перед сохранением.');
+  }
+  return value;
+}
+
+function samePath(left: string, right: string): boolean {
+  const resolvedLeft = resolve(left);
+  const resolvedRight = resolve(right);
+  return process.platform === 'win32'
+    ? resolvedLeft.toLocaleLowerCase('en-US') === resolvedRight.toLocaleLowerCase('en-US')
+    : resolvedLeft === resolvedRight;
+}
+
+export async function openStore(directory: string, options: StoreOpenOptions = {}): Promise<LocalStore> {
+  const { documentsDirectory = null, testFaults, instructionCommitter } = options;
   await mkdir(directory, { recursive: true });
   const storageRoot = await realpath(directory);
+  const instructionIssues: string[] = [];
   const projectPath = join(storageRoot, 'projects.json');
   const chatPath = join(storageRoot, 'chats.json');
   const chatsDirectory = join(storageRoot, 'chats');
+  const deletedChatsDirectory = join(storageRoot, 'deleted-chats');
+  const projectDeleteJournalPath = join(storageRoot, 'project-delete.journal.json');
   const migrationMarker = join(storageRoot, 'chats.migrated');
   const settingsPath = join(storageRoot, 'settings.json');
-  const writeOwnedAtomic = async (filePath: string, value: unknown): Promise<void> => {
+  const writeOwnedAtomic = async (filePath: string, value: unknown, signal?: AbortSignal): Promise<void> => {
     await assertOwnedPath(storageRoot, filePath);
     await mkdir(dirname(filePath), { recursive: true });
     await assertOwnedPath(storageRoot, filePath);
-    await writeAtomic(filePath, value);
+    await writeAtomic(filePath, value, signal);
   };
   const writeOwnedTextAtomic = async (filePath: string, value: string): Promise<void> => {
     await assertOwnedPath(storageRoot, filePath);
@@ -533,50 +656,295 @@ export async function openStore(directory: string): Promise<LocalStore> {
     await assertOwnedPath(storageRoot, filePath);
     return readInstructionsFile(filePath);
   };
-  const readInstructionsFile = async (filePath: string): Promise<string> => {
+  const readInstructionSnapshot = async (
+    filePath: string,
+    ownedRoot?: string,
+    revalidatePath?: () => Promise<string | null>,
+  ): Promise<InstructionSnapshot> => {
+    if (ownedRoot) await assertOwnedPath(ownedRoot, filePath);
+    if (revalidatePath && !samePath(await revalidatePath() ?? '', filePath)) {
+      throw new Error('Рабочая папка проекта изменилась перед чтением AGENTS.md.');
+    }
     const file = await lstat(filePath).catch((error: unknown) => {
       if (isMissingFile(error)) return null;
       throw error;
     });
-    if (!file) return '';
+    if (!file) {
+      if (revalidatePath && !samePath(await revalidatePath() ?? '', filePath)) {
+        throw new Error('Рабочая папка проекта изменилась во время чтения AGENTS.md.');
+      }
+      return { document: createInstructionDocument(filePath, null), exists: false };
+    }
     if (!file.isFile()) throw new Error('Файл инструкции недоступен для чтения.');
+    if (!samePath(await realpath(filePath), filePath)) throw new Error('Путь инструкции изменился и был перенаправлен. Файл не изменён.');
     if (file.size > MAX_INSTRUCTION_BYTES) {
       throw new Error('Инструкция должна быть текстом размером не более 64 КБ.');
     }
-    return requireInstructions(await readFile(filePath, 'utf8'));
+    const bytes = await readFile(filePath);
+    if (bytes.byteLength > MAX_INSTRUCTION_BYTES) throw new Error('Инструкция должна быть текстом размером не более 64 КБ.');
+    let text: string;
+    try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes); }
+    catch { throw new Error('Файл инструкции содержит некорректный UTF-8 и не изменён.'); }
+    const verified = await lstat(filePath);
+    if (!verified.isFile() || verified.isSymbolicLink() || verified.size !== bytes.byteLength
+      || verified.dev !== file.dev || verified.ino !== file.ino || verified.mtimeMs !== file.mtimeMs
+      || !samePath(await realpath(filePath), filePath)) {
+      throw new Error('Файл инструкции изменился во время чтения. Перечитайте его перед сохранением.');
+    }
+    if (revalidatePath && !samePath(await revalidatePath() ?? '', filePath)) {
+      throw new Error('Рабочая папка проекта изменилась во время чтения AGENTS.md.');
+    }
+    return { document: createInstructionDocument(filePath, requireInstructions(text)), exists: true };
+  };
+  const readInstructionsFile = async (filePath: string): Promise<string> => {
+    return (await readInstructionSnapshot(filePath)).document.text;
+  };
+  const commitInstruction = async (
+    path: string,
+    workingFolder: string,
+    relativePath: string,
+    contents: string,
+    current: InstructionSnapshot,
+    expectedRevision: string,
+  ): Promise<InstructionSaveResult> => {
+    if (current.document.revision !== expectedRevision) {
+      return { kind: 'conflict', phase: 'before-commit', current: current.document };
+    }
+    if (!instructionCommitter) throw new Error('Безопасный writer инструкций недоступен; файл не изменён.');
+    const result = await instructionCommitter({
+      workingFolder,
+      relativePath,
+      contents,
+      expectedHash: current.exists ? instructionFileHash(current.document.text) : null,
+    });
+    if (result.kind === 'conflict-before') {
+      return {
+        kind: 'conflict',
+        phase: 'before-commit',
+        current: createInstructionDocument(path, result.currentText),
+      };
+    }
+    if (result.kind === 'conflict-after') {
+      return {
+        kind: 'conflict',
+        phase: 'after-commit',
+        current: createInstructionDocument(path, result.currentText),
+        preservedVersion: { path: result.preservedPath, text: result.preservedText },
+      };
+    }
+    const written = await readInstructionSnapshot(path, workingFolder === storageRoot ? storageRoot : undefined);
+    if (!written.exists || written.document.text !== contents) {
+      return { kind: 'conflict', phase: 'after-commit', current: written.document };
+    }
+    return { kind: 'saved', document: written.document };
+  };
+  const saveInstructionCopy = async (scope: string, contents: string): Promise<string> => {
+    if (!instructionCommitter) throw new Error('Безопасное сохранение отдельной копии недоступно.');
+    const folder = join(storageRoot, 'instruction-conflicts', scope);
+    await mkdir(folder, { recursive: true });
+    await assertOwnedPath(storageRoot, folder);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const path = join(folder, `${randomUUID()}.md`);
+      await assertOwnedPath(storageRoot, path);
+      const current = await readInstructionSnapshot(path, storageRoot);
+      if (current.exists) continue;
+      const result = await commitInstruction(path, storageRoot, relative(storageRoot, path), contents, current, current.document.revision);
+      if (result.kind === 'saved') return path;
+      if (result.phase === 'after-commit') throw new Error('Не удалось проверить отдельную копию инструкции; её файл сохранён для проверки.');
+    }
+    throw new Error('Не удалось выделить новое имя для отдельной копии инструкции.');
+  };
+  const applyProjectDeleteJournal = async (journal: ProjectDeleteJournal): Promise<void> => {
+    const projectInstructionsPath = join(storageRoot, 'project-instructions', journal.projectId, 'AGENTS.md');
+    const projectContents = await readFile(projectPath, 'utf8').catch((error: unknown) => {
+      if (isMissingFile(error)) throw storageError(projectPath);
+      throw error;
+    });
+    let currentProjects: ProjectFile;
+    try { currentProjects = parseProjectFile(JSON.parse(projectContents) as unknown).value; }
+    catch { throw storageError(projectPath); }
+    if (!sameJson(currentProjects, journal.before.projects) && !sameJson(currentProjects, journal.after.projects)) {
+      throw new Error('Удаление проекта приостановлено: список проектов изменился после записи журнала. Данные сохранены.');
+    }
+
+    const afterChats = new Map(journal.after.chats.map((chat) => [chat.id, chat]));
+    const chatWrites: Array<{ path: string; detail: ChatDetail }> = [];
+    for (const before of journal.before.chats) {
+      const after = afterChats.get(before.id);
+      if (!after) throw new Error('Журнал удаления проекта повреждён.');
+      const path = join(chatsDirectory, before.id, 'chat.json');
+      await assertOwnedPath(storageRoot, path);
+      const contents = await readFile(path, 'utf8').catch((error: unknown) => {
+        if (isMissingFile(error)) throw storageError(path);
+        throw error;
+      });
+      let current: ChatDetail;
+      try { current = validateChatDetail(JSON.parse(contents) as unknown).value; }
+      catch { throw storageError(path); }
+      if (sameJson(current, before)) chatWrites.push({ path, detail: after });
+      else if (!sameJson(current, after)) {
+        throw new Error(`Удаление проекта приостановлено: чат ${before.id} изменился после записи журнала. Данные сохранены.`);
+      }
+    }
+
+    await assertOwnedPath(storageRoot, projectInstructionsPath);
+    const instructionInfo = await lstat(projectInstructionsPath).catch((error: unknown) => {
+      if (isMissingFile(error)) return null;
+      throw error;
+    });
+    if (instructionInfo && !instructionInfo.isFile()) throw new Error('Файл инструкции проекта недоступен для удаления.');
+    const currentInstructions = instructionInfo ? await readInstructionsFile(projectInstructionsPath) : null;
+    if (currentInstructions !== journal.before.instructionText && currentInstructions !== journal.after.instructionText) {
+      throw new Error('Удаление проекта приостановлено: инструкция изменилась после записи журнала. Данные сохранены.');
+    }
+
+    for (const [index, item] of chatWrites.entries()) {
+      await writeOwnedAtomic(item.path, detailFile(item.detail));
+      await testFaults?.afterProjectDeleteStage?.('chat', index);
+    }
+    if (!sameJson(currentProjects, journal.after.projects)) {
+      await writeOwnedAtomic(projectPath, journal.after.projects);
+      await testFaults?.afterProjectDeleteStage?.('projects');
+    }
+    if (currentInstructions !== null) {
+      await unlink(projectInstructionsPath);
+      await testFaults?.afterProjectDeleteStage?.('instructions');
+    }
+    await assertOwnedPath(storageRoot, projectDeleteJournalPath);
+    await unlink(projectDeleteJournalPath).catch((error: unknown) => {
+      if (!isMissingFile(error)) throw error;
+    });
+    await testFaults?.afterProjectDeleteStage?.('journal-cleared');
   };
   const externalInstructionsPath = async (project: Project): Promise<string | null> => {
     if (!project.workingFolder) return null;
-    if (!isAbsolute(project.workingFolder)) throw new Error('Путь к папке проекта должен быть абсолютным.');
-    const folder = await lstat(project.workingFolder);
-    if (!folder.isDirectory() || folder.isSymbolicLink()) throw new Error('Рабочая папка проекта недоступна или является ссылкой.');
-    return join(project.workingFolder, 'AGENTS.md');
+    const folder = await validateProjectFolder(project.workingFolder, documentsDirectory);
+    return validateProjectInstructionsPath(folder);
   };
   const copyLegacyInstructions = async (project: Project): Promise<void> => {
     const legacy = await readOwnedInstructions(projectInstructionsPath(project.id));
     if (!legacy) return;
     const target = await externalInstructionsPath(project);
     if (!target) return;
-    try { await writeFile(target, legacy, { encoding: 'utf8', flag: 'wx' }); }
-    catch (error) { if (!isRecord(error) || error.code !== 'EEXIST') throw error; }
+    const workingFolder = project.workingFolder;
+    if (!workingFolder) throw new Error('Рабочая папка проекта недоступна.');
+    const current = await readInstructionSnapshot(target, undefined, () => externalInstructionsPath(project));
+    if (current.exists) return;
+    await testFaults?.beforeProjectInstructionCommit?.(target);
+    const verifiedTarget = await externalInstructionsPath(project);
+    if (verifiedTarget !== target) throw new Error('Рабочая папка проекта изменилась перед записью AGENTS.md.');
+    if (!instructionCommitter) {
+      instructionIssues.push(`Старые инструкции проекта ${project.name} сохранены в приложении (${projectInstructionsPath(project.id)}); безопасный writer недоступен, ${target} не изменён.`);
+      return;
+    }
+    let result: InstructionSaveResult;
+    try { result = await commitInstruction(target, workingFolder, 'AGENTS.md', legacy, current, current.document.revision); }
+    catch {
+      instructionIssues.push(`Перенос старых инструкций проекта ${project.name} не подтверждён; исходный текст сохранён в приложении (${projectInstructionsPath(project.id)}), проверьте ${target}.`);
+      return;
+    }
+    if (result.kind === 'conflict') {
+      instructionIssues.push(result.phase === 'after-commit'
+        ? `Перенос AGENTS.md завершился конфликтом; сохранённая внешняя версия доступна по пути ${result.preservedVersion?.path ?? target}.`
+        : `Перенос AGENTS.md остановлен: файл появился в папке проекта и не был заменён (${target}); исходный текст сохранён в приложении (${projectInstructionsPath(project.id)}).`);
+    }
   };
-  const copyInstructionsOnFolderChange = async (previous: Project, next: Project): Promise<void> => {
-    const source = await externalInstructionsPath(previous);
-    const text = source ? await readInstructionsFile(source) : await readOwnedInstructions(projectInstructionsPath(previous.id));
-    if (!text) return;
+  const copyInstructionsOnFolderChange = async (previous: Project, next: Project): Promise<string | null> => {
+    let source: string | null;
+    try { source = await externalInstructionsPath(previous); }
+    catch (error) {
+      if (!isUnavailableProjectFolder(error)) throw error;
+      const backup = await readOwnedInstructions(projectInstructionsPath(previous.id));
+      let copiedBackup = false;
+      let backupConflict: Extract<InstructionSaveResult, { kind: 'conflict' }> | null = null;
+      let backupConflictTarget: string | null = null;
+      if (backup) {
+        const target = await externalInstructionsPath(next);
+        if (target) {
+          const workingFolder = next.workingFolder;
+          if (!workingFolder) throw new Error('Рабочая папка проекта недоступна.');
+          const current = await readInstructionSnapshot(target, undefined, () => externalInstructionsPath(next));
+          if (!current.exists && instructionCommitter) {
+            let result: InstructionSaveResult;
+            try { result = await commitInstruction(target, workingFolder, 'AGENTS.md', backup, current, current.document.revision); }
+            catch {
+              return `Папка проекта перепривязана, перенос инструкций не подтверждён; исходный текст сохранён в приложении (${projectInstructionsPath(previous.id)}), проверьте ${target}.`;
+            }
+            copiedBackup = result.kind === 'saved';
+            if (result.kind === 'conflict') {
+              backupConflict = result;
+              backupConflictTarget = target;
+            }
+          }
+        }
+      }
+      if (backupConflict?.phase === 'after-commit') {
+        return `Папка проекта перепривязана с конфликтом инструкций. Резервный текст записан в новую папку; фактически вытесненная версия доступна по пути ${backupConflict.preservedVersion?.path ?? backupConflictTarget}.`;
+      }
+      if (backupConflict) {
+        return `Папка проекта перепривязана, но AGENTS.md в новой папке появился во время переноса и не был заменён (${backupConflictTarget}). Резервный текст сохранён в приложении: ${projectInstructionsPath(previous.id)}.`;
+      }
+      if (backup && !copiedBackup) {
+        return `Папка проекта перепривязана, но резервные инструкции не перенесены: безопасный writer недоступен или файл уже существует. Исходный текст сохранён в приложении (${projectInstructionsPath(previous.id)}); проверьте ${await externalInstructionsPath(next)}.`;
+      }
+      return copiedBackup
+        ? 'Папка проекта перепривязана. Прежняя папка недоступна, поэтому в новую перенесена только резервная версия AGENTS.md; проверьте её содержимое.'
+        : 'Папка проекта перепривязана, старые инструкции не перенесены: прежнюю папку не удалось проверить. Проверьте AGENTS.md в новой папке.';
+    }
+    let text: string | null;
+    try { text = source ? await readInstructionsFile(source) : await readOwnedInstructions(projectInstructionsPath(previous.id)); }
+    catch (error) {
+      if (!isUnavailableProjectFolder(error)) throw error;
+      return 'Папка проекта перепривязана, но старые инструкции не перенесены: прежняя папка недоступна.';
+    }
+    if (!text) return null;
     const target = await externalInstructionsPath(next);
-    if (!target) return;
-    try { await writeFile(target, text, { encoding: 'utf8', flag: 'wx' }); }
-    catch (error) { if (!isRecord(error) || error.code !== 'EEXIST') throw error; }
+    if (!target) return null;
+    const workingFolder = next.workingFolder;
+    if (!workingFolder) throw new Error('Рабочая папка проекта недоступна.');
+    const current = await readInstructionSnapshot(target, undefined, () => externalInstructionsPath(next));
+    if (current.exists) return null;
+    if (!instructionCommitter) {
+      return `Папка проекта перепривязана, но перенос AGENTS.md не выполнен: безопасный writer недоступен. Исходный файл сохранён по пути ${source ?? projectInstructionsPath(previous.id)}; новая папка ${target} не изменена.`;
+    }
+    await testFaults?.beforeProjectInstructionCommit?.(target);
+    const verifiedTarget = await externalInstructionsPath(next);
+    if (verifiedTarget !== target) throw new Error('Рабочая папка проекта изменилась перед записью AGENTS.md.');
+    let result: InstructionSaveResult;
+    try { result = await commitInstruction(target, workingFolder, 'AGENTS.md', text, current, current.document.revision); }
+    catch {
+      return `Папка проекта перепривязана, состояние переноса AGENTS.md не подтверждено. Исходный файл сохранён по пути ${source ?? projectInstructionsPath(previous.id)}; проверьте также ${target}.`;
+    }
+    if (result.kind === 'conflict') {
+      if (result.phase === 'after-commit') {
+        return `Папка проекта перепривязана с конфликтом инструкций. Текст из прежней папки записан, а фактически вытеснённая версия сохранена по пути ${result.preservedVersion?.path ?? target}.`;
+      }
+      const sourcePath = source ?? projectInstructionsPath(previous.id);
+      return `Папка проекта перепривязана, но AGENTS.md в новой папке уже изменился и не был перезаписан (${target}). Переносимый текст остаётся по исходному пути: ${sourcePath}.`;
+    }
+    return null;
   };
 
   await Promise.all([
     assertOwnedPath(storageRoot, projectPath),
     assertOwnedPath(storageRoot, chatPath),
     assertOwnedPath(storageRoot, chatsDirectory),
+    assertOwnedPath(storageRoot, deletedChatsDirectory),
+    assertOwnedPath(storageRoot, projectDeleteJournalPath),
     assertOwnedPath(storageRoot, migrationMarker),
     assertOwnedPath(storageRoot, settingsPath),
   ]);
+
+  const journalContents = await readFile(projectDeleteJournalPath, 'utf8').catch((error: unknown) => {
+    if (isMissingFile(error)) return null;
+    throw error;
+  });
+  if (journalContents !== null) {
+    let journal: ProjectDeleteJournal;
+    try { journal = validateProjectDeleteJournal(JSON.parse(journalContents) as unknown); }
+    catch { throw storageError(projectDeleteJournalPath); }
+    await applyProjectDeleteJournal(journal);
+  }
 
   // Parse every existing file before creating or migrating any of them.
   const [projectFile, settingsFile] = await Promise.all([
@@ -625,6 +993,7 @@ export async function openStore(directory: string): Promise<LocalStore> {
   });
   const loadedChats: ChatDetail[] = [];
   const chatsNeedingMigration: ChatDetail[] = [];
+  const storageIssues: string[] = [];
   for (const entry of entries) {
     if (entry.isSymbolicLink()) throw new Error('Каталог чата не может быть символической ссылкой.');
     if (!entry.isDirectory()) continue;
@@ -634,14 +1003,45 @@ export async function openStore(directory: string): Promise<LocalStore> {
     try { contents = await readFile(detailPath, 'utf8'); }
     catch (error) {
       if (!migrated && legacyChats.some((chat) => chat.id === entry.name) && isMissingFile(error)) continue;
-      throw storageError(detailPath);
+      if (isMissingFile(error)) {
+        storageIssues.push(`Чат ${entry.name} недоступен: файл истории отсутствует; каталог сохранён.`);
+        continue;
+      }
+      throw error;
     }
     try {
       const detail = validateChatDetail(JSON.parse(contents) as unknown);
       if (detail.value.id !== entry.name) throw new Error('Chat ID mismatch.');
       loadedChats.push(detail.value);
       if (detail.needsWrite) chatsNeedingMigration.push(detail.value);
-    } catch { throw storageError(detailPath); }
+    } catch {
+      storageIssues.push(`Чат ${entry.name} недоступен: файл истории повреждён; каталог сохранён.`);
+    }
+  }
+
+  const deletedChatsInfo = await lstat(deletedChatsDirectory).catch((error: unknown) => {
+    if (isMissingFile(error)) return null;
+    throw error;
+  });
+  const deletedChatEntries = deletedChatsInfo?.isDirectory()
+    ? await readdir(deletedChatsDirectory, { withFileTypes: true })
+    : [];
+  if (deletedChatsInfo && !deletedChatsInfo.isDirectory()) {
+    storageIssues.push('Карантин удаления чатов недоступен; здоровые чаты загружены, данные карантина сохранены.');
+  }
+  for (const entry of deletedChatEntries) {
+    if (!entry.isDirectory() || entry.isSymbolicLink()
+      || !/^[A-Za-z0-9_-]{1,128}\.deleted-[0-9a-f-]{36}$/i.test(entry.name)) {
+      storageIssues.push('В карантине удаления чатов остались неизвестные данные; они сохранены без изменений.');
+      continue;
+    }
+    const quarantinePath = join(deletedChatsDirectory, entry.name);
+    try {
+      await assertOwnedPath(storageRoot, quarantinePath);
+      await rm(quarantinePath, { recursive: true });
+    } catch {
+      storageIssues.push(`Не удалось завершить очистку чата ${entry.name.split('.deleted-')[0]}; данные сохранены в карантине.`);
+    }
   }
 
   if (!migrated) {
@@ -668,10 +1068,27 @@ export async function openStore(directory: string): Promise<LocalStore> {
   let projects = projectFile.value.projects;
   let chats = loadedChats;
   let settings = settingsFile.value.settings;
+  const selectionRevisions = new Map(chats.map((chat) => [chat.id, { permissionProfile: 0, skill: 0 }]));
+  const turnReservations = new Map<string, {
+    chatId: string;
+    permissionProfile: { value: PermissionProfile; revision: number } | null;
+    skill: { value: string; revision: number } | null;
+  }>();
   let writeQueue: Promise<void> = Promise.resolve();
+  let pendingProjectDelete: ProjectDeleteJournal | null = null;
 
   const serialize = <T>(operation: () => Promise<T>): Promise<T> => {
-    const result = writeQueue.then(operation);
+    const result = writeQueue.then(async () => {
+      if (pendingProjectDelete) {
+        const journal = pendingProjectDelete;
+        await applyProjectDeleteJournal(journal);
+        projects = journal.after.projects.projects;
+        const updates = new Map(journal.after.chats.map((chat) => [chat.id, chat]));
+        chats = chats.map((chat) => updates.get(chat.id) ?? chat);
+        pendingProjectDelete = null;
+      }
+      return operation();
+    });
     writeQueue = result.then(() => undefined, () => undefined);
     return result;
   };
@@ -680,8 +1097,8 @@ export async function openStore(directory: string): Promise<LocalStore> {
     projects = next;
   };
   const chatFolder = (id: string): string => join(chatsDirectory, requireId(id));
-  const saveChat = async (chat: ChatDetail): Promise<void> => {
-    await writeOwnedAtomic(join(chatFolder(chat.id), 'chat.json'), detailFile(chat));
+  const saveChat = async (chat: ChatDetail, signal?: AbortSignal): Promise<void> => {
+    await writeOwnedAtomic(join(chatFolder(chat.id), 'chat.json'), detailFile(chat), signal);
     chats = chats.some((item) => item.id === chat.id)
       ? chats.map((item) => item.id === chat.id ? chat : item)
       : [...chats, chat];
@@ -689,6 +1106,16 @@ export async function openStore(directory: string): Promise<LocalStore> {
   const findChat = (idInput: unknown): ChatDetail => {
     const chat = chats.find((item) => item.id === requireId(idInput));
     if (!chat) throw new Error('Чат не найден.');
+    return chat;
+  };
+  const validateAcceptedTurnBinding = (turn: AcceptedTurnInput): ChatDetail => {
+    const chat = findChat(turn.chatId);
+    if (chat.projectId !== turn.projectId) throw new Error('Чат перемещён после принятия хода; запрос остановлен.');
+    const project = turn.projectId ? projects.find((item) => item.id === turn.projectId) : null;
+    if (turn.projectId && (!project || project.workingFolder !== turn.projectWorkingFolder)) {
+      throw new Error('Рабочая папка проекта изменилась после принятия хода; запрос остановлен.');
+    }
+    if (!turn.projectId && turn.projectWorkingFolder !== null) throw new Error('Привязка папки хода повреждена.');
     return chat;
   };
   const createStoredChat = async (projectId: string | null, kind: ChatKind): Promise<ChatDetail> => {
@@ -699,7 +1126,19 @@ export async function openStore(directory: string): Promise<LocalStore> {
       nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: settings.defaultModelId, messages: [], artifacts: [],
     };
     await saveChat(chat);
+    selectionRevisions.set(chat.id, { permissionProfile: 0, skill: 0 });
     return chat;
+  };
+  const appendLocalMessage = async (idInput: unknown, textInput: unknown): Promise<ChatDetail> => {
+    const chat = findChat(idInput);
+    if (typeof textInput !== 'string' || !textInput.trim() || textInput.length > 100_000) {
+      throw new Error('Сообщение должно содержать от 1 до 100 000 символов.');
+    }
+    const now = new Date().toISOString();
+    const message: ChatMessage = { id: randomUUID(), role: 'user', text: textInput.trim(), createdAt: now };
+    const updated = { ...chat, draft: '', updatedAt: now, messages: [...chat.messages, message] };
+    await saveChat(updated);
+    return structuredClone(updated);
   };
   const saveSettings = async (next: Settings): Promise<void> => {
     await writeOwnedAtomic(settingsPath, { schemaVersion: 10, settings: next });
@@ -715,6 +1154,7 @@ export async function openStore(directory: string): Promise<LocalStore> {
     listProjects: () => serialize(async () => projects.map((project) => ({ ...project }))),
     createProject: (nameInput, folderInput = null) => serialize(async () => {
       const now = new Date().toISOString();
+      const requestedFolder = requireFolderPath(folderInput, 'Рабочая папка проекта');
       const project: Project = {
         id: randomUUID(),
         name: requireName(nameInput, 'Название проекта', 120),
@@ -722,20 +1162,27 @@ export async function openStore(directory: string): Promise<LocalStore> {
         archived: false,
         createdAt: now,
         updatedAt: now,
-        workingFolder: requireFolderPath(folderInput, 'Рабочая папка проекта'),
+        workingFolder: requestedFolder ? await validateProjectFolder(requestedFolder, documentsDirectory) : null,
       };
       await saveProjects([...projects, project]);
       return { ...project };
     }),
     updateProject: (idInput, patchInput) => serialize(async () => {
       const id = requireId(idInput);
-      const patch = validateProjectPatch(patchInput);
+      let patch = validateProjectPatch(patchInput);
+      if (patch.workingFolder !== undefined && patch.workingFolder !== null) {
+        patch = { ...patch, workingFolder: await validateProjectFolder(patch.workingFolder, documentsDirectory) };
+      }
       const project = projects.find((item) => item.id === id);
       if (!project) throw new Error('Проект не найден.');
       const updated = { ...project, ...patch, updatedAt: new Date().toISOString() };
-      if (patch.workingFolder && patch.workingFolder !== project.workingFolder) await copyInstructionsOnFolderChange(project, updated);
+      let warning: string | null = null;
+      if (patch.workingFolder && patch.workingFolder !== project.workingFolder) {
+        await externalInstructionsPath(updated);
+        warning = await copyInstructionsOnFolderChange(project, updated);
+      }
       await saveProjects(projects.map((item) => item.id === id ? updated : item));
-      return { ...updated };
+      return { project: { ...updated }, warning };
     }),
     migrateProjectInstructions: (idInput) => serialize(async () => {
       const project = projects.find((item) => item.id === requireId(idInput));
@@ -769,29 +1216,40 @@ export async function openStore(directory: string): Promise<LocalStore> {
         throw error;
       });
       if (instructions && !instructions.isFile()) throw new Error('Файл инструкции проекта недоступен для удаления.');
-      const previousProjects = projects;
       const linkedChats = chats.filter((item) => item.projectId === id);
       const now = new Date().toISOString();
-      try {
-        for (const chat of linkedChats) {
-          await saveChat({ ...chat, projectId: null, updatedAt: now });
-        }
-        await saveProjects(projects.filter((project) => project.id !== id));
-        if (instructions) {
-          await assertOwnedPath(storageRoot, instructionsPath);
-          await unlink(instructionsPath).catch((error: unknown) => {
-            if (!isMissingFile(error)) throw error;
-          });
-        }
-      } catch (error) {
-        try {
-          for (const chat of linkedChats) await saveChat(chat);
-          await saveProjects(previousProjects);
-        } catch {
-          throw new Error('Удаление проекта завершилось ошибкой, и восстановить исходные данные не удалось.');
-        }
-        throw error;
-      }
+      const instructionText = instructions ? await readInstructionsFile(instructionsPath) : null;
+      const before: ProjectDeleteState = {
+        projects: { schemaVersion: 2, projects: projects.map((item) => ({ ...item })) },
+        chats: linkedChats.map((item) => structuredClone(item)),
+        instructionText,
+      };
+      const after: ProjectDeleteState = {
+        projects: { schemaVersion: 2, projects: projects.filter((item) => item.id !== id) },
+        chats: linkedChats.map((chat) => ({
+          ...chat,
+          projectId: null,
+          nextTurnSkillId: detachProjectSkill(chat.nextTurnSkillId, id),
+          updatedAt: now,
+        })),
+        instructionText: null,
+      };
+      const journalRecord = {
+        schemaVersion: 1,
+        operationId: randomUUID(),
+        projectId: id,
+        before: { ...before, chats: before.chats.map(detailFile) },
+        after: { ...after, chats: after.chats.map(detailFile) },
+      };
+      const journal = validateProjectDeleteJournal(journalRecord);
+      await writeOwnedAtomic(projectDeleteJournalPath, journalRecord);
+      pendingProjectDelete = journal;
+      await testFaults?.afterProjectDeleteStage?.('journal');
+      await applyProjectDeleteJournal(journal);
+      projects = journal.after.projects.projects;
+      const updates = new Map(journal.after.chats.map((chat) => [chat.id, chat]));
+      chats = chats.map((chat) => updates.get(chat.id) ?? chat);
+      pendingProjectDelete = null;
     }),
     listChats: () => serialize(async () => chats.map(summary)),
     getChat: (id) => serialize(async () => structuredClone(findChat(id))),
@@ -807,27 +1265,106 @@ export async function openStore(directory: string): Promise<LocalStore> {
     }),
     updateChat: (idInput, patchInput) => serialize(async () => {
       const id = requireId(idInput);
-      const patch = validateChatPatch(patchInput);
+      let patch = validateChatPatch(patchInput);
       if (patch.projectId && !projects.some((project) => project.id === patch.projectId && !project.archived)) {
         throw new Error('Выбранный проект недоступен.');
       }
       const chat = findChat(id);
+      if (patch.projectId !== undefined && patch.nextTurnSkillId === undefined) {
+        const nextTurnSkillId = skillForProject(chat.nextTurnSkillId, patch.projectId);
+        if (nextTurnSkillId !== chat.nextTurnSkillId) patch = { ...patch, nextTurnSkillId };
+      }
       const updated = { ...chat, ...patch, updatedAt: new Date().toISOString() };
       await saveChat(updated);
+      const revisions = selectionRevisions.get(id) ?? { permissionProfile: 0, skill: 0 };
+      if ('nextTurnPermissionProfile' in patch) revisions.permissionProfile += 1;
+      if ('nextTurnSkillId' in patch) revisions.skill += 1;
+      selectionRevisions.set(id, revisions);
       return summary(updated);
     }),
-    appendLocalMessage: (id, textInput) => serialize(async () => {
-      const chat = findChat(id);
-      if (typeof textInput !== 'string' || !textInput.trim() || textInput.length > 100_000) {
-        throw new Error('Сообщение должно содержать от 1 до 100 000 символов.');
+    appendLocalMessage: (id, textInput) => serialize(() => appendLocalMessage(id, textInput)),
+    acceptLocalMessage: (idInput, textInput, turnIdInput) => serialize(async () => {
+      const turnId = requireId(turnIdInput);
+      if (turnReservations.has(turnId)) throw new Error('Ход с таким идентификатором уже принят.');
+      const before = findChat(idInput);
+      if (before.projectId && !projects.some((item) => item.id === before.projectId)) {
+        throw new Error('Проект чата больше недоступен.');
       }
-      const now = new Date().toISOString();
-      const message: ChatMessage = { id: randomUUID(), role: 'user', text: textInput.trim(), createdAt: now };
-      const updated = { ...chat, draft: '', updatedAt: now, messages: [...chat.messages, message] };
-      await saveChat(updated);
-      return structuredClone(updated);
+      const detail = await appendLocalMessage(idInput, textInput);
+      const project = detail.projectId ? projects.find((item) => item.id === detail.projectId) : null;
+      if (detail.projectId && !project) throw new Error('Проект чата больше недоступен.');
+      const revisions = selectionRevisions.get(detail.id) ?? { permissionProfile: 0, skill: 0 };
+      const profileAlreadyReserved = [...turnReservations.values()].some((item) => item.chatId === detail.id
+        && item.permissionProfile?.revision === revisions.permissionProfile);
+      const skillAlreadyReserved = [...turnReservations.values()].some((item) => item.chatId === detail.id
+        && item.skill?.revision === revisions.skill);
+      const profileReservation = detail.nextTurnPermissionProfile !== null && !profileAlreadyReserved
+        ? { value: detail.nextTurnPermissionProfile, revision: revisions.permissionProfile }
+        : null;
+      const skillReservation = detail.nextTurnSkillId !== null && !skillAlreadyReserved
+        ? { value: detail.nextTurnSkillId, revision: revisions.skill }
+        : null;
+      turnReservations.set(turnId, { chatId: detail.id, permissionProfile: profileReservation, skill: skillReservation });
+      const message = detail.messages[detail.messages.length - 1];
+      if (!message || message.role !== 'user') throw new Error('Принятое сообщение отсутствует в истории чата.');
+      const turn: AcceptedTurnInput = {
+        turnId,
+        chatId: detail.id,
+        projectId: detail.projectId,
+        projectWorkingFolder: project?.workingFolder ?? null,
+        messageId: message.id,
+        historyBoundary: detail.messages.length,
+        messages: structuredClone(detail.messages),
+        permissionProfile: profileReservation?.value ?? settings.defaultPermissionProfile,
+        modelId: detail.modelId ?? settings.defaultModelId,
+        skillId: skillReservation?.value ?? null,
+        reservation: {
+          permissionProfileRevision: profileReservation?.revision ?? null,
+          skillRevision: skillReservation?.revision ?? null,
+        },
+      };
+      return { detail, turn };
     }),
-    appendAssistantMessageFromRuntime: (id, textInput) => serialize(async () => {
+    releaseTurnReservation: (turnIdInput) => {
+      if (typeof turnIdInput === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(turnIdInput)) turnReservations.delete(turnIdInput);
+    },
+    validateAcceptedTurn: (turn) => serialize(async () => {
+      validateAcceptedTurnBinding(turn);
+    }),
+    consumeTurnReservation: (turn, signal) => serialize(async () => {
+      if (signal?.aborted) throw createAbortError();
+      const chat = validateAcceptedTurnBinding(turn);
+      const reservation = turnReservations.get(turn.turnId);
+      if (!reservation) return;
+      if (reservation.chatId !== turn.chatId) throw new Error('Резервирование хода повреждено.');
+      const revisions = selectionRevisions.get(chat.id) ?? { permissionProfile: 0, skill: 0 };
+      let updated = chat;
+      let clearProfile = false;
+      let clearSkill = false;
+      if (reservation.permissionProfile && turn.reservation.permissionProfileRevision === reservation.permissionProfile.revision
+        && revisions.permissionProfile === reservation.permissionProfile.revision
+        && chat.nextTurnPermissionProfile === reservation.permissionProfile.value) {
+        updated = { ...updated, nextTurnPermissionProfile: null };
+        clearProfile = true;
+      }
+      if (reservation.skill && turn.reservation.skillRevision === reservation.skill.revision
+        && revisions.skill === reservation.skill.revision
+        && chat.nextTurnSkillId === reservation.skill.value) {
+        updated = { ...updated, nextTurnSkillId: null };
+        clearSkill = true;
+      }
+      if (clearProfile || clearSkill) {
+        updated = { ...updated, updatedAt: new Date().toISOString() };
+        await saveChat(updated, signal);
+        if (clearProfile) revisions.permissionProfile += 1;
+        if (clearSkill) revisions.skill += 1;
+        selectionRevisions.set(chat.id, revisions);
+      }
+      if (signal?.aborted) throw createAbortError();
+      turnReservations.delete(turn.turnId);
+    }),
+    appendAssistantMessageFromRuntime: (id, textInput, signal) => serialize(async () => {
+      if (signal?.aborted) throw createAbortError();
       const chat = findChat(id);
       if (typeof textInput !== 'string' || !textInput.trim() || textInput.length > 100_000) {
         throw new Error('Ответ должен содержать от 1 до 100 000 символов.');
@@ -835,7 +1372,7 @@ export async function openStore(directory: string): Promise<LocalStore> {
       const now = new Date().toISOString();
       const message: ChatMessage = { id: randomUUID(), role: 'assistant', text: textInput.trim(), createdAt: now };
       const updated = { ...chat, updatedAt: now, messages: [...chat.messages, message] };
-      await saveChat(updated);
+      await saveChat(updated, signal);
       return structuredClone(updated);
     }),
     importFile: (idInput, sourcePath, projectIdInput = null) => serialize(async () => {
@@ -904,8 +1441,20 @@ export async function openStore(directory: string): Promise<LocalStore> {
       const chat = findChat(idInput);
       const path = chatFolder(chat.id);
       await assertOwnedPath(storageRoot, path);
-      await rm(path, { recursive: true });
+      const sourceInfo = await lstat(path);
+      if (!sourceInfo.isDirectory()) throw new Error('Каталог чата недоступен для безопасного удаления.');
+      await mkdir(deletedChatsDirectory, { recursive: true });
+      await assertOwnedPath(storageRoot, deletedChatsDirectory);
+      const quarantinePath = join(deletedChatsDirectory, `${chat.id}.deleted-${randomUUID()}`);
+      await assertOwnedPath(storageRoot, quarantinePath);
+      await rename(path, quarantinePath);
       chats = chats.filter((item) => item.id !== chat.id);
+      selectionRevisions.delete(chat.id);
+      for (const [turnId, reservation] of turnReservations) {
+        if (reservation.chatId === chat.id) turnReservations.delete(turnId);
+      }
+      try { await rm(quarantinePath, { recursive: true }); }
+      catch { storageIssues.push(`Не удалось завершить очистку чата ${chat.id}; данные сохранены в карантине.`); }
     }),
     getSettings: () => serialize(async () => ({ ...settings })),
     updateSettings: (patchInput) => serialize(async () => {
@@ -930,27 +1479,81 @@ export async function openStore(directory: string): Promise<LocalStore> {
       }
       return { chatCount: chats.length, projectCount: projects.length, activityDayCount: activityDays.size };
     }),
+    getStorageIssues: () => serialize(async () => [...instructionIssues, ...storageIssues]),
     readGlobalInstructions: () => serialize(() => readOwnedInstructions(join(storageRoot, 'GIGACHAT.md'))),
-    saveGlobalInstructions: (contents) => serialize(() => writeOwnedTextAtomic(join(storageRoot, 'GIGACHAT.md'), requireInstructions(contents))),
-    readProjectInstructions: (id) => {
+    readGlobalInstructionDocument: () => serialize(async () =>
+      (await readInstructionSnapshot(join(storageRoot, 'GIGACHAT.md'), storageRoot)).document),
+    saveGlobalInstructions: (contents, expectedRevision) => {
+      const validatedContents = requireInstructions(contents);
+      const revision = requireInstructionRevision(expectedRevision);
+      const path = join(storageRoot, 'GIGACHAT.md');
+      return serialize(async () => {
+        const current = await readInstructionSnapshot(path, storageRoot);
+        return commitInstruction(path, storageRoot, 'GIGACHAT.md', validatedContents, current, revision);
+      });
+    },
+    saveGlobalInstructionsCopy: (contents) => {
+      const validatedContents = requireInstructions(contents);
+      return serialize(() => saveInstructionCopy('global', validatedContents));
+    },
+    readProjectInstructions: (id, expectedWorkingFolderInput) => {
       const validatedId = requireId(id);
+      const expectedWorkingFolder = expectedWorkingFolderInput === undefined
+        ? undefined : requireFolderPath(expectedWorkingFolderInput, 'Рабочая папка проекта');
       return serialize(async () => {
         const project = projects.find((item) => item.id === validatedId);
         if (!project) throw new Error('Проект не найден.');
+        if (expectedWorkingFolder !== undefined && project.workingFolder !== expectedWorkingFolder) {
+          throw new Error('Рабочая папка проекта изменилась после принятия хода.');
+        }
         const target = await externalInstructionsPath(project);
         return target ? readInstructionsFile(target) : readOwnedInstructions(projectInstructionsPath(project.id));
       });
     },
-    saveProjectInstructions: (id, contents) => {
+    readProjectInstructionDocument: (id) => {
       const validatedId = requireId(id);
-      const validatedContents = requireInstructions(contents);
       return serialize(async () => {
         const project = projects.find((item) => item.id === validatedId);
         if (!project) throw new Error('Проект не найден.');
         const target = await externalInstructionsPath(project);
-        if (!target) return writeOwnedTextAtomic(projectInstructionsPath(validatedId), validatedContents);
-        await readInstructionsFile(target);
-        await writeTextAtomic(target, validatedContents);
+        return (await readInstructionSnapshot(
+          target ?? projectInstructionsPath(project.id),
+          target ? undefined : storageRoot,
+          target ? () => externalInstructionsPath(project) : undefined,
+        )).document;
+      });
+    },
+    saveProjectInstructions: (id, contents, expectedRevision) => {
+      const validatedId = requireId(id);
+      const validatedContents = requireInstructions(contents);
+      const revision = requireInstructionRevision(expectedRevision);
+      return serialize(async () => {
+        const project = projects.find((item) => item.id === validatedId);
+        if (!project) throw new Error('Проект не найден.');
+        const target = await externalInstructionsPath(project);
+        const path = target ?? projectInstructionsPath(validatedId);
+        const root = target ? project.workingFolder : storageRoot;
+        if (!root) throw new Error('Рабочая папка проекта недоступна.');
+        const relativePath = target ? 'AGENTS.md' : relative(storageRoot, path);
+        const current = await readInstructionSnapshot(
+          path,
+          target ? undefined : storageRoot,
+          target ? () => externalInstructionsPath(project) : undefined,
+        );
+        await testFaults?.beforeProjectInstructionCommit?.(path);
+        if (target) {
+          const verifiedTarget = await externalInstructionsPath(project);
+          if (verifiedTarget !== target) throw new Error('Рабочая папка проекта изменилась перед записью AGENTS.md.');
+        }
+        return commitInstruction(path, root, relativePath, validatedContents, current, revision);
+      });
+    },
+    saveProjectInstructionsCopy: (id, contents) => {
+      const validatedId = requireId(id);
+      const validatedContents = requireInstructions(contents);
+      return serialize(async () => {
+        if (!projects.some((project) => project.id === validatedId)) throw new Error('Проект не найден.');
+        return saveInstructionCopy(validatedId, validatedContents);
       });
     },
   };

@@ -30,6 +30,9 @@ test('Studio return control recognizes only the official landing origin and path
 test('in-page navigation updates Studio status and keeps the return control usable', async () => {
   let currentUrl = '';
   let loadCount = 0;
+  let viewCount = 0;
+  let sessionCount = 0;
+  let visible = false;
   const contents = Object.assign(new EventEmitter(), {
     isDestroyed: () => false,
     canGoBack: () => false,
@@ -46,7 +49,7 @@ test('in-page navigation updates Studio status and keeps the return control usab
   });
   const view = {
     webContents: contents,
-    setVisible: () => undefined,
+    setVisible: (value: boolean) => { visible = value; },
     setBounds: () => undefined,
   } as unknown as WebContentsView;
   const session = Object.assign(new EventEmitter(), {
@@ -61,8 +64,8 @@ test('in-page navigation updates Studio status and keeps the return control usab
     webContents: { getZoomFactor: () => 1 },
   } as unknown as BrowserWindow;
   const browser = createOnboardingBrowser(() => window, {
-    createSession: () => session as never,
-    createView: () => view,
+    createSession: () => { sessionCount += 1; return session as never; },
+    createView: () => { viewCount += 1; return view; },
   });
 
   await browser.openStudio();
@@ -75,6 +78,20 @@ test('in-page navigation updates Studio status and keeps the return control usab
   const returned = await browser.openStudio();
   assert.equal(returned.atStudio, true);
   assert.equal(loadCount, 2);
+
+  const retainedUrl = currentUrl;
+  browser.setBounds({ x: 100, y: 50, width: 600, height: 500 });
+  assert.equal(visible, true);
+  browser.setBounds(null);
+  assert.equal(visible, false);
+  assert.equal(browser.getStatus().open, true);
+  assert.equal(currentUrl, retainedUrl);
+  browser.setBounds({ x: 100, y: 50, width: 600, height: 500 });
+  assert.equal(visible, true);
+  assert.equal(currentUrl, retainedUrl);
+  assert.equal(loadCount, 2);
+  assert.equal(viewCount, 1);
+  assert.equal(sessionCount, 1);
 });
 
 test('onboarding browser bounds are zoomed and clipped to the app content area', () => {

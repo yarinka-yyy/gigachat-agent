@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Win32.SafeHandles;
@@ -17,8 +18,18 @@ internal static class Program
     private const uint StartfUseStdHandles = 0x00000100;
     private const uint HandleFlagInherit = 1;
     private const uint GenericWrite = 0x40000000;
+    private const uint GenericRead = 0x80000000;
+    private const uint DeleteAccess = 0x00010000;
+    private const uint FileReadAttributes = 0x80;
     private const uint FileShareRead = 1;
     private const uint FileShareWrite = 2;
+    private const uint FileShareDelete = 4;
+    private const uint OpenExisting = 3;
+    private const uint FileFlagBackupSemantics = 0x02000000;
+    private const uint FileFlagOpenReparsePoint = 0x00200000;
+    private const int FileDispositionInfoClass = 4;
+    private const uint FileAttributeDirectory = 0x10;
+    private const uint FileAttributeReparsePoint = 0x400;
     private const uint CreateNew = 1;
     private const uint FileAttributeNormal = 0x80;
     private const uint JobObjectLimitKillOnJobClose = 0x00002000;
@@ -37,6 +48,8 @@ internal static class Program
     private const int MaxInputBytes = 1024 * 1024;
     private const int MaxRequestChars = 2 * 1024 * 1024;
     private const int MaxBrokerJournalBytes = 16 * 1024;
+    private const int MaxInstructionBytes = 64 * 1024;
+    private const int MaxInstructionJournalBytes = 64 * 1024;
     private const int MaxRelativePathChars = 2048;
     private const int MaxOutputBytes = 4 * 1024 * 1024;
     private const int MaxTimeoutMs = 120_000;
@@ -80,6 +93,21 @@ internal static class Program
             {
                 stage = "write project file";
                 WriteProjectFile(args[1]);
+                return 0;
+            }
+            if (args.Length == 2 && args[0] == "--recover-instructions")
+            {
+                stage = "recover instruction writes";
+                string directory = PrepareRecoveryDirectory(args[1]);
+                using FileStream instructionLock = AcquireRuntimeLock(directory, MaxRecoveryLockWaitMs);
+                string[] conflicts = RecoverInstructionWrites(directory);
+                Console.WriteLine(JsonSerializer.Serialize(new InstructionRecoveryResult(conflicts.Length == 0, conflicts)));
+                return 0;
+            }
+            if (args.Length == 2 && args[0] == "--write-instruction")
+            {
+                stage = "write versioned instruction";
+                WriteInstructionFile(args[1]);
                 return 0;
             }
             if (args.Length == 2 && args[0] == "--delete-app-data")
@@ -155,19 +183,27 @@ internal static class Program
             EnsureNoReparseComponents(parent);
             EnsureNoReparseComponents(target);
             if (Directory.Exists(target)) throw new InvalidDataException("Путь указывает на папку.");
-
-            bool targetExists = File.Exists(target);
+            stage = "pin target directory";
+            using var directoryPins = new PinnedDirectories(PinDirectoryChain(parent));
+            using FileSnapshot before = ReadBrokerSnapshot(target);
+            bool targetExists = before.Exists;
+            SecuritySnapshot? originalSecurity = before.Exists ? ReadSecuritySnapshot(target) : null;
             string id = Guid.NewGuid().ToString("N");
             string temporaryLeaf = $".gigachat-write-{id}.tmp";
             string backupLeaf = $".gigachat-write-{id}.bak";
             string temporary = Path.Combine(parent, temporaryLeaf);
             string backup = Path.Combine(parent, backupLeaf);
             string journal = Path.Combine(recoveryDirectory, $"write-{id}.json");
-            var journalData = new BrokerWriteJournal(id, root, request.RelativePath, targetExists, temporaryLeaf, backupLeaf);
+            string intendedHash = HashBytes(payload);
+            int writtenBytes = payload.Length;
+            var journalData = new BrokerWriteJournal(1, id, root, request.RelativePath, targetExists,
+                before.Hash, before.Identity, intendedHash, null, originalSecurity, temporaryLeaf, backupLeaf, "prepared");
             bool preserveJournal = false;
+            bool mutationAttempted = false;
+            bool temporaryCreated = false;
 
             stage = "write temporary file";
-            WriteBrokerJournal(journal, journalData);
+            WriteBrokerJournal(journal, journalData, createOnly: true);
             try
             {
                 EnsureNoReparseComponents(root);
@@ -177,71 +213,110 @@ internal static class Program
                 using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
                     4096, FileOptions.WriteThrough))
                 {
+                    temporaryCreated = true;
                     stream.Write(payload, 0, payload.Length);
                     stream.Flush(true);
                 }
                 Array.Clear(payload);
+                using FileSnapshot staged = ReadBrokerSnapshot(temporary);
+                if (!staged.Exists || staged.Hash != intendedHash)
+                    throw new IOException("Временный файл изменился до замены.");
+                string intendedIdentity = staged.Identity
+                    ?? throw new InvalidDataException("Identity временного файла недоступен.");
                 SecuritySnapshot temporarySecurity = ReadSecuritySnapshot(temporary);
-                bool currentTargetExists = File.Exists(target);
-                if (targetExists != currentTargetExists || Directory.Exists(target))
-                    throw new IOException("Целевой файл изменился до записи.");
+                if (originalSecurity is not null) RequireSupportedSecurity(originalSecurity, temporarySecurity);
+                SecuritySnapshot expectedSecurity = originalSecurity ?? temporarySecurity;
+                journalData = journalData with { IntendedIdentity = intendedIdentity, ExpectedSecurity = expectedSecurity };
+                WriteBrokerJournal(journal, journalData);
+
+                stage = "revalidate target before replace";
+                EnsureNoReparseComponents(root);
+                EnsureNoReparseComponents(parent);
+                EnsureNoReparseComponents(target);
+                EnsureNoReparseComponents(temporary);
+                using FileSnapshot latest = ReadBrokerSnapshot(target);
+                using FileSnapshot stagedLatest = ReadBrokerSnapshot(temporary);
+                bool latestMatchesBefore = latest.Exists == before.Exists
+                    && (!before.Exists || (latest.Hash == before.Hash && latest.Identity == before.Identity
+                        && originalSecurity is not null && SecurityEquals(originalSecurity, ReadSecuritySnapshot(target))));
+                bool stagedStillMatches = stagedLatest.Exists && stagedLatest.Hash == intendedHash
+                    && stagedLatest.Identity == intendedIdentity
+                    && SecurityEquals(temporarySecurity, ReadSecuritySnapshot(temporary));
+                if (!latestMatchesBefore || !stagedStillMatches)
+                    throw new IOException("Target или временный файл изменился до замены.");
+
+                stage = targetExists ? "replace existing file" : "move new file into place";
+                mutationAttempted = true;
+                staged.Dispose();
+                stagedLatest.Dispose();
+                if (targetExists)
+                    File.Replace(temporary, target, backup);
+                else
+                    File.Move(temporary, target);
+                journalData = journalData with { Stage = "displaced" };
+                WriteBrokerJournal(journal, journalData);
+
+                stage = "verify committed file";
+                using FileSnapshot committed = ReadBrokerSnapshot(target);
+                SecuritySnapshot committedSecurity = ReadSecuritySnapshot(target);
+                if (!committed.Exists || committed.Hash != intendedHash || committed.Identity != intendedIdentity
+                    || !SecurityEquals(expectedSecurity, committedSecurity))
+                {
+                    journalData = journalData with { Stage = "conflict" };
+                    WriteBrokerJournal(journal, journalData);
+                    preserveJournal = true;
+                    throw new IOException("Target changed after broker commit.");
+                }
 
                 if (targetExists)
                 {
-                    stage = "preflight target security descriptor";
-                    SecuritySnapshot originalSecurity = ReadSecuritySnapshot(target);
-                    RequireSupportedSecurity(originalSecurity, temporarySecurity);
-
-                    stage = "revalidate target before replace";
-                    EnsureNoReparseComponents(root);
-                    EnsureNoReparseComponents(parent);
-                    EnsureNoReparseComponents(target);
-                    EnsureNoReparseComponents(temporary);
-                    if (!File.Exists(target) || !File.Exists(temporary)
-                        || !SecurityEquals(originalSecurity, ReadSecuritySnapshot(target))
-                        || !SecurityEquals(temporarySecurity, ReadSecuritySnapshot(temporary)))
-                        throw new IOException("Путь или дескриптор изменился до замены.");
-
-                    stage = "replace existing file";
-                    File.Replace(temporary, target, backup);
-                    SecuritySnapshot replacedSecurity = ReadSecuritySnapshot(target);
-                    if (!SecurityEquals(originalSecurity, replacedSecurity))
+                    stage = "verify displaced file";
+                    using FileSnapshot displaced = ReadBrokerSnapshot(backup);
+                    SecuritySnapshot displacedSecurity = ReadSecuritySnapshot(backup);
+                    if (!displaced.Exists || displaced.Hash != before.Hash || displaced.Identity != before.Identity
+                        || originalSecurity is null || !SecurityEquals(originalSecurity, displacedSecurity))
                     {
-                        stage = "restore original file after descriptor mismatch";
-                        File.Move(backup, target, overwrite: true);
-                        if (!SecurityEquals(originalSecurity, ReadSecuritySnapshot(target)))
-                        {
-                            preserveJournal = true;
-                            throw new IOException("Дескриптор исходного файла не удалось восстановить.");
-                        }
-                        throw new InvalidDataException("EXISTING_FILE_REPLACE_UNAVAILABLE");
+                        journalData = journalData with { Stage = "conflict" };
+                        WriteBrokerJournal(journal, journalData);
+                        preserveJournal = true;
+                        throw new IOException("The displaced broker file changed after replacement.");
                     }
-                    File.Delete(backup);
                 }
-                else
+                else if (File.Exists(backup) || Directory.Exists(backup))
                 {
-                    stage = "revalidate new-file target";
-                    EnsureNoReparseComponents(root);
-                    EnsureNoReparseComponents(parent);
-                    EnsureNoReparseComponents(temporary);
-                    if (File.Exists(target) || Directory.Exists(target))
-                        throw new IOException("Целевой путь появился до записи.");
-                    stage = "move new file into place";
-                    File.Move(temporary, target);
-                    if (!SecurityEquals(temporarySecurity, ReadSecuritySnapshot(target)))
-                    {
-                        File.Delete(target);
-                        throw new InvalidDataException("NEW_FILE_DESCRIPTOR_UNAVAILABLE");
-                    }
+                    journalData = journalData with { Stage = "conflict" };
+                    WriteBrokerJournal(journal, journalData);
+                    preserveJournal = true;
+                    throw new IOException("Unexpected backup after creating a broker file.");
                 }
+
+                journalData = journalData with { Stage = "committed" };
+                WriteBrokerJournal(journal, journalData);
+                if (targetExists)
+                {
+                    DeleteOwnedFileByHandle(backup, before.Hash!, before.Identity!, originalSecurity!);
+                }
+                preserveJournal = false;
 
                 stage = "clean write journal";
                 File.Delete(journal);
-                Console.WriteLine(JsonSerializer.Serialize(new BrokerWriteResult(payload.Length, targetExists)));
+                Console.WriteLine(JsonSerializer.Serialize(new BrokerWriteResult(writtenBytes, targetExists)));
             }
             catch
             {
-                if (File.Exists(temporary)) File.Delete(temporary);
+                if (mutationAttempted) preserveJournal = true;
+                if (!preserveJournal && temporaryCreated)
+                {
+                    try
+                    {
+                        if (journalData.IntendedIdentity is null || journalData.ExpectedSecurity is null)
+                            preserveJournal = File.Exists(temporary) || Directory.Exists(temporary);
+                        else
+                            DeleteOwnedFileByHandle(temporary, intendedHash, journalData.IntendedIdentity,
+                                journalData.ExpectedSecurity);
+                    }
+                    catch { preserveJournal = true; }
+                }
                 if (File.Exists(backup)) preserveJournal = true;
                 if (!preserveJournal && File.Exists(journal)) File.Delete(journal);
                 throw;
@@ -252,6 +327,558 @@ internal static class Program
             throw new InvalidOperationException($"{stage}: {error.Message}", error);
         }
     }
+
+    private static void WriteInstructionFile(string recoveryDirectoryInput)
+    {
+        string stage = "validate instruction request";
+        bool mutationAttempted = false;
+        bool temporaryCreated = false;
+        bool preserveRecoveryArtifacts = false;
+        string? intendedHash = null;
+        string? stagedIdentity = null;
+        SecuritySnapshot? expectedCommitSecurity = null;
+        string? journalPath = null;
+        string? temporary = null;
+        try
+        {
+            if (string.IsNullOrWhiteSpace(recoveryDirectoryInput) || !Path.IsPathFullyQualified(recoveryDirectoryInput))
+                throw new InvalidDataException("Некорректная папка instruction runtime.");
+            InstructionWriteRequest request = JsonSerializer.Deserialize<InstructionWriteRequest>(
+                ReadBounded(Console.In, MaxRequestChars), JsonOptions)
+                ?? throw new InvalidDataException("Пустой запрос записи инструкции.");
+            if (request.ContentsBase64 is null || request.ContentsBase64.Length > checked(((MaxInstructionBytes + 2) / 3) * 4))
+                throw new InvalidDataException("Инструкция превышает лимит 64 КБ.");
+            byte[] payload = Convert.FromBase64String(request.ContentsBase64);
+            if (payload.Length > MaxInstructionBytes || Convert.ToBase64String(payload) != request.ContentsBase64)
+                throw new InvalidDataException("Инструкция превышает лимит 64 КБ.");
+            string text = new UTF8Encoding(false, true).GetString(payload);
+            if (text.Contains('\0')) throw new InvalidDataException("Инструкция содержит запрещённый символ.");
+            if (request.ExpectedHash is not null && !IsSha256(request.ExpectedHash))
+                throw new InvalidDataException("Некорректная версия инструкции.");
+
+            string recoveryDirectory = PrepareRecoveryDirectory(recoveryDirectoryInput);
+            using FileStream runtimeLock = AcquireRuntimeLock(recoveryDirectory, MaxRunLockWaitMs);
+            string[] conflicts = RecoverInstructionWrites(recoveryDirectory);
+
+            stage = "validate instruction target";
+            string root = ValidateDirectory(request.WorkingFolder, "Рабочая папка инструкции");
+            string[] parts = ValidateRelativeFilePath(request.RelativePath);
+            if (!IsAllowedInstructionTarget(parts)) throw new InvalidDataException("Цель не разрешена для инструкции приложения.");
+            bool appOwnedTarget = IsAppOwnedInstructionTarget(parts);
+            if (PathsIntersect(root, recoveryDirectory)
+                && (!appOwnedTarget || !IsSameOrWithin(recoveryDirectory, root)))
+                throw new InvalidDataException("Папка инструкции пересекается с ограниченным runtime.");
+            string target = Path.GetFullPath(Path.Combine(root, Path.Combine(parts)));
+            if (!IsSameOrWithin(target, root) || IsSameOrWithin(target, recoveryDirectory))
+                throw new InvalidDataException("Цель инструкции выходит за разрешённую границу.");
+            if (conflicts.Any(path => PathsMatch(path, target)))
+                throw new InvalidDataException("INSTRUCTION_RECOVERY_CONFLICT");
+
+            stage = "prepare instruction target directory";
+            if (appOwnedTarget)
+            {
+                string cursor = root;
+                foreach (string component in Path.GetDirectoryName(Path.Combine(parts))?.Split(
+                    [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries) ?? [])
+                {
+                    EnsureNoReparseComponents(cursor);
+                    cursor = Path.Combine(cursor, component);
+                    if (File.Exists(cursor)) throw new InvalidDataException("Компонент пути инструкции не является папкой.");
+                    Directory.CreateDirectory(cursor);
+                }
+            }
+            string parent = Path.GetDirectoryName(target) ?? throw new InvalidDataException("Некорректная папка инструкции.");
+            EnsureNoReparseComponents(root);
+            EnsureNoReparseComponents(parent);
+            EnsureNoReparseComponents(target);
+            if (Directory.Exists(target)) throw new InvalidDataException("Путь инструкции указывает на папку.");
+
+            stage = "pin instruction path";
+            using var directoryPins = new PinnedDirectories(PinDirectoryChain(parent));
+            using FileSnapshot before = ReadInstructionSnapshot(target);
+            if (!string.Equals(before.Hash, request.ExpectedHash, StringComparison.Ordinal))
+            {
+                Console.WriteLine(JsonSerializer.Serialize(new InstructionWriteResult("conflict-before", before.Text)));
+                return;
+            }
+            SecuritySnapshot? originalSecurity = before.Exists ? ReadSecuritySnapshot(target) : null;
+            intendedHash = HashBytes(payload);
+            string id = Guid.NewGuid().ToString("N");
+            string temporaryLeaf = $".gigachat-instruction-{id}.tmp";
+            string backupLeaf = $".gigachat-instruction-{id}.bak";
+            temporary = Path.Combine(parent, temporaryLeaf);
+            string backup = Path.Combine(parent, backupLeaf);
+            journalPath = Path.Combine(recoveryDirectory, $"instruction-write-{id}.json");
+            var journal = new InstructionWriteJournal(1, id, root, request.RelativePath, before.Exists,
+                before.Hash, before.Identity, intendedHash, null, originalSecurity, temporaryLeaf, backupLeaf, "prepared");
+            WriteInstructionJournal(journalPath, journal, createOnly: true);
+
+            stage = "write instruction temporary";
+            using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                4096, FileOptions.WriteThrough))
+            {
+                temporaryCreated = true;
+                stream.Write(payload, 0, payload.Length);
+                stream.Flush(true);
+            }
+            Array.Clear(payload);
+            using FileSnapshot staged = ReadInstructionSnapshot(temporary);
+            if (!staged.Exists || staged.Hash != intendedHash) throw new IOException("Временная инструкция изменилась.");
+            stagedIdentity = staged.Identity ?? throw new InvalidDataException("Identity временной инструкции недоступен.");
+            journal = journal with { IntendedIdentity = stagedIdentity };
+            SecuritySnapshot temporarySecurity = ReadSecuritySnapshot(temporary);
+            if (originalSecurity is not null) RequireSupportedSecurity(originalSecurity, temporarySecurity);
+            expectedCommitSecurity = originalSecurity ?? temporarySecurity;
+            if (JsonSerializer.SerializeToUtf8Bytes(expectedCommitSecurity).Length > MaxInstructionJournalBytes / 2)
+                throw new InvalidDataException("Дескриптор безопасности инструкции превышает лимит журнала.");
+            journal = journal with { ExpectedSecurity = expectedCommitSecurity };
+            WriteInstructionJournal(journalPath, journal);
+
+            stage = "revalidate instruction target";
+            EnsureNoReparseComponents(root);
+            EnsureNoReparseComponents(parent);
+            EnsureNoReparseComponents(target);
+            using FileSnapshot latest = ReadInstructionSnapshot(target);
+            if (!string.Equals(latest.Hash, request.ExpectedHash, StringComparison.Ordinal))
+            {
+                DeleteOwnedFileByHandle(temporary, intendedHash, stagedIdentity, expectedCommitSecurity,
+                    MaxInstructionBytes);
+                File.Delete(journalPath);
+                Console.WriteLine(JsonSerializer.Serialize(new InstructionWriteResult("conflict-before", latest.Text)));
+                return;
+            }
+            if (before.Exists && latest.Identity != before.Identity)
+            {
+                DeleteOwnedFileByHandle(temporary, intendedHash, stagedIdentity, expectedCommitSecurity,
+                    MaxInstructionBytes);
+                File.Delete(journalPath);
+                Console.WriteLine(JsonSerializer.Serialize(new InstructionWriteResult("conflict-before", latest.Text)));
+                return;
+            }
+
+            stage = "replace instruction target";
+            mutationAttempted = true;
+            staged.Dispose();
+            if (before.Exists) File.Replace(temporary, target, backup);
+            else File.Move(temporary, target);
+            journal = journal with { Stage = "displaced" };
+            WriteInstructionJournal(journalPath, journal);
+
+            stage = "verify committed instruction";
+            using FileSnapshot committed = ReadInstructionSnapshot(target);
+            SecuritySnapshot committedSecurity = ReadSecuritySnapshot(target);
+            if (!committed.Exists || committed.Hash != intendedHash || committed.Identity != stagedIdentity
+                || !SecurityEquals(expectedCommitSecurity!, committedSecurity))
+            {
+                journal = journal with { Stage = "conflict" };
+                WriteInstructionJournal(journalPath, journal);
+                throw new IOException("INSTRUCTION_TARGET_CHANGED_AFTER_COMMIT");
+            }
+
+            if (before.Exists)
+            {
+                stage = "verify displaced instruction";
+                FileSnapshot displaced;
+                try { displaced = ReadInstructionSnapshot(backup); }
+                catch (Exception error) when (error is IOException or Win32Exception)
+                {
+                    journal = journal with { Stage = "conflict" };
+                    WriteInstructionJournal(journalPath, journal);
+                    Console.WriteLine(JsonSerializer.Serialize(new InstructionWriteResult(
+                        "conflict-after", committed.Text, backup, null)));
+                    return;
+                }
+                using (displaced)
+                {
+                    SecuritySnapshot displacedSecurity;
+                    try { displacedSecurity = ReadSecuritySnapshot(backup); }
+                    catch (Exception error) when (error is IOException or Win32Exception or UnauthorizedAccessException)
+                    {
+                        journal = journal with { Stage = "conflict" };
+                        WriteInstructionJournal(journalPath, journal);
+                        Console.WriteLine(JsonSerializer.Serialize(new InstructionWriteResult(
+                            "conflict-after", committed.Text, backup, null)));
+                        return;
+                    }
+                    if (!displaced.Exists || displaced.Hash != request.ExpectedHash || displaced.Identity != before.Identity
+                        || !SecurityEquals(expectedCommitSecurity, displacedSecurity))
+                    {
+                        journal = journal with { Stage = "conflict" };
+                        WriteInstructionJournal(journalPath, journal);
+                        Console.WriteLine(JsonSerializer.Serialize(new InstructionWriteResult(
+                            "conflict-after", committed.Text, backup, displaced.Text)));
+                        return;
+                    }
+                    journal = journal with { Stage = "committed" };
+                    WriteInstructionJournal(journalPath, journal);
+                    stage = "finish instruction commit";
+                    try
+                    {
+                        DeleteOwnedFileByHandle(backup, request.ExpectedHash!, before.Identity!,
+                            expectedCommitSecurity, MaxInstructionBytes);
+                    }
+                    catch (Exception error) when (IsUnavailableInstructionTarget(error))
+                    {
+                        journal = journal with { Stage = "conflict" };
+                        WriteInstructionJournal(journalPath, journal);
+                        preserveRecoveryArtifacts = true;
+                        Console.WriteLine(JsonSerializer.Serialize(new InstructionWriteResult(
+                            "conflict-after", committed.Text, backup, displaced.Text)));
+                        return;
+                    }
+                }
+            }
+            else
+            {
+                journal = journal with { Stage = "committed" };
+                WriteInstructionJournal(journalPath, journal);
+            }
+            File.Delete(journalPath);
+            Console.WriteLine(JsonSerializer.Serialize(new InstructionWriteResult("saved")));
+        }
+        catch (Exception error)
+        {
+            if (!mutationAttempted && !preserveRecoveryArtifacts)
+            {
+                if (temporaryCreated && temporary is not null)
+                {
+                    if (intendedHash is null || stagedIdentity is null || expectedCommitSecurity is null)
+                        preserveRecoveryArtifacts = File.Exists(temporary) || Directory.Exists(temporary);
+                    else
+                    {
+                        try { DeleteOwnedFileByHandle(temporary, intendedHash, stagedIdentity,
+                            expectedCommitSecurity, MaxInstructionBytes); }
+                        catch { preserveRecoveryArtifacts = true; }
+                    }
+                }
+                else if (temporary is not null && (File.Exists(temporary) || Directory.Exists(temporary)))
+                {
+                    preserveRecoveryArtifacts = true;
+                }
+                if (preserveRecoveryArtifacts) throw new InvalidOperationException($"{stage}: {error.Message}", error);
+                if (journalPath is not null && File.Exists(journalPath)) File.Delete(journalPath);
+            }
+            throw new InvalidOperationException($"{stage}: {error.Message}", error);
+        }
+    }
+
+    private static string[] RecoverInstructionWrites(string recoveryDirectory)
+    {
+        EnsureNoReparseComponents(recoveryDirectory);
+        var conflicts = new List<string>();
+        foreach (string path in Directory.EnumerateFiles(recoveryDirectory, "instruction-write-*.json"))
+        {
+            string? conflict = RecoverInstructionWriteJournal(path, recoveryDirectory);
+            if (conflict is not null) conflicts.Add(conflict);
+        }
+        return conflicts.ToArray();
+    }
+
+    private static string? RecoverInstructionWriteJournal(string path, string recoveryDirectory)
+    {
+        EnsureNoReparseComponents(path);
+        var info = new FileInfo(path);
+        if (info.Length > MaxInstructionJournalBytes) throw new InvalidDataException("Журнал инструкции превышает лимит.");
+        InstructionWriteJournal journal = JsonSerializer.Deserialize<InstructionWriteJournal>(File.ReadAllText(path), JsonOptions)
+            ?? throw new InvalidDataException("Повреждён журнал инструкции.");
+        string fileId = Path.GetFileNameWithoutExtension(path)["instruction-write-".Length..];
+        if (journal.Version != 1 || !Guid.TryParseExact(fileId, "N", out _) || journal.Id != fileId
+            || string.IsNullOrWhiteSpace(journal.WorkingFolder) || string.IsNullOrWhiteSpace(journal.RelativePath)
+            || string.IsNullOrWhiteSpace(journal.IntendedHash)
+            || journal.TemporaryLeaf != $".gigachat-instruction-{fileId}.tmp"
+            || journal.BackupLeaf != $".gigachat-instruction-{fileId}.bak"
+            || (journal.ExpectedHash is not null && !IsSha256(journal.ExpectedHash))
+            || !IsSha256(journal.IntendedHash)
+            || journal.TargetExisted != (journal.ExpectedHash is not null)
+            || journal.TargetExisted != (journal.TargetIdentity is not null)
+            || (journal.TargetIdentity is not null && !IsFileIdentity(journal.TargetIdentity))
+            || (journal.ExpectedSecurity is not null && JsonSerializer.SerializeToUtf8Bytes(journal.ExpectedSecurity).Length > MaxInstructionJournalBytes / 2)
+            || journal.Stage is not ("prepared" or "displaced" or "conflict" or "committed")
+            || (journal.IntendedIdentity is not null && !IsFileIdentity(journal.IntendedIdentity)))
+            throw new InvalidDataException("Журнал инструкции не прошёл проверку.");
+        string root = NormalizeInstructionJournalRoot(journal.WorkingFolder);
+        string[] parts = ValidateRelativeFilePath(journal.RelativePath);
+        if (!IsAllowedInstructionTarget(parts)) throw new InvalidDataException("Цель журнала инструкции не разрешена.");
+        bool appOwnedTarget = IsAppOwnedInstructionTarget(parts);
+        if (PathsIntersect(root, recoveryDirectory)
+            && (!appOwnedTarget || !IsSameOrWithin(recoveryDirectory, root)))
+            throw new InvalidDataException("Папка журнала инструкции пересекается с runtime.");
+        string target = Path.GetFullPath(Path.Combine(root, Path.Combine(parts)));
+        if (!IsSameOrWithin(target, root) || IsSameOrWithin(target, recoveryDirectory))
+            throw new InvalidDataException("Цель журнала инструкции выходит за границу.");
+        string parent = Path.GetDirectoryName(target) ?? throw new InvalidDataException("Папка журнала инструкции некорректна.");
+        string temporary = Path.Combine(parent, journal.TemporaryLeaf);
+        string backup = Path.Combine(parent, journal.BackupLeaf);
+        try
+        {
+            root = ValidateDirectory(root, "Рабочая папка журнала инструкции");
+            EnsureNoReparseComponents(parent);
+            EnsureNoReparseComponents(target);
+            EnsureNoReparseComponents(temporary);
+            EnsureNoReparseComponents(backup);
+            using var directoryPins = new PinnedDirectories(PinDirectoryChain(parent));
+            using FileSnapshot current = ReadInstructionSnapshot(target);
+            using FileSnapshot staged = ReadInstructionSnapshot(temporary);
+            using FileSnapshot displaced = ReadInstructionSnapshot(backup);
+
+            bool originalStillThere = journal.TargetExisted
+                ? current.Exists && current.Hash == journal.ExpectedHash && current.Identity == journal.TargetIdentity
+                : !current.Exists;
+            bool stagedMatchesJournal = !staged.Exists
+                || (staged.Hash == journal.IntendedHash
+                    && journal.IntendedIdentity is not null && staged.Identity == journal.IntendedIdentity
+                    && journal.ExpectedSecurity is not null
+                    && SecurityEquals(journal.ExpectedSecurity, ReadSecuritySnapshot(temporary)));
+            if (journal.Stage == "prepared" && originalStillThere && !displaced.Exists
+                && stagedMatchesJournal)
+            {
+                if (staged.Exists)
+                    DeleteOwnedFileByHandle(temporary, journal.IntendedHash, journal.IntendedIdentity!,
+                        journal.ExpectedSecurity!, MaxInstructionBytes);
+                File.Delete(path);
+                return null;
+            }
+
+            if (staged.Exists) return target;
+            bool intendedIsCurrent = current.Exists && current.Hash == journal.IntendedHash
+                && journal.IntendedIdentity is not null && current.Identity == journal.IntendedIdentity;
+            if (intendedIsCurrent && journal.Stage != "conflict")
+            {
+                if (journal.ExpectedSecurity is null || !SecurityEquals(journal.ExpectedSecurity, ReadSecuritySnapshot(target)))
+                    return target;
+                if (journal.TargetExisted)
+                {
+                    if (!displaced.Exists)
+                    {
+                        if (journal.Stage != "committed") return target;
+                    }
+                    else
+                    {
+                        if (displaced.Hash != journal.ExpectedHash || displaced.Identity != journal.TargetIdentity
+                            || !SecurityEquals(journal.ExpectedSecurity, ReadSecuritySnapshot(backup)))
+                            return target;
+                        DeleteOwnedFileByHandle(backup, journal.ExpectedHash!, journal.TargetIdentity!,
+                            journal.ExpectedSecurity!, MaxInstructionBytes);
+                    }
+                }
+                else if (displaced.Exists)
+                {
+                    return target;
+                }
+                File.Delete(path);
+                return null;
+            }
+            return target;
+        }
+        catch (Exception error) when (IsUnavailableInstructionTarget(error))
+        {
+            return target;
+        }
+    }
+
+    private static string NormalizeInstructionJournalRoot(string input)
+    {
+        if (input.Length > 32_767 || input.Contains('\0') || !Path.IsPathFullyQualified(input))
+            throw new InvalidDataException("Рабочая папка журнала инструкции некорректна.");
+        string full = Path.GetFullPath(input);
+        string driveRoot = Path.GetPathRoot(full) ?? string.Empty;
+        if (driveRoot.Length != 3 || string.Equals(full, driveRoot, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("Журнал инструкции должен указывать на локальную рабочую папку.");
+        string supplied = input.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+        if (!string.Equals(Path.TrimEndingDirectorySeparator(supplied),
+                Path.TrimEndingDirectorySeparator(full), StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("Путь журнала инструкции должен быть нормализован.");
+        return full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+    }
+
+    private static bool IsUnavailableInstructionTarget(Exception error) =>
+        error is IOException or Win32Exception or UnauthorizedAccessException or InvalidDataException
+            or NotSupportedException or System.Security.SecurityException;
+
+    private static FileSnapshot ReadInstructionSnapshot(string path) =>
+        ReadFileSnapshot(path, MaxInstructionBytes, readText: true);
+
+    private static FileSnapshot ReadBrokerSnapshot(string path) =>
+        ReadFileSnapshot(path, null, readText: false);
+
+    private static FileSnapshot ReadFileSnapshot(string path, long? maxBytes, bool readText)
+    {
+        SafeFileHandle handle = Native.CreateFileW(path, GenericRead, FileShareRead | FileShareDelete,
+            IntPtr.Zero, OpenExisting, FileFlagOpenReparsePoint, IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            int error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            if (error is 2 or 3) return FileSnapshot.Missing;
+            throw new Win32Exception(error, "Не удалось безопасно прочитать версию инструкции.");
+        }
+        var stream = new FileStream(handle, FileAccess.Read);
+        try
+        {
+            if (!Native.GetFileInformationByHandle(stream.SafeFileHandle, out ByHandleFileInformation fileInfo))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "GetFileInformationByHandle");
+            if ((fileInfo.FileAttributes & (FileAttributeDirectory | FileAttributeReparsePoint)) != 0)
+                throw new InvalidDataException("Цель записи должна быть обычным файлом, а не ссылкой или папкой.");
+            if (fileInfo.NumberOfLinks != 1) throw new InvalidDataException("Файл с несколькими жёсткими ссылками нельзя изменять.");
+            long length = stream.Length;
+            if (maxBytes.HasValue && length > maxBytes.Value)
+                throw new InvalidDataException("Инструкция превышает допустимый размер.");
+            string? text = null;
+            string hash;
+            if (readText)
+            {
+                byte[] bytes = new byte[checked((int)length)];
+                stream.ReadExactly(bytes);
+                if (stream.ReadByte() != -1 || stream.Length != bytes.Length)
+                    throw new IOException("Файл инструкции изменился во время чтения.");
+                text = new UTF8Encoding(false, true).GetString(bytes);
+                if (text.Contains('\0')) throw new InvalidDataException("Инструкция содержит запрещённый символ.");
+                hash = HashBytes(bytes);
+            }
+            else
+            {
+                hash = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+                if (stream.Position != length || stream.Length != length)
+                    throw new IOException("Файл изменился во время чтения.");
+            }
+            string identity = FileIdentity(fileInfo);
+            return new FileSnapshot(true, text, hash, identity, stream);
+        }
+        catch
+        {
+            stream.Dispose();
+            throw;
+        }
+    }
+
+    private static void ValidateWorkingTreeBeforeGrant(string workingFolder)
+    {
+        var pendingDirectories = new Stack<string>();
+        pendingDirectories.Push(Path.GetFullPath(workingFolder));
+        while (pendingDirectories.TryPop(out string? directory))
+        {
+            using SafeFileHandle directoryHandle = Native.CreateFileW(directory, FileReadAttributes,
+                FileShareRead | FileShareWrite, IntPtr.Zero, OpenExisting,
+                FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero);
+            if (directoryHandle.IsInvalid)
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Не удалось проверить рабочую папку перед выдачей доступа.");
+            if (!Native.GetFileInformationByHandle(directoryHandle, out ByHandleFileInformation directoryInfo)
+                || (directoryInfo.FileAttributes & FileAttributeDirectory) == 0
+                || (directoryInfo.FileAttributes & FileAttributeReparsePoint) != 0)
+                throw new InvalidDataException("Рабочая папка содержит ссылку или недопустимую папку.");
+
+            foreach (string entry in Directory.EnumerateFileSystemEntries(directory))
+            {
+                using SafeFileHandle entryHandle = Native.CreateFileW(entry, FileReadAttributes,
+                    FileShareRead | FileShareWrite, IntPtr.Zero, OpenExisting,
+                    FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero);
+                if (entryHandle.IsInvalid)
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Не удалось проверить элемент рабочей папки перед выдачей доступа.");
+                if (!Native.GetFileInformationByHandle(entryHandle, out ByHandleFileInformation entryInfo))
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Не удалось прочитать идентификатор элемента рабочей папки.");
+                if ((entryInfo.FileAttributes & FileAttributeReparsePoint) != 0)
+                    throw new InvalidDataException("Рабочая папка содержит reparse point.");
+                if ((entryInfo.FileAttributes & FileAttributeDirectory) != 0)
+                    pendingDirectories.Push(entry);
+                else if (entryInfo.NumberOfLinks != 1)
+                    throw new InvalidDataException("Рабочая папка содержит файл с несколькими жёсткими ссылками.");
+            }
+        }
+    }
+
+    private static List<SafeFileHandle> PinDirectoryChain(string directory)
+    {
+        string full = Path.GetFullPath(directory);
+        string root = Path.GetPathRoot(full) ?? throw new InvalidDataException("Некорректный путь папки.");
+        var handles = new List<SafeFileHandle>();
+        try
+        {
+            string current = root;
+            handles.Add(OpenPinnedDirectory(current));
+            foreach (string component in Path.GetRelativePath(root, full).Split(
+                [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries))
+            {
+                current = Path.Combine(current, component);
+                handles.Add(OpenPinnedDirectory(current));
+            }
+            return handles;
+        }
+        catch
+        {
+            foreach (SafeFileHandle handle in handles) handle.Dispose();
+            throw;
+        }
+    }
+
+    private static SafeFileHandle OpenPinnedDirectory(string path)
+    {
+        SafeFileHandle handle = Native.CreateFileW(path, FileReadAttributes, FileShareRead | FileShareWrite,
+            IntPtr.Zero, OpenExisting, FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            int error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(error, "Не удалось закрепить родительскую папку инструкции.");
+        }
+        if (!Native.GetFileInformationByHandle(handle, out ByHandleFileInformation info)
+            || (info.FileAttributes & FileAttributeDirectory) == 0
+            || (info.FileAttributes & FileAttributeReparsePoint) != 0)
+        {
+            handle.Dispose();
+            throw new InvalidDataException("Путь инструкции содержит ссылку или недопустимую папку.");
+        }
+        return handle;
+    }
+
+    private static void WriteInstructionJournal(string path, InstructionWriteJournal journal, bool createOnly = false)
+    {
+        EnsureNoReparseComponents(path);
+        string temporary = path + ".next";
+        using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+            4096, FileOptions.WriteThrough))
+        {
+            byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(journal);
+            if (bytes.Length > MaxInstructionJournalBytes) throw new InvalidDataException("Журнал инструкции превышает лимит.");
+            stream.Write(bytes, 0, bytes.Length);
+            stream.Flush(true);
+        }
+        if (createOnly) File.Move(temporary, path);
+        else if (File.Exists(path)) File.Replace(temporary, path, null);
+        else File.Move(temporary, path);
+    }
+
+    private static bool IsAllowedInstructionTarget(string[] parts)
+    {
+        if (parts.Length == 1 && string.Equals(parts[0], "GIGACHAT.md", StringComparison.OrdinalIgnoreCase)) return true;
+        if (parts.Length == 1 && string.Equals(parts[0], "AGENTS.md", StringComparison.OrdinalIgnoreCase)) return true;
+        if (parts.Length == 3 && string.Equals(parts[0], "project-instructions", StringComparison.OrdinalIgnoreCase)
+            && IsSafePathToken(parts[1]) && string.Equals(parts[2], "AGENTS.md", StringComparison.OrdinalIgnoreCase)) return true;
+        return parts.Length == 3 && string.Equals(parts[0], "instruction-conflicts", StringComparison.OrdinalIgnoreCase)
+            && IsSafePathToken(parts[1]) && parts[2].EndsWith(".md", StringComparison.OrdinalIgnoreCase)
+            && Guid.TryParseExact(parts[2][..^3], "D", out _);
+    }
+
+    private static bool IsAppOwnedInstructionTarget(string[] parts) =>
+        parts.Length == 1 && string.Equals(parts[0], "GIGACHAT.md", StringComparison.OrdinalIgnoreCase)
+        || parts.Length == 3 && (string.Equals(parts[0], "project-instructions", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(parts[0], "instruction-conflicts", StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsSafePathToken(string value) => value.Length is > 0 and <= 128
+        && value.All(character => char.IsAsciiLetterOrDigit(character) || character is '_' or '-');
+
+    private static bool PathsIntersect(string left, string right) => IsSameOrWithin(left, right) || IsSameOrWithin(right, left);
+
+    private static bool IsSha256(string value) => value.Length == 64 && value.All(character => char.IsAsciiHexDigit(character));
+
+    private static bool IsFileIdentity(string value) => value.Length == 24 && value.All(character => char.IsAsciiHexDigit(character));
+
+    private static string HashBytes(byte[] bytes) => Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+
+    private static string FileIdentity(ByHandleFileInformation info) =>
+        $"{info.VolumeSerialNumber:x8}{info.FileIndexHigh:x8}{info.FileIndexLow:x8}";
+
+    private static string InstructionJournalTargetPath(InstructionWriteJournal journal, string root) =>
+        Path.GetFullPath(Path.Combine(root, Path.Combine(ValidateRelativeFilePath(journal.RelativePath))));
 
     private static int DeleteAppDataAfterParentExit(uint parentProcessId)
     {
@@ -540,13 +1167,66 @@ internal static class Program
         if (result != 0) throw new Win32Exception(unchecked((int)result), "GetNamedSecurityInfoW");
         try
         {
-            return new SecuritySnapshot(
-                ConvertSecurityPart(descriptor, SecurityInfoOwner),
-                ConvertSecurityPart(descriptor, SecurityInfoGroup),
-                ConvertSecurityPart(descriptor, SecurityInfoDacl),
-                ConvertSecurityPart(descriptor, SecurityInfoLabel));
+            return SecuritySnapshotFromDescriptor(descriptor);
         }
         finally { if (descriptor != IntPtr.Zero) Native.LocalFree(descriptor); }
+    }
+
+    private static SecuritySnapshot ReadSecuritySnapshot(SafeFileHandle handle)
+    {
+        uint result = Native.GetSecurityInfo(handle, 1, SecurityInfoOwner | SecurityInfoGroup
+            | SecurityInfoDacl | SecurityInfoLabel, out _, out _, out _, out _, out IntPtr descriptor);
+        if (result != 0) throw new Win32Exception(unchecked((int)result), "GetSecurityInfo");
+        try { return SecuritySnapshotFromDescriptor(descriptor); }
+        finally { if (descriptor != IntPtr.Zero) Native.LocalFree(descriptor); }
+    }
+
+    private static SecuritySnapshot SecuritySnapshotFromDescriptor(IntPtr descriptor) => new(
+        ConvertSecurityPart(descriptor, SecurityInfoOwner),
+        ConvertSecurityPart(descriptor, SecurityInfoGroup),
+        ConvertSecurityPart(descriptor, SecurityInfoDacl),
+        ConvertSecurityPart(descriptor, SecurityInfoLabel));
+
+    private static void DeleteOwnedFileByHandle(string path, string expectedHash, string expectedIdentity,
+        SecuritySnapshot expectedSecurity, long? maxBytes = null)
+    {
+        SafeFileHandle handle = Native.CreateFileW(path, GenericRead | DeleteAccess, FileShareRead,
+            IntPtr.Zero, OpenExisting, FileFlagOpenReparsePoint, IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            int error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(error, "Не удалось закрепить файл перед безопасным удалением.");
+        }
+
+        using var stream = new FileStream(handle, FileAccess.Read);
+        if (!Native.GetFileInformationByHandle(stream.SafeFileHandle, out ByHandleFileInformation before))
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Не удалось прочитать identity файла перед удалением.");
+        EnsureDeletableOwnedFile(before, expectedIdentity, "Файл изменился перед безопасным удалением.");
+        long length = stream.Length;
+        if (maxBytes.HasValue && length > maxBytes.Value)
+            throw new InvalidDataException("Файл превышает допустимый размер для безопасного удаления.");
+        string hash = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+        if (stream.Position != length || stream.Length != length || hash != expectedHash)
+            throw new InvalidDataException("Содержимое файла изменилось перед безопасным удалением.");
+        if (!SecurityEquals(expectedSecurity, ReadSecuritySnapshot(stream.SafeFileHandle)))
+            throw new InvalidDataException("Дескриптор файла изменился перед безопасным удалением.");
+        if (!Native.GetFileInformationByHandle(stream.SafeFileHandle, out ByHandleFileInformation after))
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Не удалось подтвердить identity файла перед удалением.");
+        EnsureDeletableOwnedFile(after, expectedIdentity, "Identity файла изменился перед безопасным удалением.");
+
+        var disposition = new FileDispositionInfo { DeleteFile = 1 };
+        if (!Native.SetFileInformationByHandle(stream.SafeFileHandle, FileDispositionInfoClass,
+                ref disposition, (uint)Marshal.SizeOf<FileDispositionInfo>()))
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Не удалось удалить проверенный файл по handle.");
+    }
+
+    private static void EnsureDeletableOwnedFile(ByHandleFileInformation information, string expectedIdentity,
+        string message)
+    {
+        if ((information.FileAttributes & (FileAttributeDirectory | FileAttributeReparsePoint)) != 0
+            || information.NumberOfLinks != 1 || FileIdentity(information) != expectedIdentity)
+            throw new InvalidDataException(message);
     }
 
     private static string? ConvertSecurityPart(IntPtr descriptor, uint information)
@@ -558,18 +1238,25 @@ internal static class Program
         finally { if (text != IntPtr.Zero) Native.LocalFree(text); }
     }
 
-    private static void WriteBrokerJournal(string path, BrokerWriteJournal journal)
+    private static void WriteBrokerJournal(string path, BrokerWriteJournal journal, bool createOnly = false)
     {
         EnsureNoReparseComponents(path);
         string temporary = path + ".tmp";
+        EnsureNoReparseComponents(temporary);
+        byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(journal);
+        if (bytes.Length > MaxBrokerJournalBytes
+            || (journal.ExpectedSecurity is not null
+                && JsonSerializer.SerializeToUtf8Bytes(journal.ExpectedSecurity).Length > MaxBrokerJournalBytes / 2))
+            throw new InvalidDataException("Журнал записи превышает допустимый размер.");
         using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
             4096, FileOptions.WriteThrough))
         {
-            byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(journal);
             stream.Write(bytes, 0, bytes.Length);
             stream.Flush(true);
         }
-        File.Move(temporary, path);
+        if (createOnly) File.Move(temporary, path);
+        else if (File.Exists(path)) File.Replace(temporary, path, null);
+        else File.Move(temporary, path);
     }
 
     private static void RecoverBrokerWriteJournal(string path, string recoveryDirectory)
@@ -577,13 +1264,50 @@ internal static class Program
         EnsureNoReparseComponents(path);
         var info = new FileInfo(path);
         if (info.Length > MaxBrokerJournalBytes) throw new InvalidDataException("Журнал записи превышает лимит.");
-        BrokerWriteJournal journal = JsonSerializer.Deserialize<BrokerWriteJournal>(File.ReadAllText(path), JsonOptions)
-            ?? throw new InvalidDataException("Повреждён журнал записи.");
+        using JsonDocument document = JsonDocument.Parse(File.ReadAllBytes(path));
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+            throw new InvalidDataException("Журнал записи повреждён.");
         string fileId = Path.GetFileNameWithoutExtension(path)[6..];
-        if (!Guid.TryParseExact(fileId, "N", out _) || journal.Id != fileId
+        if (!Guid.TryParseExact(fileId, "N", out _))
+            throw new InvalidDataException("Идентификатор журнала записи не прошёл проверку.");
+
+        if (!document.RootElement.TryGetProperty("Version", out JsonElement versionElement))
+        {
+            LegacyBrokerWriteJournal legacy = JsonSerializer.Deserialize<LegacyBrokerWriteJournal>(
+                document.RootElement.GetRawText(), JsonOptions)
+                ?? throw new InvalidDataException("Повреждён legacy журнал записи.");
+            if (legacy.Id != fileId || string.IsNullOrWhiteSpace(legacy.WorkingFolder)
+                || string.IsNullOrWhiteSpace(legacy.RelativePath)
+                || legacy.TemporaryLeaf != $".gigachat-write-{fileId}.tmp"
+                || legacy.BackupLeaf != $".gigachat-write-{fileId}.bak")
+                throw new InvalidDataException("Legacy журнал записи не прошёл проверку.");
+            _ = ValidateRelativeFilePath(legacy.RelativePath);
+            throw new InvalidDataException("Legacy журнал записи сохранён: состояние файла нельзя доказуемо восстановить.");
+        }
+        if (versionElement.ValueKind != JsonValueKind.Number || !versionElement.TryGetInt32(out int version) || version != 1)
+            throw new InvalidDataException("Версия журнала записи не поддерживается.");
+
+        BrokerWriteJournal journal = JsonSerializer.Deserialize<BrokerWriteJournal>(
+            document.RootElement.GetRawText(), JsonOptions)
+            ?? throw new InvalidDataException("Повреждён журнал записи.");
+        if (journal.Version != 1 || journal.Id != fileId || string.IsNullOrWhiteSpace(journal.WorkingFolder)
+            || string.IsNullOrWhiteSpace(journal.RelativePath)
             || journal.TemporaryLeaf != $".gigachat-write-{fileId}.tmp"
-            || journal.BackupLeaf != $".gigachat-write-{fileId}.bak")
+            || journal.BackupLeaf != $".gigachat-write-{fileId}.bak"
+            || journal.TargetExisted != (journal.ExpectedHash is not null)
+            || journal.TargetExisted != (journal.TargetIdentity is not null)
+            || (journal.ExpectedHash is not null && !IsSha256(journal.ExpectedHash))
+            || (journal.TargetIdentity is not null && !IsFileIdentity(journal.TargetIdentity))
+            || !IsSha256(journal.IntendedHash)
+            || (journal.IntendedIdentity is not null && !IsFileIdentity(journal.IntendedIdentity))
+            || (journal.ExpectedSecurity is not null
+                && JsonSerializer.SerializeToUtf8Bytes(journal.ExpectedSecurity).Length > MaxBrokerJournalBytes / 2)
+            || journal.Stage is not ("prepared" or "displaced" or "committed" or "conflict")
+            || (journal.TargetExisted && journal.ExpectedSecurity is null))
             throw new InvalidDataException("Журнал записи не прошёл проверку.");
+        if (journal.Stage == "conflict")
+            throw new InvalidDataException("Журнал записи сохранён в состоянии конфликта.");
+
         string root = ValidateDirectory(journal.WorkingFolder, "Рабочая папка");
         if (root.Equals(recoveryDirectory, StringComparison.OrdinalIgnoreCase)
             || IsWithin(root, recoveryDirectory) || IsWithin(recoveryDirectory, root))
@@ -599,13 +1323,63 @@ internal static class Program
         EnsureNoReparseComponents(target);
         EnsureNoReparseComponents(temporary);
         EnsureNoReparseComponents(backup);
-        if (File.Exists(backup))
+        using var directoryPins = new PinnedDirectories(PinDirectoryChain(parent));
+        using FileSnapshot current = ReadBrokerSnapshot(target);
+        using FileSnapshot staged = ReadBrokerSnapshot(temporary);
+        using FileSnapshot displaced = ReadBrokerSnapshot(backup);
+
+        bool originalStillThere = journal.TargetExisted
+            ? current.Exists && current.Hash == journal.ExpectedHash && current.Identity == journal.TargetIdentity
+                && journal.ExpectedSecurity is not null
+                && SecurityEquals(journal.ExpectedSecurity, ReadSecuritySnapshot(target))
+            : !current.Exists;
+        bool stagedMatchesJournal = !staged.Exists
+            || (staged.Hash == journal.IntendedHash
+                && journal.IntendedIdentity is not null && staged.Identity == journal.IntendedIdentity
+                && journal.ExpectedSecurity is not null
+                && SecurityEquals(journal.ExpectedSecurity, ReadSecuritySnapshot(temporary)));
+        if (journal.Stage == "prepared" && originalStillThere && !displaced.Exists && stagedMatchesJournal)
         {
-            if (!journal.TargetExisted || Directory.Exists(target))
-                throw new InvalidDataException("Журнал записи содержит неожиданный backup.");
-            File.Move(backup, target, overwrite: true);
+            if (staged.Exists)
+                DeleteOwnedFileByHandle(temporary, journal.IntendedHash, journal.IntendedIdentity!,
+                    journal.ExpectedSecurity!);
+            File.Delete(path);
+            return;
         }
-        if (File.Exists(temporary)) File.Delete(temporary);
+
+        if (staged.Exists) throw new InvalidDataException("Журнал записи сохранён: обнаружена неожиданная временная версия.");
+        bool intendedIsCurrent = current.Exists && current.Hash == journal.IntendedHash
+            && journal.IntendedIdentity is not null && current.Identity == journal.IntendedIdentity
+            && journal.ExpectedSecurity is not null
+            && SecurityEquals(journal.ExpectedSecurity, ReadSecuritySnapshot(target));
+        if (!intendedIsCurrent)
+            throw new InvalidDataException("Журнал записи сохранён: целевой файл изменился после подготовки.");
+
+        if (journal.TargetExisted)
+        {
+            if (!displaced.Exists)
+            {
+                if (journal.Stage != "committed")
+                    throw new InvalidDataException("Журнал записи сохранён: исходная версия отсутствует.");
+            }
+            else if (displaced.Hash != journal.ExpectedHash || displaced.Identity != journal.TargetIdentity
+                || journal.ExpectedSecurity is null
+                || !SecurityEquals(journal.ExpectedSecurity, ReadSecuritySnapshot(backup)))
+                throw new InvalidDataException("Журнал записи сохранён: резервная версия изменилась после замены.");
+        }
+        else if (displaced.Exists)
+        {
+            throw new InvalidDataException("Журнал записи сохранён: для новой цели обнаружена неожиданная резервная версия.");
+        }
+
+        if (journal.Stage != "committed")
+        {
+            journal = journal with { Stage = "committed" };
+            WriteBrokerJournal(path, journal);
+        }
+        if (displaced.Exists)
+            DeleteOwnedFileByHandle(backup, journal.ExpectedHash!, journal.TargetIdentity!,
+                journal.ExpectedSecurity!);
         File.Delete(path);
     }
 
@@ -653,6 +1427,8 @@ internal static class Program
         using FileStream runtimeLock = AcquireRuntimeLock(recoveryDirectory, MaxRunLockWaitMs);
         workingFolder = ValidateDirectory(request.WorkingFolder, "Рабочая папка");
         Recover(recoveryDirectory);
+        using var workingDirectoryPins = new PinnedDirectories(PinDirectoryChain(workingFolder));
+        ValidateWorkingTreeBeforeGrant(workingFolder);
         string runId = Guid.NewGuid().ToString("N");
         string profileName = ProfilePrefix + runId;
         string sessionDirectory = Path.Combine(recoveryDirectory, "run-" + runId);
@@ -1217,13 +1993,53 @@ internal static class Program
     private static void WriteError(string message, int code, string? stage = null) =>
         Console.WriteLine(JsonSerializer.Serialize(new ErrorResult(message, code, stage)));
 
+    private sealed record InstructionWriteRequest(string WorkingFolder, string RelativePath, string ContentsBase64, string? ExpectedHash);
+    private sealed record InstructionWriteResult(string Kind, string? CurrentText = null,
+        string? PreservedPath = null, string? PreservedText = null);
+    private sealed record InstructionRecoveryResult(bool Recovered, string[] Conflicts);
+    private sealed record InstructionWriteJournal(int Version, string Id, string WorkingFolder, string RelativePath,
+        bool TargetExisted, string? ExpectedHash, string? TargetIdentity, string IntendedHash, string? IntendedIdentity,
+        SecuritySnapshot? ExpectedSecurity, string TemporaryLeaf, string BackupLeaf, string Stage);
+    private sealed class FileSnapshot : IDisposable
+    {
+        public static FileSnapshot Missing => new(false, null, null, null, null);
+        public bool Exists { get; }
+        public string? Text { get; }
+        public string? Hash { get; }
+        public string? Identity { get; }
+        private FileStream? Stream { get; }
+
+        public FileSnapshot(bool exists, string? text, string? hash, string? identity, FileStream? stream)
+        {
+            Exists = exists;
+            Text = text;
+            Hash = hash;
+            Identity = identity;
+            Stream = stream;
+        }
+
+        public void Dispose() => Stream?.Dispose();
+    }
+    private sealed class PinnedDirectories : IDisposable
+    {
+        private readonly List<SafeFileHandle> handles;
+        public PinnedDirectories(List<SafeFileHandle> handles) => this.handles = handles;
+        public void Dispose()
+        {
+            for (int index = handles.Count - 1; index >= 0; index--) handles[index].Dispose();
+        }
+    }
+
     private sealed record RunRequest(string WorkingFolder, string Script, int TimeoutMs, int MaxOutputBytes,
         string? InputDataBase64 = null);
     private sealed record RunResult(int ExitCode, string Stdout, string Stderr, bool TimedOut, bool OutputLimited);
     private sealed record ErrorResult(string Error, int Code, string? Stage = null);
     private sealed record BrokerWriteRequest(string WorkingFolder, string RelativePath, string ContentsBase64);
     private sealed record BrokerWriteResult(int Bytes, bool ReplacedExisting);
-    private sealed record BrokerWriteJournal(string Id, string WorkingFolder, string RelativePath,
+    private sealed record BrokerWriteJournal(int Version, string Id, string WorkingFolder, string RelativePath,
+        bool TargetExisted, string? ExpectedHash, string? TargetIdentity, string IntendedHash, string? IntendedIdentity,
+        SecuritySnapshot? ExpectedSecurity, string TemporaryLeaf, string BackupLeaf, string Stage);
+    private sealed record LegacyBrokerWriteJournal(string Id, string WorkingFolder, string RelativePath,
         bool TargetExisted, string TemporaryLeaf, string BackupLeaf);
     private sealed record SecuritySnapshot(string? Owner, string? Group, string? Dacl, string? Label);
     private sealed record DeleteAppDataRequest(string UserDataPath);
@@ -1316,9 +2132,35 @@ internal static class Program
         public UIntPtr PeakProcessMemoryUsed;
         public UIntPtr PeakJobMemoryUsed;
     }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ByHandleFileInformation
+    {
+        public uint FileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileDispositionInfo { public byte DeleteFile; }
 
     private static class Native
     {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "CreateFileW")]
+        internal static extern SafeFileHandle CreateFileW(string fileName, uint desiredAccess, uint shareMode,
+            IntPtr securityAttributes, uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool GetFileInformationByHandle(
+            SafeFileHandle handle, out ByHandleFileInformation information);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool SetFileInformationByHandle(
+            SafeFileHandle handle, int fileInformationClass, ref FileDispositionInfo information, uint bufferSize);
         [DllImport("userenv.dll", CharSet = CharSet.Unicode, PreserveSig = true)]
         internal static extern int CreateAppContainerProfile(string name, string displayName, string description,
             IntPtr capabilities, uint capabilityCount, out IntPtr appContainerSid);
@@ -1330,6 +2172,9 @@ internal static class Program
         internal static extern IntPtr FreeSid(IntPtr sid);
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
         internal static extern uint GetNamedSecurityInfoW(string objectName, uint objectType, uint securityInfo,
+            out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr securityDescriptor);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        internal static extern uint GetSecurityInfo(SafeFileHandle handle, uint objectType, uint securityInfo,
             out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr securityDescriptor);
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]

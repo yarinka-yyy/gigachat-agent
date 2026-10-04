@@ -864,7 +864,6 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .app-dialog::backdrop { background: rgba(0, 0, 0, .48); }
 .app-dialog form { position: relative; display: grid; gap: 16px; padding: 25px; }
 .project-settings-dialog { width: min(540px, calc(100vw - 28px)); }
-.project-settings-dialog form { max-height: calc(100vh - 28px); overflow-y: auto; }
 .project-folder-choice { display: grid; justify-items: start; gap: 8px; padding: 15px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface); }
 .project-folder-choice strong { font-size: 14px; font-weight: 600; }
 .project-folder-choice p { max-width: 100%; overflow-wrap: anywhere; user-select: text; }
@@ -875,6 +874,13 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .project-instructions-label textarea { width: 100%; min-height: 150px; max-height: 35vh; padding: 11px; resize: vertical; border: 1px solid var(--line-strong); border-radius: 10px; color: var(--text); background: var(--surface); }
 .project-backup-note span { display: block; overflow-wrap: anywhere; user-select: text; }
 .approval-dialog > div { display: grid; gap: 15px; padding: 25px; }
+.close-error-dialog { width: min(480px, calc(100vw - 28px)); }
+.close-error-dialog > section { display: grid; gap: 14px; padding: 25px; }
+.close-error-dialog .close-error-message { color: var(--danger); overflow-wrap: anywhere; }
+.close-error-dialog .dialog-actions { flex-wrap: wrap; }
+.close-error-dialog .dialog-actions > button { max-width: 100%; white-space: normal; }
+.close-pending-dialog { width: min(440px, calc(100vw - 28px)); }
+.close-pending-dialog > section { display: grid; gap: 12px; padding: 25px; }
 .approval-dialog .approval-target { max-height: 180px; overflow: auto; padding: 10px; border-radius: 9px; background: var(--surface); color: var(--text); font: 13px/1.45 Consolas, monospace; overflow-wrap: anywhere; white-space: pre-wrap; user-select: text; }
 .approval-dialog .approval-action { color: var(--text); font-weight: 600; }
 .app-dialog h2 { margin: 0 35px 0 0; font-size: 22px; line-height: 1.3; }

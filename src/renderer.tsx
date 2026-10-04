@@ -1,7 +1,6 @@
 import { createRoot } from 'react-dom/client';
 import App from './app';
-
-require('./app.css');
+import './app.css';
 
 const root = document.getElementById('root');
 

@@ -264,7 +264,7 @@ export function createOnboardingBrowser(
     reload(): void {
       if (view && !view.webContents.isDestroyed()) view.webContents.reload();
     },
-    setBounds(bounds: BrowserBounds): void {
+    setBounds(bounds: BrowserBounds | null): void {
       currentBounds = bounds;
       if (!view || view.webContents.isDestroyed()) return;
       applyBounds(view, currentBounds);

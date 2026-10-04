@@ -4,7 +4,11 @@ import type { OnboardingBrowserStatus, SecureStoreStatus } from '../contracts';
 
 interface ConnectionSetupProps {
   firstRun: boolean;
+  suspended?: boolean;
   onContinue?: () => Promise<void>;
+  runAcceptedOperation?: <T>(operation: () => T | Promise<T>) => Promise<T>;
+  reportOperationFailure?: (error: unknown) => void;
+  onKeySaveFailureChange?: (failed: boolean) => void;
 }
 
 function errorText(error: unknown): string {
@@ -28,7 +32,14 @@ const EMPTY_BROWSER_STATUS: OnboardingBrowserStatus = {
   error: null,
 };
 
-export default function ConnectionSetup({ firstRun, onContinue }: ConnectionSetupProps) {
+export default function ConnectionSetup({
+  firstRun,
+  suspended = false,
+  onContinue,
+  runAcceptedOperation,
+  reportOperationFailure,
+  onKeySaveFailureChange,
+}: ConnectionSetupProps) {
   const [keyValue, setKeyValue] = useState('');
   const [keyStatus, setKeyStatus] = useState<SecureStoreStatus | null>(null);
   const [browserStatus, setBrowserStatus] = useState(EMPTY_BROWSER_STATUS);
@@ -37,6 +48,26 @@ export default function ConnectionSetup({ firstRun, onContinue }: ConnectionSetu
   const [busyBrowser, setBusyBrowser] = useState(false);
   const [error, setError] = useState('');
   const viewportRef = useRef<HTMLDivElement>(null);
+  const suspendedRef = useRef(suspended);
+  const syncBrowserBoundsRef = useRef<() => Promise<void>>(() => Promise.resolve());
+  const keySaveFailed = useRef(false);
+  const keyValueRef = useRef('');
+  const keySaveGeneration = useRef(0);
+  const mounted = useRef(false);
+  const reportOperationFailureRef = useRef(reportOperationFailure);
+  const keySaveFailureChangeRef = useRef(onKeySaveFailureChange);
+  suspendedRef.current = suspended;
+  reportOperationFailureRef.current = reportOperationFailure;
+  keySaveFailureChangeRef.current = onKeySaveFailureChange;
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      keySaveGeneration.current += 1;
+      keySaveFailureChangeRef.current?.(false);
+    };
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -57,6 +88,11 @@ export default function ConnectionSetup({ firstRun, onContinue }: ConnectionSetu
     });
 
     const sendBounds = (): Promise<void> => {
+      if (suspendedRef.current) {
+        if (lastBounds === 'hidden') return Promise.resolve();
+        lastBounds = 'hidden';
+        return window.gigaChat.onboarding.setBrowserBounds(null);
+      }
       const viewport = viewportRef.current;
       if (!viewport) return Promise.resolve();
       const rect = viewport.getBoundingClientRect();
@@ -66,6 +102,7 @@ export default function ConnectionSetup({ firstRun, onContinue }: ConnectionSetu
       lastBounds = signature;
       return window.gigaChat.onboarding.setBrowserBounds(bounds);
     };
+    syncBrowserBoundsRef.current = sendBounds;
     const scheduleBounds = (): void => {
       if (frame) cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
@@ -82,8 +119,8 @@ export default function ConnectionSetup({ firstRun, onContinue }: ConnectionSetu
     scheduleBounds();
 
     if (firstRun) {
-      void sendBounds().then(() => window.gigaChat.onboarding.openStudio()).then((status) => {
-        if (alive) setBrowserStatus(status);
+      void sendBounds().then(() => alive ? window.gigaChat.onboarding.openStudio() : null).then((status) => {
+        if (alive && status) setBrowserStatus(status);
       }).catch((reason: unknown) => {
         if (alive) setError(errorText(reason));
       });
@@ -91,6 +128,7 @@ export default function ConnectionSetup({ firstRun, onContinue }: ConnectionSetu
 
     return () => {
       alive = false;
+      if (syncBrowserBoundsRef.current === sendBounds) syncBrowserBoundsRef.current = () => Promise.resolve();
       unsubscribe();
       observer.disconnect();
       window.removeEventListener('resize', scheduleBounds);
@@ -100,18 +138,42 @@ export default function ConnectionSetup({ firstRun, onContinue }: ConnectionSetu
     };
   }, [firstRun]);
 
+  useEffect(() => {
+    let alive = true;
+    void syncBrowserBoundsRef.current().catch((reason: unknown) => {
+      if (alive) setError(errorText(reason));
+    });
+    return () => { alive = false; };
+  }, [suspended]);
+
   async function saveKey(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     setError('');
     setSaving(true);
+    const value = keyValueRef.current;
+    const generation = ++keySaveGeneration.current;
     try {
-      const status = await window.gigaChat.onboarding.saveKey(keyValue);
+      const save = () => window.gigaChat.onboarding.saveKey(value);
+      const status = await (runAcceptedOperation ? runAcceptedOperation(save) : save());
+      if (!mounted.current || generation !== keySaveGeneration.current) return;
       setKeyStatus(status);
-      setKeyValue('');
+      if (keyValueRef.current === value) {
+        keyValueRef.current = '';
+        setKeyValue('');
+        keySaveFailed.current = false;
+        keySaveFailureChangeRef.current?.(false);
+      } else if (!keyValueRef.current && keySaveFailed.current) {
+        keySaveFailed.current = false;
+        keySaveFailureChangeRef.current?.(false);
+      }
     } catch (reason) {
+      if (!mounted.current || generation !== keySaveGeneration.current) return;
+      keySaveFailed.current = Boolean(keyValueRef.current);
+      keySaveFailureChangeRef.current?.(keySaveFailed.current);
+      reportOperationFailureRef.current?.(reason);
       setError(errorText(reason));
     } finally {
-      setSaving(false);
+      if (mounted.current && generation === keySaveGeneration.current) setSaving(false);
     }
   }
 
@@ -171,7 +233,15 @@ export default function ConnectionSetup({ firstRun, onContinue }: ConnectionSetu
                   id="connection-key"
                   type="password"
                   value={keyValue}
-                  onChange={(event) => setKeyValue(event.target.value)}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    keyValueRef.current = value;
+                    setKeyValue(value);
+                    if (!value && keySaveFailed.current) {
+                      keySaveFailed.current = false;
+                      keySaveFailureChangeRef.current?.(false);
+                    }
+                  }}
                   autoComplete="off"
                   autoCapitalize="off"
                   spellCheck={false}

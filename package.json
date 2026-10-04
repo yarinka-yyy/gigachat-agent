@@ -3,7 +3,7 @@
   "productName": "GigaChat Agents",
   "version": "1.0.0",
   "description": "Локальная настольная основа GigaChat Agents",
-  "main": ".webpack/main",
+  "main": ".webpack/main/index.cjs",
   "private": true,
   "scripts": {
     "prestart": "node scripts/build-local-runtime.mjs && node scripts/prepare-voice-resources.mjs",
@@ -11,7 +11,7 @@
     "prepackage": "node scripts/build-local-runtime.mjs && node scripts/prepare-voice-resources.mjs",
     "package": "electron-forge package",
     "premake": "node scripts/build-local-runtime.mjs && node scripts/prepare-voice-resources.mjs && node scripts/prepare-squirrel-vendor.mjs",
-    "test": "tsx --test src/store.test.ts src/instruction-autosave.test.ts src/permissions.test.ts src/custom-permissions.test.ts src/local-tools.test.ts src/instructions.test.ts src/commands.test.ts src/runtime.test.ts src/skills.test.ts src/hooks.test.ts src/secure-store.test.ts src/onboarding-browser.test.ts src/embedded-browser.test.ts src/browser-layout.test.ts src/sidebar-behavior.test.ts src/sidebar-sections.test.ts src/project-folders.test.ts src/voice.test.ts",
+    "test": "tsx --test src/store.test.ts src/lifecycle.test.ts src/project-paths.test.ts src/renderer-operations.test.ts src/instruction-documents.test.ts src/instruction-autosave.test.ts src/permissions.test.ts src/custom-permissions.test.ts src/local-tools.test.ts src/instructions.test.ts src/commands.test.ts src/runtime.test.ts src/skills.test.ts src/hooks.test.ts src/secure-store.test.ts src/onboarding-browser.test.ts src/embedded-browser.test.ts src/browser-layout.test.ts src/sidebar-behavior.test.ts src/sidebar-sections.test.ts src/project-folders.test.ts src/voice.test.ts",
     "make": "electron-forge make",
     "prepublish": "node scripts/build-local-runtime.mjs && node scripts/prepare-voice-resources.mjs",
     "publish": "electron-forge publish",
@@ -20,25 +20,26 @@
   "keywords": [],
   "license": "MIT",
   "devDependencies": {
-    "@electron-forge/cli": "^7.11.2",
-    "@electron-forge/maker-deb": "^7.11.2",
-    "@electron-forge/maker-rpm": "^7.11.2",
-    "@electron-forge/maker-squirrel": "^7.11.2",
-    "@electron-forge/maker-zip": "^7.11.2",
-    "@electron-forge/plugin-auto-unpack-natives": "^7.11.2",
-    "@electron-forge/plugin-fuses": "^7.11.2",
-    "@electron-forge/plugin-webpack": "^7.11.2",
-    "@electron/fuses": "^1.8.0",
+    "@electron-forge/cli": "^8.0.1",
+    "@electron-forge/maker-deb": "^8.0.1",
+    "@electron-forge/maker-rpm": "^8.0.1",
+    "@electron-forge/maker-squirrel": "^8.0.1",
+    "@electron-forge/maker-zip": "^8.0.1",
+    "@electron-forge/plugin-auto-unpack-natives": "^8.0.1",
+    "@electron-forge/plugin-fuses": "^8.0.1",
+    "@electron-forge/plugin-webpack": "^8.0.1",
+    "@electron/fuses": "^2.1.3",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
-    "@typescript-eslint/eslint-plugin": "^5.62.0",
-    "@typescript-eslint/parser": "^5.62.0",
+    "@typescript-eslint/eslint-plugin": "^8.71.0",
+    "@typescript-eslint/parser": "^8.71.0",
     "@vercel/webpack-asset-relocator-loader": "^1.7.3",
     "css-loader": "^6.11.0",
+    "eslint-import-resolver-typescript": "^4.4.5",
     "electron": "44.4.5",
     "eslint": "^8.57.1",
     "eslint-plugin-import": "^2.32.0",
-    "fork-ts-checker-webpack-plugin": "^7.3.0",
+    "fork-ts-checker-webpack-plugin": "^9.1.0",
     "node-loader": "^2.1.0",
     "style-loader": "^3.3.4",
     "ts-loader": "^9.6.2",
@@ -51,5 +52,13 @@
     "lucide-react": "^1.48.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0"
+  },
+  "overrides": {
+    "webpack-dev-server": {
+      "chokidar": "4.0.3"
+    },
+    "sockjs": {
+      "uuid": "11.1.1"
+    }
   }
 }

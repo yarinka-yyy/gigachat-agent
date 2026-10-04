@@ -45,9 +45,20 @@ export function createEmbeddedBrowser(
   let attachedView: WebContentsView | null = null;
   let saveChain: Promise<unknown> = Promise.resolve();
   let saveError: string | null = null;
+  let metadataPaused = false;
   const listeners = new Set<(status: EmbeddedBrowserStatus) => void>();
   const activeTab = (): Tab | undefined => tabs.find((tab) => tab.id === activeTabId);
   const live = (tab: Tab): boolean => Boolean(tab.view && !tab.view.webContents.isDestroyed());
+  const normalizedTitle = (title: string, url: string): string => title.replace(/\p{Cc}/gu, '').slice(0, 160) || new URL(url).hostname;
+  const syncMetadataFromViews = (): void => {
+    for (const tab of tabs) {
+      if (!tab.view || !live(tab)) continue;
+      const url = tab.view.webContents.getURL();
+      if (!isAllowedPageUrl(url)) continue;
+      tab.url = url;
+      tab.title = normalizedTitle(tab.view.webContents.getTitle(), url);
+    }
+  };
 
   const getStatus = (): EmbeddedBrowserStatus => ({
     tabs: tabs.map((tab) => ({
@@ -63,7 +74,11 @@ export function createEmbeddedBrowser(
     const records = tabs.map(({ id, title, url }) => ({ id, title, url }));
     const selected = activeTabId;
     saveChain = saveChain.catch(() => undefined).then(() => dependencies.persist(records, selected));
-    void saveChain.then(() => { saveError = null; }, () => {
+    void saveChain.then(() => {
+      const hadError = saveError !== null;
+      saveError = null;
+      if (hadError) publish();
+    }, () => {
       saveError = 'Не удалось сохранить вкладки браузера.';
       publish();
     });
@@ -107,7 +122,7 @@ export function createEmbeddedBrowser(
       if (details.isMainFrame && !isAllowedPageUrl(details.url)) details.preventDefault();
     });
     contents.setWindowOpenHandler(({ url }) => {
-      if (isAllowedPageUrl(url)) {
+      if (!metadataPaused && isAllowedPageUrl(url)) {
         try { createTab(url); } catch { /* The existing 20-tab limit remains in force. */ }
       }
       return { action: 'deny' };
@@ -116,7 +131,7 @@ export function createEmbeddedBrowser(
     contents.on('did-stop-loading', () => { tab.loading = false; publish(); });
     contents.on('did-finish-load', () => { tab.loading = false; tab.error = null; showActive(); publish(); });
     const recordNavigation = (_event: unknown, url: string): void => {
-      if (!isAllowedPageUrl(url)) return;
+      if (metadataPaused || !isAllowedPageUrl(url)) return;
       tab.url = url;
       persist();
       publish();
@@ -124,7 +139,8 @@ export function createEmbeddedBrowser(
     contents.on('did-navigate', recordNavigation);
     contents.on('did-navigate-in-page', (event, url, isMainFrame) => { if (isMainFrame) recordNavigation(event, url); });
     contents.on('page-title-updated', (_event, title) => {
-      tab.title = title.replace(/\p{Cc}/gu, '').slice(0, 160) || new URL(tab.url).hostname;
+      if (metadataPaused) return;
+      tab.title = normalizedTitle(title, tab.url);
       persist();
       publish();
     });
@@ -164,6 +180,25 @@ export function createEmbeddedBrowser(
     if (url) load(tab, url);
     else { showActive(); persist(); publish(); }
     return getStatus();
+  };
+
+  const flush = async (): Promise<void> => {
+    if (metadataPaused) syncMetadataFromViews();
+    persist();
+    for (;;) {
+      const pending = saveChain;
+      try { await pending; }
+      catch (error) { if (pending === saveChain) throw error; }
+      if (pending === saveChain) return;
+    }
+  };
+
+  const resumeMetadata = (): void => {
+    if (!metadataPaused) return;
+    metadataPaused = false;
+    syncMetadataFromViews();
+    publish();
+    persist();
   };
 
   return {
@@ -206,10 +241,12 @@ export function createEmbeddedBrowser(
     setBounds(next: BrowserBounds | null): void {
       bounds = next;
       const tab = activeTab();
-      if (bounds && tab?.url && !live(tab)) load(tab, tab.url);
+      if (!metadataPaused && bounds && tab?.url && !live(tab)) load(tab, tab.url);
       else showActive();
     },
-    flush: () => saveChain,
+    pauseMetadata(): void { metadataPaused = true; },
+    resumeMetadata,
+    flush,
     destroy(): void {
       const host = getHostWindow();
       if (attachedView && host && !host.isDestroyed()) host.contentView.removeChildView(attachedView);

@@ -4,6 +4,10 @@ import type { GigaChatModelId } from './models';
 export type Theme = 'system' | 'emerald' | 'light' | 'dark' | 'warm';
 export type ChatKind = 'text' | 'image';
 export type PreferredOpener = 'system' | 'explorer' | 'detected-app';
+export type CloseAttemptResult =
+  | { status: 'closed' }
+  | { status: 'failed'; reason: 'browser-metadata' | 'close'; message: string };
+export type CloseFailure = Extract<CloseAttemptResult, { status: 'failed' }>;
 
 export interface NotificationSettings {
   taskStarted: boolean;
@@ -33,6 +37,11 @@ export interface Project {
   workingFolder: string | null;
 }
 
+export interface ProjectUpdateResult {
+  project: Project;
+  warning: string | null;
+}
+
 export interface ChatSummary {
   id: string;
   title: string;
@@ -60,11 +69,56 @@ export interface InstructionLayer {
   text: string;
 }
 
+export interface InstructionDocument {
+  text: string;
+  revision: string;
+}
+
+export interface PreservedInstructionVersion {
+  path: string;
+  text: string | null;
+}
+
+export type InstructionSaveResult =
+  | { kind: 'saved'; document: InstructionDocument }
+  | {
+    kind: 'conflict';
+    phase: 'before-commit' | 'after-commit';
+    current: InstructionDocument;
+    preservedVersion?: PreservedInstructionVersion;
+  };
+
+export interface InstructionCommitRequest {
+  workingFolder: string;
+  relativePath: string;
+  contents: string;
+  expectedHash: string | null;
+}
+
+export type InstructionCommitResult =
+  | { kind: 'saved' }
+  | { kind: 'conflict-before'; currentText: string | null }
+  | { kind: 'conflict-after'; currentText: string; preservedPath: string; preservedText: string | null };
+
 export interface ProviderTurnRequest {
   system: InstructionLayer[];
   messages: ChatMessage[];
   permissionProfile: PermissionProfile;
   modelId: GigaChatModelId | null;
+}
+
+export interface AcceptedTurnInput {
+  turnId: string;
+  chatId: string;
+  projectId: string | null;
+  projectWorkingFolder: string | null;
+  messageId: string;
+  historyBoundary: number;
+  messages: ChatMessage[];
+  permissionProfile: PermissionProfile;
+  modelId: GigaChatModelId | null;
+  skillId: string | null;
+  reservation: { permissionProfileRevision: number | null; skillRevision: number | null };
 }
 
 export type ProviderToolName = 'list' | 'search' | 'read' | 'write' | 'open' | 'powershell';
@@ -250,6 +304,8 @@ export interface AppInfo {
   version: string;
   dataPath: string;
   packaged: boolean;
+  installedLauncherAvailable: boolean;
+  autoStartMigrationIssue: string | null;
   platform: string;
 }
 
@@ -281,12 +337,13 @@ export interface AppApi {
     create(name: string, workingFolder?: string | null): Promise<Project>;
     pickFolder(): Promise<string | null>;
     instructionsBackupPath(id: string): Promise<string | null>;
-    update(id: string, patch: ProjectPatch): Promise<Project>;
+    update(id: string, patch: ProjectPatch): Promise<ProjectUpdateResult>;
     remove(id: string): Promise<void>;
-    chooseFolder(id: string): Promise<Project>;
+    chooseFolder(id: string): Promise<ProjectUpdateResult>;
     openFolder(id: string): Promise<void>;
-    readInstructions(id: string): Promise<string>;
-    saveInstructions(id: string, contents: string): Promise<void>;
+    readInstructions(id: string): Promise<InstructionDocument>;
+    saveInstructions(id: string, contents: string, expectedRevision: string): Promise<InstructionSaveResult>;
+    saveInstructionsCopy(id: string, contents: string): Promise<string>;
   };
   chats: {
     list(): Promise<ChatSummary[]>;
@@ -326,7 +383,7 @@ export interface AppApi {
     getBrowserStatus(): Promise<OnboardingBrowserStatus>;
     openStudio(): Promise<OnboardingBrowserStatus>;
     closeBrowser(): Promise<void>;
-    setBrowserBounds(bounds: BrowserBounds): Promise<void>;
+    setBrowserBounds(bounds: BrowserBounds | null): Promise<void>;
     back(): Promise<void>;
     reload(): Promise<void>;
     onBrowserStatus(listener: (status: OnboardingBrowserStatus) => void): () => void;
@@ -358,14 +415,17 @@ export interface AppApi {
     getAppInfo(): Promise<AppInfo>;
     getAutoStart(): Promise<boolean>;
     setAutoStart(enabled: boolean): Promise<boolean>;
-    readInstructions(): Promise<string>;
-    saveInstructions(contents: string): Promise<void>;
+    readInstructions(): Promise<InstructionDocument>;
+    saveInstructions(contents: string, expectedRevision: string): Promise<InstructionSaveResult>;
+    saveInstructionsCopy(contents: string): Promise<string>;
     deleteAppData(): Promise<boolean>;
   };
   usage: {
     getLocalStats(): Promise<LocalUsageStats>;
   };
-  onCloseRequested(flush: () => Promise<void>): () => void;
+  onCloseRequested(flush: () => Promise<void>, onFailure: (result: CloseFailure) => void): () => void;
+  retryClose(discardBrowserMetadata?: boolean): Promise<CloseAttemptResult>;
+  returnFromClose(): Promise<void>;
 }
 
 declare global {

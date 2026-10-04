@@ -1,4 +1,5 @@
-import { execFile, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, mkdtemp, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { app, BrowserWindow, dialog, ipcMain, nativeTheme, Notification, safeStorage, screen, session, shell, systemPreferences, WebContentsView, type IpcMainInvokeEvent, type MediaAccessPermissionRequest } from 'electron';
@@ -6,7 +7,7 @@ import { openStore, type LocalStore } from './store';
 import { buildInstructionRequest } from './instructions';
 import { createLocalTools, createPowerShellHelper, resolvePowerShellHelperPath, type LocalTools } from './local-tools';
 import { createTurnRuntime, type TurnRuntime } from './runtime';
-import type { ChatPatch, FolderOpener, NotificationSettings, PreferredOpener, RuntimeAvailability, SettingsPatch, Theme, VoiceAvailability } from './contracts';
+import type { AcceptedTurnInput, ChatPatch, FolderOpener, NotificationSettings, PreferredOpener, RuntimeAvailability, SettingsPatch, Theme, VoiceAvailability } from './contracts';
 import { requirePermissionProfile } from './permissions';
 import { requireModelId } from './models';
 import { openCustomPermissions, parseCustomConfig } from './custom-permissions';
@@ -18,10 +19,17 @@ import { createOnboardingBrowser, type BrowserBounds } from './onboarding-browse
 import { createEmbeddedBrowser } from './embedded-browser';
 import { createNumberedProjectFolder, prepareProjectFolders, removeEmptyCreatedFolder } from './project-folders';
 import { createVoiceRuntime, VOICE_MAX_OUTPUT_BYTES, type VoiceRuntime } from './voice';
-
-if (require('electron-squirrel-startup')) {
-  app.quit();
-}
+import {
+  acquirePrimaryInstance,
+  createCloseAdmission,
+  createCloseController,
+  createDetectedFolderOpener,
+  migrateCurrentVersionAutoStart,
+  readInstalledAutoStart,
+  resolveSquirrelLauncher,
+  writeInstalledAutoStart,
+} from './lifecycle';
+import { validateProjectFolder } from './project-paths';
 
 declare const MAIN_WINDOW_WEBPACK_ENTRY: string;
 declare const MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY: string;
@@ -31,9 +39,35 @@ let onboardingBrowser: ReturnType<typeof createOnboardingBrowser> | null = null;
 let embeddedBrowser: ReturnType<typeof createEmbeddedBrowser> | null = null;
 let currentTheme: Theme = 'emerald';
 let allowClose = false;
+let allowAppQuit = false;
 let deletingAppData = false;
+const closeAdmission = createCloseAdmission();
+let closeController: ReturnType<typeof createCloseController> | null = null;
 let approvalBroker: ReturnType<typeof createPermissionApprovals> | null = null;
 let microphoneConsentGranted = false;
+let secondInstancePendingFocus = false;
+let autoStartMigrationIssue: string | null = null;
+
+function focusMainWindow(): void {
+  if (!mainWindow) {
+    secondInstancePendingFocus = true;
+    return;
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+let isSquirrelStartup = false;
+// Squirrel startup handles install/update argv synchronously before the instance lock.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+if (require('electron-squirrel-startup')) isSquirrelStartup = true;
+const isPrimaryInstance = acquirePrimaryInstance(
+  isSquirrelStartup,
+  () => app.requestSingleInstanceLock(),
+  () => app.quit(),
+);
+if (isPrimaryInstance) app.on('second-instance', focusMainWindow);
 
 function titleBarColors(): { color: string; symbolColor: string } {
   const theme = currentTheme === 'system'
@@ -264,9 +298,7 @@ async function requireDirectory(value: unknown): Promise<string> {
 }
 
 async function requireProjectDirectory(value: unknown): Promise<string> {
-  const path = await requireDirectory(value);
-  if ((await lstat(path)).isSymbolicLink()) throw new Error('Папка проекта не может быть ссылкой.');
-  return path;
+  return validateProjectFolder(value, app.getPath('documents'));
 }
 
 async function chooseDirectory(defaultPath?: string | null): Promise<string | null> {
@@ -291,22 +323,28 @@ function getVscodeCandidates(): string[] {
   return candidates.filter((candidate): candidate is string => Boolean(candidate));
 }
 
-async function verifiedVscode(): Promise<string | null> {
-  for (const candidate of getVscodeCandidates()) {
-    try {
-      if (!(await stat(candidate)).isFile()) continue;
-      await new Promise<void>((resolve, reject) => {
-        execFile(candidate, ['--version'], { windowsHide: true, timeout: 5000, maxBuffer: 2048 }, (error) => {
-          if (error) reject(error);
-          else resolve();
-        });
-      });
-      return candidate;
-    } catch {
-      continue;
-    }
-  }
-  return null;
+const vscodeOpener = createDetectedFolderOpener(
+  getVscodeCandidates,
+  async (candidate) => {
+    const info = await lstat(candidate).catch(() => null);
+    return Boolean(info?.isFile() && !info.isSymbolicLink());
+  },
+  launchDetached,
+);
+
+async function getInstalledLauncher() {
+  if (process.platform !== 'win32' || !app.isPackaged) return null;
+  return resolveSquirrelLauncher(process.execPath, async (candidate) => {
+    const info = await lstat(candidate).catch(() => null);
+    return Boolean(info?.isFile() && !info.isSymbolicLink());
+  });
+}
+
+function loginItemApi() {
+  return {
+    getSettings: (options: { path: string; args: string[] }) => app.getLoginItemSettings(options),
+    setSettings: (settings: { path: string; args: string[]; openAtLogin: boolean; enabled: boolean }) => app.setLoginItemSettings(settings),
+  };
 }
 
 async function availableOpeners(): Promise<FolderOpener[]> {
@@ -314,13 +352,13 @@ async function availableOpeners(): Promise<FolderOpener[]> {
     { id: 'system', name: 'Приложение Windows по умолчанию' },
     { id: 'explorer', name: 'Проводник Windows' },
   ];
-  if (await verifiedVscode()) openers.push({ id: 'vscode', name: 'Visual Studio Code' });
+  if (await vscodeOpener.detect()) openers.push({ id: 'vscode', name: 'Visual Studio Code' });
   return openers;
 }
 
-function launchDetached(executable: string, args: string[]): Promise<void> {
+function launchDetached(executable: string, args: string[], windowsHide = true): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn(executable, args, { detached: true, stdio: 'ignore', windowsHide: true });
+    const child = spawn(executable, args, { detached: true, stdio: 'ignore', windowsHide });
     child.once('error', reject);
     child.once('spawn', () => {
       child.unref();
@@ -343,9 +381,7 @@ async function openDirectory(pathInput: unknown, opener: PreferredOpener): Promi
     await launchDetached(explorer, [path]);
     return;
   }
-  const executable = await verifiedVscode();
-  if (!executable) throw new Error('Visual Studio Code не найден или не прошёл проверку запуска.');
-  await launchDetached(executable, [path]);
+  if (!(await vscodeOpener.openFolder(path))) throw new Error('Visual Studio Code не найден.');
 }
 
 function requirePreferredOpener(value: unknown): PreferredOpener {
@@ -506,6 +542,7 @@ async function createMainRuntime(
   store: LocalStore,
   customPermissions: Awaited<ReturnType<typeof openCustomPermissions>>,
   approvals: ReturnType<typeof createPermissionApprovals>,
+  helperCandidate: ReturnType<typeof createPowerShellHelper> | undefined,
 ): Promise<MainRuntimeBundle> {
   const skills = createSkillRegistry({ userDataPath: app.getPath('userData'), listProjects: () => store.listProjects() });
   const hooks = createHookRegistry({
@@ -513,23 +550,13 @@ async function createMainRuntime(
     listProjects: () => store.listProjects(),
     listSkills: async () => (await skills.list()).skills,
   });
-  const helperPath = resolvePowerShellHelperPath({
-    platform: process.platform,
-    isPackaged: app.isPackaged,
-    resourcesPath: process.resourcesPath,
-    appPath: app.getAppPath(),
-  });
-  let helper: ReturnType<typeof createPowerShellHelper> | undefined;
+  let helper = helperCandidate;
   let unavailableReason: string | null = null;
-  if (helperPath) {
-    const candidate = createPowerShellHelper({
-      helperPath,
-      recoveryDirectory: join(app.getPath('userData'), 'local-runtime'),
-    });
+  if (helper) {
     try {
-      await candidate.recover();
-      helper = candidate;
+      await helper.recover();
     } catch {
+      helper = undefined;
       // A runtime recovery failure disables tools but does not prevent local chats from opening.
       unavailableReason = 'Не удалось восстановить ограниченный локальный runtime.';
     }
@@ -543,9 +570,15 @@ async function createMainRuntime(
     protectedDirectory: app.getPath('userData'),
     getCustomPolicy: customPermissions.policy,
     requestApproval: approvals.request,
-    openPath: async (path) => {
-      const error = await shell.openPath(path);
-      if (error) throw new Error('Не удалось открыть элемент проекта.');
+    revealItem: async (path) => {
+      shell.showItemInFolder(path);
+    },
+    openTextFile: async (path) => {
+      const windowsDirectory = process.env.WINDIR ?? 'C:\\Windows';
+      const notepad = join(windowsDirectory, 'System32', 'notepad.exe');
+      const notepadInfo = await lstat(notepad).catch(() => null);
+      if (!notepadInfo?.isFile() || notepadInfo.isSymbolicLink()) throw new Error('Блокнот Windows недоступен.');
+      await launchDetached(notepad, [path], false);
     },
     ...(helper ? { runPowerShell: helper.run, writeFile: helper.writeFile } : {}),
     onEvent: (event) => {
@@ -560,42 +593,43 @@ async function createMainRuntime(
   const turnRuntime = createTurnRuntime({
     provider: null,
     tools,
-    prepareTurn: async (chatId) => {
-      const chat = await store.getChat(chatId);
-      const settings = await store.getSettings();
-      const permissionProfile = chat.nextTurnPermissionProfile ?? settings.defaultPermissionProfile;
-      const modelId = chat.modelId ?? settings.defaultModelId;
+    prepareTurn: async (turn, signal) => {
+      if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
+      await store.validateAcceptedTurn(turn);
       const projects = await store.listProjects();
-      const project = chat.projectId ? projects.find((item) => item.id === chat.projectId) : null;
-      if (chat.projectId && !project) throw new Error('Проект чата больше недоступен.');
-      const selectedSkill = chat.nextTurnSkillId ? await skills.getEnabled(chat.nextTurnSkillId) : null;
-      if (chat.nextTurnSkillId && !selectedSkill) throw new Error('Выбранный Skill удалён или выключен. Включите его снова либо снимите выбор.');
-      if (selectedSkill?.scope === 'project' && selectedSkill.projectId !== chat.projectId) {
+      const project = turn.projectId ? projects.find((item) => item.id === turn.projectId) : null;
+      if (turn.projectId && (!project || project.workingFolder !== turn.projectWorkingFolder)) {
+        throw new Error('Проект или его рабочая папка изменились после принятия хода.');
+      }
+      const selectedSkill = turn.skillId ? await skills.getEnabled(turn.skillId) : null;
+      if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
+      if (turn.skillId && !selectedSkill) throw new Error('Выбранный Skill удалён или выключен. Включите его снова либо снимите выбор.');
+      if (selectedSkill?.scope === 'project' && selectedSkill.projectId !== turn.projectId) {
         throw new Error('Выбранный Skill принадлежит другому проекту; выбор для этого хода не изменён.');
       }
       const projectInstructions = project
-        ? await store.readProjectInstructions(project.id)
+        ? await store.readProjectInstructions(project.id, turn.projectWorkingFolder)
         : '';
+      const globalText = await store.readGlobalInstructions();
+      if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
+      await store.validateAcceptedTurn(turn);
       const request = buildInstructionRequest({
-        globalText: await store.readGlobalInstructions(),
+        globalText,
         projectInstructions: project ? [{ scope: project.name, text: projectInstructions }] : [],
         selectedSkill: selectedSkill ? {
           name: selectedSkill.name,
           scope: selectedSkill.scope === 'global' ? 'Global' : `Project · ${selectedSkill.projectName ?? project?.name ?? 'неизвестный проект'}`,
           text: selectedSkill.instructions,
         } : null,
-        messages: chat.messages,
-        permissionProfile,
-        modelId,
+        messages: turn.messages,
+        permissionProfile: turn.permissionProfile,
+        modelId: turn.modelId,
       });
-      if (chat.nextTurnPermissionProfile !== null || chat.nextTurnSkillId !== null) {
-        await store.updateChat(chat.id, { nextTurnPermissionProfile: null, nextTurnSkillId: null });
-      }
       return request;
     },
-    appendAssistant: async (chatId, text) => {
-      await store.appendAssistantMessageFromRuntime(chatId, text);
-    },
+    consumeTurn: (turn: AcceptedTurnInput, signal) => store.consumeTurnReservation(turn, signal),
+    releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
+    appendAssistant: async (turn, text, signal) => { await store.appendAssistantMessageFromRuntime(turn.chatId, text, signal); },
     onUpdate: (turn) => {
       if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('runtime:update', turn);
       if (lastNotifiedStatus.get(turn.id) === turn.status) return;
@@ -639,15 +673,67 @@ async function registerIpcHandlers(
   approvals: ReturnType<typeof createPermissionApprovals>,
 ): Promise<void> {
   const { runtime, availability, voiceRuntime, voiceAvailability, skills, hooks } = mainRuntime;
-  const handle = (channel: string, callback: (...args: unknown[]) => unknown): void => {
+  const nonCriticalChannels = new Set([
+    'projects:list', 'projects:pick-folder', 'projects:open-folder', 'projects:read-instructions', 'projects:instructions-backup-path',
+    'chats:list', 'chats:get', 'chats:open-artifact', 'chats:open-folder',
+    'runtime:list', 'runtime:status', 'permissions:read-config', 'permissions:respond',
+    'voice:status', 'voice:cancel', 'skills:list', 'skills:read-source', 'skills:open-folder', 'hooks:list',
+    'onboarding:key-status', 'onboarding:browser-status', 'onboarding:browser-open', 'onboarding:browser-close',
+    'onboarding:browser-back', 'onboarding:browser-reload', 'onboarding:browser-bounds',
+    'browser:status', 'browser:bounds', 'runtime:cancel',
+    'settings:get', 'usage:local-stats', 'settings:open-projects-folder', 'settings:list-openers', 'settings:app-info',
+    'settings:get-auto-start', 'settings:read-instructions',
+  ]);
+  const readOnlyChannels = new Set([
+    'projects:list', 'projects:read-instructions', 'projects:instructions-backup-path',
+    'chats:list', 'chats:get', 'runtime:list', 'runtime:status', 'permissions:read-config',
+    'voice:status', 'skills:list', 'skills:read-source', 'hooks:list', 'onboarding:key-status',
+    'onboarding:browser-status', 'browser:status', 'settings:get', 'usage:local-stats',
+    'settings:list-openers', 'settings:app-info', 'settings:get-auto-start', 'settings:read-instructions',
+  ]);
+  const availableDuringClose = new Set([
+    'runtime:cancel', 'permissions:respond', 'voice:cancel',
+    ...readOnlyChannels,
+    'onboarding:browser-bounds', 'browser:bounds',
+  ]);
+  const handle = (
+    channel: string,
+    callback: (...args: unknown[]) => unknown,
+    options: { track?: boolean } = {},
+  ): void => {
     ipcMain.handle(channel, (event, ...args: unknown[]) => {
       assertTrustedSender(event);
-      return callback(...args);
+      return closeAdmission.run(() => callback(...args), {
+        critical: !nonCriticalChannels.has(channel),
+        allowWhileClosing: availableDuringClose.has(channel),
+        track: options.track,
+      });
     });
   };
 
+  closeController = createCloseController(closeAdmission, {
+    pauseBrowserMetadata: () => userBrowser.pauseMetadata(),
+    resumeBrowserMetadata: () => userBrowser.resumeMetadata(),
+    cancelRuntime: async () => { await runtime.cancelAll(); },
+    cancelVoice: async () => { await voiceRuntime?.cancelAll(); },
+    flushBrowser: () => userBrowser.flush(),
+    drainStore: async () => { await store.getSettings(); },
+    closeOnboardingBrowser: () => browser.close(),
+    destroyBrowser: () => userBrowser.destroy(),
+    allowClose: () => { allowClose = true; allowAppQuit = true; },
+    closeWindow: () => {
+      const closingWindow = mainWindow;
+      setImmediate(() => {
+        if (closingWindow && mainWindow === closingWindow && !closingWindow.isDestroyed()) closingWindow.close();
+      });
+    },
+  });
+
   handle('projects:list', () => store.listProjects());
-  handle('projects:pick-folder', () => chooseDirectory(app.getPath('documents')));
+  handle('projects:pick-folder', async () => {
+    const folder = await chooseDirectory(app.getPath('documents'));
+    return folder ? requireProjectDirectory(folder) : null;
+  });
   handle('projects:create', async (name, folderInput) => withLocalFailureNotification(store, async () => {
     const selected = folderInput === null || folderInput === undefined ? null : await requireProjectDirectory(folderInput);
     const createdFolder = selected ? null : await createNumberedProjectFolder(await requireDirectory(app.getPath('documents')));
@@ -671,7 +757,7 @@ async function registerIpcHandlers(
     const selected = await chooseDirectory(project.workingFolder);
     return selected
       ? withLocalFailureNotification(store, async () => store.updateProject(id, { workingFolder: await requireProjectDirectory(selected) }))
-      : project;
+      : { project, warning: null };
   });
   handle('projects:open-folder', async (idInput) => {
     const project = (await store.listProjects()).find((item) => item.id === requireId(idInput));
@@ -679,8 +765,11 @@ async function registerIpcHandlers(
     const settings = await store.getSettings();
     await openDirectory(project.workingFolder, settings.preferredOpener);
   });
-  handle('projects:read-instructions', (id) => store.readProjectInstructions(requireId(id)));
-  handle('projects:save-instructions', (id, contents) => withLocalFailureNotification(store, () => store.saveProjectInstructions(requireId(id), contents)));
+  handle('projects:read-instructions', (id) => store.readProjectInstructionDocument(requireId(id)));
+  handle('projects:save-instructions', (id, contents, expectedRevision) =>
+    withLocalFailureNotification(store, () => store.saveProjectInstructions(requireId(id), contents, expectedRevision)));
+  handle('projects:save-instructions-copy', (id, contents) =>
+    withLocalFailureNotification(store, () => store.saveProjectInstructionsCopy(requireId(id), contents)));
   handle('projects:instructions-backup-path', (id) => store.projectInstructionsBackupPath(requireId(id)));
 
   handle('chats:list', () => store.listChats());
@@ -705,10 +794,14 @@ async function registerIpcHandlers(
     return withLocalFailureNotification(store, () => store.updateChat(id, patch));
   });
   handle('chats:append-local-message', async (id, text) => {
-    const detail = await withLocalFailureNotification(store, () => store.appendLocalMessage(id, text));
-    // No provider is configured in the local profile, so this remains a local-only save.
-    runtime.enqueue(detail.id);
-    return detail;
+    const accepted = await withLocalFailureNotification(store, () => store.acceptLocalMessage(id, text, randomUUID()));
+    try {
+      if (!runtime.enqueue(accepted.turn)) store.releaseTurnReservation(accepted.turn.turnId);
+      return accepted.detail;
+    } catch (error) {
+      store.releaseTurnReservation(accepted.turn.turnId);
+      throw error;
+    }
   });
   handle('chats:import-file', async (id, projectId) => {
     const options = { properties: ['openFile'] as Array<'openFile'> };
@@ -784,7 +877,7 @@ async function registerIpcHandlers(
       () => voiceRuntime.transcribe(requestId as string, audio as Uint8Array, mediaType as string),
       (error) => !(error instanceof Error && error.message === 'Распознавание отменено.'),
     );
-  });
+  }, { track: false });
   handle('voice:cancel', (requestId) => voiceRuntime?.cancel(requestId as string) ?? false);
 
   handle('skills:list', () => skills.list());
@@ -805,7 +898,7 @@ async function registerIpcHandlers(
   handle('onboarding:browser-status', () => browser.getStatus());
   handle('onboarding:browser-open', () => browser.openStudio());
   handle('onboarding:browser-close', () => browser.close());
-  handle('onboarding:browser-bounds', (bounds) => browser.setBounds(requireBrowserBounds(bounds)));
+  handle('onboarding:browser-bounds', (bounds) => browser.setBounds(bounds === null ? null : requireBrowserBounds(bounds)));
   handle('onboarding:browser-back', () => browser.back());
   handle('onboarding:browser-reload', () => browser.reload());
   browser.onStatus((status) => {
@@ -833,8 +926,8 @@ async function registerIpcHandlers(
     if (patch.defaultProjectsFolder !== undefined && patch.defaultProjectsFolder !== null) {
       await requireDirectory(patch.defaultProjectsFolder);
     }
-    if (patch.preferredOpener === 'detected-app' && !(await verifiedVscode())) {
-      throw new Error('Сначала найдите и проверьте Visual Studio Code.');
+    if (patch.preferredOpener === 'detected-app' && !(await vscodeOpener.detect())) {
+      throw new Error('Сначала установите Visual Studio Code.');
     }
     const settings = await withLocalFailureNotification(store, () => store.updateSettings(patch));
     currentTheme = settings.theme;
@@ -881,14 +974,18 @@ async function registerIpcHandlers(
     app.exit(0);
     return true;
   });
-  handle('app:close-ready', async () => {
-    await runtime.cancelAll();
-    await voiceRuntime?.cancelAll();
-    await userBrowser.flush();
-    userBrowser.destroy();
-    await browser.close();
-    allowClose = true;
-    mainWindow?.close();
+  ipcMain.handle('app:close-ready', (event, discardBrowserMetadata) => {
+    assertTrustedSender(event);
+    if (discardBrowserMetadata !== undefined && typeof discardBrowserMetadata !== 'boolean') {
+      throw new Error('Некорректный параметр закрытия.');
+    }
+    if (!closeController) throw new Error('Закрытие приложения ещё не готово.');
+    return closeController.close(discardBrowserMetadata === true);
+  });
+  ipcMain.handle('app:close-return', (event) => {
+    assertTrustedSender(event);
+    if (!closeController?.resume()) throw new Error('Сейчас нельзя вернуться к работе: закрытие ещё выполняется.');
+    return true;
   });
   handle('settings:choose-projects-folder', async () => {
     const current = await store.getSettings();
@@ -901,23 +998,34 @@ async function registerIpcHandlers(
     await openDirectory(settings.defaultProjectsFolder, settings.preferredOpener);
   });
   handle('settings:list-openers', availableOpeners);
-  handle('settings:app-info', () => ({
+  handle('settings:app-info', async () => ({
     version: app.getVersion(),
     dataPath: app.getPath('userData'),
     packaged: app.isPackaged,
+    installedLauncherAvailable: Boolean(await getInstalledLauncher()),
+    autoStartMigrationIssue,
     platform: process.platform,
   }));
-  handle('settings:get-auto-start', () => process.platform === 'win32' ? app.getLoginItemSettings().openAtLogin : false);
-  handle('settings:set-auto-start', (enabled) => {
+  handle('settings:get-auto-start', async () => {
+    const launcher = await getInstalledLauncher();
+    return process.platform === 'win32'
+      ? readInstalledAutoStart(launcher, loginItemApi())
+      : false;
+  });
+  handle('settings:set-auto-start', async (enabled) => {
     if (typeof enabled !== 'boolean') throw new Error('Ожидается логическое значение автозапуска.');
-    if (process.platform !== 'win32' || !app.isPackaged) {
+    if (process.platform !== 'win32') {
       throw new Error('Автозапуск доступен только в установленной Windows-версии приложения.');
     }
-    app.setLoginItemSettings({ openAtLogin: enabled });
-    return app.getLoginItemSettings().openAtLogin;
+    const saved = writeInstalledAutoStart(enabled, await getInstalledLauncher(), loginItemApi());
+    autoStartMigrationIssue = null;
+    return saved;
   });
-  handle('settings:read-instructions', () => store.readGlobalInstructions());
-  handle('settings:save-instructions', (contents) => withLocalFailureNotification(store, () => store.saveGlobalInstructions(contents)));
+  handle('settings:read-instructions', () => store.readGlobalInstructionDocument());
+  handle('settings:save-instructions', (contents, expectedRevision) =>
+    withLocalFailureNotification(store, () => store.saveGlobalInstructions(contents, expectedRevision)));
+  handle('settings:save-instructions-copy', (contents) =>
+    withLocalFailureNotification(store, () => store.saveGlobalInstructionsCopy(contents)));
 }
 
 const createWindow = (): void => {
@@ -927,6 +1035,8 @@ const createWindow = (): void => {
     app.isPackaged ? 'gigachat-icon.ico' : 'src/assets/gigachat-icon.ico');
   const initialZoomFactor = 0.8;
   allowClose = false;
+  allowAppQuit = false;
+  closeController?.reopen();
   const window = new BrowserWindow({
     height: Math.min(720, displayHeight),
     minHeight: Math.min(480, displayHeight),
@@ -1013,11 +1123,49 @@ function configureMainAudioPermission(): void {
   });
 }
 
-void app.whenReady().then(async () => {
+if (isPrimaryInstance) void app.whenReady().then(async () => {
   try {
     configureMainAudioPermission();
-    const store = await openStore(app.getPath('userData'));
-    const projectFolderIssues = await prepareProjectFolders(store, app.getPath('documents'));
+    const documentsDirectory = app.getPath('documents');
+    const userDataDirectory = app.getPath('userData');
+    const installedLauncher = await getInstalledLauncher();
+    if (installedLauncher) {
+      try {
+        migrateCurrentVersionAutoStart(installedLauncher, { path: process.execPath, args: [] }, loginItemApi());
+      } catch {
+        autoStartMigrationIssue = 'Не удалось подтвердить перенос автозапуска. Проверьте настройку в Windows.';
+      }
+    }
+    const helperPath = resolvePowerShellHelperPath({
+      platform: process.platform,
+      isPackaged: app.isPackaged,
+      resourcesPath: process.resourcesPath,
+      appPath: app.getAppPath(),
+    });
+    const helperCandidate = helperPath ? createPowerShellHelper({
+      helperPath,
+      recoveryDirectory: join(userDataDirectory, 'local-runtime'),
+      instructionRecoveryDirectory: join(userDataDirectory, 'instruction-runtime'),
+    }) : undefined;
+    const instructionRecoveryIssues: string[] = [];
+    let instructionCommitter: ReturnType<typeof createPowerShellHelper>['writeInstruction'];
+    if (helperCandidate?.recoverInstructions && helperCandidate.writeInstruction) {
+      try {
+        const conflicts = await helperCandidate.recoverInstructions();
+        instructionCommitter = helperCandidate.writeInstruction;
+        if (conflicts.length) instructionRecoveryIssues.push(
+          `Конфликтующие версии инструкций сохранены и требуют проверки:\n${conflicts.join('\n')}`,
+        );
+      } catch {
+        instructionRecoveryIssues.push('Не удалось проверить журналы записи инструкций; сохранение инструкций временно недоступно. Локальные чаты останутся доступны.');
+      }
+    }
+    const store = await openStore(userDataDirectory, {
+      documentsDirectory,
+      ...(instructionCommitter ? { instructionCommitter } : {}),
+    });
+    const projectFolderIssues = await prepareProjectFolders(store, documentsDirectory);
+    const storageIssues = await store.getStorageIssues();
     microphoneConsentGranted = (await store.getSettings()).microphoneConsent === 'allowed';
     const customPermissions = await openCustomPermissions(app.getPath('userData'));
     const approvals = createPermissionApprovals((request) => {
@@ -1038,10 +1186,13 @@ void app.whenReady().then(async () => {
     }, initialSettings.browserTabs, initialSettings.browserActiveTabId);
     currentTheme = initialSettings.theme;
     nativeTheme.on('updated', syncTitleBarOverlay);
-    const mainRuntime = await createMainRuntime(store, customPermissions, approvals);
+    const mainRuntime = await createMainRuntime(store, customPermissions, approvals, helperCandidate);
     await registerIpcHandlers(store, mainRuntime, secureStore, onboardingBrowser, embeddedBrowser, customPermissions, approvals);
     createWindow();
-    if (projectFolderIssues.length) dialog.showErrorBox('Папки проектов', `Не удалось подготовить некоторые проекты:\n${projectFolderIssues.join('\n')}`);
+    if (secondInstancePendingFocus) focusMainWindow();
+    const startupIssues = [...instructionRecoveryIssues, ...projectFolderIssues, ...storageIssues,
+      ...(autoStartMigrationIssue ? [autoStartMigrationIssue] : [])];
+    if (startupIssues.length) dialog.showErrorBox('Некоторые локальные данные требуют внимания', startupIssues.join('\n'));
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Неизвестная ошибка локальных данных.';
     dialog.showErrorBox('Не удалось загрузить локальные данные', message);
@@ -1049,11 +1200,23 @@ void app.whenReady().then(async () => {
   }
 });
 
-app.on('window-all-closed', () => {
-  if (deletingAppData) return;
-  if (process.platform !== 'darwin') app.quit();
-});
+if (isPrimaryInstance) {
+  app.on('before-quit', (event) => {
+    if (allowAppQuit || deletingAppData) return;
+    if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed() || mainWindow.webContents.isLoadingMainFrame()) {
+      allowAppQuit = true;
+      return;
+    }
+    event.preventDefault();
+    mainWindow.close();
+  });
 
-app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) createWindow();
-});
+  app.on('window-all-closed', () => {
+    if (deletingAppData) return;
+    if (process.platform !== 'darwin') app.quit();
+  });
+
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+}
