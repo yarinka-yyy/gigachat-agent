@@ -259,10 +259,11 @@ function ScrollingRowTitle({ value, pinned = false }: { value: string; pinned?: 
   </span>;
 }
 
-function ActionMenu({ children, label, trigger, className = '', placement = 'side', initialFocus, onOpen, onVisibilityChange, disabled = false }: {
+function ActionMenu({ children, label, trigger, className = '', placement = 'side', initialFocus, onOpen, onVisibilityChange, disabled = false, popupRole, popupLabel, triggerHasPopup, onTriggerKeyDown }: {
   children: ReactNode; label: string; trigger?: ReactNode; className?: string;
   placement?: 'side' | 'below' | 'below-start'; initialFocus?: string; onOpen?: () => void;
   onVisibilityChange?: (id: string, open: boolean) => void; disabled?: boolean;
+  popupRole?: 'listbox'; popupLabel?: string; triggerHasPopup?: 'listbox'; onTriggerKeyDown?: (event: ReactKeyboardEvent<HTMLButtonElement>) => void;
 }) {
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
@@ -318,7 +319,7 @@ function ActionMenu({ children, label, trigger, className = '', placement = 'sid
 
   return (
     <div className={`action-menu ${className}`}>
-      <button ref={triggerRef} type="button" aria-label={label} aria-expanded={open} title={label} disabled={disabled} onClick={() => {
+      <button ref={triggerRef} type="button" aria-label={label} aria-haspopup={triggerHasPopup} aria-controls={popupRole ? overlayId : undefined} aria-expanded={open} title={label} disabled={disabled} onKeyDown={onTriggerKeyDown} onClick={() => {
         const popup = popupRef.current;
         if (!popup) return;
         if (popup.matches(':popover-open')) popup.hidePopover();
@@ -330,7 +331,7 @@ function ActionMenu({ children, label, trigger, className = '', placement = 'sid
           if (initialFocus) requestAnimationFrame(() => popup.querySelector<HTMLElement>(initialFocus)?.focus());
         }
       }}>{trigger ?? <MoreHorizontal className="icon" aria-hidden="true" />}</button>
-      <div ref={popupRef} popover="auto" className="action-menu-content" onToggle={() => {
+      <div ref={popupRef} id={popupRole ? overlayId : undefined} role={popupRole} aria-label={popupLabel} popover="auto" className="action-menu-content" onToggle={() => {
         const isOpen = popupRef.current?.matches(':popover-open') ?? false;
         if (!isOpen) popupRef.current?.querySelectorAll<HTMLDivElement>('.submenu-content:popover-open').forEach((submenu) => submenu.hidePopover());
         if (!isOpen && popupRef.current?.contains(document.activeElement)) triggerRef.current?.focus();
@@ -345,6 +346,121 @@ function ActionMenu({ children, label, trigger, className = '', placement = 'sid
       }}>{children}</div>
     </div>
   );
+}
+
+type ChoiceOption = { value: string; label: string; disabled?: boolean };
+
+function ChoiceMenu({ label, value, options, onChange, onVisibilityChange }: {
+  label: string; value: string; options: ChoiceOption[]; onChange: (value: string) => void;
+  onVisibilityChange?: (id: string, open: boolean) => void;
+}) {
+  const listRef = useRef<HTMLDivElement>(null);
+  const focusedIndex = useRef(0);
+  const pendingOpenIndex = useRef<number | null>(null);
+  const selectedIndex = Math.max(0, options.findIndex((option) => option.value === value));
+  const selectedOption = options[selectedIndex] ?? { value: '', label: '' };
+
+  function enabledFrom(start: number, direction = 1): number {
+    for (let offset = 0; offset < options.length; offset += 1) {
+      const index = (start + direction * offset + options.length * 2) % options.length;
+      if (!options[index]?.disabled) return index;
+    }
+    return -1;
+  }
+
+  function focusOption(index: number): void {
+    if (index < 0) return;
+    focusedIndex.current = index;
+    const option = listRef.current?.querySelector<HTMLButtonElement>(`[data-choice-index="${index}"]`);
+    option?.focus();
+    option?.scrollIntoView({ block: 'nearest' });
+  }
+
+  function handleOpen(): void {
+    focusedIndex.current = enabledFrom(pendingOpenIndex.current ?? selectedIndex);
+    pendingOpenIndex.current = null;
+  }
+
+  function handleVisibilityChange(id: string, open: boolean): void {
+    onVisibilityChange?.(id, open);
+    if (open) requestAnimationFrame(() => {
+      if (listRef.current?.closest('[popover]')?.matches(':popover-open')) focusOption(focusedIndex.current);
+    });
+  }
+
+  function handleTriggerKeyDown(event: ReactKeyboardEvent<HTMLButtonElement>): void {
+    const popup = event.currentTarget.closest('.action-menu')?.querySelector<HTMLDivElement>('.action-menu-content');
+    const open = popup?.matches(':popover-open') ?? false;
+    const current = open && focusedIndex.current >= 0 ? focusedIndex.current : selectedIndex;
+    let next = -1;
+    if (event.key === 'ArrowDown') next = enabledFrom(open ? current + 1 : current);
+    else if (event.key === 'ArrowUp') next = enabledFrom(open ? current - 1 : current, -1);
+    else if (event.key === 'Home') next = enabledFrom(0);
+    else if (event.key === 'End') next = enabledFrom(options.length - 1, -1);
+    else return;
+
+    event.preventDefault();
+    if (open) focusOption(next);
+    else {
+      pendingOpenIndex.current = next;
+      event.currentTarget.click();
+    }
+  }
+
+  function handleListKeyDown(event: ReactKeyboardEvent<HTMLDivElement>): void {
+    const target = event.target instanceof Element ? event.target.closest<HTMLButtonElement>('[data-choice-index]') : null;
+    const current = target ? Number(target.dataset.choiceIndex) : focusedIndex.current;
+    let next = -1;
+    if (event.key === 'ArrowDown') next = enabledFrom(current + 1);
+    else if (event.key === 'ArrowUp') next = enabledFrom(current - 1, -1);
+    else if (event.key === 'Home') next = enabledFrom(0);
+    else if (event.key === 'End') next = enabledFrom(options.length - 1, -1);
+    else if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      listRef.current?.closest<HTMLDivElement>('[popover]')?.hidePopover();
+      return;
+    } else if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      if (target && !target.disabled) target.click();
+      return;
+    } else return;
+
+    event.preventDefault();
+    focusOption(next);
+  }
+
+  return <ActionMenu
+    className="choice-menu"
+    label={`${label}: ${selectedOption.label}`}
+    placement="below-start"
+    triggerHasPopup="listbox"
+    popupRole="listbox"
+    popupLabel={label}
+    onOpen={handleOpen}
+    onVisibilityChange={handleVisibilityChange}
+    onTriggerKeyDown={handleTriggerKeyDown}
+    trigger={<><span className="choice-menu-value">{selectedOption.label}</span><Icon name="chevron" className="choice-menu-chevron" /></>}
+  >
+    <div ref={listRef} className="choice-menu-content" role="presentation" onKeyDown={handleListKeyDown}>
+      {options.map((option, index) => {
+        const selected = option.value === value;
+        return <button
+          key={`${option.value}:${index}`}
+          type="button"
+          role="option"
+          data-choice-index={index}
+          aria-selected={selected}
+          disabled={option.disabled}
+          onFocus={() => { focusedIndex.current = index; }}
+          onClick={() => onChange(option.value)}
+        >
+          <span>{option.label}</span>
+          {selected && <Icon name="check" />}
+        </button>;
+      })}
+    </div>
+  </ActionMenu>;
 }
 
 function ProjectSubmenu({ chat, projects, onSelect, onVisibilityChange }: {
@@ -2568,14 +2684,12 @@ export default function App() {
                 }} /><span /></label>
               </SettingRow>
               <SettingRow title="Открывать папки в" description="Изменение применяется к папкам проектов и к папке по умолчанию.">
-                <select className="settings-select" value={settings.preferredOpener} onChange={(event) => {
-                  void updateLocalSettings({ preferredOpener: event.target.value as Settings['preferredOpener'] });
-                }}>
-                  <option value="system" title="Приложение Windows по умолчанию">По умолчанию (Windows)</option>
-                  <option value="explorer">Проводник Windows</option>
-                  {openers.some((opener) => opener.id === 'vscode') && <option value="detected-app">Visual Studio Code</option>}
-                  {settings.preferredOpener === 'detected-app' && !openers.some((opener) => opener.id === 'vscode') && <option value="detected-app" disabled>Приложение не найдено</option>}
-                </select>
+                <ChoiceMenu label="Открывать папки в" value={settings.preferredOpener} options={[
+                  { value: 'system', label: 'По умолчанию (Windows)' },
+                  { value: 'explorer', label: 'Проводник Windows' },
+                  ...(openers.some((opener) => opener.id === 'vscode') ? [{ value: 'detected-app', label: 'Visual Studio Code' }] : []),
+                  ...(settings.preferredOpener === 'detected-app' && !openers.some((opener) => opener.id === 'vscode') ? [{ value: 'detected-app', label: 'Приложение не найдено', disabled: true }] : []),
+                ]} onChange={(value) => { void updateLocalSettings({ preferredOpener: value as Settings['preferredOpener'] }); }} onVisibilityChange={trackNativeOverlay} />
               </SettingRow>
             </div>
           </>
@@ -2720,10 +2834,10 @@ export default function App() {
                 <div className="setting-row">
                   <div className="setting-row-copy"><strong>Project Skills</strong><p>Отдельная папка для каждого проекта.</p></div>
                   <div className="inline-actions">
-                    <select className="settings-select" aria-label="Проект для локальных Skills" value={skillProjectId} onChange={(event) => setSkillProjectId(event.target.value)}>
-                      <option value="">Выберите проект</option>
-                      {skillProjects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
-                    </select>
+                    <ChoiceMenu label="Проект для локальных Skills" value={skillProjectId} options={[
+                      { value: '', label: 'Выберите проект' },
+                      ...skillProjects.map((project) => ({ value: project.id, label: project.name })),
+                    ]} onChange={setSkillProjectId} onVisibilityChange={trackNativeOverlay} />
                     <button type="button" className="secondary-button" disabled={!skillProjectId} onClick={() => void openSkillFolder('project', skillProjectId)}>Открыть</button>
                   </div>
                 </div>
@@ -2989,6 +3103,7 @@ export default function App() {
             aria-label={sidebarShown ? 'Скрыть боковую панель' : 'Показать боковую панель'}
             aria-expanded={sidebarShown}
             aria-controls="application-sidebar"
+            data-sidebar-collapsed={compactLayout ? !sidebarShown : !settings.sidebarVisible}
             title={sidebarShown ? 'Скрыть боковую панель' : 'Показать боковую панель'}
             onClick={() => { if (compactLayout) setSidebarPreview((value) => !value); else void toggleSidebar(); }}
             onPointerEnter={() => { if (!compactLayout && !settings.sidebarVisible) { clearPreviewClose(); setSidebarPreview(true); } }}
@@ -3022,6 +3137,7 @@ export default function App() {
           onPointerEnter={clearPreviewClose}
           onPointerLeave={() => { if (!settings.sidebarVisible && !compactLayout) schedulePreviewClose(); }}
         >
+          <div className="sidebar-inner">
           <ActionMenu className="brand-menu" label="Выбрать режим GigaChat" placement="below" onVisibilityChange={trackNativeOverlay} trigger={
             <><span className="brand-wordmark">ГИГАЧАТ <i>{runtimeMode === 'api' ? 'API' : 'WEB'}</i></span><Icon name="chevron" className="brand-chevron" /></>
           }>
@@ -3066,6 +3182,7 @@ export default function App() {
             </button>
             <button type="button" className="profile-settings-button" aria-label="Настройки" onClick={() => openSettings('general')}><Icon name="settings" /><span className="profile-tooltip" role="tooltip">Настройки</span></button>
           </div>
+          </div>
         </aside>}
 
         {!compactLayout && settings.sidebarVisible && route.page !== 'settings' && route.page !== 'onboarding' && <div
@@ -3085,7 +3202,10 @@ export default function App() {
 
         <main ref={mainPanelRef} className={route.page === 'settings' ? 'main-panel settings-panel' : 'main-panel'}>
           {route.page === 'chat' && selectedChat && <div className="chat-header">
-            <span className="chat-header-title" title={selectedChat.title}>{selectedChat.title}</span>
+            <div className="chat-header-title-group">
+              {selectedChat.projectId && <Icon name="folder" className="chat-header-folder" />}
+              <span className="chat-header-title" title={selectedChat.title}>{selectedChat.title}</span>
+            </div>
             <button type="button" className="chat-browser-toggle" aria-label={settings.browserPaneOpen ? 'Скрыть браузер' : 'Показать браузер'} aria-expanded={settings.browserPaneOpen} title={settings.browserPaneOpen ? 'Скрыть браузер' : 'Показать браузер'} onClick={() => void updateLocalSettings({ browserPaneOpen: !settings.browserPaneOpen })}><Icon name="panelRight" /></button>
           </div>}
           <div className={route.page === 'chat' ? `chat-workspace${settings.browserPaneOpen ? ' browser-open' : ''}` : 'content-workspace'}>

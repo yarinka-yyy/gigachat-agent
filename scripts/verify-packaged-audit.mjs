@@ -21,7 +21,7 @@ async function runNodeDriver() {
     await mkdir(join(repo, '.qa'), { recursive: true });
     return realpath(join(repo, '.qa'));
   });
-  const fixture = await import('node:fs/promises').then(({ mkdtemp }) => mkdtemp(join(qaDirectory, 'plan007-renderer-')));
+  const fixture = await import('node:fs/promises').then(({ mkdtemp }) => mkdtemp(join(qaDirectory, 'plan008-desktop-polish-renderer-')));
   assert.equal(dirname(fixture), qaDirectory, 'fixture must be a direct child of ignored app/.qa');
   console.log(`Renderer QA fixture: ${fixture}`);
   const bundleDirectory = join(fixture, 'renderer');
@@ -106,11 +106,23 @@ async function runElectronHost() {
     ...summary, draft, nextTurnPermissionProfile: null, modelId: null, nextTurnSkillId: null,
     messages: [{ id: `${summary.id}-message`, role: 'assistant', text, createdAt: timestamp }], artifacts: [],
   });
-  const projects = [makeProject('project-a', 'Project A', 'C:\\audit\\project-a'), makeProject('project-b', 'Project B', 'C:\\audit\\project-b')];
+  const projects = [
+    makeProject('project-a', 'Project A', 'C:\\audit\\project-a'),
+    makeProject('project-b', 'Project B', 'C:\\audit\\project-b'),
+    ...Array.from({ length: 12 }, (_, index) => makeProject(
+      `scroll-project-${index + 1}`,
+      `Long Project ${String(index + 1).padStart(2, '0')}`,
+      `C:\\audit\\scroll-project-${index + 1}`,
+    )),
+  ];
   const chatA = makeChat('chat-a', 'Chat A');
   const chatB = makeChat('chat-b', 'Chat B');
-  const chats = [chatA, chatB];
-  const details = new Map(chats.map((chat, index) => [chat.id, makeDetail(chat, index === 0 ? 'A baseline' : 'B baseline')]));
+  const chats = [
+    chatA,
+    chatB,
+    ...Array.from({ length: 24 }, (_, index) => makeChat(`history-${index + 1}`, `History chat ${String(index + 1).padStart(2, '0')}`)),
+  ];
+  const details = new Map(chats.map((chat, index) => [chat.id, makeDetail(chat, index === 0 ? 'A baseline' : index === 1 ? 'B baseline' : 'History baseline')]));
   const state = {
     projects, chats, details,
     deferChatGets: false, pendingGets: new Map(), rejectNextGet: null,
@@ -131,7 +143,7 @@ async function runElectronHost() {
     appSettings: {
       theme: 'dark', sidebarTransparent: false, sidebarVisible: true, sidebarWidthPx: 264,
       browserPaneOpen: false, browserWidthPx: 420, browserTabs: [], browserActiveTabId: null,
-      defaultProjectsFolder: null, preferredOpener: 'system', defaultPermissionProfile: 'ask',
+      defaultProjectsFolder: null, preferredOpener: 'detected-app', defaultPermissionProfile: 'ask',
       defaultModelId: null, onboardingCompleted: true, microphoneConsent: 'declined',
       notifications: { taskStarted: false, taskCompleted: true, failures: true },
     },
@@ -402,6 +414,7 @@ async function runElectronHost() {
 
   let window;
   let passCount = 0;
+  const layoutMeasurements = [];
   const passed = (name) => { passCount += 1; console.log(`PASS ${name}`); };
   const sleep = (duration = 60) => new Promise((resolveSleep) => setTimeout(resolveSleep, duration));
   const evaluate = (source) => window.webContents.executeJavaScript(source);
@@ -414,6 +427,109 @@ async function runElectronHost() {
     throw new Error(`Timed out waiting for ${name}`);
   };
   const waitDom = (name, expression, timeout) => waitUntil(name, () => evaluate(expression), timeout);
+  const measureLayout = async (label) => {
+    const layout = await evaluate(`JSON.stringify((() => {
+      const box = (selector) => {
+        const element = document.querySelector(selector);
+        if (!element) return null;
+        const rect = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return {
+          x: rect.x, right: rect.right, width: rect.width, height: rect.height,
+          paddingLeft: style.paddingLeft, paddingRight: style.paddingRight,
+          boxSizing: style.boxSizing, minWidth: style.minWidth, cssWidth: style.width,
+          marginRight: style.marginRight, borderLeftWidth: style.borderLeftWidth,
+          borderRadius: style.borderRadius, overflowY: style.overflowY,
+          scrollHeight: element.scrollHeight, clientHeight: element.clientHeight,
+          clientWidth: element.clientWidth,
+        };
+      };
+      const workspace = document.querySelector('.workspace');
+      const resizer = document.querySelector('.sidebar-resizer');
+      return {
+        viewport: { width: innerWidth, height: innerHeight, devicePixelRatio },
+        gridTemplateColumns: workspace ? getComputedStyle(workspace).gridTemplateColumns : null,
+        sidebarWidthVariable: workspace ? getComputedStyle(workspace).getPropertyValue('--sidebar-width').trim() : null,
+        workspace: box('.workspace'), sidebar: box('.sidebar'), sidebarInner: box('.sidebar-inner'), mainPanel: box('.main-panel'),
+        resizer: box('.sidebar-resizer'), sidebarLibrary: box('.sidebar-library'),
+        resizerAccentTop: resizer ? getComputedStyle(resizer, '::after').top : null,
+        dividerHitTest: (() => {
+          const sidebar = document.querySelector('.sidebar')?.getBoundingClientRect();
+          if (!sidebar) return null;
+          const y = Math.min(sidebar.bottom - 2, Math.max(sidebar.top + 2, sidebar.top + 80));
+          const leftHit = document.elementFromPoint(sidebar.right - 1, y);
+          const rightHit = document.elementFromPoint(sidebar.right + 1, y);
+          return {
+            leftHitsResizer: Boolean(leftHit?.closest('.sidebar-resizer')),
+            rightHitsResizer: Boolean(rightHit?.closest('.sidebar-resizer')),
+          };
+        })(),
+      };
+    })())`);
+    console.log(`LAYOUT ${label} ${layout}`);
+    const measured = JSON.parse(layout);
+    layoutMeasurements.push({ label, ...measured });
+    return measured;
+  };
+  const measureSidebarTracks = async () => {
+    const originalSize = window.getSize();
+    const originalZoom = window.webContents.getZoomFactor();
+    window.setSize(960, 720);
+    window.webContents.setZoomFactor(1);
+    await sleep(350);
+    const originalStyle = await evaluate(`document.querySelector('.workspace')?.getAttribute('style') ?? null`);
+    const originalClass = await evaluate(`document.querySelector('.workspace')?.className ?? null`);
+    const originalSidebarStyle = await evaluate(`document.querySelector('.sidebar')?.getAttribute('style') ?? null`);
+    const originalSidebarInnerStyle = await evaluate(`document.querySelector('.sidebar-inner')?.getAttribute('style') ?? null`);
+    assert.ok(await evaluate(`document.querySelector('.sidebar-resizer') !== null`), 'sidebar track probe requires desktop layout and a visible resizer');
+    try {
+      await evaluate(`document.querySelector('.workspace').classList.add('sidebar-dragging')`);
+      for (const width of [242, 180, 22, 14, 0]) {
+        await evaluate(`document.querySelector('.workspace').style.setProperty('--sidebar-width', '${width}px')`);
+        await sleep(260);
+        const measured = await measureLayout(`forced-transient-track-${width}`);
+        assert.ok(Math.abs(measured.sidebar.width - width) <= 1, `sidebar box must stay inside the ${width}px grid track; actual ${measured.sidebar.width}px`);
+        assert.ok(Math.abs(measured.mainPanel.x - measured.sidebar.right) <= 1, `main edge must meet the ${width}px sidebar edge; main ${measured.mainPanel.x}px/sidebar ${measured.sidebar.right}px`);
+        assert.ok(Math.abs(Number.parseFloat(measured.gridTemplateColumns) - width) <= 1, `computed grid track must remain ${width}px`);
+        assert.equal(measured.mainPanel.borderRadius.split(' ')[0], '0px', 'main panel top-left corner must be square');
+        assert.equal(measured.resizerAccentTop, '0px', 'resizer accent must reach the top edge');
+        if (width === 242) {
+          assert.ok(Math.abs(measured.sidebar.right - measured.sidebarLibrary.right - 2) <= 1, `sidebar scroll viewport must end within 2px of divider; actual gap ${measured.sidebar.right - measured.sidebarLibrary.right}px`);
+          assert.ok(measured.sidebarLibrary.scrollHeight > measured.sidebarLibrary.clientHeight, 'many-chat fixture must produce a scrollable sidebar');
+          assert.equal(measured.dividerHitTest.leftHitsResizer, false, 'resizer hit target must not cover the left-side scrollbar edge');
+          assert.equal(measured.dividerHitTest.rightHitsResizer, true, 'divider hit target must begin on the main-panel side');
+        }
+        if (width === 0) {
+          await evaluate(`document.querySelector('.sidebar-inner').style.setProperty('padding-inline', '0px')`);
+          await measureLayout('forced-transient-track-0-inner-padding-inline-0');
+          await evaluate(`(() => { const sidebarInner = document.querySelector('.sidebar-inner'); const original = ${JSON.stringify(originalSidebarInnerStyle)}; if (original === null) sidebarInner.removeAttribute('style'); else sidebarInner.setAttribute('style', original); })()`);
+        }
+      }
+    } finally {
+      await evaluate(`(() => {
+        const workspace = document.querySelector('.workspace');
+        const sidebar = document.querySelector('.sidebar');
+        const sidebarInner = document.querySelector('.sidebar-inner');
+        const originalWorkspaceStyle = ${JSON.stringify(originalStyle)};
+        const originalWorkspaceClass = ${JSON.stringify(originalClass)};
+        const originalSidebarStyle = ${JSON.stringify(originalSidebarStyle)};
+        const originalSidebarInnerStyle = ${JSON.stringify(originalSidebarInnerStyle)};
+        if (workspace) {
+          if (originalWorkspaceStyle === null) workspace.removeAttribute('style'); else workspace.setAttribute('style', originalWorkspaceStyle);
+          if (originalWorkspaceClass !== null) workspace.className = originalWorkspaceClass;
+        }
+        if (sidebar) {
+          if (originalSidebarStyle === null) sidebar.removeAttribute('style'); else sidebar.setAttribute('style', originalSidebarStyle);
+        }
+        if (sidebarInner) {
+          if (originalSidebarInnerStyle === null) sidebarInner.removeAttribute('style'); else sidebarInner.setAttribute('style', originalSidebarInnerStyle);
+        }
+      })()`);
+      window.webContents.setZoomFactor(originalZoom);
+      window.setSize(originalSize[0], originalSize[1]);
+      await sleep(350);
+    }
+  };
   const click = async (selector) => {
     const result = await evaluate(`(() => { const element = document.querySelector(${JSON.stringify(selector)}); if (!element || element.disabled) return false; element.click(); return true; })()`);
     assert.equal(result, true, `button not found or disabled: ${selector}`);
@@ -437,6 +553,11 @@ async function runElectronHost() {
     window.webContents.sendInputEvent({ type: 'mouseMove', x, y });
     window.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
     window.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+  };
+  const sendKey = async (keyCode) => {
+    window.webContents.sendInputEvent({ type: 'keyDown', keyCode });
+    window.webContents.sendInputEvent({ type: 'keyUp', keyCode });
+    await sleep(80);
   };
   const focusProjectEditorThenAction = async (value) => {
     const originalSize = window.getSize();
@@ -687,6 +808,80 @@ async function runElectronHost() {
     }
     console.log('Synthetic React app ready');
 
+    const originalSize = window.getSize();
+    const originalZoom = window.webContents.getZoomFactor();
+    for (const [width, height, zoom] of [[1120, 760, 1], [960, 720, 1], [802, 720, 1], [560, 480, 1], [960, 720, 0.8], [1424, 892, 1]]) {
+      window.setSize(width, height);
+      window.webContents.setZoomFactor(zoom);
+      await sleep(350);
+      await measureLayout(`before-${width}x${height}-zoom-${zoom}`);
+    }
+    window.setSize(...originalSize);
+    window.webContents.setZoomFactor(originalZoom);
+    await sleep(180);
+    await measureSidebarTracks();
+    window.show();
+    window.focus();
+    window.webContents.focus();
+    await evaluate('new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
+    await sleep(40);
+    const sidebarToggleSelector = 'button[aria-controls="application-sidebar"]';
+    const initialSidebarToggle = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const button = document.querySelector(${JSON.stringify(sidebarToggleSelector)});
+      const path = button?.querySelector('.icon path:last-of-type');
+      return { exists: Boolean(button), collapsed: button?.dataset.sidebarCollapsed, reducedMotion: matchMedia('(prefers-reduced-motion: reduce)').matches, pathName: path?.tagName, transition: path ? getComputedStyle(path).transition : null, transform: path ? getComputedStyle(path).transform : null };
+    })())`));
+    console.log(`D4 animation baseline ${JSON.stringify(initialSidebarToggle)}`);
+    assert.equal(initialSidebarToggle.exists, true, 'desktop sidebar toggle must be present after track probe');
+    assert.equal(initialSidebarToggle.collapsed, 'false', 'synthetic desktop starts with sidebar expanded');
+    await sendMouseClick(sidebarToggleSelector);
+    await waitDom('sidebar collapse state', `document.querySelector(${JSON.stringify(sidebarToggleSelector)})?.dataset.sidebarCollapsed === 'true'`);
+    await waitUntil('sidebar divider begins collapsing', async () => {
+      const frame = JSON.parse(await evaluate(`JSON.stringify((() => {
+        const path = document.querySelector(${JSON.stringify(sidebarToggleSelector)}).querySelector('.icon path:last-of-type');
+        return new DOMMatrixReadOnly(getComputedStyle(path).transform).m41;
+      })())`));
+      return frame < -0.1 && frame > -5;
+    }, 1000);
+    const collapseFrame = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const path = document.querySelector(${JSON.stringify(sidebarToggleSelector)}).querySelector('.icon path:last-of-type');
+      return { x: new DOMMatrixReadOnly(getComputedStyle(path).transform).m41, clip: getComputedStyle(path).clipPath };
+    })())`));
+    if (!initialSidebarToggle.reducedMotion) assert.ok(collapseFrame.x < -0.1 && collapseFrame.x > -5, `sidebar line should be moving before the collapsed endpoint; x=${collapseFrame.x}`);
+    await sendMouseClick(sidebarToggleSelector);
+    await sleep(35);
+    const reversalFrame = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const path = document.querySelector(${JSON.stringify(sidebarToggleSelector)}).querySelector('.icon path:last-of-type');
+      return new DOMMatrixReadOnly(getComputedStyle(path).transform).m41;
+    })())`));
+    if (!initialSidebarToggle.reducedMotion) assert.ok(reversalFrame > collapseFrame.x, `rapid reverse should move the divider line back toward zero; collapse=${collapseFrame.x}, reverse=${reversalFrame}`);
+    await waitDom('sidebar rapid reversal returns to expanded', `document.querySelector(${JSON.stringify(sidebarToggleSelector)})?.dataset.sidebarCollapsed === 'false'`);
+    await sleep(260);
+    const expandedLine = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const path = document.querySelector(${JSON.stringify(sidebarToggleSelector)}).querySelector('.icon path:last-of-type');
+      return { x: new DOMMatrixReadOnly(getComputedStyle(path).transform).m41, clip: getComputedStyle(path).clipPath };
+    })())`));
+    assert.ok(Math.abs(expandedLine.x) <= 0.1, `expanded divider line must return to x=0; actual ${expandedLine.x}`);
+    assert.match(expandedLine.clip, /inset\(0px\)/, 'expanded divider line must be fully visible');
+    await sendMouseClick(sidebarToggleSelector);
+    await waitDom('sidebar final collapsed state', `document.querySelector(${JSON.stringify(sidebarToggleSelector)})?.dataset.sidebarCollapsed === 'true'`);
+    await sleep(260);
+    const collapsedLine = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const path = document.querySelector(${JSON.stringify(sidebarToggleSelector)}).querySelector('.icon path:last-of-type');
+      return { x: new DOMMatrixReadOnly(getComputedStyle(path).transform).m41, clip: getComputedStyle(path).clipPath };
+    })())`));
+    assert.ok(Math.abs(collapsedLine.x + 5) <= 0.1, `collapsed divider line must be shifted left 5px; actual ${collapsedLine.x}`);
+    assert.match(collapsedLine.clip, /inset\(1px/, 'collapsed divider line must be slightly clipped at its rounded endpoints');
+    await capture('sidebar-toggle-collapsed');
+    await sendMouseClick(sidebarToggleSelector);
+    await waitDom('sidebar final expanded state', `document.querySelector(${JSON.stringify(sidebarToggleSelector)})?.dataset.sidebarCollapsed === 'false'`);
+    await sleep(260);
+    await capture('sidebar-toggle-expanded');
+    passed('Rendered sidebar toggle animates, reverses, and clips only the collapsed divider line');
+    const layoutReport = join(fixturePath, 'layout-measurements.json');
+    await writeFile(layoutReport, `${JSON.stringify(layoutMeasurements, null, 2)}\n`, 'utf8');
+    console.log(`Layout measurement report retained: ${layoutReport}`);
+
     const draftSelector = '.composer textarea';
     const closeCreateStart = state.pendingCreates.length;
     await clickText('.sidebar-actions button', 'Новый чат');
@@ -935,6 +1130,31 @@ async function runElectronHost() {
     assert.equal(await evaluate(`document.querySelector('.chat-header-title')?.textContent`), 'Chat B');
     assert.equal(await evaluate(`document.querySelector('.chat-history')?.textContent.includes('B baseline')`), true);
     state.deferProjectMoves = false;
+    const projectBExpanded = await evaluate(`(() => [...document.querySelectorAll('.project-section .project-tree > .list-row > .list-row-main')].find((button) => button.textContent.includes('Project B'))?.getAttribute('aria-expanded') === 'true')()`);
+    if (!projectBExpanded) await clickText('.project-section .project-tree > .list-row > .list-row-main', 'Project B');
+    await waitDom('moved chat appears in Project B tree', `document.querySelector('#project-chats-project-b .nested-chat-row')`);
+    const nestedLine = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const tree = document.querySelector('#project-chats-project-b');
+      const row = tree?.querySelector('.nested-chat-row');
+      return { border: row ? getComputedStyle(tree).borderLeftWidth : null, margin: row ? getComputedStyle(tree).marginLeft : null, selectedRow: Boolean(row?.classList.contains('selected')) };
+    })())`));
+    assert.equal(nestedLine.border, '0px', 'expanded project chats must not show the old gray child line');
+    await clickChat('Chat A');
+    await waitDom('selected nested chat and project header marker', `document.querySelector('.chat-header-title')?.textContent === 'Chat A' && document.querySelector('.chat-header-folder') && document.querySelector('#project-chats-project-b .nested-chat-row.selected')`);
+    const selectedNestedLine = await evaluate(`getComputedStyle(document.querySelector('#project-chats-project-b')).borderLeftWidth`);
+    assert.equal(selectedNestedLine, '0px', 'selected nested chat must not restore the old gray child line');
+    const projectHeader = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const title = document.querySelector('.chat-header-title');
+      return { size: getComputedStyle(title).fontSize, weight: getComputedStyle(title).fontWeight, folder: Boolean(document.querySelector('.chat-header-folder')) };
+    })())`));
+    assert.equal(projectHeader.size, '18px', 'chat title should use the reviewed 18px size');
+    assert.equal(projectHeader.weight, '700', 'chat title should use a bold weight');
+    assert.equal(projectHeader.folder, true, 'project chat should show its decorative folder marker');
+    await capture('project-chat-header');
+    await clickChat('Chat B');
+    await waitDom('standalone chat without project marker', `document.querySelector('.chat-header-title')?.textContent === 'Chat B' && !document.querySelector('.chat-header-folder')`);
+    await capture('standalone-chat-header');
+    passed('Rendered project nesting, square-free child list, and project-aware chat title');
     passed('Rendered late project move updates its own chat without replacing another active chat');
 
     const pendingNavigationCreateStart = state.pendingCreates.length;
@@ -1417,6 +1637,165 @@ async function runElectronHost() {
 
     await clickChat('Chat B');
     await waitDom('Chat B before menu overlay check', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'`);
+    const originalChoiceWindowSize = window.getSize();
+    const originalChoiceZoom = window.webContents.getZoomFactor();
+    window.setSize(560, 480);
+    window.webContents.setZoomFactor(0.8);
+    await sleep(350);
+    await click('.profile-settings-button');
+    await waitDom('Settings navigation before opener choice test', `document.querySelector('.settings-nav-item')`);
+    await clickText('.settings-nav-item', 'Общие');
+    await waitDom('General settings before opener choice test', `document.querySelector('.settings-nav-item.active')?.textContent.includes('Общие') && document.querySelector('.choice-menu > button')`);
+    const transparencySelector = `(() => [...document.querySelectorAll('.setting-row')].find((row) => row.querySelector('.setting-row-copy strong')?.textContent.trim() === 'Прозрачная боковая панель')?.querySelector('.switch-control input'))()`;
+    const generalSettingsRows = JSON.parse(await evaluate(`JSON.stringify([...document.querySelectorAll('.setting-row')].map((row) => ({ title: row.querySelector('.setting-row-copy strong')?.textContent.trim() ?? null, switches: row.querySelectorAll('.switch-control input').length })))`));
+    console.log(`General settings rows before switch probe ${JSON.stringify(generalSettingsRows)}`);
+    const readSwitchGeometry = async (selectorExpression) => JSON.parse(await evaluate(`JSON.stringify((() => {
+      const input = ${selectorExpression};
+      if (!input) return null;
+      const track = input.nextElementSibling;
+      const thumb = getComputedStyle(track, '::after');
+      const transform = thumb.transform === 'none' ? 0 : new DOMMatrixReadOnly(thumb.transform).m41;
+      return { checked: input.checked, disabled: input.disabled, trackWidth: track.getBoundingClientRect().width, trackHeight: track.getBoundingClientRect().height, top: Number.parseFloat(thumb.top), left: Number.parseFloat(thumb.left), width: Number.parseFloat(thumb.width), height: Number.parseFloat(thumb.height), travel: transform };
+    })())`));
+    const assertSwitchGeometry = (geometry, expected, label) => {
+      assert.ok(geometry, `${label}: switch input must exist`);
+      for (const [property, value] of Object.entries(expected)) {
+        assert.ok(Math.abs(geometry[property] - value) <= 0.1, `${label}: ${property} should be within 0.1px of ${value}; actual ${geometry[property]}`);
+      }
+    };
+    const autostartOff = await readSwitchGeometry(`(() => [...document.querySelectorAll('.setting-row')].find((row) => row.querySelector('.setting-row-copy strong')?.textContent.trim() === 'Запускать вместе с Windows')?.querySelector('.switch-control input'))()`);
+    assert.equal(autostartOff.disabled, true, 'synthetic portable profile keeps autostart switch disabled');
+    assertSwitchGeometry(autostartOff, { top: 5, left: 4, width: 18, height: 18, travel: 0 }, 'disabled common switch retains the same off geometry');
+    await clickText('.settings-nav-item', 'Оформление');
+    await waitDom('Appearance settings before transparency switch test', `document.querySelector('.settings-nav-item.active')?.textContent.includes('Оформление') && ${transparencySelector} !== null`);
+    const transparencyOff = await readSwitchGeometry(transparencySelector);
+    assertSwitchGeometry(transparencyOff, { trackWidth: 48, trackHeight: 28, top: 5, left: 4, width: 18, height: 18, travel: 0 }, 'unchecked common switch thumb must be centered and start with a 4px inset');
+    await evaluate(`${transparencySelector}.click()`);
+    await waitDom('transparency switch becomes checked', `${transparencySelector}?.checked === true`);
+    await waitUntil('transparency switch thumb settles at checked endpoint', async () => Math.abs((await readSwitchGeometry(transparencySelector))?.travel - 22) <= 0.1, 1000);
+    const transparencyOn = await readSwitchGeometry(transparencySelector);
+    assertSwitchGeometry(transparencyOn, { travel: 22 }, 'checked common switch thumb must reach the checked endpoint');
+    await evaluate(`${transparencySelector}.click()`);
+    await waitDom('transparency switch restored off', `${transparencySelector}?.checked === false`);
+    await waitUntil('transparency switch thumb settles at unchecked endpoint', async () => (await readSwitchGeometry(transparencySelector))?.travel === 0, 1000);
+    await clickText('.settings-nav-item', 'Общие');
+    await waitDom('General settings restored before opener choice test', `document.querySelector('.settings-nav-item.active')?.textContent.includes('Общие') && document.querySelector('.choice-menu > button')`);
+
+    await sendMouseClick('.choice-menu > button');
+    await waitDom('General opener listbox opens', `document.querySelector('.choice-menu .action-menu-content[role="listbox"]:popover-open')`);
+    await waitDom('General opener trigger reports expanded state', `document.querySelector('.choice-menu > button')?.getAttribute('aria-expanded') === 'true'`);
+    const openerPopup = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const popup = document.querySelector('.choice-menu .action-menu-content[role="listbox"]');
+      const trigger = document.querySelector('.choice-menu > button');
+      const options = [...(popup?.querySelectorAll('[role="option"]') ?? [])];
+      const popupBounds = popup?.getBoundingClientRect();
+      const triggerBounds = trigger?.getBoundingClientRect();
+      return {
+        label: popup?.getAttribute('aria-label'), triggerHasPopup: trigger?.getAttribute('aria-haspopup'),
+        controlsTarget: trigger?.getAttribute('aria-controls') === popup?.id, expanded: trigger?.getAttribute('aria-expanded'),
+        popupLeft: popupBounds?.left, popupTop: popupBounds?.top, popupBottom: popupBounds?.bottom,
+        triggerLeft: triggerBounds?.left, triggerTop: triggerBounds?.top, triggerBottom: triggerBounds?.bottom,
+        options: options.map((option) => ({ text: option.textContent.trim(), disabled: option.disabled, selected: option.getAttribute('aria-selected') })),
+        popupBackground: popup ? getComputedStyle(popup).backgroundColor : null,
+      };
+    })())`));
+    assert.equal(openerPopup.label, 'Открывать папки в', 'listbox has an accessible name');
+    assert.equal(openerPopup.triggerHasPopup, 'listbox');
+    assert.equal(openerPopup.controlsTarget, true, 'choice trigger controls its popup');
+    assert.equal(openerPopup.expanded, 'true');
+    assert.ok(Math.abs(openerPopup.popupLeft - openerPopup.triggerLeft) <= 1, 'choice list aligns with the start edge of its trigger');
+    assert.ok(openerPopup.popupTop >= openerPopup.triggerBottom - 1 || openerPopup.popupBottom <= openerPopup.triggerTop + 1, 'choice list opens vertically below its trigger or flips above it');
+    assert.deepEqual(openerPopup.options.map((option) => option.text), ['По умолчанию (Windows)', 'Проводник Windows', 'Приложение не найдено']);
+    assert.deepEqual(openerPopup.options[2], { text: 'Приложение не найдено', disabled: true, selected: 'true' }, 'unavailable VSCode opener remains selected and visibly disabled');
+    await capture('choice-menu-general-open');
+    await sendKey('END');
+    assert.match(await evaluate(`document.activeElement?.textContent ?? ''`), /Проводник Windows/, 'End skips the disabled last option');
+    await sendKey('SPACE');
+    await waitUntil('folder opener selection is applied', () => state.appSettings.preferredOpener === 'explorer');
+    await waitDom('folder choice closes and returns focus', `!document.querySelector('.choice-menu .action-menu-content:popover-open') && document.activeElement === document.querySelector('.choice-menu > button')`);
+    assert.match(await evaluate(`document.querySelector('.choice-menu > button')?.textContent ?? ''`), /Проводник Windows/);
+    await sendMouseClick('.choice-menu > button');
+    await waitDom('folder choice reopens with current value', `document.querySelector('.choice-menu .action-menu-content:popover-open')`);
+    await sendKey('ESC');
+    await waitDom('Escape closes folder choice and returns focus', `!document.querySelector('.choice-menu .action-menu-content:popover-open') && document.activeElement === document.querySelector('.choice-menu > button')`);
+    assert.equal(await evaluate(`document.querySelector('.settings-nav-item.active')?.textContent.includes('Общие')`), true, 'Escape must not leave Settings');
+    assert.equal(state.appSettings.preferredOpener, 'explorer', 'Escape must not change the selected opener');
+
+    await clickText('.settings-nav-item', 'Skills и интеграции');
+    await waitDom('Project Skills selector is ready', `document.querySelector('.skill-locations .inline-actions .choice-menu > button')`);
+    const skillChoiceTrigger = '.skill-locations .inline-actions .choice-menu > button';
+    assert.equal(await evaluate(`document.querySelector('.skill-locations .inline-actions .secondary-button')?.disabled`), true, 'empty Project Skills selection keeps Open disabled');
+    await sendMouseClick(skillChoiceTrigger);
+    await waitDom('Project Skills long list opens', `document.querySelector('.skill-locations .choice-menu .action-menu-content:popover-open')`);
+    await waitDom('Project Skills trigger reports expanded state', `document.querySelector('.skill-locations .choice-menu > button')?.getAttribute('aria-expanded') === 'true'`);
+    const skillPopup = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const popup = document.querySelector('.skill-locations .choice-menu .action-menu-content');
+      const list = popup?.querySelector('.choice-menu-content');
+      const bounds = popup?.getBoundingClientRect();
+      const trigger = document.querySelector('.skill-locations .choice-menu > button')?.getBoundingClientRect();
+      return {
+        optionCount: popup?.querySelectorAll('[role="option"]').length,
+        scrollHeight: popup?.scrollHeight, clientHeight: popup?.clientHeight, scrollTop: popup?.scrollTop,
+        top: bounds?.top, right: bounds?.right, bottom: bounds?.bottom, left: bounds?.left,
+        triggerLeft: trigger?.left, triggerTop: trigger?.top, triggerBottom: trigger?.bottom, viewWidth: innerWidth, viewHeight: innerHeight,
+        label: popup?.getAttribute('aria-label'), listRole: popup?.getAttribute('role'),
+        background: popup ? getComputedStyle(popup).backgroundColor : null,
+        selectedPlaceholder: popup?.querySelector('[role="option"][aria-selected="true"]')?.textContent.trim(),
+        wrapperRole: list?.getAttribute('role') ?? null,
+      };
+    })())`));
+    console.log(`Project Skills popup geometry ${JSON.stringify(skillPopup)}`);
+    await capture('choice-menu-skills-open');
+    assert.equal(skillPopup.optionCount, 15, 'synthetic project list must include a placeholder and 14 projects');
+    assert.equal(skillPopup.label, 'Проект для локальных Skills');
+    assert.equal(skillPopup.listRole, 'listbox');
+    assert.equal(skillPopup.selectedPlaceholder, 'Выберите проект');
+    assert.ok(skillPopup.scrollHeight > skillPopup.clientHeight, 'long project choices must scroll inside the popup');
+    assert.ok(Math.abs(skillPopup.left - skillPopup.triggerLeft) <= 1, 'Project Skills list aligns with the start edge of its trigger');
+    assert.ok(skillPopup.left >= 7 && skillPopup.right <= skillPopup.viewWidth - 7, 'choice popup must stay within horizontal viewport edges (1px rounding tolerance)');
+    assert.ok(skillPopup.top >= 7 && skillPopup.bottom <= skillPopup.viewHeight - 7, `choice popup must stay within vertical viewport edges (1px rounding tolerance); ${JSON.stringify({ top: skillPopup.top, bottom: skillPopup.bottom, viewHeight: skillPopup.viewHeight, triggerTop: skillPopup.triggerTop, triggerBottom: skillPopup.triggerBottom })}`);
+    const skillPopupFitsAbove = skillPopup.triggerTop >= (skillPopup.bottom - skillPopup.top) + 13;
+    const skillPopupFitsBelow = skillPopup.viewHeight - skillPopup.triggerBottom >= (skillPopup.bottom - skillPopup.top) + 13;
+    if (skillPopupFitsAbove || skillPopupFitsBelow) {
+      assert.ok(skillPopup.top >= skillPopup.triggerBottom - 1 || skillPopup.bottom <= skillPopup.triggerTop + 1, 'Project Skills list opens vertically below its trigger or flips above it when there is room');
+    }
+    await sendKey('END');
+    assert.match(await evaluate(`document.activeElement?.textContent ?? ''`), /Long Project 12/, 'End reaches the last project choice');
+    await waitUntil('end navigation scrolls the project list', async () => (await evaluate(`document.querySelector('.skill-locations .choice-menu .action-menu-content')?.scrollTop ?? 0`) > 0));
+    await sendKey('SPACE');
+    await waitDom('last Project Skills choice becomes selected', `document.querySelector('.skill-locations .choice-menu > button')?.textContent.includes('Long Project 12')`);
+    assert.equal(await evaluate(`document.querySelector('.skill-locations .inline-actions .secondary-button')?.disabled`), false, 'selecting a project enables Open');
+    await sendKey('HOME');
+    await waitDom('Project Skills Home focuses placeholder', `document.activeElement?.textContent.includes('Выберите проект')`);
+    await sendKey('ENTER');
+    await waitDom('Project Skills placeholder restores empty selection', `document.querySelector('.skill-locations .choice-menu > button')?.textContent.includes('Выберите проект') && document.querySelector('.skill-locations .inline-actions .secondary-button')?.disabled`);
+    await sendMouseClick(skillChoiceTrigger);
+    await waitDom('Project Skills popup before outside click', `document.querySelector('.skill-locations .choice-menu .action-menu-content:popover-open')`);
+    const skillSwitchOn = await readSwitchGeometry(`document.querySelector('.skill-enabled-toggle .switch-control input')`);
+    assert.equal(skillSwitchOn.checked, true, 'synthetic Skill consumer starts checked');
+    assertSwitchGeometry(skillSwitchOn, { top: 5, left: 4, width: 18, height: 18, travel: 22 }, 'checked Skill switch uses the common geometry');
+    const outsideButton = await evaluate(`(() => {
+      const button = document.querySelector('.skill-registry-actions .quiet-button');
+      if (!button || button.disabled) return null;
+      const rect = button.getBoundingClientRect();
+      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, left: rect.left, right: rect.right };
+    })()`);
+    assert.ok(outsideButton && outsideButton.left > skillPopup.right, 'visible Skill refresh action must be an unoccluded outside-click target');
+    const outsideZoom = window.webContents.getZoomFactor();
+    const outsideX = Math.round(outsideButton.x * outsideZoom);
+    const outsideY = Math.round(outsideButton.y * outsideZoom);
+    window.webContents.sendInputEvent({ type: 'mouseMove', x: outsideX, y: outsideY });
+    window.webContents.sendInputEvent({ type: 'mouseDown', x: outsideX, y: outsideY, button: 'left', clickCount: 1 });
+    window.webContents.sendInputEvent({ type: 'mouseUp', x: outsideX, y: outsideY, button: 'left', clickCount: 1 });
+    await waitDom('outside click on visible Skills action dismisses popup', `!document.querySelector('.skill-locations .choice-menu .action-menu-content:popover-open') && document.querySelector('.settings-nav-item.active')?.textContent.includes('Skills и интеграции')`);
+    await clickText('.settings-nav-item', 'Hooks');
+    await waitDom('Hooks navigation follows outside dismissal', `document.querySelector('.settings-nav-item.active')?.textContent.includes('Hooks')`);
+    await click('button.window-action[aria-label="Назад"]');
+    await waitDom('Chat B restored after Settings choice test', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'`);
+    window.webContents.setZoomFactor(originalChoiceZoom);
+    window.setSize(originalChoiceWindowSize[0], originalChoiceWindowSize[1]);
+    await sleep(350);
+    passed('Rendered settings choices preserve disabled/empty values, keyboard/focus, themed viewport-clamped popovers, and switch symmetry');
     await click('button[aria-label="Показать браузер"]');
     await waitDom('browser pane with its synthetic page', `document.querySelector('.browser-pane .browser-tab button[title="Synthetic page"]')`);
     await waitUntil('browser has native bounds before opening menus', () => state.browserBoundsCalls.some((bounds) => bounds && bounds.width > 0 && bounds.height > 0));
