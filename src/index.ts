@@ -342,7 +342,8 @@ async function getInstalledLauncher() {
 
 function loginItemApi() {
   return {
-    getSettings: (options: { path: string; args: string[] }) => app.getLoginItemSettings(options),
+    // Electron parses this Windows path as a command line and truncates at spaces unless quoted.
+    getSettings: (options: { path: string; args: string[] }) => app.getLoginItemSettings({ ...options, path: `"${options.path}"` }),
     setSettings: (settings: { path: string; args: string[]; openAtLogin: boolean; enabled: boolean }) => app.setLoginItemSettings(settings),
   };
 }
