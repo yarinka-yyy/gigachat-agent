@@ -1,7 +1,7 @@
 {
   "name": "gigachat-agents",
   "productName": "GigaChat Agents",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Локальная настольная основа GigaChat Agents",
   "main": ".webpack/main/index.cjs",
   "private": true,
