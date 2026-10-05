@@ -8,6 +8,7 @@ import {
   createCloseAdmission,
   createCloseController,
   createDetectedFolderOpener,
+  createTrayLifecycle,
   migrateCurrentVersionAutoStart,
   readInstalledAutoStart,
   resolveSquirrelLauncher,
@@ -230,6 +231,29 @@ test('primary application launch keeps the process running after acquiring the l
   assert.equal(primary, true);
   assert.equal(lockRequests, 1);
   assert.equal(quitCalls, 0);
+});
+
+test('tray hides on ordinary close and waits for the renderer close listener before Exit', () => {
+  const tray = createTrayLifecycle();
+  tray.windowCreated();
+  assert.equal(tray.windowClose(true), 'hide');
+  assert.equal(tray.windowClose(false), 'wait', 'without a tray, close still waits for the renderer handler');
+  assert.equal(tray.closeHandlerReady(), true);
+  assert.equal(tray.windowClose(false), 'close', 'the no-tray fallback keeps the normal safe close path');
+  tray.returnToWork();
+  assert.equal(tray.requestExit(), 'close');
+  tray.mainFrameNavigating();
+  assert.equal(tray.requestExit(), 'already-exiting');
+  assert.equal(tray.closeHandlerReady(), true, 'a main-frame reload re-arms the pending Exit after listener readiness');
+  assert.equal(tray.windowClose(true), 'close');
+  tray.returnToWork();
+  tray.windowCreated();
+  assert.equal(tray.requestExit(), 'wait', 'an early tray Exit stays pending until the renderer listener is installed');
+  assert.equal(tray.requestExit(), 'already-exiting', 'repeated Exit cannot start a second close attempt');
+  assert.equal(tray.closeHandlerReady(), true, 'preload acknowledgement releases the pending close');
+  assert.equal(tray.windowClose(true), 'close', 'Exit bypasses hide only after the renderer close path is ready');
+  tray.returnToWork();
+  assert.equal(tray.windowClose(true), 'hide', 'Return resets the Exit intent');
 });
 
 test('close admission drains accepted IPC, rejects new work, and resumes after a failed close', async () => {

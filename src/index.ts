@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, mkdtemp, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { app, BrowserWindow, dialog, ipcMain, nativeTheme, Notification, safeStorage, screen, session, shell, systemPreferences, WebContentsView, type IpcMainInvokeEvent, type MediaAccessPermissionRequest } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, Notification, safeStorage, screen, session, shell, systemPreferences, Tray, WebContentsView, type IpcMainInvokeEvent, type MediaAccessPermissionRequest } from 'electron';
 import { openStore, type LocalStore } from './store';
 import { buildInstructionRequest } from './instructions';
 import { createLocalTools, createPowerShellHelper, resolvePowerShellHelperPath, type LocalTools } from './local-tools';
@@ -24,6 +24,7 @@ import {
   createCloseAdmission,
   createCloseController,
   createDetectedFolderOpener,
+  createTrayLifecycle,
   migrateCurrentVersionAutoStart,
   readInstalledAutoStart,
   resolveSquirrelLauncher,
@@ -41,6 +42,9 @@ let currentTheme: Theme = 'emerald';
 let allowClose = false;
 let allowAppQuit = false;
 let deletingAppData = false;
+let tray: Tray | null = null;
+let createMainWindow: (() => void) | null = null;
+const trayLifecycle = createTrayLifecycle();
 const closeAdmission = createCloseAdmission();
 let closeController: ReturnType<typeof createCloseController> | null = null;
 let approvalBroker: ReturnType<typeof createPermissionApprovals> | null = null;
@@ -49,13 +53,24 @@ let secondInstancePendingFocus = false;
 let autoStartMigrationIssue: string | null = null;
 
 function focusMainWindow(): void {
-  if (!mainWindow) {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    if (app.isReady() && createMainWindow) {
+      secondInstancePendingFocus = false;
+      createMainWindow();
+    } else {
+      secondInstancePendingFocus = true;
+      return;
+    }
+  }
+  const window = mainWindow;
+  if (!window || window.isDestroyed()) {
     secondInstancePendingFocus = true;
     return;
   }
-  if (mainWindow.isMinimized()) mainWindow.restore();
-  mainWindow.show();
-  mainWindow.focus();
+  secondInstancePendingFocus = false;
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
 }
 
 let isSquirrelStartup = false;
@@ -712,6 +727,18 @@ async function registerIpcHandlers(
     });
   };
 
+  ipcMain.handle('app:close-handler-ready', (event) => {
+    assertTrustedSender(event);
+    const shouldRetryClose = trayLifecycle.closeHandlerReady();
+    const readyWindow = mainWindow;
+    if (shouldRetryClose && readyWindow && !readyWindow.isDestroyed()) {
+      setImmediate(() => {
+        if (mainWindow === readyWindow && !readyWindow.isDestroyed()) readyWindow.close();
+      });
+    }
+    return true;
+  });
+
   closeController = createCloseController(closeAdmission, {
     pauseBrowserMetadata: () => userBrowser.pauseMetadata(),
     resumeBrowserMetadata: () => userBrowser.resumeMetadata(),
@@ -721,7 +748,12 @@ async function registerIpcHandlers(
     drainStore: async () => { await store.getSettings(); },
     closeOnboardingBrowser: () => browser.close(),
     destroyBrowser: () => userBrowser.destroy(),
-    allowClose: () => { allowClose = true; allowAppQuit = true; },
+    allowClose: () => {
+      allowClose = true;
+      allowAppQuit = true;
+      tray?.destroy();
+      tray = null;
+    },
     closeWindow: () => {
       const closingWindow = mainWindow;
       setImmediate(() => {
@@ -986,6 +1018,7 @@ async function registerIpcHandlers(
   ipcMain.handle('app:close-return', (event) => {
     assertTrustedSender(event);
     if (!closeController?.resume()) throw new Error('Сейчас нельзя вернуться к работе: закрытие ещё выполняется.');
+    trayLifecycle.returnToWork();
     return true;
   });
   handle('settings:choose-projects-folder', async () => {
@@ -1035,6 +1068,7 @@ const createWindow = (): void => {
   const icon = join(app.isPackaged ? process.resourcesPath : app.getAppPath(),
     app.isPackaged ? 'gigachat-icon.ico' : 'src/assets/gigachat-icon.ico');
   const initialZoomFactor = 0.8;
+  trayLifecycle.windowCreated();
   allowClose = false;
   allowAppQuit = false;
   closeController?.reopen();
@@ -1079,15 +1113,24 @@ const createWindow = (): void => {
   window.webContents.on('will-navigate', (event, navigationUrl) => {
     if (navigationUrl !== entryUrl.href) event.preventDefault();
   });
+  window.webContents.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) trayLifecycle.mainFrameNavigating();
+  });
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   window.webContents.once('did-finish-load', () => window.webContents.setZoomFactor(initialZoomFactor));
   window.once('ready-to-show', () => window.show());
   window.on('close', (event) => {
-    if (allowClose || window.webContents.isDestroyed() || window.webContents.isLoadingMainFrame()) return;
+    if (allowClose || window.webContents.isDestroyed()) return;
+    const decision = trayLifecycle.windowClose(Boolean(tray));
     event.preventDefault();
-    window.webContents.send('app:close-requested');
+    if (decision === 'hide') {
+      window.hide();
+      return;
+    }
+    if (decision === 'close') window.webContents.send('app:close-requested');
   });
   window.on('closed', () => {
+    trayLifecycle.windowDestroyed();
     approvalBroker?.cancelAll();
     mainWindow = null;
     void onboardingBrowser?.close();
@@ -1095,6 +1138,39 @@ const createWindow = (): void => {
   });
   void window.loadURL(MAIN_WINDOW_WEBPACK_ENTRY);
 };
+
+function requestApplicationExit(): void {
+  const decision = trayLifecycle.requestExit();
+  if (decision === 'already-exiting') {
+    focusMainWindow();
+    return;
+  }
+  focusMainWindow();
+  if (decision === 'close') mainWindow?.close();
+}
+
+function createTray(): void {
+  if (process.platform !== 'win32') return;
+  let applicationTray: Tray | null = null;
+  try {
+    const icon = join(app.isPackaged ? process.resourcesPath : app.getAppPath(),
+      app.isPackaged ? 'gigachat-icon.ico' : 'src/assets/gigachat-icon.ico');
+    applicationTray = new Tray(icon);
+    applicationTray.setToolTip('GigaChat Agents');
+    applicationTray.setContextMenu(Menu.buildFromTemplate([
+      { label: 'Открыть приложение', click: focusMainWindow },
+      { type: 'separator' },
+      { label: 'Выход', click: requestApplicationExit },
+    ]));
+    applicationTray.on('click', focusMainWindow);
+    applicationTray.on('double-click', focusMainWindow);
+    tray = applicationTray;
+  } catch (error) {
+    applicationTray?.destroy();
+    tray = null;
+    dialog.showErrorBox('Значок приложения недоступен', error instanceof Error ? error.message : 'Не удалось создать значок в области уведомлений.');
+  }
+}
 
 function configureMainAudioPermission(): void {
   const mainSession = session.defaultSession;
@@ -1189,7 +1265,9 @@ if (isPrimaryInstance) void app.whenReady().then(async () => {
     nativeTheme.on('updated', syncTitleBarOverlay);
     const mainRuntime = await createMainRuntime(store, customPermissions, approvals, helperCandidate);
     await registerIpcHandlers(store, mainRuntime, secureStore, onboardingBrowser, embeddedBrowser, customPermissions, approvals);
+    createMainWindow = createWindow;
     createWindow();
+    createTray();
     if (secondInstancePendingFocus) focusMainWindow();
     const startupIssues = [...instructionRecoveryIssues, ...projectFolderIssues, ...storageIssues,
       ...(autoStartMigrationIssue ? [autoStartMigrationIssue] : [])];
@@ -1204,20 +1282,20 @@ if (isPrimaryInstance) void app.whenReady().then(async () => {
 if (isPrimaryInstance) {
   app.on('before-quit', (event) => {
     if (allowAppQuit || deletingAppData) return;
-    if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed() || mainWindow.webContents.isLoadingMainFrame()) {
+    if (!tray && (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed())) {
       allowAppQuit = true;
       return;
     }
     event.preventDefault();
-    mainWindow.close();
+    requestApplicationExit();
   });
 
   app.on('window-all-closed', () => {
-    if (deletingAppData) return;
+    if (deletingAppData || tray) return;
     if (process.platform !== 'darwin') app.quit();
   });
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    if (BrowserWindow.getAllWindows().length === 0) focusMainWindow();
   });
 }

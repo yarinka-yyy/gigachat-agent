@@ -172,6 +172,9 @@ const api: AppApi = {
       void runCloseAttempt(false);
     };
     ipcRenderer.on('app:close-requested', listener);
+    void ipcRenderer.invoke('app:close-handler-ready').catch((error: unknown) => {
+      console.error('Не удалось подтвердить готовность безопасного закрытия.', error);
+    });
     return () => {
       ipcRenderer.removeListener('app:close-requested', listener);
       if (closeFlush === flush) {

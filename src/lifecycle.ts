@@ -146,6 +146,54 @@ export function acquirePrimaryInstance(
   return true;
 }
 
+export function createTrayLifecycle() {
+  let closeHandlerReady = false;
+  let closePending = false;
+  let exitRequested = false;
+
+  return {
+    windowCreated(): void {
+      closeHandlerReady = false;
+      closePending = exitRequested;
+    },
+    windowDestroyed(): void {
+      closeHandlerReady = false;
+      closePending = exitRequested;
+    },
+    mainFrameNavigating(): void {
+      closeHandlerReady = false;
+      closePending ||= exitRequested;
+    },
+    windowClose(hasTray: boolean): 'hide' | 'wait' | 'close' {
+      if (hasTray && !exitRequested) return 'hide';
+      if (!closeHandlerReady) {
+        closePending = true;
+        return 'wait';
+      }
+      return 'close';
+    },
+    requestExit(): 'already-exiting' | 'wait' | 'close' {
+      if (exitRequested) return 'already-exiting';
+      exitRequested = true;
+      if (!closeHandlerReady) {
+        closePending = true;
+        return 'wait';
+      }
+      return 'close';
+    },
+    closeHandlerReady(): boolean {
+      closeHandlerReady = true;
+      if (!closePending) return false;
+      closePending = false;
+      return true;
+    },
+    returnToWork(): void {
+      exitRequested = false;
+      closePending = false;
+    },
+  };
+}
+
 export function createCloseAdmission() {
   let accepting = true;
   let completed = false;
