@@ -878,6 +878,190 @@ async function runElectronHost() {
     await sleep(260);
     await capture('sidebar-toggle-expanded');
     passed('Rendered sidebar toggle animates, reverses, and clips only the collapsed divider line');
+
+    const dragWindowSize = window.getSize();
+    const dragZoom = window.webContents.getZoomFactor();
+    window.setSize(1424, 892);
+    window.webContents.setZoomFactor(1);
+    window.show();
+    window.focus();
+    window.webContents.focus();
+    await sleep(350);
+    const dragCapturedPointer = async (label, deltaX, cancel = false) => {
+      const widthMargin = Math.max(10, Math.abs(deltaX) / 2);
+      const start = JSON.parse(await evaluate(`JSON.stringify((() => {
+        const divider = document.querySelector('.sidebar-resizer');
+        const sidebar = document.querySelector('.sidebar');
+        if (!divider) return null;
+        const rect = divider.getBoundingClientRect();
+        window.__auditPointerProbe = null;
+        window.__auditPointerEvents = [];
+        const recordPointerEvent = (event) => {
+          const pointer = window.__auditPointerProbe;
+          if (!pointer || event.pointerId !== pointer.pointerId) return;
+          const currentDivider = document.querySelector('.sidebar-resizer');
+          window.__auditPointerEvents.push({
+            type: event.type,
+            pointerId: event.pointerId,
+            pointerType: event.pointerType,
+            buttons: event.buttons,
+            clientX: event.clientX,
+            target: event.target?.className?.baseVal ?? event.target?.className ?? event.target?.tagName ?? null,
+            captured: currentDivider?.hasPointerCapture(event.pointerId) ?? false,
+            dragging: document.querySelector('.workspace')?.classList.contains('sidebar-dragging') ?? false,
+            width: document.querySelector('.sidebar')?.getBoundingClientRect().width ?? null,
+          });
+        };
+        window.addEventListener('pointerdown', (event) => {
+          window.__auditPointerProbe = { pointerId: event.pointerId, pointerType: event.pointerType };
+          recordPointerEvent(event);
+        }, { capture: true, once: true });
+        window.__auditPointerListeners = ['pointermove', 'pointerup', 'pointercancel', 'lostpointercapture']
+          .map((type) => ({ type, listener: recordPointerEvent }));
+        for (const { type, listener } of window.__auditPointerListeners) window.addEventListener(type, listener, { capture: true });
+        return {
+          x: rect.left + 4,
+          y: rect.top + 80,
+          width: sidebar?.getBoundingClientRect().width ?? 0,
+          ariaWidth: Number(divider.getAttribute('aria-valuenow')),
+        };
+      })())`));
+      assert.ok(start, `${label}: visible sidebar resizer is required`);
+      const zoom = window.webContents.getZoomFactor();
+      const x = Math.round(start.x * zoom);
+      const y = Math.round(start.y * zoom);
+      let held = false;
+      try {
+        window.webContents.sendInputEvent({ type: 'mouseMove', x, y });
+        window.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+        held = true;
+        await waitUntil(`${label} pointer capture is active`, async () => evaluate(`(() => {
+          const divider = document.querySelector('.sidebar-resizer');
+          const pointer = window.__auditPointerProbe;
+          return Boolean(divider && pointer && pointer.pointerType === 'mouse' && divider.hasPointerCapture(pointer.pointerId));
+        })()`));
+        const pointer = JSON.parse(await evaluate('JSON.stringify(window.__auditPointerProbe)'));
+        const movedX = Math.round((start.x + deltaX) * zoom);
+        window.webContents.sendInputEvent({ type: 'mouseMove', x: movedX, y, button: 'left', modifiers: ['leftButtonDown'] });
+        await waitUntil(`${label} transient width changes`, async () => {
+          const currentWidth = Number(await evaluate(`document.querySelector('.sidebar-resizer')?.getAttribute('aria-valuenow')`) ?? 0);
+          return deltaX >= 0 ? currentWidth > start.width + widthMargin : currentWidth < start.width - widthMargin;
+        });
+        const transient = await measureLayout(`pointer-${label}-during`);
+        assert.ok(deltaX >= 0 ? transient.sidebar.width > start.width + widthMargin : transient.sidebar.width < start.width - widthMargin,
+          `${label}: captured pointer movement should resize the sidebar`);
+        if (cancel) {
+          const cancellation = await evaluate(`(() => {
+            const divider = document.querySelector('.sidebar-resizer');
+            const pointerId = ${pointer.pointerId};
+            const capturedBefore = divider.hasPointerCapture(pointerId);
+            divider.dispatchEvent(new PointerEvent('pointercancel', {
+              bubbles: true, pointerId, pointerType: 'mouse', button: 0, buttons: 0,
+              clientX: ${start.x + deltaX}, clientY: ${start.y},
+            }));
+            return { capturedBefore, type: 'pointercancel' };
+          })()`);
+          assert.equal(cancellation.capturedBefore, true, `${label}: pointercancel must be sent during capture`);
+          window.webContents.sendInputEvent({ type: 'mouseUp', x: movedX, y, button: 'left', clickCount: 1 });
+          held = false;
+          await waitDom(`${label} ends dragging`, `!document.querySelector('.workspace')?.classList.contains('sidebar-dragging')`);
+          await waitUntil(`${label} preserves saved width`, () => state.appSettings.sidebarWidthPx === start.width);
+          assert.equal(state.appSettings.sidebarVisible, true, `${label}: cancellation must not hide the sidebar`);
+        } else {
+          window.webContents.sendInputEvent({ type: 'mouseUp', x: movedX, y, button: 'left', clickCount: 1 });
+          held = false;
+          await waitUntil(`${label} saves released width`, () => deltaX >= 0
+            ? state.appSettings.sidebarWidthPx > start.width + widthMargin
+            : state.appSettings.sidebarWidthPx < start.width - widthMargin);
+          await waitDom(`${label} ends dragging`, `!document.querySelector('.workspace')?.classList.contains('sidebar-dragging')`);
+        }
+        const pointerEvents = JSON.parse(await evaluate('JSON.stringify(window.__auditPointerEvents ?? [])'));
+        await evaluate(`(() => {
+          for (const { type, listener } of window.__auditPointerListeners ?? []) window.removeEventListener(type, listener, true);
+          window.__auditPointerListeners = [];
+        })()`);
+        return { startWidth: start.width, ariaStartWidth: start.ariaWidth, transientWidth: transient.sidebar.width, persistedWidth: state.appSettings.sidebarWidthPx, pointerId: pointer.pointerId, canceled: cancel, pointerEvents };
+      } catch (error) {
+        const diagnostic = await evaluate(`JSON.stringify({
+          pointerEvents: window.__auditPointerEvents ?? [],
+          width: document.querySelector('.sidebar')?.getBoundingClientRect().width ?? null,
+          ariaWidth: document.querySelector('.sidebar-resizer')?.getAttribute('aria-valuenow') ?? null,
+          dragging: document.querySelector('.workspace')?.classList.contains('sidebar-dragging') ?? null,
+          capture: (() => {
+            const pointer = window.__auditPointerProbe;
+            const divider = document.querySelector('.sidebar-resizer');
+            return pointer && divider ? divider.hasPointerCapture(pointer.pointerId) : null;
+          })(),
+        })`);
+        error.message += `; synthetic pointer state: ${diagnostic}`;
+        throw error;
+      } finally {
+        if (held) window.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+      }
+    };
+    const releasedDrag = await dragCapturedPointer('release', 60);
+    assert.ok(releasedDrag.persistedWidth > releasedDrag.startWidth + 40, `release: setting should persist the dragged width; ${JSON.stringify(releasedDrag)}`);
+    const canceledDrag = await dragCapturedPointer('cancel', 70, true);
+    assert.equal(canceledDrag.persistedWidth, releasedDrag.persistedWidth, 'pointercancel must discard the transient width');
+    await waitUntil('canceled transient width returns to its saved layout', async () => {
+      const actualWidth = Number(await evaluate(`document.querySelector('.sidebar')?.getBoundingClientRect().width ?? 0`));
+      return Math.abs(actualWidth - canceledDrag.persistedWidth) <= 0.5;
+    });
+    console.log(`Synthetic pointer drag evidence ${JSON.stringify({ releasedDrag, canceledDrag })}`);
+    const restoreDrag = await dragCapturedPointer('restore-width', releasedDrag.startWidth - releasedDrag.persistedWidth);
+    assert.equal(restoreDrag.persistedWidth, releasedDrag.startWidth, 'synthetic drag probe must restore its initial saved width');
+    await waitUntil('restored sidebar width reaches its saved layout', async () => {
+      const actualWidth = Number(await evaluate(`document.querySelector('.sidebar')?.getBoundingClientRect().width ?? 0`));
+      return Math.abs(actualWidth - restoreDrag.persistedWidth) <= 0.5;
+    });
+    window.webContents.setZoomFactor(dragZoom);
+    window.setSize(dragWindowSize[0], dragWindowSize[1]);
+    await sleep(350);
+    passed('Synthetic captured pointer release persists width and pointercancel discards it');
+
+    const debuggerWasAttached = window.webContents.debugger.isAttached();
+    if (!debuggerWasAttached) window.webContents.debugger.attach('1.3');
+    try {
+      await window.webContents.debugger.sendCommand('Emulation.setEmulatedMedia', {
+        features: [{ name: 'prefers-reduced-motion', value: 'reduce' }],
+      });
+      await waitDom('reduced-motion media emulation is active', `matchMedia('(prefers-reduced-motion: reduce)').matches`);
+      const reducedMotionStyle = JSON.parse(await evaluate(`JSON.stringify((() => {
+        const path = document.querySelector(${JSON.stringify(sidebarToggleSelector)}).querySelector('.icon path:last-of-type');
+        const durations = getComputedStyle(path).transitionDuration.split(',').map((value) => {
+          const duration = value.trim();
+          const amount = Number.parseFloat(duration);
+          return duration.endsWith('ms') ? amount : amount * 1000;
+        });
+        return { reduced: matchMedia('(prefers-reduced-motion: reduce)').matches, transitionMs: Math.max(...durations) };
+      })())`));
+      assert.equal(reducedMotionStyle.reduced, true);
+      assert.ok(reducedMotionStyle.transitionMs <= 0.011, `reduced-motion divider transition should be at most 0.01ms; actual ${reducedMotionStyle.transitionMs}ms`);
+      await sendMouseClick(sidebarToggleSelector);
+      await waitDom('reduced-motion sidebar collapse state', `document.querySelector(${JSON.stringify(sidebarToggleSelector)})?.dataset.sidebarCollapsed === 'true'`);
+      await sleep(40);
+      const reducedMotionEndpoint = JSON.parse(await evaluate(`JSON.stringify((() => {
+        const path = document.querySelector(${JSON.stringify(sidebarToggleSelector)}).querySelector('.icon path:last-of-type');
+        return { x: new DOMMatrixReadOnly(getComputedStyle(path).transform).m41, clip: getComputedStyle(path).clipPath };
+      })())`));
+      assert.ok(Math.abs(reducedMotionEndpoint.x + 5) <= 0.1, `reduced-motion collapse must reach its endpoint; x=${reducedMotionEndpoint.x}`);
+      assert.match(reducedMotionEndpoint.clip, /inset\(1px/, 'reduced-motion collapse keeps the clipped endpoint');
+      await sendMouseClick(sidebarToggleSelector);
+      await waitDom('reduced-motion sidebar restored expanded', `document.querySelector(${JSON.stringify(sidebarToggleSelector)})?.dataset.sidebarCollapsed === 'false'`);
+      await sleep(40);
+      assert.equal(await evaluate(`matchMedia('(prefers-reduced-motion: reduce)').matches`), true);
+      const reducedMotionExpandedEndpoint = JSON.parse(await evaluate(`JSON.stringify((() => {
+        const path = document.querySelector(${JSON.stringify(sidebarToggleSelector)}).querySelector('.icon path:last-of-type');
+        return { x: new DOMMatrixReadOnly(getComputedStyle(path).transform).m41, clip: getComputedStyle(path).clipPath };
+      })())`));
+      assert.ok(Math.abs(reducedMotionExpandedEndpoint.x) <= 0.1, `reduced-motion expanded endpoint must return to zero; x=${reducedMotionExpandedEndpoint.x}`);
+      assert.match(reducedMotionExpandedEndpoint.clip, /inset\(0px\)/, 'reduced-motion expanded endpoint must be fully visible');
+      passed('Rendered sidebar toggle reaches both endpoints with reduced motion enabled');
+    } finally {
+      await window.webContents.debugger.sendCommand('Emulation.setEmulatedMedia', { features: [] });
+      if (!debuggerWasAttached && window.webContents.debugger.isAttached()) window.webContents.debugger.detach();
+    }
+
     const layoutReport = join(fixturePath, 'layout-measurements.json');
     await writeFile(layoutReport, `${JSON.stringify(layoutMeasurements, null, 2)}\n`, 'utf8');
     console.log(`Layout measurement report retained: ${layoutReport}`);
@@ -1826,6 +2010,131 @@ async function runElectronHost() {
     await click('button[aria-label="Закрыть браузерную панель"]');
     await waitDom('browser pane unmounted after explicit close', `!document.querySelector('.browser-pane')`);
     assert.equal(state.browserBoundsCalls.at(-1), null, 'unmount must leave no native bounds token behind');
+
+    const originalTheme = state.appSettings.theme;
+    const themeCases = [
+      { value: 'dark', label: 'Тёмная' },
+      { value: 'emerald', label: 'Изумрудная' },
+      { value: 'light', label: 'Светлая' },
+      { value: 'warm', label: 'Тёплая' },
+      { value: 'system', label: 'Как в Windows' },
+    ];
+    const themeSamples = [];
+    await click('.profile-settings-button');
+    await clickText('.settings-nav-item', 'Оформление');
+    for (let index = 0; index < themeCases.length; index += 1) {
+      const themeCase = themeCases[index];
+      if (themeCase.value === 'system') await click('.system-theme');
+      else await clickText('.theme-option', themeCase.label);
+      await waitUntil(`${themeCase.label} theme setting is stored`, () => state.appSettings.theme === themeCase.value);
+      const resolvedTheme = themeCase.value === 'system'
+        ? await evaluate(`matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'`)
+        : themeCase.value;
+      await waitDom(`${themeCase.label} theme class is applied`, `document.querySelector('.app-frame')?.classList.contains(${JSON.stringify(`theme-${resolvedTheme}`)})`);
+      await clickText('.settings-nav-item', 'Общие');
+      await waitDom(`${themeCase.label} choice control is ready`, `document.querySelector('.settings-nav-item.active')?.textContent.includes('Общие') && document.querySelector('.choice-menu > button')`);
+      await sendMouseClick('.choice-menu > button');
+      await waitDom(`${themeCase.label} choice popup opens`, `document.querySelector('.choice-menu .action-menu-content[role="listbox"]:popover-open')`);
+      const sample = JSON.parse(await evaluate(`JSON.stringify((() => {
+        const frame = document.querySelector('.app-frame');
+        const popup = document.querySelector('.choice-menu .action-menu-content[role="listbox"]');
+        const selected = popup?.querySelector('.choice-menu-content button[aria-selected="true"]');
+        const frameStyle = getComputedStyle(frame);
+        const popupStyle = getComputedStyle(popup);
+        const selectedStyle = selected ? getComputedStyle(selected) : null;
+        return {
+          themeClasses: [...frame.classList].filter((name) => name.startsWith('theme-')),
+          popupToken: frameStyle.getPropertyValue('--popup').trim(),
+          textToken: frameStyle.getPropertyValue('--text').trim(),
+          popupBackground: popupStyle.backgroundColor,
+          popupText: popupStyle.color,
+          selectedBackground: selectedStyle?.backgroundColor ?? null,
+          selectedText: selectedStyle?.color ?? null,
+          selectedOption: selected?.textContent.trim() ?? null,
+        };
+      })())`));
+      assert.deepEqual(sample.themeClasses, [`theme-${resolvedTheme}`], `${themeCase.label}: exactly one resolved theme class should be active`);
+      assert.ok(sample.popupToken && sample.textToken, `${themeCase.label}: theme tokens must resolve`);
+      assert.notEqual(sample.popupBackground, 'rgba(0, 0, 0, 0)', `${themeCase.label}: choice popup must have a themed surface`);
+      assert.notEqual(sample.popupText, 'rgba(0, 0, 0, 0)', `${themeCase.label}: choice popup text must be visible`);
+      assert.ok(sample.selectedOption, `${themeCase.label}: selected choice remains visible`);
+      assert.notEqual(sample.selectedBackground, 'rgba(0, 0, 0, 0)', `${themeCase.label}: selected choice has a themed highlight`);
+      assert.notEqual(sample.selectedText, 'rgba(0, 0, 0, 0)', `${themeCase.label}: selected choice text remains visible`);
+      themeSamples.push({ requested: themeCase.value, resolved: resolvedTheme, ...sample });
+      await capture(`theme-${themeCase.value}-choice-popup`);
+      await sendKey('ESC');
+      await waitDom(`${themeCase.label} choice popup closes`, `!document.querySelector('.choice-menu .action-menu-content:popover-open')`);
+      if (index < themeCases.length - 1) await clickText('.settings-nav-item', 'Оформление');
+    }
+    assert.ok(new Set(themeSamples.map((sample) => sample.popupBackground)).size >= 4,
+      `Dark/Emerald/Light/Warm/System should render at least four resolved popup palettes: ${JSON.stringify(themeSamples.map((sample) => [sample.requested, sample.resolved, sample.popupBackground]))}`);
+    await clickText('.settings-nav-item', 'Оформление');
+    const originalThemeCase = themeCases.find((themeCase) => themeCase.value === originalTheme);
+    assert.ok(originalThemeCase, `synthetic fixture original theme must be known: ${originalTheme}`);
+    if (originalTheme === 'system') await click('.system-theme');
+    else await clickText('.theme-option', originalThemeCase.label);
+    await waitUntil('original fixture theme is restored', () => state.appSettings.theme === originalTheme);
+    const originalResolvedTheme = originalTheme === 'system'
+      ? await evaluate(`matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'`)
+      : originalTheme;
+    await waitDom('original fixture theme class is restored', `document.querySelector('.app-frame')?.classList.contains(${JSON.stringify(`theme-${originalResolvedTheme}`)})`);
+    await click('button.window-action[aria-label="Назад"]');
+    await waitDom('Chat B restored after theme matrix', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'`);
+    console.log(`Rendered theme palette evidence ${JSON.stringify(themeSamples.map(({ requested, resolved, popupBackground, popupText, selectedBackground, selectedText }) => ({ requested, resolved, popupBackground, popupText, selectedBackground, selectedText })))}`);
+    passed('Rendered Dark/Emerald/Light/Warm/System palettes style the shared choice popup and restore the original theme');
+
+    const titleOriginalSize = window.getSize();
+    const titleOriginalZoom = window.webContents.getZoomFactor();
+    window.setSize(560, 480);
+    window.webContents.setZoomFactor(1);
+    window.show();
+    window.focus();
+    window.webContents.focus();
+    await sleep(350);
+    const renameSyntheticChat = async (currentTitle, nextTitle) => {
+      await click(`button[aria-label="Действия чата ${currentTitle}"]`);
+      await waitDom(`chat actions for ${currentTitle} open`, `document.querySelector('.action-menu-content:popover-open')`);
+      await clickText('.action-menu-content:popover-open button', 'Переименовать');
+      await waitDom(`rename dialog for ${currentTitle} opens`, `document.querySelector('dialog[open] .dialog-label input')`);
+      await fillInput('dialog[open] .dialog-label input', nextTitle);
+      await click('dialog[open] .dialog-actions button[type="submit"]');
+      await waitUntil(`synthetic chat renamed to ${nextTitle}`, () => state.chats.find((chat) => chat.id === 'chat-b')?.title === nextTitle);
+      await waitDom(`chat header shows ${nextTitle}`, `document.querySelector('.chat-header-title')?.textContent === ${JSON.stringify(nextTitle)}`);
+    };
+    await renameSyntheticChat('Chat B', '2');
+    const shortTitleGeometry = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const title = document.querySelector('.chat-header-title');
+      const style = getComputedStyle(title);
+      return { text: title.textContent, title: title.title, fontSize: style.fontSize, fontWeight: style.fontWeight, clientWidth: title.clientWidth, scrollWidth: title.scrollWidth };
+    })())`));
+    assert.equal(shortTitleGeometry.text, '2');
+    assert.equal(shortTitleGeometry.title, '2');
+    assert.equal(shortTitleGeometry.fontSize, '18px');
+    assert.equal(shortTitleGeometry.fontWeight, '700');
+    assert.ok(shortTitleGeometry.clientWidth > 0 && shortTitleGeometry.scrollWidth <= shortTitleGeometry.clientWidth,
+      `short title remains fully visible: ${JSON.stringify(shortTitleGeometry)}`);
+    await capture('chat-header-title-2');
+    const longTitle = 'Long synthetic chat title '.repeat(5).trim();
+    await renameSyntheticChat('2', longTitle);
+    const longTitleGeometry = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const title = document.querySelector('.chat-header-title');
+      const style = getComputedStyle(title);
+      return { text: title.textContent, title: title.title, clientWidth: title.clientWidth, scrollWidth: title.scrollWidth, overflow: style.overflow, whiteSpace: style.whiteSpace, textOverflow: style.textOverflow };
+    })())`));
+    assert.equal(longTitleGeometry.text, longTitle);
+    assert.equal(longTitleGeometry.title, longTitle);
+    assert.ok(longTitleGeometry.scrollWidth > longTitleGeometry.clientWidth, `long title should overflow its measured header box: ${JSON.stringify(longTitleGeometry)}`);
+    assert.equal(longTitleGeometry.overflow, 'hidden');
+    assert.equal(longTitleGeometry.whiteSpace, 'nowrap');
+    assert.equal(longTitleGeometry.textOverflow, 'ellipsis');
+    await capture('chat-header-long-title-ellipsis-560x480');
+    await renameSyntheticChat(longTitle, 'Chat B');
+    window.webContents.setZoomFactor(titleOriginalZoom);
+    window.setSize(titleOriginalSize[0], titleOriginalSize[1]);
+    await sleep(350);
+    console.log(`Rendered title evidence ${JSON.stringify({ shortTitleGeometry, longTitleGeometry })}`);
+    passed('Rendered chat header keeps title 2 readable and ellipsizes a long title at 560x480');
+
     window.hide();
     passed('Rendered nested chat menus suspend native browser bounds until the last overlay closes');
 
