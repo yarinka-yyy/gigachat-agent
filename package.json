@@ -1,7 +1,7 @@
 {
   "name": "gigachat-agents",
   "productName": "GigaChat Agents",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Локальная настольная основа GigaChat Agents",
   "main": ".webpack/main/index.cjs",
   "private": true,
@@ -35,9 +35,10 @@
     "@typescript-eslint/parser": "^8.71.0",
     "@vercel/webpack-asset-relocator-loader": "^1.7.3",
     "css-loader": "^6.11.0",
-    "eslint-import-resolver-typescript": "^4.4.5",
     "electron": "44.4.5",
+    "electron-builder": "26.17.0",
     "eslint": "^8.57.1",
+    "eslint-import-resolver-typescript": "^4.4.5",
     "eslint-plugin-import": "^2.32.0",
     "fork-ts-checker-webpack-plugin": "^9.1.0",
     "node-loader": "^2.1.0",
@@ -54,6 +55,11 @@
     "react-dom": "^19.3.0"
   },
   "overrides": {
+    "app-builder-lib": {
+      "@electron/get": {
+        "global-agent": "4.1.3"
+      }
+    },
     "webpack-dev-server": {
       "chokidar": "4.0.3"
     },

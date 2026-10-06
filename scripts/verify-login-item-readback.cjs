@@ -4,9 +4,16 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const electron = require('electron');
 
-const fixture = path.resolve(__dirname, '..', '.qa', 'plan007-owner-upgrade-20261005', 'login-item-readback');
-const ownName = 'com.squirrel.gigachat_agents.GigaChatAgents';
-const stablePath = path.join(process.env.LOCALAPPDATA || '', 'gigachat_agents', 'GigaChat Agents.exe');
+const nsisFixtureExe = process.env.GIGACHAT_PLAN008_LOGIN_ITEM_FIXTURE_EXE;
+const fixture = path.resolve(__dirname, '..', '.qa', nsisFixtureExe
+  ? 'plan008-desktop-polish-nsis-login-item-readback'
+  : 'plan007-owner-upgrade-20261005/login-item-readback');
+const lifecycleSource = fs.readFileSync(path.resolve(__dirname, '../src/lifecycle.ts'), 'utf8');
+const ownName = lifecycleSource.match(/export const APP_USER_MODEL_ID = '([^']+)'/)?.[1];
+if (!ownName) throw new Error('The stable application identity was not found in lifecycle.ts.');
+const stablePath = nsisFixtureExe
+  ? path.resolve(nsisFixtureExe)
+  : path.join(process.env.LOCALAPPDATA || '', 'gigachat_agents', 'GigaChat Agents.exe');
 const profile = path.join(fixture, 'user-data');
 const cache = path.join(fixture, 'cache');
 const sessionData = path.join(fixture, 'session-data');
@@ -19,6 +26,7 @@ function ensureDirectory(directory) {
 
 function runDriver() {
   if (process.platform !== 'win32' || !process.env.LOCALAPPDATA) throw new Error('Run this check on Windows with an installed user profile.');
+  if (nsisFixtureExe && !path.isAbsolute(nsisFixtureExe)) throw new Error('The NSIS fixture executable path must be absolute.');
   for (const directory of [fixture, profile, cache, sessionData]) ensureDirectory(directory);
   const child = spawn(electron, [
     `--user-data-dir=${path.join(fixture, 'electron-user-data')}`,

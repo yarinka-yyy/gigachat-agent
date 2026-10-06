@@ -1,5 +1,5 @@
 import type { CloseAttemptResult } from './contracts';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve, win32 } from 'node:path';
 
 export type { CloseAttemptResult } from './contracts';
 
@@ -7,6 +7,18 @@ export interface InstalledLauncher {
   path: string;
   args: string[];
 }
+
+export interface NsisInstallRegistration {
+  scope: 'user' | 'machine';
+  installLocation: string | null;
+  uninstallString: string | null;
+}
+
+export const APP_USER_MODEL_ID = 'com.squirrel.gigachat_agents.GigaChatAgents';
+export const NSIS_INSTALLER_GUID = 'f76d090a-101e-54f5-92f4-ce5b1f2c4822';
+
+const nsisExecutableName = 'GigaChat Agents.exe';
+const nsisUninstallerName = 'Uninstall GigaChat Agents.exe';
 
 export interface LoginItemLaunch {
   name: string;
@@ -65,6 +77,45 @@ export async function resolveSquirrelLauncher(
   return { path: launcherPath, args: [] };
 }
 
+export async function resolveInstalledLauncher(
+  executablePath: string,
+  isFile: (candidate: string) => Promise<boolean>,
+  readNsisRegistrations: () => Promise<NsisInstallRegistration[] | null>,
+): Promise<InstalledLauncher | null> {
+  const squirrelLauncher = await resolveSquirrelLauncher(executablePath, isFile);
+  if (squirrelLauncher) return squirrelLauncher;
+
+  const registrations = await readNsisRegistrations().catch(() => null);
+  return resolveNsisLauncher(executablePath, registrations, isFile);
+}
+
+export async function resolveNsisLauncher(
+  executablePath: string,
+  registrations: NsisInstallRegistration[] | null,
+  isFile: (candidate: string) => Promise<boolean>,
+): Promise<InstalledLauncher | null> {
+  if (!win32.isAbsolute(executablePath)
+    || basename(executablePath).toLowerCase() !== nsisExecutableName.toLowerCase()) return null;
+
+  const installDirectory = dirname(executablePath);
+  if (basename(installDirectory).toLowerCase() !== 'gigachat agents') return null;
+  if (!registrations || registrations.length !== 1) return null;
+
+  const [registration] = registrations;
+  if (!registration.installLocation || !registration.uninstallString
+    || !win32.isAbsolute(registration.installLocation)) return null;
+  if (!sameWindowsPath(registration.installLocation, installDirectory)) return null;
+
+  const expectedUninstaller = join(installDirectory, nsisUninstallerName);
+  const expectedSwitch = registration.scope === 'user' ? '/currentuser' : '/allusers';
+  const expectedUninstallString = `"${expectedUninstaller}" ${expectedSwitch}`;
+  if (registration.scope !== 'user' && registration.scope !== 'machine') return null;
+  if (registration.uninstallString.toLowerCase() !== expectedUninstallString.toLowerCase()) return null;
+  if (!(await isFile(executablePath)) || !(await isFile(expectedUninstaller))) return null;
+
+  return { path: win32.resolve(executablePath), args: [] };
+}
+
 export function readInstalledAutoStart(
   launcher: InstalledLauncher | null,
   api: LoginItemApi,
@@ -86,10 +137,12 @@ export function migrateCurrentVersionAutoStart(
     confirmedEnabled(stableState, stableOptions);
     return false;
   }
+  if (matchingOwnUserItem(stableState, stableOptions)) return false;
   const oldOptions = { path: currentVersion.path, args: [...currentVersion.args] };
   const oldState = api.getSettings(oldOptions);
+  const oldItem = matchingOwnUserItem(oldState, oldOptions);
   if (!oldState.openAtLogin) return false;
-  const oldItem = confirmedOwnUserItem(oldState, oldOptions);
+  if (!oldItem) throw new Error('Не удалось однозначно проверить запись автозапуска приложения.');
   api.setSettings({ ...stableOptions, openAtLogin: true, enabled: oldItem.enabled });
   const migratedState = api.getSettings(stableOptions);
   if (!migratedState.openAtLogin || confirmedOwnUserItem(migratedState, stableOptions).enabled !== oldItem.enabled) {
@@ -105,6 +158,9 @@ export function writeInstalledAutoStart(
 ): boolean {
   if (!launcher) throw new Error('Автозапуск доступен только в установленной Windows-версии приложения.');
   const options = { path: launcher.path, args: [...launcher.args] };
+  const before = api.getSettings(options);
+  if (before.openAtLogin) confirmedOwnUserItem(before, options);
+  else matchingOwnUserItem(before, options);
   api.setSettings({ ...options, openAtLogin: enabled, enabled });
   const state = api.getSettings(options);
   const actual = confirmedEnabled(state, options);
@@ -118,17 +174,30 @@ function sameExecutable(left: string, right: string): boolean {
   return resolve(left).toLowerCase() === resolve(right).toLowerCase();
 }
 
+function sameWindowsPath(left: string, right: string): boolean {
+  return win32.resolve(left).toLowerCase() === win32.resolve(right).toLowerCase();
+}
+
 function confirmedEnabled(snapshot: LoginItemSnapshot, options: InstalledLauncher): boolean {
+  const ownItem = matchingOwnUserItem(snapshot, options);
   if (!snapshot.openAtLogin) return false;
-  return confirmedOwnUserItem(snapshot, options).enabled;
+  if (!ownItem) throw new Error('Не удалось однозначно проверить запись автозапуска приложения.');
+  return ownItem.enabled;
 }
 
 function confirmedOwnUserItem(snapshot: LoginItemSnapshot, options: InstalledLauncher): LoginItemLaunch {
+  const ownItem = matchingOwnUserItem(snapshot, options);
+  if (!ownItem) throw new Error('Не удалось однозначно проверить запись автозапуска приложения.');
+  return ownItem;
+}
+
+function matchingOwnUserItem(snapshot: LoginItemSnapshot, options: InstalledLauncher): LoginItemLaunch | null {
   const matches = snapshot.launchItems.filter((item) =>
     sameExecutable(item.path, options.path)
     && item.args.length === options.args.length
     && item.args.every((arg, index) => arg === options.args[index]));
-  if (matches.length !== 1 || matches[0].scope !== 'user') {
+  if (matches.length === 0 && !snapshot.openAtLogin) return null;
+  if (matches.length !== 1 || matches[0].name !== APP_USER_MODEL_ID || matches[0].scope !== 'user') {
     throw new Error('Не удалось однозначно проверить запись автозапуска приложения.');
   }
   return matches[0];

@@ -1,0 +1,22 @@
+appId: com.squirrel.gigachat_agents.GigaChatAgents
+productName: GigaChat Agents
+directories:
+  output: out/nsis
+nsis:
+  guid: f76d090a-101e-54f5-92f4-ce5b1f2c4822
+  oneClick: false
+  perMachine: false
+  selectPerMachineByDefault: false
+  allowToChangeInstallationDirectory: true
+  installerIcon: src/assets/gigachat-icon.ico
+  uninstallerIcon: src/assets/gigachat-icon.ico
+  installerLanguages:
+    - ru_RU
+  language: "1049"
+  displayLanguageSelector: false
+  createStartMenuShortcut: true
+  runAfterFinish: true
+  deleteAppDataOnUninstall: false
+  include: build/installer.nsh
+win:
+  signAndEditExecutable: false

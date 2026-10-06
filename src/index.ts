@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, mkdtemp, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -25,15 +25,20 @@ import {
   createCloseController,
   createDetectedFolderOpener,
   createTrayLifecycle,
+  APP_USER_MODEL_ID,
   migrateCurrentVersionAutoStart,
   readInstalledAutoStart,
-  resolveSquirrelLauncher,
+  resolveInstalledLauncher,
+  NSIS_INSTALLER_GUID,
   writeInstalledAutoStart,
+  type NsisInstallRegistration,
 } from './lifecycle';
 import { validateProjectFolder } from './project-paths';
 
 declare const MAIN_WINDOW_WEBPACK_ENTRY: string;
 declare const MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY: string;
+
+if (process.platform === 'win32') app.setAppUserModelId(APP_USER_MODEL_ID);
 
 let mainWindow: BrowserWindow | null = null;
 let onboardingBrowser: ReturnType<typeof createOnboardingBrowser> | null = null;
@@ -349,9 +354,86 @@ const vscodeOpener = createDetectedFolderOpener(
 
 async function getInstalledLauncher() {
   if (process.platform !== 'win32' || !app.isPackaged) return null;
-  return resolveSquirrelLauncher(process.execPath, async (candidate) => {
+  return resolveInstalledLauncher(process.execPath, async (candidate) => {
     const info = await lstat(candidate).catch(() => null);
     return Boolean(info?.isFile() && !info.isSymbolicLink());
+  }, readNsisInstallRegistrations);
+}
+
+function readNsisInstallRegistrations(): Promise<NsisInstallRegistration[] | null> {
+  const systemRoot = process.env.SystemRoot;
+  if (!systemRoot || !isAbsolute(systemRoot)) return Promise.resolve(null);
+  const powershellExecutable = join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const script = `
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$guid = '${NSIS_INSTALLER_GUID}'
+$items = [System.Collections.Generic.List[object]]::new()
+foreach ($entry in @(
+  [pscustomobject]@{ Scope = 'user'; Hive = [Microsoft.Win32.RegistryHive]::CurrentUser },
+  [pscustomobject]@{ Scope = 'machine'; Hive = [Microsoft.Win32.RegistryHive]::LocalMachine }
+)) {
+  $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($entry.Hive, [Microsoft.Win32.RegistryView]::Registry64)
+  $installKey = $null
+  $uninstallKey = $null
+  try {
+    $installKey = $baseKey.OpenSubKey('Software\\' + $guid, $false)
+    $uninstallKey = $baseKey.OpenSubKey('Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\' + $guid, $false)
+    if ($null -ne $installKey -or $null -ne $uninstallKey) {
+      $installLocation = if ($null -ne $installKey) { $installKey.GetValue('InstallLocation', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) } else { $null }
+      $uninstallString = if ($null -ne $uninstallKey) { $uninstallKey.GetValue('UninstallString', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) } else { $null }
+      [void]$items.Add([pscustomobject]@{ scope = $entry.Scope; installLocation = $installLocation; uninstallString = $uninstallString })
+    }
+  } finally {
+    if ($null -ne $installKey) { $installKey.Close() }
+    if ($null -ne $uninstallKey) { $uninstallKey.Close() }
+    $baseKey.Close()
+  }
+}
+ConvertTo-Json -InputObject $items.ToArray() -Compress
+`;
+
+  return new Promise((resolvePromise) => {
+    execFile(powershellExecutable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+      windowsHide: true,
+      timeout: 5_000,
+      maxBuffer: 16_384,
+      encoding: 'utf8',
+    }, (error, stdout) => {
+      if (error) {
+        resolvePromise(null);
+        return;
+      }
+      try {
+        const parsed: unknown = JSON.parse(stdout.trim());
+        if (!Array.isArray(parsed)) {
+          resolvePromise(null);
+          return;
+        }
+        const registrations: NsisInstallRegistration[] = [];
+        for (const item of parsed) {
+          if (typeof item !== 'object' || item === null) {
+            resolvePromise(null);
+            return;
+          }
+          const record = item as Record<string, unknown>;
+          if ((record.scope !== 'user' && record.scope !== 'machine')
+            || (record.installLocation !== null && typeof record.installLocation !== 'string')
+            || (record.uninstallString !== null && typeof record.uninstallString !== 'string')) {
+            resolvePromise(null);
+            return;
+          }
+          registrations.push({
+            scope: record.scope,
+            installLocation: record.installLocation,
+            uninstallString: record.uninstallString,
+          });
+        }
+        resolvePromise(registrations);
+      } catch {
+        resolvePromise(null);
+      }
+    });
   });
 }
 

@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
-import { lstat, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import {
+  APP_USER_MODEL_ID,
+  NSIS_INSTALLER_GUID,
   acquirePrimaryInstance,
   createCloseAdmission,
   createCloseController,
@@ -11,10 +13,13 @@ import {
   createTrayLifecycle,
   migrateCurrentVersionAutoStart,
   readInstalledAutoStart,
+  resolveInstalledLauncher,
+  resolveNsisLauncher,
   resolveSquirrelLauncher,
   writeInstalledAutoStart,
   type LoginItemApi,
   type LoginItemLaunch,
+  type NsisInstallRegistration,
 } from './lifecycle';
 import { createVoiceRuntime } from './voice';
 
@@ -53,7 +58,7 @@ test('Squirrel launcher and login-item settings stay stable across version updat
     await writeFile(join(installRoot, 'packages', 'RELEASES'), 'release');
     await writeFile(versionOnePath, 'v1');
 
-    const ownEntry = { name: 'app-user-model-id', path: versionOnePath, args: [] as string[], scope: 'user' as const, enabled: false };
+    const ownEntry = { name: APP_USER_MODEL_ID, path: versionOnePath, args: [] as string[], scope: 'user' as const, enabled: false };
     const foreignEntry: LoginItemLaunch = {
       name: 'other-app', path: 'C:\\Other\\Agent.exe', args: ['--background'], scope: 'user', enabled: true,
     };
@@ -92,9 +97,13 @@ test('Squirrel launcher and login-item settings stay stable across version updat
 
     const launcherV1 = await resolveSquirrelLauncher(versionOnePath, isFile);
     assert.deepEqual(launcherV1, { path: stablePath, args: [] });
+    assert.deepEqual(
+      await resolveInstalledLauncher(versionOnePath, isFile, async () => assert.fail('Squirrel proof must not query NSIS registration')),
+      launcherV1,
+    );
     assert.equal(migrateCurrentVersionAutoStart(launcherV1, { path: versionOnePath, args: [] }, api), true);
     assert.equal(readInstalledAutoStart(launcherV1, api), false);
-    assert.deepEqual(ownEntry, { name: 'app-user-model-id', path: stablePath, args: [], scope: 'user', enabled: false }, 'migration preserves Task Manager disabled state');
+    assert.deepEqual(ownEntry, { name: APP_USER_MODEL_ID, path: stablePath, args: [], scope: 'user', enabled: false }, 'migration preserves Task Manager disabled state');
     assert.deepEqual(foreignEntry, foreignBefore, 'migration leaves foreign login entries untouched');
     assert.deepEqual(samePathForeignArgs, samePathForeignBefore, 'path-filtered launch items with other arguments remain untouched');
     assert.deepEqual(samePathMachineEntry, samePathMachineBefore, 'machine-scope entries remain untouched');
@@ -106,7 +115,7 @@ test('Squirrel launcher and login-item settings stay stable across version updat
     assert.deepEqual(launcherV2, { path: stablePath, args: [] });
     assert.equal(readInstalledAutoStart(launcherV2, api), false);
     assert.equal(writeInstalledAutoStart(true, launcherV2, api), true);
-    assert.deepEqual(ownEntry, { name: 'app-user-model-id', path: stablePath, args: [], scope: 'user', enabled: true });
+    assert.deepEqual(ownEntry, { name: APP_USER_MODEL_ID, path: stablePath, args: [], scope: 'user', enabled: true });
     assert.equal(writeInstalledAutoStart(false, launcherV2, api), false, 'explicit opt-out removes the own login item');
     assert.equal(ownRegistered, false);
     assert.ok(calls.every(({ path, args }) => (path === stablePath || path === versionOnePath) && args.length === 0));
@@ -114,6 +123,112 @@ test('Squirrel launcher and login-item settings stay stable across version updat
   } finally {
     await rm(installRoot, { recursive: true, force: true });
   }
+});
+
+test('NSIS launcher requires one exact registration pair and preserves disabled login state', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gigachat-plan008-nsis-'));
+  const installDirectory = join(root, 'Папка пользователя', 'Программы с пробелами', 'GigaChat Agents');
+  const executablePath = join(installDirectory, 'GigaChat Agents.exe');
+  const uninstallerPath = join(installDirectory, 'Uninstall GigaChat Agents.exe');
+  const isFile = async (candidate: string): Promise<boolean> => {
+    const info = await lstat(candidate).catch(() => null);
+    return Boolean(info?.isFile() && !info.isSymbolicLink());
+  };
+
+  try {
+    await mkdir(installDirectory, { recursive: true });
+    await writeFile(executablePath, 'NSIS installed executable fixture');
+    await writeFile(uninstallerPath, 'NSIS uninstaller fixture');
+    const userRegistration: NsisInstallRegistration = {
+      scope: 'user',
+      installLocation: installDirectory,
+      uninstallString: `"${uninstallerPath}" /currentuser`,
+    };
+    const launcher = await resolveNsisLauncher(executablePath, [userRegistration], isFile);
+    assert.deepEqual(launcher, { path: resolve(executablePath), args: [] });
+
+    const machineLauncher = await resolveNsisLauncher(executablePath, [{
+      scope: 'machine',
+      installLocation: installDirectory,
+      uninstallString: `"${uninstallerPath}" /allusers`,
+    }], isFile);
+    assert.deepEqual(machineLauncher, launcher, 'the exact machine-scope registration pair is also accepted');
+    assert.equal(await resolveNsisLauncher(executablePath, null, isFile), null);
+    assert.equal(await resolveNsisLauncher(executablePath, [], isFile), null, 'an adjacent uninstaller is not installation proof');
+    assert.equal(await resolveNsisLauncher(executablePath, [userRegistration, userRegistration], isFile), null, 'duplicate scopes are ambiguous');
+    assert.equal(await resolveNsisLauncher(executablePath, [{
+      ...userRegistration,
+      installLocation: root,
+    }], isFile), null, 'a foreign registered folder is rejected');
+    assert.equal(await resolveNsisLauncher(executablePath, [{
+      ...userRegistration,
+      uninstallString: `"${uninstallerPath}" /allusers`,
+    }], isFile), null, 'scope and uninstall arguments must agree');
+    assert.equal(await resolveNsisLauncher(join(root, 'portable', 'GigaChat Agents.exe'), [userRegistration], isFile), null);
+    assert.equal(await resolveInstalledLauncher(join(root, 'portable', 'GigaChat Agents.exe'), async () => true, async () => [userRegistration]), null);
+
+    const config = await readFile(resolve(process.cwd(), 'electron-builder.yml'), 'utf8');
+    assert.ok(config.includes(`appId: ${APP_USER_MODEL_ID}`));
+    assert.ok(config.includes(`  guid: ${NSIS_INSTALLER_GUID}`));
+
+    const oldPath = join(root, 'app-1.0.2', 'GigaChat Agents.exe');
+    let registeredPath = oldPath;
+    let enabled = false;
+    const ownItem: LoginItemLaunch = {
+      name: APP_USER_MODEL_ID,
+      path: oldPath,
+      args: [],
+      scope: 'user',
+      enabled,
+    };
+    const api: LoginItemApi = {
+      getSettings(options) {
+        const matches = registeredPath.toLowerCase() === options.path.toLowerCase();
+        return {
+          openAtLogin: matches,
+          launchItems: matches ? [{ ...ownItem, path: registeredPath }] : [],
+        };
+      },
+      setSettings(settings) {
+        enabled = settings.enabled;
+        ownItem.path = settings.path;
+        ownItem.enabled = settings.enabled;
+        registeredPath = settings.openAtLogin ? settings.path : '';
+      },
+    };
+    assert.equal(migrateCurrentVersionAutoStart(launcher, { path: oldPath, args: [] }, api), true);
+    assert.equal(registeredPath, executablePath);
+    assert.equal(enabled, false, 'migration keeps the Windows Task Manager disabled state');
+    assert.equal(readInstalledAutoStart(launcher, api), false);
+    assert.equal(writeInstalledAutoStart(true, launcher, api), true);
+    assert.equal(writeInstalledAutoStart(false, launcher, api), false);
+    assert.throws(() => writeInstalledAutoStart(true, launcher, {
+      getSettings: () => ({ openAtLogin: false, launchItems: [] }),
+      setSettings: () => {},
+    }), /подтвердить изменение/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('autostart reads and writes reject an exact-command foreign AppUserModelId', () => {
+  const launcher = { path: 'C:\\Apps\\GigaChat Agents\\GigaChat Agents.exe', args: [] };
+  let writes = 0;
+  const api: LoginItemApi = {
+    getSettings: () => ({
+      openAtLogin: false,
+      launchItems: [{ name: 'another-application', ...launcher, scope: 'user', enabled: false }],
+    }),
+    setSettings: () => { writes += 1; },
+  };
+
+  assert.throws(() => readInstalledAutoStart(launcher, api), /однозначно/);
+  assert.throws(() => writeInstalledAutoStart(true, launcher, api), /однозначно/);
+  assert.throws(() => writeInstalledAutoStart(true, launcher, {
+    getSettings: () => ({ openAtLogin: true, launchItems: [] }),
+    setSettings: () => { writes += 1; },
+  }), /однозначно/);
+  assert.equal(writes, 0, 'foreign login items are rejected before any write');
 });
 
 test('ambiguous same-command login entries are preserved instead of migrating', async () => {
@@ -140,7 +255,7 @@ test('ambiguous same-command login entries are preserved instead of migrating', 
         return {
           openAtLogin: isLegacy,
           launchItems: isLegacy ? [
-            { name: 'own-aumid', path: versionPath, args: [], scope: 'user', enabled: true },
+            { name: APP_USER_MODEL_ID, path: versionPath, args: [], scope: 'user', enabled: true },
             { name: 'ambiguous-app', path: versionPath, args: [], scope: 'user', enabled: true },
           ] : [],
         };
@@ -160,7 +275,7 @@ test('ambiguous same-command login entries are preserved instead of migrating', 
 test('autostart migration and explicit changes fail when Windows does not confirm the write', () => {
   const oldPath = 'C:\\GigaChat\\app-1.0.0\\GigaChat Agents.exe';
   const stablePath = 'C:\\GigaChat\\GigaChat Agents.exe';
-  const oldItem: LoginItemLaunch = { name: 'own-aumid', path: oldPath, args: [], scope: 'user', enabled: true };
+  const oldItem: LoginItemLaunch = { name: APP_USER_MODEL_ID, path: oldPath, args: [], scope: 'user', enabled: true };
   let writes = 0;
   const api: LoginItemApi = {
     getSettings(options) {
