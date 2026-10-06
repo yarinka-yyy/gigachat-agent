@@ -91,3 +91,5 @@ node scripts/verify-packaged-audit.mjs --native-browser-workspace
 ```
 
 NSIS Setup 1.0.3 из предыдущего этапа не пересобирался и не содержит интерфейс Plan009; для его поставки нужна новая сборка.
+
+Для запрошенного обновления установленной Squirrel1.0.2 собран Squirrel1.0.4 с интерфейсом Plan009: `out/make/squirrel.windows/x64/GigaChat Agents-1.0.4 Setup.exe` (403387392 B, SHA256 `DC2BC2F77639A568FC5BB63A3C560E21807AD3140B27AC6C727DDEA765179208`). `npm run make` завершился успешно; версия EXE/ASAR1.0.4, новые workspace controls в packaged renderer, Electron fuses, RELEASES hash/size и все12resource hashes между Forge payload и nupkg совпали. Установщик не запускался; реальное обновление и визуальная приёмка выполняются пользователем. NSIS migration gate остаётся открытым.
