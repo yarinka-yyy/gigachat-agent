@@ -936,6 +936,8 @@ export default function App() {
     if (!panel || (route.page !== 'home' && route.page !== 'chat')) return;
     const observer = new ResizeObserver(resizeComposer);
     observer.observe(panel);
+    const chatColumn = panel.querySelector<HTMLElement>('.chat-column');
+    if (chatColumn) observer.observe(chatColumn);
     window.addEventListener('resize', resizeComposer);
     return () => { observer.disconnect(); window.removeEventListener('resize', resizeComposer); };
   }, [route.page]);
@@ -3201,15 +3203,8 @@ export default function App() {
         />}
 
         <main ref={mainPanelRef} className={route.page === 'settings' ? 'main-panel settings-panel' : 'main-panel'}>
-          {route.page === 'chat' && selectedChat && <div className="chat-header">
-            <div className="chat-header-title-group">
-              {selectedChat.projectId && <Icon name="folder" className="chat-header-folder" />}
-              <span className="chat-header-title" title={selectedChat.title}>{selectedChat.title}</span>
-            </div>
-            <button type="button" className="chat-browser-toggle" aria-label={settings.browserPaneOpen ? 'Скрыть браузер' : 'Показать браузер'} aria-expanded={settings.browserPaneOpen} title={settings.browserPaneOpen ? 'Скрыть браузер' : 'Показать браузер'} onClick={() => void updateLocalSettings({ browserPaneOpen: !settings.browserPaneOpen })}><Icon name="panelRight" /></button>
-          </div>}
-          <div className={route.page === 'chat' ? `chat-workspace${settings.browserPaneOpen ? ' browser-open' : ''}` : 'content-workspace'}>
-          <div className="chat-column">
+          {(() => {
+            const chatContent = <>
           <div className={route.page === 'home' ? 'view-area home-view' : route.page === 'settings' ? 'view-area settings-view' : route.page === 'onboarding' ? 'view-area onboarding-view' : 'view-area'}>{renderContent()}</div>
           {(route.page === 'home' || route.page === 'chat') && (
             <div className="composer-stack">
@@ -3341,9 +3336,22 @@ export default function App() {
               </div>
             </div>
           )}
-          </div>
-          {route.page === 'chat' && settings.browserPaneOpen && <BrowserPanel onClose={() => void updateLocalSettings({ browserPaneOpen: false })} onWidthChange={(browserWidthPx) => void updateLocalSettings({ browserWidthPx })} preferredWidth={settings.browserWidthPx} suspended={sidebarPreview || nativeOverlayOpen || Boolean(dialogRequest) || Boolean(approvalRequest) || closePending || Boolean(closeFailure)} />}
-          </div>
+            </>;
+            if (route.page === 'chat') return <BrowserPanel
+              chatHeading={<>
+                <Icon name={selectedChat?.projectId ? 'folder' : 'chat'} className={selectedChat?.projectId ? 'chat-header-folder' : 'chat-header-chat'} />
+                <span className="chat-header-title" title={selectedChat?.title ?? 'Загрузка чата'}>{selectedChat?.title ?? 'Загрузка чата…'}</span>
+              </>}
+              chatContent={chatContent}
+              paneOpen={settings.browserPaneOpen}
+              onPaneOpenChange={(browserPaneOpen) => void updateLocalSettings({ browserPaneOpen })}
+              paneIcon={<Icon name="panelRight" />}
+              onWidthChange={(browserWidthPx) => void updateLocalSettings({ browserWidthPx })}
+              preferredWidth={settings.browserWidthPx}
+              suspended={sidebarPreview || nativeOverlayOpen || Boolean(dialogRequest) || Boolean(approvalRequest) || closePending || Boolean(closeFailure)}
+            />;
+            return <div className="content-workspace"><div className="chat-column">{chatContent}</div></div>;
+          })()}
           {notice && <div className={`notice notice-${noticeKind}`} role={noticeKind === 'error' ? 'alert' : 'status'}><span>{notice}</span><button type="button" aria-label="Закрыть уведомление" onClick={() => setNotice('')}><Icon name="x" /></button></div>}
         </main>
       </div>

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { createServer } from 'node:http';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
@@ -9,6 +10,8 @@ const require = createRequire(import.meta.url);
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 async function runNodeDriver() {
+  const nativeWorkspaceMode = process.argv.includes('--native-browser-workspace');
+  const holdForReview = process.argv.includes('--hold-for-review');
   const { register } = await import('tsx/esm/api');
   register();
   const { rules } = await import('../webpack.rules.ts');
@@ -21,7 +24,8 @@ async function runNodeDriver() {
     await mkdir(join(repo, '.qa'), { recursive: true });
     return realpath(join(repo, '.qa'));
   });
-  const fixture = await import('node:fs/promises').then(({ mkdtemp }) => mkdtemp(join(qaDirectory, 'plan008-desktop-polish-renderer-')));
+  const fixturePrefix = nativeWorkspaceMode ? 'plan009-browser-workspace-native-' : 'plan009-browser-workspace-renderer-';
+  const fixture = await import('node:fs/promises').then(({ mkdtemp }) => mkdtemp(join(qaDirectory, fixturePrefix)));
   assert.equal(dirname(fixture), qaDirectory, 'fixture must be a direct child of ignored app/.qa');
   console.log(`Renderer QA fixture: ${fixture}`);
   const bundleDirectory = join(fixture, 'renderer');
@@ -54,13 +58,36 @@ async function runNodeDriver() {
   console.log('Actual renderer bundle compiled');
   if (stats.hasWarnings()) process.stdout.write(`Renderer bundle warnings: ${stats.toString({ all: false, warnings: true })}\n`);
 
+  if (nativeWorkspaceMode) {
+    const nativeDirectory = join(fixture, 'native');
+    await mkdir(nativeDirectory, { recursive: true });
+    const nativeCompiler = webpack({
+      module: { rules },
+      resolve: { extensions: ['.js', '.ts', '.jsx', '.tsx', '.css', '.json'] },
+      mode: 'development',
+      devtool: false,
+      entry: resolve(repo, 'src/embedded-browser.ts'),
+      target: 'electron-main',
+      output: { path: nativeDirectory, filename: 'embedded-browser.cjs', library: { type: 'commonjs2' } },
+      plugins: [new AssetRelocatorPatch(false, false)],
+      optimization: { minimize: false },
+    });
+    await new Promise((resolveStats, reject) => nativeCompiler.run((error, result) => {
+      if (error) reject(error);
+      else if (!result || result.hasErrors()) reject(new Error(result?.toString({ all: false, errors: true }) ?? 'Native controller webpack returned no stats'));
+      else resolveStats(result);
+    }));
+    await new Promise((resolveClose, reject) => nativeCompiler.close((error) => error ? reject(error) : resolveClose()));
+    console.log('Actual embedded-browser main bundle compiled');
+  }
+
   const html = (await readFile(join(repo, 'src/index.html'), 'utf8'))
     .replace('</body>', '  <script defer src="./renderer.js"></script>\n  </body>');
   await writeFile(join(bundleDirectory, 'index.html'), html, 'utf8');
   await writeFile(join(fixture, 'preload.cjs'), fakePreloadSource, 'utf8');
 
   const electronPath = require('electron');
-  const child = spawn(electronPath, [`--user-data-dir=${userDataDirectory}`, fileURLToPath(import.meta.url)], {
+  const child = spawn(electronPath, [`--user-data-dir=${userDataDirectory}`, fileURLToPath(import.meta.url), ...process.argv.slice(2)], {
     cwd: repo,
     env: { ...process.env, GIGACHAT_AUDIT_ROOT: fixture },
     windowsHide: true,
@@ -75,7 +102,7 @@ async function runNodeDriver() {
     const timeout = setTimeout(() => {
       child.kill();
       reject(new Error(`Electron renderer host timed out; fixture: ${fixture}`));
-    }, 120_000);
+    }, holdForReview ? 10 * 60_000 : 120_000);
     child.once('error', (error) => { clearTimeout(timeout); reject(error); });
     child.once('close', (code, signal) => {
       clearTimeout(timeout);
@@ -89,8 +116,10 @@ async function runNodeDriver() {
 
 async function runElectronHost() {
   console.log('Electron host entry reached');
-  const { app, BrowserWindow, ipcMain } = require('electron');
+  const { app, BrowserWindow, WebContentsView, ipcMain, screen, session } = require('electron');
   console.log('Electron API loaded');
+  const nativeWorkspaceMode = process.argv.includes('--native-browser-workspace');
+  const holdForReview = process.argv.includes('--hold-for-review');
   const fixture = process.env.GIGACHAT_AUDIT_ROOT;
   assert.ok(fixture, 'synthetic GIGACHAT_AUDIT_ROOT is required');
   const fixturePath = await realpath(fixture);
@@ -106,6 +135,7 @@ async function runElectronHost() {
     ...summary, draft, nextTurnPermissionProfile: null, modelId: null, nextTurnSkillId: null,
     messages: [{ id: `${summary.id}-message`, role: 'assistant', text, createdAt: timestamp }], artifacts: [],
   });
+  const makeBrowserTab = (id, title, url) => ({ id, title, url, canGoBack: false, canGoForward: false, loading: false, error: null });
   const projects = [
     makeProject('project-a', 'Project A', 'C:\\audit\\project-a'),
     makeProject('project-b', 'Project B', 'C:\\audit\\project-b'),
@@ -134,6 +164,11 @@ async function runElectronHost() {
     deferKeySaves: false, pendingKeySaves: [], keySaveCalls: 0,
     deferOnboardingBounds: false, pendingOnboardingBounds: [], onboardingBoundsCalls: [], openStudioCalls: 0,
     browserBoundsCalls: [],
+    browserStatus: nativeWorkspaceMode ? { tabs: [], activeTabId: null, error: null } : {
+      tabs: [makeBrowserTab('audit-browser-tab', 'Synthetic page', 'https://example.test/'), makeBrowserTab('audit-browser-tab-2', 'Second page', 'https://second.example.test/')],
+      activeTabId: 'audit-browser-tab', error: null,
+    },
+    deferBrowserMethod: null, pendingBrowserActions: [],
     voiceAvailable: true, voiceAccessCalls: 0, deferVoiceAccess: false, pendingVoiceAccess: [],
     voiceTranscribeCalls: [], deferVoiceTranscribe: false, pendingVoiceTranscribes: [], voiceCancelCalls: 0, voiceCancelFailuresRemaining: 0,
     deferProjectReads: false, rejectProjectRead: null, pendingProjectReads: new Map(), projectReadCalls: [],
@@ -181,6 +216,10 @@ async function runElectronHost() {
     state.configContents = record.contents;
     record.resolve(record.contents);
   };
+  const resolveBrowserAction = (record, next) => {
+    state.browserStatus = clone(next);
+    record.resolve(clone(next));
+  };
   const readProjectInstructions = (id) => {
     state.projectReadCalls.push(id);
     if (state.rejectProjectRead === id) {
@@ -197,8 +236,30 @@ async function runElectronHost() {
     return { text: `# instructions ${id}`, revision: `revision-${id}` };
   };
 
+  let nativeBrowser = null;
+  let nativeServer = null;
+  const nativeViewsCreated = [];
+  const nativeLoadCounts = new Map();
+  const nativeRequests = new Map();
+
   ipcMain.handle('audit:api', async (_event, group, method, args) => {
     console.log(`Synthetic bridge call: ${group}.${method}`);
+    if (nativeWorkspaceMode && group === 'browser') {
+      if (!nativeBrowser) throw new Error('Native browser controller is not ready.');
+      if (method === 'getStatus') return nativeBrowser.getStatus();
+      if (method === 'newTab') return nativeBrowser.newTab();
+      if (method === 'closeTab') return nativeBrowser.closeTab(args[0]);
+      if (method === 'activateTab') return nativeBrowser.activateTab(args[0]);
+      if (method === 'navigate') return nativeBrowser.navigate(args[0]);
+      if (method === 'back') { nativeBrowser.back(); return true; }
+      if (method === 'forward') { nativeBrowser.forward(); return true; }
+      if (method === 'reload') { nativeBrowser.reload(); return true; }
+      if (method === 'setBounds') {
+        state.browserBoundsCalls.push(clone(args[0]));
+        nativeBrowser.setBounds(args[0]);
+        return true;
+      }
+    }
     if (group === 'projects' && method === 'list') return clone(state.projects);
     if (group === 'projects' && method === 'readInstructions') return readProjectInstructions(args[0]);
     if (group === 'projects' && method === 'instructionsBackupPath') return null;
@@ -393,10 +454,31 @@ async function runElectronHost() {
     if (group === 'settings' && method === 'getAutoStart') return false;
     if (group === 'settings' && method === 'listOpeners') return [];
     if (group === 'settings' && method === 'getAppInfo') return { version: 'audit', dataPath: profile, packaged: false, installedLauncherAvailable: false, autoStartMigrationIssue: null, platform: 'win32' };
-    if (group === 'browser' && method === 'getStatus') return {
-      tabs: [{ id: 'audit-browser-tab', title: 'Synthetic page', url: 'https://example.test/', canGoBack: false, canGoForward: false, loading: false, error: null }],
-      activeTabId: 'audit-browser-tab', error: null,
-    };
+    if (group === 'browser' && method === 'getStatus') return clone(state.browserStatus);
+    if (group === 'browser' && ['newTab', 'activateTab', 'closeTab', 'navigate'].includes(method)) {
+      if (state.deferBrowserMethod === method) {
+        state.deferBrowserMethod = null;
+        const request = deferred();
+        const record = { method, args: clone(args), resolve: (next) => request.resolve(clone(next)), reject: request.reject };
+        state.pendingBrowserActions.push(record);
+        return request.promise;
+      }
+      if (method === 'activateTab') state.browserStatus.activeTabId = args[0];
+      if (method === 'newTab') {
+        const id = `audit-browser-tab-${state.browserStatus.tabs.length + 1}`;
+        state.browserStatus.tabs.push(makeBrowserTab(id, 'New synthetic page', ''));
+        state.browserStatus.activeTabId = id;
+      }
+      if (method === 'closeTab') {
+        state.browserStatus.tabs = state.browserStatus.tabs.filter((tab) => tab.id !== args[0]);
+        state.browserStatus.activeTabId = state.browserStatus.tabs[0]?.id ?? null;
+      }
+      if (method === 'navigate') {
+        const activeTab = state.browserStatus.tabs.find((tab) => tab.id === state.browserStatus.activeTabId);
+        if (activeTab) activeTab.url = args[0];
+      }
+      return clone(state.browserStatus);
+    }
     if (group === 'browser' && method === 'setBounds') {
       state.browserBoundsCalls.push(clone(args[0]));
       return true;
@@ -426,7 +508,7 @@ async function runElectronHost() {
     }
     throw new Error(`Timed out waiting for ${name}`);
   };
-  const waitDom = (name, expression, timeout) => waitUntil(name, () => evaluate(expression), timeout);
+  const waitDom = (name, expression, timeout) => waitUntil(name, () => evaluate(`Boolean(${expression})`), timeout);
   const measureLayout = async (label) => {
     const layout = await evaluate(`JSON.stringify((() => {
       const box = (selector) => {
@@ -556,6 +638,12 @@ async function runElectronHost() {
   };
   const sendKey = async (keyCode) => {
     window.webContents.sendInputEvent({ type: 'keyDown', keyCode });
+    window.webContents.sendInputEvent({ type: 'keyUp', keyCode });
+    await sleep(80);
+  };
+  const sendNativeButtonKey = async (keyCode, character) => {
+    window.webContents.sendInputEvent({ type: 'keyDown', keyCode });
+    window.webContents.sendInputEvent({ type: 'char', keyCode: character });
     window.webContents.sendInputEvent({ type: 'keyUp', keyCode });
     await sleep(80);
   };
@@ -760,6 +848,425 @@ async function runElectronHost() {
     console.log(`SCREENSHOT ${screenshotPath}`);
   };
 
+  const runNativeBrowserWorkspace = async () => {
+    const pageHtml = (title, path) => `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title><style>body{font:18px sans-serif;margin:24px}main{min-height:2200px}input{font-size:18px}section{margin-top:900px}</style></head><body><main data-fixture-page="${path}"><h1 id="fixture-title">${title}</h1><label>Saved input <input id="saved-input" value="initial"></label><form id="fixture-form"><label>Form value <input id="form-input" value=""></label><button type="submit">Apply</button><output id="form-result"></output></form><a id="history-link" href="/one?step=2">History entry</a><section id="deep-section">Scroll state</section><script>document.querySelector('#fixture-form').addEventListener('submit',(event)=>{event.preventDefault();document.querySelector('#form-result').value=document.querySelector('#form-input').value})</script></main></body></html>`;
+    nativeServer = createServer((request, response) => {
+      const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+      const key = `${url.pathname}${url.search}`;
+      nativeRequests.set(key, (nativeRequests.get(key) ?? 0) + 1);
+      const one = url.pathname === '/one';
+      if (!one && url.pathname !== '/two') {
+        response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+        response.end('Not found');
+        return;
+      }
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+      response.end(pageHtml(one ? 'Workspace fixture one' : 'Workspace fixture two', url.pathname));
+    });
+    await new Promise((resolveListen, rejectListen) => {
+      nativeServer.once('error', rejectListen);
+      nativeServer.listen(0, '127.0.0.1', resolveListen);
+    });
+    const address = nativeServer.address();
+    assert.ok(address && typeof address === 'object', 'loopback fixture server must bind to an ephemeral port');
+    const origin = `http://127.0.0.1:${address.port}`;
+    const nativeTitle = `Plan009 Native Browser Workspace QA PID ${process.pid} ${fixturePath.split(/[\\/]/).at(-1)}`;
+    window.setTitle(nativeTitle);
+    window.setSize(1520, 940);
+    window.show();
+    window.focus();
+    window.webContents.focus();
+    await sleep(180);
+
+    const status = () => nativeBrowser.getStatus();
+    const activeStatus = () => {
+      const current = status();
+      return current.tabs.find((tab) => tab.id === current.activeTabId) ?? null;
+    };
+    const waitUrl = (name, path) => waitUntil(name, () => activeStatus()?.url?.endsWith(path) ?? false, 10000);
+    const waitNativePage = async (name, view, path) => waitUntil(name, async () => {
+      if (view.webContents.isDestroyed() || !view.webContents.getURL().endsWith(path)) return false;
+      const tabIndex = nativeViewsCreated.indexOf(view);
+      const tab = status().tabs[tabIndex];
+      return tab?.loading === false && await view.webContents.executeJavaScript("document.readyState === 'complete' && Boolean(document.querySelector('#fixture-title'))");
+    }, 10000);
+    const navigateAddress = async (url) => {
+      await evaluate(`(() => { const input = document.querySelector('.browser-address input'); if (!input) return false; input.focus(); input.select(); return true; })()`);
+      window.webContents.insertText(url);
+      await waitUntil('address field receives fixture URL', () => evaluate(`document.querySelector('.browser-address input')?.value === ${JSON.stringify(url)}`));
+      const submitted = await evaluate(`(() => { const form = document.querySelector('.browser-address'); if (!form) return false; form.requestSubmit(); return true; })()`);
+      assert.equal(submitted, true, 'native address form must submit through the rendered UI handler');
+    };
+    const attached = (view) => window.contentView.children.includes(view);
+    const assertViewportBounds = async (view, label) => {
+      const css = JSON.parse(await evaluate(`JSON.stringify((() => {
+        const viewport = document.querySelector('.browser-viewport')?.getBoundingClientRect();
+        const header = document.querySelector('.chat-header')?.getBoundingClientRect();
+        const toolbar = document.querySelector('.browser-toolbar')?.getBoundingClientRect();
+        return viewport && header && toolbar ? { x: viewport.x, y: viewport.y, width: viewport.width, height: viewport.height, headerBottom: header.bottom, toolbarTop: toolbar.top, toolbarBottom: toolbar.bottom } : null;
+      })())`));
+      assert.ok(css, `${label}: browser viewport, title row, and toolbar must exist`);
+      assert.ok(css.headerBottom <= css.toolbarTop + 1, `${label}: workspace title row must be above the browser toolbar`);
+      assert.ok(css.toolbarBottom <= css.y + 1, `${label}: native page must begin below the browser toolbar`);
+      const zoom = window.webContents.getZoomFactor();
+      const expected = { x: css.x * zoom, y: css.y * zoom, width: css.width * zoom, height: css.height * zoom };
+      const actual = view.getBounds();
+      for (const key of ['x', 'y', 'width', 'height']) {
+        assert.ok(Math.abs(actual[key] - expected[key]) <= 2, `${label}: native ${key} ${actual[key]} should match rendered viewport ${expected[key]}`);
+      }
+      return { css, zoom, expected, actual };
+    };
+    const startDividerGesture = async (label) => {
+      await evaluate(`(() => {
+        window.__plan009PointerTrace = [];
+        const record = (event) => {
+          if (!event.target?.closest?.('.browser-resizer') && !document.querySelector('.browser-workspace.is-dragging')) return;
+          const divider = document.querySelector('.browser-resizer');
+          window.__plan009PointerTrace.push({ type: event.type, pointerId: event.pointerId, buttons: event.buttons, clientX: event.clientX, captured: Boolean(divider?.hasPointerCapture?.(event.pointerId)) });
+        };
+        for (const type of ['pointerdown', 'pointermove', 'pointerup', 'pointercancel', 'lostpointercapture']) window.addEventListener(type, record, true);
+        return true;
+      })()`);
+      const geometry = JSON.parse(await evaluate(`JSON.stringify((() => {
+        const divider = document.querySelector('.browser-resizer')?.getBoundingClientRect();
+        const workspace = document.querySelector('.browser-workspace')?.getBoundingClientRect();
+        return divider && workspace ? { dividerX: divider.left + divider.width / 2, y: divider.top + Math.min(90, divider.height / 2), workspaceLeft: workspace.left, workspaceWidth: workspace.width, paneWidth: document.querySelector('.browser-pane')?.getBoundingClientRect().width } : null;
+      })())`));
+      assert.ok(geometry, `${label}: split view resizer and workspace must be visible`);
+      const zoom = window.webContents.getZoomFactor();
+      const x = Math.round(geometry.dividerX * zoom);
+      const y = Math.round(geometry.y * zoom);
+      window.webContents.sendInputEvent({ type: 'mouseMove', x, y });
+      window.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+      await waitDom(`${label}: captured drag starts`, `document.querySelector('.browser-workspace.is-dragging')`);
+      return { ...geometry, zoom, x, y };
+    };
+    const moveCapturedPointer = (xCss, yCss, zoom) => window.webContents.sendInputEvent({
+      type: 'mouseMove', x: Math.round(xCss * zoom), y: Math.round(yCss * zoom), modifiers: ['leftButtonDown'],
+    });
+    const releaseCapturedPointer = (xCss, yCss, zoom) => window.webContents.sendInputEvent({
+      type: 'mouseUp', x: Math.round(xCss * zoom), y: Math.round(yCss * zoom), button: 'left', clickCount: 1,
+    });
+
+    await clickChat('Chat B');
+    await waitDom('native test selects Chat B', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'`);
+    await evaluate(`window.__plan009Composer = document.querySelector('.composer textarea')`);
+    await click('button[aria-label="Показать браузер"]');
+    await waitDom('native browser pane opens', `document.querySelector('.browser-address input')`);
+    await waitUntil('native controller creates the blank tab', () => status().tabs.length === 1);
+    await navigateAddress(`${origin}/one`);
+    await waitUrl('native first tab receives /one', '/one');
+    await waitUntil('native first WebContentsView is created', () => nativeViewsCreated.length === 1);
+    const firstTab = activeStatus();
+    const firstView = nativeViewsCreated[0];
+    await waitNativePage('native first page finishes', firstView, '/one');
+    assert.equal(attached(firstView), true, 'active native browser view must attach in split mode');
+    await sleep(120);
+    const splitBrowserGeometry = await assertViewportBounds(firstView, 'split layout');
+    passed('Native controller creates an isolated WebContentsView for loopback page one');
+
+    await firstView.webContents.executeJavaScript(`(() => {
+      document.querySelector('#saved-input').value = 'preserved-across-surface-switch';
+      document.querySelector('#form-input').value = 'form-state-survives';
+      document.querySelector('#form-input').dispatchEvent(new Event('input', { bubbles: true }));
+      window.scrollTo(0, 680);
+      return true;
+    })()`);
+    const pageOneBefore = await firstView.webContents.executeJavaScript(`JSON.stringify({ url: location.href, title: document.title, saved: document.querySelector('#saved-input').value, form: document.querySelector('#form-input').value, scrollY: window.scrollY })`);
+    const pageOneState = JSON.parse(pageOneBefore);
+    assert.equal(pageOneState.saved, 'preserved-across-surface-switch');
+    assert.equal(pageOneState.form, 'form-state-survives');
+    assert.ok(pageOneState.scrollY >= 600, `native page should scroll before detach: ${pageOneState.scrollY}`);
+
+    await firstView.webContents.executeJavaScript("document.querySelector('#history-link').scrollIntoView({ block: 'center' })");
+    const historyLinkRect = await firstView.webContents.executeJavaScript(`(() => { const rect = document.querySelector('#history-link').getBoundingClientRect(); return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }; })()`);
+    const childZoom = firstView.webContents.getZoomFactor();
+    const historyLinkX = Math.round(historyLinkRect.x * childZoom);
+    const historyLinkY = Math.round(historyLinkRect.y * childZoom);
+    await sleep(60);
+    window.show();
+    window.focus();
+    firstView.webContents.focus();
+    const historyInputBefore = {
+      url: firstView.webContents.getURL(), rect: historyLinkRect, zoom: childZoom, bounds: firstView.getBounds(), attached: attached(firstView), visible: firstView.getVisible(),
+      hit: await firstView.webContents.executeJavaScript(`document.elementFromPoint(${historyLinkRect.x}, ${historyLinkRect.y})?.id ?? null`),
+    };
+    console.log(`NATIVE_HISTORY_INPUT_BEFORE ${JSON.stringify(historyInputBefore)}`);
+    firstView.webContents.sendInputEvent({ type: 'mouseMove', x: historyLinkX, y: historyLinkY });
+    firstView.webContents.sendInputEvent({ type: 'mouseDown', x: historyLinkX, y: historyLinkY, button: 'left', clickCount: 1 });
+    firstView.webContents.sendInputEvent({ type: 'mouseUp', x: historyLinkX, y: historyLinkY, button: 'left', clickCount: 1 });
+    try { await waitUrl('native history link adds an entry', '/one?step=2'); }
+    catch (error) {
+      const historyInputAfter = {
+        url: firstView.webContents.getURL(), status: activeStatus(), pageUserActivation: await firstView.webContents.executeJavaScript('navigator.userActivation.hasBeenActive'),
+        history: { activeIndex: firstView.webContents.navigationHistory.getActiveIndex(), entries: firstView.webContents.navigationHistory.getAllEntries().map((entry) => entry.url) },
+      };
+      console.log(`NATIVE_HISTORY_INPUT_AFTER ${JSON.stringify(historyInputAfter)}`);
+      error.message += `; history input evidence: ${JSON.stringify({ before: historyInputBefore, after: historyInputAfter })}`;
+      throw error;
+    }
+    await waitNativePage('native history entry finishes', firstView, '/one?step=2');
+    let backHistoryAvailable = true;
+    try { await waitUntil('native controller publishes committed back history', () => activeStatus()?.canGoBack === true, 1800); }
+    catch { backHistoryAvailable = false; }
+    const historyDiagnostic = {
+      status: activeStatus(), url: firstView.webContents.getURL(), pageUserActivation: await firstView.webContents.executeJavaScript('navigator.userActivation.hasBeenActive'), legacyCanGoBack: firstView.webContents.canGoBack(),
+      navigationHistory: {
+        canGoBack: firstView.webContents.navigationHistory.canGoBack(),
+        canGoForward: firstView.webContents.navigationHistory.canGoForward(),
+        activeIndex: firstView.webContents.navigationHistory.getActiveIndex(),
+        entries: firstView.webContents.navigationHistory.getAllEntries().map((entry) => ({ url: entry.url, title: entry.title })),
+      },
+    };
+    console.log(`NATIVE_HISTORY_DIAGNOSTIC ${JSON.stringify(historyDiagnostic)}`);
+    assert.equal(backHistoryAvailable, true, `the browser tab should expose committed back history after the fixture link: ${JSON.stringify(historyDiagnostic)}`);
+    await click('button[aria-label="Назад в браузере"]');
+    await waitUrl('native browser back restores the first fixture URL', '/one');
+    await waitNativePage('native browser back finishes', firstView, '/one');
+    await waitUntil('native forward history is available', () => activeStatus()?.canGoForward === true);
+    await firstView.webContents.executeJavaScript(`(() => {
+      document.querySelector('#saved-input').value = 'preserved-across-surface-switch';
+      document.querySelector('#form-input').value = 'form-state-survives';
+      window.scrollTo(0, 680);
+      return true;
+    })()`);
+    const stateAfterHistory = JSON.parse(await firstView.webContents.executeJavaScript(`JSON.stringify({ url: location.href, saved: document.querySelector('#saved-input').value, form: document.querySelector('#form-input').value, scrollY: window.scrollY })`));
+    const firstLoadCountAfterHistory = nativeLoadCounts.get(firstView.webContents.id) ?? 0;
+    assert.ok(firstLoadCountAfterHistory >= 2, `native history should have loaded multiple entries: ${firstLoadCountAfterHistory}`);
+
+    await click('.browser-new-tab');
+    await waitUntil('native second tab appears', () => status().tabs.length === 2);
+    await navigateAddress(`${origin}/two`);
+    await waitUrl('native second tab receives /two', '/two');
+    await waitUntil('native second WebContentsView is created', () => nativeViewsCreated.length === 2);
+    const secondTab = activeStatus();
+    const secondView = nativeViewsCreated[1];
+    await waitNativePage('native second page finishes', secondView, '/two');
+    assert.equal(attached(secondView), true, 'active second native view must attach in split mode');
+    assert.notEqual(firstView.webContents.id, secondView.webContents.id, 'each real browser tab must keep its own WebContents');
+    assert.equal(firstView.webContents.session, secondView.webContents.session, 'browser tabs must reuse the dedicated browser session');
+    assert.equal(firstView.webContents.session, session.fromPartition('persist:gigachat-browser'), 'native browser pages must stay in the product browser partition');
+    const nativePreferences = firstView.webContents.getLastWebPreferences();
+    assert.deepEqual({ contextIsolation: nativePreferences.contextIsolation, nodeIntegration: nativePreferences.nodeIntegration, sandbox: nativePreferences.sandbox, webSecurity: nativePreferences.webSecurity },
+      { contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true }, 'native browser views must retain their restricted web preferences');
+    passed('Two browser tabs retain distinct WebContents in the same restricted browser session');
+
+    await click(`[data-browser-tab-id="${firstTab.id}"]`);
+    await waitUrl('activating first tab restores its native page', '/one');
+    await waitUntil('first tab view reattaches', () => attached(firstView));
+    const restoredPageOne = JSON.parse(await firstView.webContents.executeJavaScript(`JSON.stringify({ url: location.href, title: document.title, saved: document.querySelector('#saved-input').value, form: document.querySelector('#form-input').value, scrollY: window.scrollY })`));
+    assert.equal(firstView.webContents.id, nativeViewsCreated[0].webContents.id);
+    assert.equal(restoredPageOne.saved, pageOneState.saved);
+    assert.equal(restoredPageOne.form, pageOneState.form);
+    assert.equal(restoredPageOne.scrollY, pageOneState.scrollY);
+
+    await click('button[aria-label="Развернуть на всю рабочую область"]');
+    await waitDom('native browser surface enters full workspace mode', `document.querySelector('.browser-workspace.is-full.surface-browser')`);
+    await waitUntil('native full-browser view is attached', () => attached(firstView));
+    const fullBrowserBounds = firstView.getBounds();
+    assert.ok(fullBrowserBounds.width > 500 && fullBrowserBounds.height > 300, `full-browser bounds must cover its content area: ${JSON.stringify(fullBrowserBounds)}`);
+    await sleep(120);
+    const fullBrowserGeometry = await assertViewportBounds(firstView, 'full-browser layout');
+    const pageOneBeforeDetach = JSON.parse(await firstView.webContents.executeJavaScript(`JSON.stringify({ url: location.href, title: document.title, saved: document.querySelector('#saved-input').value, form: document.querySelector('#form-input').value, scrollY: window.scrollY })`));
+    await capture('native-browser-workspace-full-browser');
+
+    await click('#workspace-chat-tab');
+    await waitDom('native full workspace selects Chat B', `document.querySelector('.browser-workspace.is-full.surface-chat')`);
+    await waitUntil('native view detaches for full-chat surface', () => !attached(firstView) && state.browserBoundsCalls.at(-1) === null);
+    assert.equal(await evaluate(`document.querySelector('.composer textarea') === window.__plan009Composer`), true, 'switching surfaces must retain the same mounted chat composer');
+    const detachedPageOne = JSON.parse(await firstView.webContents.executeJavaScript(`JSON.stringify({ url: location.href, saved: document.querySelector('#saved-input').value, form: document.querySelector('#form-input').value, scrollY: window.scrollY })`));
+    assert.deepEqual(detachedPageOne, { url: pageOneBeforeDetach.url, saved: pageOneBeforeDetach.saved, form: pageOneBeforeDetach.form, scrollY: pageOneBeforeDetach.scrollY }, 'detaching the native view must preserve its live page state');
+    await capture('native-browser-workspace-full-chat-detached');
+
+    await click(`[data-browser-tab-id="${firstTab.id}"]`);
+    await waitDom('native browser tab returns to the full workspace', `document.querySelector('.browser-workspace.is-full.surface-browser')`);
+    await waitUntil('same native view reattaches after full chat', () => attached(firstView));
+    assert.equal(firstView.webContents.id, nativeViewsCreated[0].webContents.id, 'restoring the page must not create a replacement WebContents');
+    await click('button[aria-label="Выйти из режима полного просмотра"]');
+    await waitDom('native workspace returns to split mode', `!document.querySelector('.browser-workspace.is-full') && document.querySelector('.browser-pane')`);
+    await waitUntil('native split view remains attached', () => attached(firstView));
+    const restoredSplitBounds = firstView.getBounds();
+    assert.ok(restoredSplitBounds.width > 250 && restoredSplitBounds.width < fullBrowserBounds.width, `split view bounds must be restored: ${JSON.stringify(restoredSplitBounds)}`);
+    assert.equal(firstView.webContents.getURL(), restoredPageOne.url, 'restoring split mode must not reload or navigate the live tab');
+    assert.equal(nativeLoadCounts.get(firstView.webContents.id), firstLoadCountAfterHistory, 'detaching/restoring a live tab must not reload it');
+    assert.equal(nativeRequests.get('/two'), 1, 'the second fixture should be requested once despite tab switches');
+    const requestsAfterTabLoads = Object.fromEntries(nativeRequests);
+    passed('Full browser, full chat, and split restoration keep page IDs, form/scroll state, and live bounds');
+
+    const beforeOverlayLoads = Object.fromEntries(nativeLoadCounts);
+    const beforeOverlayRequests = Object.fromEntries(nativeRequests);
+    await click('button[aria-label="Действия чата Chat B"]');
+    await waitDom('native chat action overlay opens', `document.querySelector('.action-menu-content:popover-open')`);
+    await waitUntil('native view detaches for the first overlay', () => !attached(firstView) && state.browserBoundsCalls.at(-1) === null);
+    await clickText('.action-menu-content:popover-open .submenu-trigger', 'Переместить в проект');
+    await waitDom('native nested project overlay opens', `document.querySelector('.submenu-content:popover-open')`);
+    assert.equal(attached(firstView), false, 'nested overlays must keep the real browser view detached');
+    const closeNativeOverlay = async () => {
+      window.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'ESC' });
+      window.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'ESC' });
+      await sleep(100);
+    };
+    await closeNativeOverlay();
+    await waitDom('native nested overlay closes while parent stays open', `!document.querySelector('.submenu-content:popover-open') && document.querySelector('.action-menu-content:popover-open')`);
+    assert.equal(state.browserBoundsCalls.at(-1), null, 'closing only the nested overlay must keep native bounds suspended');
+    assert.equal(attached(firstView), false, 'closing only the nested overlay must not reattach the browser view');
+    await closeNativeOverlay();
+    await waitUntil('native view reattaches after the last overlay closes', () => attached(firstView) && state.browserBoundsCalls.at(-1)?.width > 0);
+    await sleep(100);
+    const boundsAfterLastOverlay = await assertViewportBounds(firstView, 'native view after last overlay closes');
+    assert.deepEqual(Object.fromEntries(nativeLoadCounts), beforeOverlayLoads, 'overlays must not reload native pages');
+    assert.deepEqual(Object.fromEntries(nativeRequests), beforeOverlayRequests, 'overlays must not request native pages again');
+    passed('Nested native overlays detach the live view and restore it only after the last overlay closes');
+
+    for (let index = 0; index < 3; index += 1) {
+      await click('button[aria-label="Развернуть на всю рабочую область"]');
+      await waitDom(`rapid full-browser presentation ${index + 1}`, `document.querySelector('.browser-workspace.is-full.surface-browser')`);
+      await waitUntil(`rapid full-browser view ${index + 1} stays attached`, () => attached(firstView));
+      await sleep(45);
+      await assertViewportBounds(firstView, `rapid full-browser presentation ${index + 1}`);
+      await click('button[aria-label="Выйти из режима полного просмотра"]');
+      await waitDom(`rapid split presentation ${index + 1}`, `!document.querySelector('.browser-workspace.is-full') && document.querySelector('.browser-pane')`);
+      await waitUntil(`rapid split view ${index + 1} stays attached`, () => attached(firstView));
+      await sleep(45);
+      await assertViewportBounds(firstView, `rapid split presentation ${index + 1}`);
+    }
+    assert.equal(firstView.webContents.id, nativeViewsCreated[0].webContents.id, 'rapid presentation changes must retain the same WebContents');
+    assert.deepEqual(Object.fromEntries(nativeLoadCounts), beforeOverlayLoads, 'rapid presentation changes must not reload native pages');
+    assert.deepEqual(Object.fromEntries(nativeRequests), beforeOverlayRequests, 'rapid presentation changes must not request native pages again');
+    passed('Three rapid full/split transitions keep native IDs, bounds, and loaded pages stable');
+
+    const beforeWindowResize = window.getSize();
+    window.setSize(beforeWindowResize[0] - 120, beforeWindowResize[1] - 80);
+    await sleep(320);
+    const boundsAfterWindowResize = await assertViewportBounds(firstView, 'native view after host window resize');
+    window.setSize(beforeWindowResize[0], beforeWindowResize[1]);
+    await sleep(320);
+    const boundsAfterWindowRestore = await assertViewportBounds(firstView, 'native view after host window restores');
+    assert.equal(firstView.webContents.id, nativeViewsCreated[0].webContents.id, 'host resize must not replace native WebContents');
+    assert.deepEqual(Object.fromEntries(nativeLoadCounts), beforeOverlayLoads, 'host resize must not reload native pages');
+    assert.deepEqual(Object.fromEntries(nativeRequests), beforeOverlayRequests, 'host resize must not request native pages again');
+    passed('Native viewport follows a host window resize and restores without reloading pages');
+
+    const widthBeforeGesture = state.appSettings.browserWidthPx;
+    const releaseDrag = await startDividerGesture('normal release');
+    const releaseTargetX = releaseDrag.dividerX + 32;
+    moveCapturedPointer(releaseTargetX, releaseDrag.y, releaseDrag.zoom);
+    try {
+      await waitUntil('captured drag changes transient browser width', async () => {
+        const width = await evaluate(`Number(document.querySelector('.browser-resizer')?.getAttribute('aria-valuenow'))`);
+        return width > 320 && width < releaseDrag.paneWidth;
+      });
+    } catch (error) {
+      const dragDiagnostic = await evaluate(`JSON.stringify({ workspaceClass: document.querySelector('.browser-workspace')?.className, width: document.querySelector('.browser-resizer')?.getAttribute('aria-valuenow'), paneWidth: document.querySelector('.browser-pane')?.getBoundingClientRect().width, trace: window.__plan009PointerTrace })`);
+      console.log(`NATIVE_DRAG_DIAGNOSTIC ${dragDiagnostic}`);
+      error.message += `; native drag evidence: ${dragDiagnostic}`;
+      throw error;
+    }
+    releaseCapturedPointer(releaseTargetX, releaseDrag.y, releaseDrag.zoom);
+    await waitUntil('normal pointer release commits preferred width', () => state.appSettings.browserWidthPx !== widthBeforeGesture);
+    await waitUntil('normal release settles native viewport bounds', async () => Math.abs(firstView.getBounds().width - state.appSettings.browserWidthPx) <= 2);
+    const committedWidth = state.appSettings.browserWidthPx;
+    const releaseTrace = JSON.parse(await evaluate('JSON.stringify(window.__plan009PointerTrace)'));
+    assert.ok(releaseTrace.some((event) => event.type === 'pointermove' && event.buttons > 0 && event.captured), `normal drag must deliver captured held-button moves: ${JSON.stringify(releaseTrace)}`);
+    assert.ok(releaseTrace.some((event) => event.type === 'pointerup'), `normal release must end with pointerup: ${JSON.stringify(releaseTrace)}`);
+    passed('Native mouse input resizes the browser and pointerup commits its preferred width');
+
+    const cancelDrag = await startDividerGesture('pointer cancel');
+    moveCapturedPointer(cancelDrag.dividerX + 22, cancelDrag.y, cancelDrag.zoom);
+    await waitUntil('cancel drag has an active captured pointer', async () => evaluate(`document.querySelector('.browser-workspace.is-dragging') && window.__plan009PointerTrace.some((event) => event.type === 'pointermove' && event.captured)`));
+    const cancelPointerId = await evaluate(`window.__plan009PointerTrace.findLast((event) => event.type === 'pointerdown')?.pointerId ?? null`);
+    assert.equal(typeof cancelPointerId, 'number', 'cancel test must capture the live pointer id');
+    await evaluate(`(() => {
+      const divider = document.querySelector('.browser-resizer');
+      divider.dispatchEvent(new PointerEvent('pointercancel', { bubbles: true, pointerId: ${cancelPointerId}, pointerType: 'mouse', isPrimary: true, buttons: 0, clientX: ${Math.round((cancelDrag.dividerX + 22) * cancelDrag.zoom)}, clientY: ${cancelDrag.y} }));
+      return true;
+    })()`);
+    await waitDom('synthetic pointercancel clears the active browser resize', `!document.querySelector('.browser-workspace.is-dragging')`);
+    releaseCapturedPointer(cancelDrag.dividerX + 22, cancelDrag.y, cancelDrag.zoom);
+    await waitUntil('cancel restores native split bounds', async () => Math.abs(firstView.getBounds().width - committedWidth) <= 2);
+    assert.equal(state.appSettings.browserWidthPx, committedWidth, 'pointercancel must not persist its transient width');
+    const cancelTrace = JSON.parse(await evaluate('JSON.stringify(window.__plan009PointerTrace)'));
+    assert.ok(cancelTrace.some((event) => event.type === 'pointercancel'), `cancel gesture must dispatch pointercancel: ${JSON.stringify(cancelTrace)}`);
+    passed('Captured pointercancel restores the split width without committing transient state');
+
+    const edgeDrag = await startDividerGesture('left-edge snap');
+    const edgeX = edgeDrag.workspaceLeft + 5;
+    moveCapturedPointer(edgeX, edgeDrag.y, edgeDrag.zoom);
+    await waitDom('captured drag snaps to full browser at workspace edge', `document.querySelector('.browser-workspace.is-full.surface-browser')`);
+    releaseCapturedPointer(edgeX, edgeDrag.y, edgeDrag.zoom);
+    assert.equal(state.appSettings.browserWidthPx, committedWidth, 'full-view edge snap must not persist a full-width pane');
+    await sleep(120);
+    const edgeFullGeometry = await assertViewportBounds(firstView, 'left-edge full browser');
+    passed('Captured leftward pointer crossing the 12px edge zone opens full browser without width persistence');
+
+    await click('button[aria-label="Выйти из режима полного просмотра"]');
+    await waitDom('edge-snap returns to split browser', `!document.querySelector('.browser-workspace.is-full') && document.querySelector('.browser-pane')`);
+    await waitUntil('edge-snap split restores same page view', () => attached(firstView));
+
+    const originalZoom = window.webContents.getZoomFactor();
+    const originalWindowBounds = window.getBounds();
+    const display = screen.getDisplayMatching(window.getBounds());
+    const zoomBounds = [];
+    for (const zoom of [0.8, 1, 1.25]) {
+      window.webContents.setZoomFactor(zoom);
+      window.setSize(1520, 940);
+      await sleep(280);
+      const geometry = await assertViewportBounds(firstView, `native split zoom ${zoom}`);
+      zoomBounds.push({ zoom, geometry, host: window.getBounds(), native: firstView.getBounds() });
+    }
+    window.webContents.setZoomFactor(originalZoom);
+    window.setSize(originalWindowBounds.width, originalWindowBounds.height);
+    await sleep(280);
+    await assertViewportBounds(firstView, 'restored native split after zoom checks');
+    assert.equal(firstView.webContents.getURL(), restoredPageOne.url, 'window zoom checks must preserve the active native page');
+    assert.deepEqual(Object.fromEntries(nativeRequests), requestsAfterTabLoads, 'resize/zoom and workspace surface changes must not reload either native tab');
+    passed(`Native view bounds follow viewport at host zoom 80/100/125 percent; display scale is ${display.scaleFactor}`);
+
+    const evidence = {
+      fixture: fixturePath,
+      userData: await realpath(profile),
+      host: { pid: process.pid, title: nativeTitle, bounds: window.getBounds(), contentBounds: window.getContentBounds(), scaleFactor: screen.getDisplayMatching(window.getBounds()).scaleFactor },
+      pages: [
+        { tabId: firstTab.id, webContentsId: firstView.webContents.id, loadCount: nativeLoadCounts.get(firstView.webContents.id), sessionPartition: 'persist:gigachat-browser', status: status().tabs.find((tab) => tab.id === firstTab.id), historyDiagnostic, beforeHistory: pageOneState, afterHistoryBack: stateAfterHistory, afterRestore: restoredPageOne, beforeDetach: pageOneBeforeDetach, detached: detachedPageOne },
+        { tabId: secondTab.id, webContentsId: secondView.webContents.id, loadCount: nativeLoadCounts.get(secondView.webContents.id), status: status().tabs.find((tab) => tab.id === secondTab.id) },
+      ],
+      requests: Object.fromEntries(nativeRequests),
+      boundsCalls: state.browserBoundsCalls,
+      nativeLoadCounts: Object.fromEntries(nativeLoadCounts),
+      fullBrowserBounds,
+      splitBrowserGeometry,
+      fullBrowserGeometry,
+      restoredSplitBounds,
+      boundsAfterLastOverlay,
+      boundsAfterWindowResize,
+      boundsAfterWindowRestore,
+      edgeFullGeometry,
+      zoomBounds,
+      gesture: { widthBefore: widthBeforeGesture, widthCommitted: committedWidth, releaseTrace, cancelTrace },
+      checks: ['split-view', 'two-loopback-tabs', 'restricted-browser-preferences', 'history-back-forward', 'native-header-and-toolbar-bounds', 'full-browser', 'full-chat-detach', 'persistent-composer', 'page-form-scroll-state', 'split-restore', 'native-overlay-detach-last-close-restore', 'three-rapid-full-split-transitions', 'host-window-resize-restore', 'captured-resize-release', 'captured-pointercancel', 'left-edge-full-snap', 'zoom-80-100-125'],
+    };
+    await writeFile(join(fixturePath, 'native-browser-workspace.json'), `${JSON.stringify(evidence, null, 2)}\n`, 'utf8');
+    console.log(`NATIVE_BROWSER_WORKSPACE_EVIDENCE ${JSON.stringify(evidence)}`);
+
+    if (holdForReview) {
+      const workArea = display.workArea;
+      const finalWindowWidth = Math.min(1800, workArea.width - 40);
+      const finalWindowHeight = Math.min(1000, workArea.height - 40);
+      window.webContents.setZoomFactor(1);
+      window.setSize(finalWindowWidth, finalWindowHeight);
+      window.setPosition(Math.round(workArea.x + (workArea.width - finalWindowWidth) / 2), Math.round(workArea.y + (workArea.height - finalWindowHeight) / 2));
+      await sleep(350);
+      const finalGeometry = await evaluate(`JSON.stringify((() => { const rect = document.querySelector('.browser-workspace')?.getBoundingClientRect(); const sidebar = document.querySelector('.sidebar')?.getBoundingClientRect(); return { mainWidth: rect?.width ?? null, sidebarWidth: sidebar?.width ?? null }; })())`);
+      const ready = { title: nativeTitle, pid: process.pid, fixture: fixturePath, bounds: window.getBounds(), contentBounds: window.getContentBounds(), scaleFactor: screen.getDisplayMatching(window.getBounds()).scaleFactor, layout: JSON.parse(finalGeometry) };
+      console.log(`NATIVE_BROWSER_WORKSPACE_READY ${JSON.stringify(ready)}`);
+      await new Promise((resolveClosed) => window.once('closed', resolveClosed));
+    }
+
+    nativeBrowser.destroy();
+    if (nativeServer) await new Promise((resolveClose, rejectClose) => nativeServer.close((error) => error ? rejectClose(error) : resolveClose()));
+    process.stdout.write('Plan009 native browser workspace: PASS\n', () => app.exit(0));
+  };
+
   try {
     await app.whenReady();
     console.log('Electron app ready');
@@ -792,6 +1299,26 @@ async function runElectronHost() {
     window.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
       console.error(`Renderer navigation failed: ${errorCode} ${errorDescription}; mainFrame=${isMainFrame}; url=${validatedURL}`);
     });
+    if (nativeWorkspaceMode) {
+      const { createEmbeddedBrowser } = require(join(fixturePath, 'native', 'embedded-browser.cjs'));
+      nativeBrowser = createEmbeddedBrowser(() => window, {
+        createSession: (partition) => session.fromPartition(partition),
+        createView: (options) => {
+          const view = new WebContentsView(options);
+          nativeViewsCreated.push(view);
+        nativeLoadCounts.set(view.webContents.id, 0);
+        view.webContents.on('did-start-loading', () => nativeLoadCounts.set(view.webContents.id, (nativeLoadCounts.get(view.webContents.id) ?? 0) + 1));
+          return view;
+        },
+        persist: async (tabs, activeTabId) => {
+          state.appSettings.browserTabs = clone(tabs);
+          state.appSettings.browserActiveTabId = activeTabId;
+        },
+      }, [], null);
+      nativeBrowser.onStatus((status) => {
+        if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('audit:browser', status);
+      });
+    }
     await window.loadFile(join(bundleDirectory, 'index.html'));
     console.log('Renderer document loaded');
     try {
@@ -807,6 +1334,72 @@ async function runElectronHost() {
       throw error;
     }
     console.log('Synthetic React app ready');
+
+    if (nativeWorkspaceMode) {
+      try {
+        await runNativeBrowserWorkspace();
+      } catch (error) {
+        if (holdForReview && window && !window.isDestroyed()) {
+          const diagnosticTitle = `Plan009 Native Browser Workspace DIAGNOSTIC PID ${process.pid} ${fixturePath.split(/[\\/]/).at(-1)}`;
+          window.setTitle(diagnosticTitle);
+          window.show();
+          window.focus();
+          window.webContents.focus();
+          console.error(`NATIVE_BROWSER_WORKSPACE_DIAGNOSTIC_READY ${JSON.stringify({ title: diagnosticTitle, pid: process.pid, fixture: fixturePath, message: error?.message ?? String(error), bounds: window.getBounds(), contentBounds: window.getContentBounds(), scaleFactor: screen.getDisplayMatching(window.getBounds()).scaleFactor, browser: nativeBrowser?.getStatus() ?? null })}`);
+          await new Promise((resolveClosed) => window.once('closed', resolveClosed));
+          nativeBrowser?.destroy();
+          if (nativeServer?.listening) await new Promise((resolveClose) => nativeServer.close(() => resolveClose()));
+        }
+        throw error;
+      }
+      return;
+    }
+
+    if (process.argv.includes('--browser-workspace-async-smoke')) {
+      await clickChat('Chat B');
+      await waitDom('smoke starts on Chat B', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'`);
+      await click('button[aria-label="Показать браузер"]');
+      await waitDom('smoke browser opened', `document.querySelector('.browser-header-cell .browser-tab button[title="Synthetic page"]')`);
+      await click('button[aria-label="Развернуть на всю рабочую область"]');
+      await waitDom('smoke full browser surface', `document.querySelector('.browser-workspace.is-full.surface-browser')`);
+      await click('#workspace-chat-tab');
+      await waitDom('smoke full chat surface', `document.querySelector('.browser-workspace.is-full.surface-chat')`);
+
+      state.deferBrowserMethod = 'newTab';
+      await click('.browser-new-tab');
+      await waitUntil('smoke deferred successful new tab', () => state.pendingBrowserActions.length === 1);
+      const successfulNewTab = state.pendingBrowserActions[0];
+      const firstTab = makeBrowserTab('smoke-success-tab', 'Smoke success', 'https://success.example.test/');
+      resolveBrowserAction(successfulNewTab, { ...state.browserStatus, tabs: [...state.browserStatus.tabs, firstTab], activeTabId: firstTab.id });
+      await waitDom('smoke successful new tab selects browser', `document.querySelector('.browser-workspace.is-full.surface-browser')`);
+      await waitUntil('smoke successful new tab focuses address', () => evaluate(`document.activeElement === document.querySelector('.browser-address input')`));
+
+      await click('#workspace-chat-tab');
+      await waitDom('smoke chat surface before pending request', `document.querySelector('.browser-workspace.is-full.surface-chat')`);
+      state.deferBrowserMethod = 'newTab';
+      await click('.browser-new-tab');
+      await waitUntil('smoke deferred stale new tab', () => state.pendingBrowserActions.length === 2);
+      const staleNewTab = state.pendingBrowserActions[1];
+      await click('#browser-tab-audit-browser-tab');
+      await waitDom('smoke switches to browser during pending response', `document.querySelector('.browser-workspace.is-full.surface-browser')`);
+      await click('#workspace-chat-tab');
+      await waitDom('smoke returns to chat during pending response', `document.querySelector('.browser-workspace.is-full.surface-chat')`);
+      assert.equal(await evaluate(`(() => { const tab = document.querySelector('#workspace-chat-tab'); tab?.focus(); return document.activeElement === tab; })()`), true);
+      const staleTab = makeBrowserTab('smoke-stale-tab', 'Smoke stale', 'https://stale.example.test/');
+      resolveBrowserAction(staleNewTab, { ...state.browserStatus, tabs: [...state.browserStatus.tabs, staleTab], activeTabId: staleTab.id });
+      await waitDom('smoke stale success updates status', `document.querySelector('#browser-tab-smoke-stale-tab')`);
+      await sleep(80);
+      assert.equal(await evaluate(`document.querySelector('.browser-workspace')?.classList.contains('surface-chat')`), true);
+      assert.equal(await evaluate(`document.activeElement?.id`), 'workspace-chat-tab');
+
+      state.deferBrowserMethod = 'activateTab';
+      await click('#browser-tab-audit-browser-tab-2');
+      await waitUntil('smoke deferred activation failure', () => state.pendingBrowserActions.length === 3);
+      state.pendingBrowserActions[2].reject(new Error('Synthetic deferred activation failure'));
+      await waitDom('smoke failed activation remains accessible on chat', `document.querySelector('.browser-workspace.is-full.surface-chat') && document.querySelector('.browser-surface-error[role="alert"]')`);
+      process.stdout.write('Plan009 async browser smoke: PASS\n', () => app.exit(0));
+      return;
+    }
 
     const originalSize = window.getSize();
     const originalZoom = window.webContents.getZoomFactor();
@@ -1336,7 +1929,7 @@ async function runElectronHost() {
     assert.equal(projectHeader.folder, true, 'project chat should show its decorative folder marker');
     await capture('project-chat-header');
     await clickChat('Chat B');
-    await waitDom('standalone chat without project marker', `document.querySelector('.chat-header-title')?.textContent === 'Chat B' && !document.querySelector('.chat-header-folder')`);
+    await waitDom('standalone chat icon without project folder marker', `document.querySelector('.chat-header-title')?.textContent === 'Chat B' && document.querySelector('.chat-header-chat') && !document.querySelector('.chat-header-folder')`);
     await capture('standalone-chat-header');
     passed('Rendered project nesting, square-free child list, and project-aware chat title');
     passed('Rendered late project move updates its own chat without replacing another active chat');
@@ -1981,7 +2574,69 @@ async function runElectronHost() {
     await sleep(350);
     passed('Rendered settings choices preserve disabled/empty values, keyboard/focus, themed viewport-clamped popovers, and switch symmetry');
     await click('button[aria-label="Показать браузер"]');
-    await waitDom('browser pane with its synthetic page', `document.querySelector('.browser-pane .browser-tab button[title="Synthetic page"]')`);
+    await waitDom('browser pane with its synthetic page', `document.querySelector('.browser-header-cell .browser-tab button[title="Synthetic page"]')`);
+    await click('button[aria-label="Развернуть на всю рабочую область"]');
+    await waitDom('combined chat and browser workspace tabs', `document.querySelector('.browser-workspace.is-full.surface-browser #workspace-chat-tab')`);
+    await click('#workspace-chat-tab');
+    await waitDom('chat surface selected in full workspace', `document.querySelector('.browser-workspace.surface-chat')`);
+
+    console.log('Plan009 browser check: resolve newTab from the chat surface');
+    state.deferBrowserMethod = 'newTab';
+    await click('.browser-new-tab');
+    await waitUntil('new-tab request deferred from full chat surface', () => state.pendingBrowserActions.some((item) => item.method === 'newTab'));
+    const focusAddressRequest = state.pendingBrowserActions.findLast((item) => item.method === 'newTab');
+    const focusAddressTab = makeBrowserTab('deferred-focus-tab', 'Deferred focus page', 'https://focus.example.test/');
+    resolveBrowserAction(focusAddressRequest, { ...state.browserStatus, tabs: [...state.browserStatus.tabs, focusAddressTab], activeTabId: focusAddressTab.id });
+    await waitDom('successful new tab switches to browser surface', `document.querySelector('.browser-workspace.is-full.surface-browser') && document.querySelector('#browser-tab-deferred-focus-tab')`);
+    await waitUntil('successful new tab focuses its address field', () => evaluate(`document.activeElement === document.querySelector('.browser-address input')`));
+    passed('Full-view new tab changes to browser only after success and focuses its address field');
+
+    console.log('Plan009 browser check: stale success after switching surfaces');
+    await click('#workspace-chat-tab');
+    await waitDom('chat surface selected before stale success', `document.querySelector('.browser-workspace.is-full.surface-chat')`);
+    state.deferBrowserMethod = 'newTab';
+    await click('.browser-new-tab');
+    await waitUntil('second new-tab request deferred from chat surface', () => state.pendingBrowserActions.filter((item) => item.method === 'newTab').length === 2);
+    const staleSuccessRequest = state.pendingBrowserActions.findLast((item) => item.method === 'newTab');
+    await click('#browser-tab-audit-browser-tab');
+    await waitDom('browser surface selected while new tab is pending', `document.querySelector('.browser-workspace.surface-browser')`);
+    await click('#workspace-chat-tab');
+    await waitDom('chat surface restored before new-tab success', `document.querySelector('.browser-workspace.surface-chat')`);
+    assert.equal(await evaluate(`(() => { const tab = document.querySelector('#workspace-chat-tab'); tab?.focus(); return document.activeElement === tab; })()`), true, 'test must focus the selected chat tab before resolving a stale action');
+    const staleSuccessTab = makeBrowserTab('deferred-stale-tab', 'Deferred stale page', 'https://stale.example.test/');
+    resolveBrowserAction(staleSuccessRequest, { ...state.browserStatus, tabs: [...state.browserStatus.tabs, staleSuccessTab], activeTabId: staleSuccessTab.id });
+    await waitDom('late successful status still updates the browser tab list', `document.querySelector('#browser-tab-deferred-stale-tab')`);
+    await sleep(80);
+    assert.equal(await evaluate(`Boolean(document.querySelector('.browser-workspace.is-full.surface-chat'))`), true, 'late new-tab success must not steal the selected chat surface');
+    assert.equal(await evaluate(`document.activeElement?.id`), 'workspace-chat-tab', 'late new-tab success must not steal focus from the chat tab');
+    passed('Late new-tab success updates browser status without stealing chat surface or focus');
+
+    console.log('Plan009 browser check: failed activation remains visible on chat');
+    state.deferBrowserMethod = 'activateTab';
+    await click('#browser-tab-audit-browser-tab-2');
+    await waitUntil('tab activation deferred while chat surface stays selected', () => state.pendingBrowserActions.some((item) => item.method === 'activateTab'));
+    const failedActivation = state.pendingBrowserActions.findLast((item) => item.method === 'activateTab');
+    failedActivation.reject(new Error('Synthetic deferred tab activation failure'));
+    await waitDom('failed activation stays on chat and exposes an accessible error', `document.querySelector('.browser-workspace.is-full.surface-chat') && document.querySelector('.browser-surface-error[role="alert"]')?.textContent.includes('Synthetic deferred tab activation failure')`);
+    passed('Failed activation preserves the chat surface and shows its error accessibly');
+
+    console.log('Plan009 browser check: deferred failure after route unmount');
+    await click('#browser-tab-audit-browser-tab');
+    await waitDom('browser surface restored after failed activation', `document.querySelector('.browser-workspace.surface-browser')`);
+    await click('#workspace-chat-tab');
+    await waitDom('chat surface restored before route unmount', `document.querySelector('.browser-workspace.surface-chat')`);
+    state.deferBrowserMethod = 'newTab';
+    await click('.browser-new-tab');
+    await waitUntil('new-tab request pending before route unmount', () => state.pendingBrowserActions.filter((item) => item.method === 'newTab').length === 3);
+    const unmountedRequest = state.pendingBrowserActions.findLast((item) => item.method === 'newTab');
+    await click('.profile-settings-button');
+    await waitDom('settings route unmounts the browser workspace', `!document.querySelector('.browser-workspace') && document.querySelector('.settings-nav-item')`);
+    unmountedRequest.reject(new Error('Synthetic failure after browser route unmount'));
+    await click('button.window-action[aria-label="Назад"]');
+    await waitDom('chat and browser workspace remount after route return', `document.querySelector('.browser-workspace') && document.querySelector('.browser-header-cell')`);
+    assert.equal(await evaluate(`document.querySelector('.browser-surface-error')`), null, 'an error arriving after route unmount must not leak into the next browser presentation');
+    passed('Browser async failure after route unmount does not leak into the next presentation');
+
     await waitUntil('browser has native bounds before opening menus', () => state.browserBoundsCalls.some((bounds) => bounds && bounds.width > 0 && bounds.height > 0));
     const boundsBeforeMenus = state.browserBoundsCalls.length;
 
@@ -2005,11 +2660,245 @@ async function runElectronHost() {
     await pressEscape();
     await waitUntil('Escape closes all menus and restores browser bounds', async () => state.browserBoundsCalls.at(-1)?.width > 0
       && !(await evaluate(`document.querySelector('.action-menu-content:popover-open')`)));
-    assert.equal(await evaluate(`document.querySelector('.browser-pane .browser-tab button[title="Synthetic page"]')?.getAttribute('aria-current')`), 'page',
+    assert.equal(await evaluate(`document.querySelector('.browser-header-cell .browser-tab button[title="Synthetic page"]')?.getAttribute('aria-selected')`), 'true',
       'the browser tab must remain mounted and active after menus close');
-    await click('button[aria-label="Закрыть браузерную панель"]');
+    await click('button[aria-label="Скрыть браузер"]');
     await waitDom('browser pane unmounted after explicit close', `!document.querySelector('.browser-pane')`);
     assert.equal(state.browserBoundsCalls.at(-1), null, 'unmount must leave no native bounds token behind');
+
+    console.log('Plan009 browser check: empty, one, several, and twenty tabs with keyboard selection');
+    const browserStatusBeforeMatrix = clone(state.browserStatus);
+    const browserMatrixWindowSize = window.getSize();
+    const browserMatrixZoom = window.webContents.getZoomFactor();
+    const publishBrowserStatus = async (next) => {
+      state.browserStatus = clone(next);
+      window.webContents.send('audit:browser', clone(state.browserStatus));
+      await sleep(50);
+    };
+    const setMainWorkspaceWidth = async (targetWidth, zoom = 1) => {
+      window.webContents.setZoomFactor(zoom);
+      await sleep(350);
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const currentWidth = Number(await evaluate(`document.querySelector('.browser-workspace')?.getBoundingClientRect().width ?? 0`));
+        if (Math.abs(currentWidth - targetWidth) <= 0.5) break;
+        const [outerWidth, outerHeight] = window.getSize();
+        window.setSize(Math.max(400, outerWidth + Math.round((targetWidth - currentWidth) * zoom)), outerHeight);
+        await sleep(350);
+      }
+      const metrics = JSON.parse(await evaluate(`JSON.stringify((() => {
+        const workspace = document.querySelector('.browser-workspace')?.getBoundingClientRect();
+        const header = document.querySelector('.chat-header')?.getBoundingClientRect();
+        const actions = document.querySelector('.workspace-header-actions')?.getBoundingClientRect();
+        const toggle = document.querySelector('.chat-browser-toggle')?.getBoundingClientRect();
+        const expand = document.querySelector('.workspace-expand-toggle')?.getBoundingClientRect();
+        const tabs = document.querySelector('.browser-tablist')?.getBoundingClientRect();
+        const firstTab = document.querySelector('.browser-tab')?.getBoundingClientRect();
+        const browserHeader = document.querySelector('.browser-header-cell')?.getBoundingClientRect();
+        const chatHeading = document.querySelector('.chat-heading-cell')?.getBoundingClientRect();
+        return {
+          workspaceWidth: workspace?.width ?? null,
+          innerWidth,
+          full: document.querySelector('.browser-workspace')?.classList.contains('is-full') ?? false,
+          headerCenter: header ? header.top + header.height / 2 : null,
+          actionCenter: actions ? actions.top + actions.height / 2 : null,
+          actionRightGap: header && actions ? header.right - actions.right : null,
+          actionsLeft: actions?.left ?? null,
+          toggle: toggle ? { left: toggle.left, right: toggle.right, top: toggle.top, width: toggle.width, height: toggle.height } : null,
+          expand: expand ? { left: expand.left, right: expand.right, top: expand.top, width: expand.width, height: expand.height } : null,
+          tablist: tabs ? { left: tabs.left, right: tabs.right, width: tabs.width } : null,
+          firstTab: firstTab ? { top: firstTab.top, height: firstTab.height } : null,
+          browserHeaderLeft: browserHeader?.left ?? null,
+          chatHeadingRight: chatHeading?.right ?? null,
+          chatTabCount: document.querySelectorAll('#workspace-chat-tab[role="tab"]').length,
+          browserTabCount: document.querySelectorAll('.browser-tablist [data-browser-tab-id]').length,
+          scrollWidth: document.querySelector('.browser-tablist')?.scrollWidth ?? null,
+          clientWidth: document.querySelector('.browser-tablist')?.clientWidth ?? null,
+        };
+      })())`));
+      assert.ok(Math.abs(metrics.workspaceWidth - targetWidth) <= 2, `main browser workspace should be ${targetWidth}px CSS; actual ${metrics.workspaceWidth}, metrics=${JSON.stringify(metrics)}`);
+      assert.ok(Math.abs(metrics.actionCenter - metrics.headerCenter) <= 1, `header actions should be vertically centered within 1 CSS px: ${JSON.stringify(metrics)}`);
+      assert.ok(Math.abs(metrics.actionRightGap - 12) <= 1, `header actions should remain 12px from the right edge: ${JSON.stringify(metrics)}`);
+      assert.ok(metrics.expand && metrics.toggle && metrics.expand.left < metrics.toggle.left, `expand action must precede the rightmost browser toggle: ${JSON.stringify(metrics)}`);
+      assert.ok([metrics.expand, metrics.toggle].every((box) => Math.abs(box.width - 34) <= 0.2 && Math.abs(box.height - 34) <= 0.2), `header action hitboxes should remain 34px: ${JSON.stringify(metrics)}`);
+      if (metrics.firstTab) assert.ok(Math.abs(metrics.firstTab.top + metrics.firstTab.height / 2 - metrics.headerCenter) <= 1, `tab frame should share the header center: ${JSON.stringify(metrics)}`);
+      if (!metrics.full) assert.ok(Math.abs(metrics.browserHeaderLeft - metrics.chatHeadingRight) <= 1, `split header cells should meet at one divider: ${JSON.stringify(metrics)}`);
+      if (metrics.tablist && metrics.actionsLeft !== null) assert.ok(metrics.tablist.right <= metrics.actionsLeft + 1, `scrolling tabs must stop before fixed header actions: ${JSON.stringify(metrics)}`);
+      return metrics;
+    };
+
+    await click('button[aria-label="Показать браузер"]');
+    await waitDom('browser pane reopens for tab matrix', `document.querySelector('.browser-workspace.browser-open')`);
+    await setMainWorkspaceWidth(1408);
+    const emptyStatus = { tabs: [], activeTabId: null, error: 'Синтетическая ошибка браузера' };
+    await publishBrowserStatus(emptyStatus);
+    await click('button[aria-label="Развернуть на всю рабочую область"]');
+    await waitDom('empty browser status remains in full workspace', `document.querySelector('.browser-workspace.is-full.surface-browser')`);
+    await waitDom('empty browser error is visible', `document.querySelector('.browser-message[role="alert"]')?.textContent.includes('Синтетическая ошибка браузера')`);
+    assert.equal(await evaluate(`document.querySelectorAll('.browser-tablist [role="tab"]').length`), 1, 'with zero browser tabs, the chat tab remains the one workspace tab');
+    await click('#workspace-chat-tab');
+    await waitDom('empty browser status keeps the chat surface selected', `document.querySelector('.browser-workspace.is-full.surface-chat') && document.querySelector('#workspace-chat-tab[aria-selected="true"]')`);
+    await click('button[aria-label="Выйти из режима полного просмотра"]');
+    await waitDom('empty status returns to split with its alert', `!document.querySelector('.browser-workspace.is-full') && document.querySelector('.browser-message[role="alert"]')`);
+    await publishBrowserStatus({ tabs: [], activeTabId: null, error: null });
+    await waitDom('empty browser status shows the address hint', `document.querySelector('.browser-message')?.textContent.includes('Введите адрес сайта') && !document.querySelector('.browser-message[role="alert"]')`);
+
+    const longCyrillicTitle = 'Очень длинная вкладка браузера с русским названием и дополнительным пояснением для проверки многоточия';
+    const longCyrillicUrl = `https://пример.рф/длинный-путь/${'проверка-длинного-адреса/'.repeat(8)}`;
+    const oneTab = makeBrowserTab('matrix-01', longCyrillicTitle, longCyrillicUrl);
+    await publishBrowserStatus({ tabs: [oneTab], activeTabId: oneTab.id, error: null });
+    await waitDom('one browser tab renders its Cyrillic title and address', `document.querySelector('#browser-tab-matrix-01') && document.querySelector('.browser-address input')?.value === ${JSON.stringify(longCyrillicUrl)}`);
+    const oneTabGeometry = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const button = document.querySelector('#browser-tab-matrix-01');
+      const label = button?.querySelector('span');
+      const address = document.querySelector('.browser-address input');
+      return { title: button?.title, label: label?.textContent, labelClientWidth: label?.clientWidth, labelScrollWidth: label?.scrollWidth, address: address?.value, active: button?.getAttribute('aria-current') };
+    })())`));
+    assert.equal(oneTabGeometry.title, longCyrillicTitle);
+    assert.equal(oneTabGeometry.label, longCyrillicTitle);
+    assert.ok(oneTabGeometry.labelScrollWidth > oneTabGeometry.labelClientWidth, `long Cyrillic browser title should ellipsize inside its tab: ${JSON.stringify(oneTabGeometry)}`);
+    assert.equal(oneTabGeometry.address, longCyrillicUrl, 'the long Cyrillic URL remains available in the address field');
+    assert.equal(oneTabGeometry.active, 'page');
+
+    const severalTabs = [oneTab, ...Array.from({ length: 2 }, (_, index) => makeBrowserTab(`matrix-0${index + 2}`, `Вкладка ${index + 2}`, `https://пример.рф/страница-${index + 2}`))];
+    await publishBrowserStatus({ tabs: severalTabs, activeTabId: 'matrix-02', error: null });
+    await waitDom('several browser tabs publish the selected tab', `document.querySelectorAll('.browser-tablist [data-browser-tab-id]').length === 3 && document.querySelector('#browser-tab-matrix-02[aria-selected="true"]')`);
+    assert.equal(await evaluate(`document.querySelectorAll('.browser-tablist [aria-selected="true"]').length`), 1, 'a single browser tab remains selected among several tabs');
+
+    await click('button[aria-label="Развернуть на всю рабочую область"]');
+    await waitDom('one full browser surface before twenty-tab matrix', `document.querySelector('.browser-workspace.is-full.surface-browser')`);
+    const twentyTabs = Array.from({ length: 20 }, (_, index) => makeBrowserTab(
+      `matrix-${String(index + 1).padStart(2, '0')}`,
+      index === 0 ? longCyrillicTitle : `Вкладка браузера ${index + 1}`,
+      index === 19 ? longCyrillicUrl : `https://пример.рф/страница-${index + 1}`,
+    ));
+    await publishBrowserStatus({ tabs: twentyTabs, activeTabId: 'matrix-20', error: null });
+    await waitDom('twenty browser tabs render beside the separate chat tab', `document.querySelectorAll('.browser-tablist [data-browser-tab-id]').length === 20 && document.querySelectorAll('.browser-tablist [role="tab"]').length === 21 && document.querySelector('#workspace-chat-tab[role="tab"]')`);
+    const twentyTabGeometry = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const list = document.querySelector('.browser-tablist');
+      const header = document.querySelector('.chat-header')?.getBoundingClientRect();
+      const actions = document.querySelector('.workspace-header-actions')?.getBoundingClientRect();
+      const selected = [...document.querySelectorAll('.browser-tablist [aria-selected="true"]')].map((tab) => tab.id);
+      return { browserTabs: list?.querySelectorAll('[data-browser-tab-id]').length, allTabs: list?.querySelectorAll('[role="tab"]').length, scrollWidth: list?.scrollWidth, clientWidth: list?.clientWidth, selected, actionsCenter: actions ? actions.top + actions.height / 2 : null, headerCenter: header ? header.top + header.height / 2 : null, address: document.querySelector('.browser-address input')?.value };
+    })())`));
+    assert.equal(twentyTabGeometry.browserTabs, 20);
+    assert.equal(twentyTabGeometry.allTabs, 21, 'the chat surface is outside the twenty-browser-tab limit');
+    assert.ok(twentyTabGeometry.scrollWidth > twentyTabGeometry.clientWidth, `twenty tabs should scroll horizontally without covering the actions: ${JSON.stringify(twentyTabGeometry)}`);
+    assert.deepEqual(twentyTabGeometry.selected, ['browser-tab-matrix-20']);
+    assert.equal(twentyTabGeometry.address, longCyrillicUrl);
+    assert.ok(Math.abs(twentyTabGeometry.actionsCenter - twentyTabGeometry.headerCenter) <= 1, 'the fixed actions stay centered beside the long tab strip');
+    await capture('browser-workspace-twenty-tabs-cyrillic');
+
+    await click('#workspace-chat-tab');
+    await waitDom('keyboard matrix starts with selected chat tab', `document.querySelector('.browser-workspace.is-full.surface-chat') && document.querySelector('#workspace-chat-tab[aria-selected="true"]')`);
+    await evaluate(`document.querySelector('#workspace-chat-tab')?.focus()`);
+    await sendKey('RIGHT');
+    await waitUntil('ArrowRight moves focus into browser tabs without selection', () => evaluate(`document.activeElement?.id === 'browser-tab-matrix-01'`));
+    assert.equal(await evaluate(`document.querySelector('#workspace-chat-tab')?.getAttribute('aria-selected')`), 'true', 'arrow navigation must not activate a tab');
+    await sendKey('LEFT');
+    await waitUntil('ArrowLeft returns focus to the chat tab', () => evaluate(`document.activeElement?.id === 'workspace-chat-tab'`));
+    await sendKey('END');
+    await waitUntil('End moves focus to the final browser tab without selection', () => evaluate(`document.activeElement?.id === 'browser-tab-matrix-20'`));
+    assert.equal(await evaluate(`document.querySelector('#browser-tab-matrix-20')?.getAttribute('aria-selected')`), 'false', 'End only moves focus under manual tab activation');
+    window.show();
+    window.focus();
+    window.webContents.focus();
+    await sleep(80);
+    const enterStart = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const target = document.querySelector('#browser-tab-matrix-20');
+      const trace = [];
+      for (const type of ['keydown', 'keypress', 'keyup', 'click']) document.addEventListener(type, (event) => {
+        const origin = event.target instanceof Element ? event.target.closest('[role="tab"]') : null;
+        if (origin?.id === 'browser-tab-matrix-20') trace.push({ type, key: event.key, code: event.code, keyCode: event.keyCode, trusted: event.isTrusted });
+      }, true);
+      window.__auditBrowserEnterTrace = trace;
+      target?.focus();
+      return { activeId: document.activeElement?.id, selected: target?.getAttribute('aria-selected') };
+    })())`));
+    assert.equal(enterStart.activeId, 'browser-tab-matrix-20', `Enter probe must begin with the final tab focused: ${JSON.stringify(enterStart)}`);
+    const enterWindowFocused = window.isFocused();
+    await sendKey('ENTER');
+    const enterWithoutChar = JSON.parse(await evaluate(`JSON.stringify({
+      activeId: document.activeElement?.id,
+      selected: document.querySelector('#browser-tab-matrix-20')?.getAttribute('aria-selected'),
+      surface: document.querySelector('.browser-workspace')?.className,
+      events: window.__auditBrowserEnterTrace,
+    })`));
+    console.log(`Plan009 native Enter input evidence ${JSON.stringify({ windowFocused: enterWindowFocused, ...enterWithoutChar })}`);
+    if (enterWithoutChar.selected !== 'true') {
+      await sendNativeButtonKey('ENTER', '\r');
+      console.log(`Plan009 complete Enter input evidence ${JSON.stringify(await evaluate(`JSON.stringify({ activeId: document.activeElement?.id, selected: document.querySelector('#browser-tab-matrix-20')?.getAttribute('aria-selected'), events: window.__auditBrowserEnterTrace })`))}`);
+    }
+    await waitDom('Enter activates the focused final browser tab', `document.querySelector('.browser-workspace.is-full.surface-browser') && document.querySelector('#browser-tab-matrix-20[aria-selected="true"]')`);
+    await sendKey('HOME');
+    await waitUntil('Home returns focus to chat without changing selection', () => evaluate(`document.activeElement?.id === 'workspace-chat-tab'`));
+    assert.equal(await evaluate(`document.querySelector('#browser-tab-matrix-20')?.getAttribute('aria-selected')`), 'true', 'Home only moves focus under manual tab activation');
+    await sendNativeButtonKey('SPACE', ' ');
+    await waitDom('Space activates the focused chat tab', `document.querySelector('.browser-workspace.is-full.surface-chat') && document.querySelector('#workspace-chat-tab[aria-selected="true"]')`);
+
+    await evaluate(`document.querySelector('#browser-tab-matrix-20')?.closest('.browser-tab')?.querySelector('.browser-tab-close')?.focus()`);
+    assert.equal(await evaluate(`document.activeElement?.getAttribute('aria-label') === 'Закрыть вкладку Вкладка браузера 20'`), true, 'focused close action is inside the final tab');
+    await sendNativeButtonKey('ENTER', '\r');
+    await waitUntil('closing the focused tab restores focus to its selected neighbor', () => evaluate(`document.querySelectorAll('.browser-tablist [data-browser-tab-id]').length === 19 && document.activeElement?.id === 'browser-tab-matrix-01' && document.querySelector('#browser-tab-matrix-01[aria-selected="true"]') !== null`));
+    await click('.browser-new-tab');
+    await waitDom('new browser tab restores the twenty-tab count after close', `document.querySelectorAll('.browser-tablist [data-browser-tab-id]').length === 20`);
+    passed('Renderer covers 0/1/3/20 browser tabs, Cyrillic title/URL, roving keyboard focus, manual activation, close focus, and new-tab recovery');
+
+    await click('button[aria-label="Выйти из режима полного просмотра"]');
+    await waitDom('width matrix returns to non-expanded split mode', `!document.querySelector('.browser-workspace.is-full') && document.querySelector('.browser-pane')`);
+    const browserWidthMatrix = [];
+    for (const { width, zoom } of [{ width: 1408, zoom: 1 }, { width: 1200, zoom: 0.8 }, { width: 880, zoom: 1 }, { width: 879, zoom: 1.25 }, { width: 560, zoom: 1 }]) {
+      if (width === 560) {
+        await click('button[aria-label="Скрыть боковую панель"]');
+        await waitUntil('sidebar hides before the narrow 560px workspace measurement', () => state.appSettings.sidebarVisible === false && evaluate(`document.querySelector('.workspace.sidebar-hidden') !== null`));
+        await sleep(300);
+      }
+      const metrics = await setMainWorkspaceWidth(width, zoom);
+      const automaticFull = metrics.workspaceWidth < 880;
+      await waitDom(`workspace width ${width} selects the expected split/full state`, automaticFull
+        ? `document.querySelector('.browser-workspace.is-full')`
+        : `!document.querySelector('.browser-workspace.is-full')`);
+      assert.equal(await evaluate(`document.querySelector('.workspace-expand-toggle')?.getAttribute('aria-pressed')`), 'false', `automatic narrow full view at ${width}px must not claim explicit full mode`);
+      assert.equal(metrics.chatTabCount, automaticFull ? 1 : 0, `chat tab role must follow effective full view at ${width}px`);
+      assert.ok(metrics.browserTabCount === 20, `the browser tab strip retains all 20 entries at ${width}px`);
+      browserWidthMatrix.push({ target: width, zoom, ...metrics });
+      if (width === 879) await capture('browser-workspace-narrow-879');
+    }
+
+    await setMainWorkspaceWidth(1200, 1);
+    await waitDom('wide browser layout restores after the compact-width sample', `!document.querySelector('.workspace.compact-workspace')`);
+    await click('button[aria-label="Показать боковую панель"]');
+    await waitUntil('sidebar returns to pinned mode after the 560px narrow sample', () => state.appSettings.sidebarVisible === true && evaluate(`!document.querySelector('.workspace')?.classList.contains('sidebar-hidden')`));
+    const pinnedWidthMetrics = await setMainWorkspaceWidth(1200, 1);
+    const pinnedWidth = pinnedWidthMetrics.workspaceWidth;
+    await click('button[aria-label="Скрыть боковую панель"]');
+    await waitUntil('sidebar hidden state widens the browser workspace', () => state.appSettings.sidebarVisible === false && evaluate(`document.querySelector('.workspace.sidebar-hidden') !== null`));
+    await sleep(300);
+    const hiddenWidth = Number(await evaluate(`document.querySelector('.browser-workspace')?.getBoundingClientRect().width ?? 0`));
+    assert.ok(hiddenWidth >= pinnedWidth + 200, `hiding the pinned sidebar should expose its workspace width: pinned=${pinnedWidth}, hidden=${hiddenWidth}`);
+    const movePointerTo = async (selector) => {
+      const point = await evaluate(`(() => { const element = document.querySelector(${JSON.stringify(selector)}); if (!element) return null; const rect = element.getBoundingClientRect(); return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }; })()`);
+      assert.ok(point, `mouse target exists: ${selector}`);
+      const zoom = window.webContents.getZoomFactor();
+      window.webContents.sendInputEvent({ type: 'mouseMove', x: Math.round(point.x * zoom), y: Math.round(point.y * zoom) });
+    };
+    await movePointerTo('button[aria-label="Показать боковую панель"]');
+    await waitDom('hidden desktop sidebar opens its hover preview', `document.querySelector('.workspace.sidebar-preview') && document.querySelector('#application-sidebar[aria-hidden="false"]')`);
+    await waitUntil('native browser bounds suspend for sidebar preview', () => state.browserBoundsCalls.at(-1) === null);
+    await movePointerTo('.browser-header-cell');
+    await waitUntil('sidebar preview closes after pointer leaves', () => evaluate(`!document.querySelector('.workspace')?.classList.contains('sidebar-preview')`), 1200);
+    await waitUntil('browser bounds restore after sidebar preview closes', () => state.browserBoundsCalls.at(-1)?.width > 0);
+    await click('button[aria-label="Показать боковую панель"]');
+    await waitUntil('sidebar returns to pinned mode', () => state.appSettings.sidebarVisible === true && evaluate(`!document.querySelector('.workspace')?.classList.contains('sidebar-hidden')`));
+    await publishBrowserStatus(browserStatusBeforeMatrix);
+    window.webContents.setZoomFactor(browserMatrixZoom);
+    window.setSize(browserMatrixWindowSize[0], browserMatrixWindowSize[1]);
+    await sleep(360);
+    await click('button[aria-label="Скрыть браузер"]');
+    await waitUntil('browser pane closes after workspace matrix', () => evaluate(`!document.querySelector('.browser-pane')`), 1500);
+    assert.equal(state.appSettings.sidebarVisible, true, 'the matrix restores the pinned sidebar setting');
+    assert.deepEqual(state.browserStatus, browserStatusBeforeMatrix, 'the matrix restores the synthetic browser status');
+    console.log(`Rendered browser workspace matrix ${JSON.stringify({ widths: browserWidthMatrix.map(({ target, zoom, workspaceWidth, innerWidth, full, chatTabCount, browserTabCount, scrollWidth, clientWidth }) => ({ target, zoom, workspaceWidth, innerWidth, full, chatTabCount, browserTabCount, scrollWidth, clientWidth })), oneTabGeometry, twentyTabGeometry, pinnedWidth, hiddenWidth })}`);
+    passed('Renderer verifies main widths 1408/1200/880/879/560 at paired zooms, header alignment, and pinned/hidden/preview sidebar states');
 
     const originalTheme = state.appSettings.theme;
     const themeCases = [
@@ -2020,6 +2909,7 @@ async function runElectronHost() {
       { value: 'system', label: 'Как в Windows' },
     ];
     const themeSamples = [];
+    const browserWorkspaceThemeSamples = [];
     await click('.profile-settings-button');
     await clickText('.settings-nav-item', 'Оформление');
     for (let index = 0; index < themeCases.length; index += 1) {
@@ -2064,10 +2954,71 @@ async function runElectronHost() {
       await capture(`theme-${themeCase.value}-choice-popup`);
       await sendKey('ESC');
       await waitDom(`${themeCase.label} choice popup closes`, `!document.querySelector('.choice-menu .action-menu-content:popover-open')`);
-      if (index < themeCases.length - 1) await clickText('.settings-nav-item', 'Оформление');
+      if (index < 4) {
+        await click('button.window-action[aria-label="Назад"]');
+        await waitDom(`${themeCase.label} returns to Chat B for actual workspace theme proof`, `document.querySelector('.chat-header-title')?.textContent === 'Chat B'`);
+        if (await evaluate(`Boolean(document.querySelector('.notice'))`)) await click('button[aria-label="Закрыть уведомление"]');
+        await waitDom(`${themeCase.label} transient notice is dismissed`, `!document.querySelector('.notice')`);
+        await click('button[aria-label="Показать браузер"]');
+        await waitDom(`${themeCase.label} browser workspace is mounted`, `document.querySelector('.browser-workspace.browser-open') && document.querySelector('.workspace-expand-toggle')`);
+        await setMainWorkspaceWidth(1200, 1);
+        await waitDom(`${themeCase.label} workspace is wide enough for an explicit split state`, `!document.querySelector('.browser-workspace.is-full')`);
+        for (const full of [false, true]) {
+          if (full) {
+            await click('button[aria-label="Развернуть на всю рабочую область"]');
+            await waitDom(`${themeCase.label} full workspace theme state`, `document.querySelector('.browser-workspace.is-full.surface-browser')`);
+          }
+          const workspaceThemeSample = JSON.parse(await evaluate(`JSON.stringify((() => {
+            const frame = document.querySelector('.app-frame');
+            const workspace = document.querySelector('.browser-workspace');
+            const header = workspace?.querySelector('.chat-header');
+            const panel = workspace?.closest('.main-panel');
+            const expand = workspace?.querySelector('.workspace-expand-toggle');
+            const svg = expand?.querySelector('svg');
+            const frameStyle = getComputedStyle(frame);
+            const headerStyle = header ? getComputedStyle(header) : null;
+            const panelStyle = panel ? getComputedStyle(panel) : null;
+            const expandStyle = expand ? getComputedStyle(expand) : null;
+            return {
+              themeClasses: [...frame.classList].filter((name) => name.startsWith('theme-')),
+              full: workspace?.classList.contains('is-full'),
+              workspaceWidth: workspace?.getBoundingClientRect().width,
+              panelBackgroundImage: panelStyle?.backgroundImage,
+              panelMidToken: frameStyle.getPropertyValue('--panel-mid').trim(),
+              headerDivider: headerStyle?.borderBottomColor,
+              toggleColor: expandStyle?.color,
+              toggleBackground: expandStyle?.backgroundColor,
+              togglePressed: expand?.getAttribute('aria-pressed'),
+              iconStroke: svg ? getComputedStyle(svg).stroke : null,
+              iconPath: svg?.querySelector('path')?.getAttribute('d') ?? null,
+            };
+          })())`));
+          assert.deepEqual(workspaceThemeSample.themeClasses, [`theme-${resolvedTheme}`], `${themeCase.label}: actual browser workspace uses its resolved theme`);
+          assert.equal(workspaceThemeSample.full, full, `${themeCase.label}: workspace visual sample uses the requested split/full state`);
+          assert.ok(workspaceThemeSample.workspaceWidth > 0, `${themeCase.label}: actual BrowserPanel is rendered`);
+          assert.notEqual(workspaceThemeSample.panelBackgroundImage, 'none', `${themeCase.label}: actual workspace panel resolves its gradient surface`);
+          assert.ok(workspaceThemeSample.panelMidToken, `${themeCase.label}: actual workspace panel theme token resolves`);
+          assert.notEqual(workspaceThemeSample.headerDivider, 'rgba(0, 0, 0, 0)', `${themeCase.label}: actual workspace header has a visible divider`);
+          assert.notEqual(workspaceThemeSample.toggleColor, 'rgba(0, 0, 0, 0)', `${themeCase.label}: actual workspace action icon has a resolved color`);
+          assert.equal(workspaceThemeSample.togglePressed, String(full), `${themeCase.label}: actual workspace icon state matches split/full mode`);
+          assert.ok(workspaceThemeSample.iconStroke && workspaceThemeSample.iconPath, `${themeCase.label}: actual workspace button renders its SVG icon`);
+          browserWorkspaceThemeSamples.push({ requested: themeCase.value, resolved: resolvedTheme, ...workspaceThemeSample });
+          await capture(`browser-workspace-theme-${themeCase.value}-${full ? 'full' : 'split'}`);
+          if (full) {
+            await click('button[aria-label="Выйти из режима полного просмотра"]');
+            await waitDom(`${themeCase.label} restores split workspace theme state`, `!document.querySelector('.browser-workspace.is-full')`);
+          }
+        }
+        await click('button[aria-label="Скрыть браузер"]');
+        await waitDom(`${themeCase.label} browser workspace closes after theme proof`, `!document.querySelector('.browser-pane')`);
+        await click('.profile-settings-button');
+        await waitDom(`${themeCase.label} returns to settings for the next palette`, `document.querySelector('.settings-nav-item')`);
+        await clickText('.settings-nav-item', 'Оформление');
+      } else if (index < themeCases.length - 1) await clickText('.settings-nav-item', 'Оформление');
     }
     assert.ok(new Set(themeSamples.map((sample) => sample.popupBackground)).size >= 4,
       `Dark/Emerald/Light/Warm/System should render at least four resolved popup palettes: ${JSON.stringify(themeSamples.map((sample) => [sample.requested, sample.resolved, sample.popupBackground]))}`);
+    assert.equal(browserWorkspaceThemeSamples.length, 8, 'Dark/Emerald/Light/Warm each render the actual BrowserPanel in split and full states');
     await clickText('.settings-nav-item', 'Оформление');
     const originalThemeCase = themeCases.find((themeCase) => themeCase.value === originalTheme);
     assert.ok(originalThemeCase, `synthetic fixture original theme must be known: ${originalTheme}`);
@@ -2080,7 +3031,11 @@ async function runElectronHost() {
     await waitDom('original fixture theme class is restored', `document.querySelector('.app-frame')?.classList.contains(${JSON.stringify(`theme-${originalResolvedTheme}`)})`);
     await click('button.window-action[aria-label="Назад"]');
     await waitDom('Chat B restored after theme matrix', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'`);
+    window.webContents.setZoomFactor(browserMatrixZoom);
+    window.setSize(browserMatrixWindowSize[0], browserMatrixWindowSize[1]);
+    await sleep(360);
     console.log(`Rendered theme palette evidence ${JSON.stringify(themeSamples.map(({ requested, resolved, popupBackground, popupText, selectedBackground, selectedText }) => ({ requested, resolved, popupBackground, popupText, selectedBackground, selectedText })))}`);
+    console.log(`Rendered browser workspace theme evidence ${JSON.stringify(browserWorkspaceThemeSamples)}`);
     passed('Rendered Dark/Emerald/Light/Warm/System palettes style the shared choice popup and restore the original theme');
 
     const titleOriginalSize = window.getSize();
@@ -2174,8 +3129,7 @@ async function runElectronHost() {
     console.log(`Rendered React deferred-bridge checks: ${passCount} PASS`);
     app.exit(0);
   } catch (error) {
-    console.error(error?.stack ?? String(error));
-    app.exit(1);
+    process.stderr.write(`${error?.stack ?? String(error)}\n`, () => app.exit(1));
   }
 }
 
@@ -2234,7 +3188,6 @@ contextBridge.exposeInMainWorld('gigaChat', api);
 
 if (process.versions.electron) {
   void runElectronHost().catch((error) => {
-    console.error(error?.stack ?? String(error));
-    require('electron').app.exit(1);
+    process.stderr.write(`${error?.stack ?? String(error)}\n`, () => require('electron').app.exit(1));
   });
 } else await runNodeDriver();

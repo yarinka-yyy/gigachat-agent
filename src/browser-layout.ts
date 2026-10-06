@@ -12,3 +12,20 @@ export function browserReleaseWidth(rawWidth: number, areaWidth: number): number
   if (rawWidth < 260) return null;
   return Math.max(320, Math.min(Math.round(rawWidth), browserMaximumWidth(areaWidth)));
 }
+
+export function shouldSnapBrowserToFullOnLeftEdge(
+  pointerClientX: number,
+  previousPointerClientX: number,
+  workspaceLeft: number,
+  areaWidth: number,
+  gestureActive: boolean,
+): boolean {
+  return gestureActive
+    && Number.isFinite(pointerClientX)
+    && Number.isFinite(previousPointerClientX)
+    && Number.isFinite(workspaceLeft)
+    && Number.isFinite(areaWidth)
+    && areaWidth >= 880
+    && pointerClientX < previousPointerClientX
+    && pointerClientX <= workspaceLeft + 12;
+}
