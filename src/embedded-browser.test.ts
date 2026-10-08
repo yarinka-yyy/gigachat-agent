@@ -70,6 +70,34 @@ test('superseded same-address load and aborted native navigation do not replace 
   browser.destroy();
 });
 
+test('internal error-page finish and subframe loading preserve failure until a new main-frame navigation', () => {
+  const { browser, contents, attached } = navigationFixture();
+  const failed = 'http://127.0.0.1:55061/unreachable';
+  contents.emit('did-start-loading');
+  contents.emit('did-start-navigation', { url: failed, isSameDocument: false, isMainFrame: true, frame: null }, failed, false, true, 1, 1);
+  contents.emit('did-fail-load', {}, -102, 'ERR_CONNECTION_REFUSED', failed, true, 1, 1);
+  assert.ok(browser.getStatus().tabs[0]?.error);
+  // Chromium commits its chrome-error document without successful did-navigate, then finishes loading it.
+  contents.emit('did-finish-load');
+  contents.emit('did-stop-loading');
+  assert.ok(browser.getStatus().tabs[0]?.error, 'error-page completion must retain the actual navigation failure');
+  assert.equal(attached.size, 0);
+  contents.emit('did-start-loading');
+  contents.emit('did-start-navigation', { url: 'https://frame.example/', isSameDocument: false, isMainFrame: false, frame: null }, 'https://frame.example/', false, false, 1, 2);
+  assert.ok(browser.getStatus().tabs[0]?.error, 'subframe/generic loading must not dismiss a main-frame failure');
+  contents.emit('did-stop-loading');
+  const recovered = 'https://recovered.example/';
+  contents.emit('did-start-navigation', { url: recovered, isSameDocument: false, isMainFrame: true, frame: null }, recovered, false, true, 1, 1);
+  assert.equal(browser.getStatus().tabs[0]?.error, null, 'new allowed main-frame intent clears the old failure');
+  contents.emit('did-navigate', {}, recovered);
+  contents.emit('did-finish-load');
+  contents.emit('did-stop-loading');
+  assert.equal(browser.getStatus().tabs[0]?.url, recovered);
+  assert.equal(browser.getStatus().tabs[0]?.error, null);
+  assert.equal(attached.size, 1);
+  browser.destroy();
+});
+
 test('browser address accepts sites, searches with Google, and rejects local or script URLs', () => {
   assert.equal(resolveBrowserAddress('example.com/path'), 'https://example.com/path');
   assert.equal(resolveBrowserAddress('http://localhost:3000/'), 'http://localhost:3000/');

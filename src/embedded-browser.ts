@@ -131,17 +131,22 @@ export function createEmbeddedBrowser(
       if (!details.isMainFrame || !isAllowedPageUrl(details.url)) return;
       tab.navigationGeneration += 1;
       tab.navigationTarget = details.url;
+      tab.error = null;
+      showActive();
+      publish();
     });
     contents.on('did-redirect-navigation', (details) => {
       if (details.isMainFrame && isAllowedPageUrl(details.url)) tab.navigationTarget = details.url;
     });
-    contents.on('did-start-loading', () => { tab.loading = true; tab.error = null; showActive(); publish(); });
+    contents.on('did-start-loading', () => { tab.loading = true; showActive(); publish(); });
     contents.on('did-stop-loading', () => { tab.loading = false; publish(); });
-    contents.on('did-finish-load', () => { tab.loading = false; tab.error = null; showActive(); publish(); });
+    contents.on('did-finish-load', () => { tab.loading = false; showActive(); publish(); });
     const recordNavigation = (_event: unknown, url: string): void => {
       if (metadataPaused || !isAllowedPageUrl(url)) return;
       tab.url = url;
       tab.navigationTarget = url;
+      tab.error = null;
+      showActive();
       persist();
       publish();
     };
