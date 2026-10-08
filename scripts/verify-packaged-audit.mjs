@@ -1434,7 +1434,9 @@ async function runElectronHost() {
         const path = document.querySelector(${JSON.stringify(sidebarToggleSelector)}).querySelector('.icon path:last-of-type');
         return new DOMMatrixReadOnly(getComputedStyle(path).transform).m41;
       })())`));
-      return frame < -0.1 && frame > -5;
+      return initialSidebarToggle.reducedMotion
+        ? Math.abs(frame + 5) <= 0.1
+        : frame < -0.1 && frame > -5;
     }, 1000);
     const collapseFrame = JSON.parse(await evaluate(`JSON.stringify((() => {
       const path = document.querySelector(${JSON.stringify(sidebarToggleSelector)}).querySelector('.icon path:last-of-type');
