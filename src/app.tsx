@@ -755,8 +755,11 @@ export default function App() {
   const [configSaved, setConfigSaved] = useState('');
   const [configError, setConfigError] = useState('');
   const [configBusy, setConfigBusy] = useState(false);
+  const [configLoading, setConfigLoading] = useState(false);
+  const [configReady, setConfigReady] = useState(false);
+  const configEditRevision = useRef(0);
   const closeUiState = useRef({ configDraft, configSaved, configBusy, chatDraftSaveError });
-  closeUiState.current = { configDraft, configSaved, configBusy, chatDraftSaveError };
+  closeUiState.current = { configDraft, configSaved, configBusy: configBusy || configLoading, chatDraftSaveError };
   const [approvalRequest, setApprovalRequest] = useState<PermissionApprovalRequest | null>(null);
   const [closeFailure, setCloseFailure] = useState<CloseFailure | null>(null);
   const [closePending, setClosePending] = useState(false);
@@ -1389,22 +1392,8 @@ export default function App() {
 
   useEffect(() => {
     if (route.page !== 'settings' || settingsSection !== 'permissions') return;
-    let cancelled = false;
-    void trackRendererOperation(async () => {
-      try {
-        const { contents, error } = await window.gigaChat.permissions.readConfig();
-        if (cancelled) return;
-        closeUiState.current.configDraft = contents;
-        closeUiState.current.configSaved = contents;
-        setConfigDraft(contents);
-        setConfigSaved(contents);
-        setConfigError(error ?? '');
-      } catch (error) {
-        if (!cancelled) setConfigError(getErrorMessage(error));
-        rendererOperations.current.reportFailure(error);
-      }
-    });
-    return () => { cancelled = true; };
+    if (closeUiState.current.configDraft !== closeUiState.current.configSaved) return;
+    void trackRendererOperation(loadCustomConfig);
   }, [route.page, settingsSection]);
 
   const library = sidebarSections(projects, chats);
@@ -1457,6 +1446,7 @@ export default function App() {
   }
 
   function handleComposerKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>): void {
+    if (event.nativeEvent.isComposing) return;
     const completion = completionDismissed ? null : getComposerCompletion(draft, event.currentTarget.selectionStart, composerSkills, composerProjectId);
     if (event.key === 'Escape' && completion) {
       event.preventDefault();
@@ -1477,7 +1467,7 @@ export default function App() {
         return;
       }
     }
-    if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+    if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
       void submitMessage();
     }
@@ -2313,12 +2303,12 @@ export default function App() {
   }
 
   async function saveCustomConfigOperation(): Promise<void> {
-    if (configBusy) return;
+    if (closeUiState.current.configBusy || !configReady) return;
     closeUiState.current.configBusy = true;
     setConfigBusy(true);
     setConfigError('');
     try {
-      const saved = await window.gigaChat.permissions.saveConfig(configDraft, configSaved);
+      const saved = await window.gigaChat.permissions.saveConfig(closeUiState.current.configDraft, closeUiState.current.configSaved);
       closeUiState.current.configSaved = saved;
       setConfigSaved(saved);
       showSuccess('Пользовательские разрешения сохранены.');
@@ -2333,19 +2323,30 @@ export default function App() {
   }
 
   function reloadCustomConfig(): Promise<void> {
-    return trackRendererOperation(async () => {
-      try {
-        const { contents, error } = await window.gigaChat.permissions.readConfig();
-        closeUiState.current.configDraft = contents;
-        closeUiState.current.configSaved = contents;
-        setConfigDraft(contents);
-        setConfigSaved(contents);
-        setConfigError(error ?? '');
-      } catch (error) {
-        rendererOperations.current.reportFailure(error);
-        setConfigError(getErrorMessage(error));
-      }
-    });
+    return trackRendererOperation(loadCustomConfig);
+  }
+
+  async function loadCustomConfig(): Promise<void> {
+    if (closeUiState.current.configBusy) return;
+    const revision = configEditRevision.current;
+    closeUiState.current.configBusy = true;
+    setConfigLoading(true);
+    try {
+      const { contents, error } = await window.gigaChat.permissions.readConfig();
+      if (revision !== configEditRevision.current) return;
+      closeUiState.current.configDraft = contents;
+      closeUiState.current.configSaved = contents;
+      setConfigDraft(contents);
+      setConfigSaved(contents);
+      setConfigError(error ?? '');
+      setConfigReady(true);
+    } catch (error) {
+      rendererOperations.current.reportFailure(error);
+      setConfigError(getErrorMessage(error));
+    } finally {
+      closeUiState.current.configBusy = false;
+      setConfigLoading(false);
+    }
   }
 
   async function answerApproval(allowed: boolean): Promise<void> {
@@ -2761,12 +2762,12 @@ export default function App() {
             <section className="settings-card custom-config-card">
               <div className="setting-subheading"><div><h3>Пользовательский профиль</h3><p>Правила для доступных локальных инструментов. Дополнительные каталоги указываются абсолютными путями.</p></div></div>
               <p className="config-path path-value">{appInfo?.dataPath ? `${appInfo.dataPath}\\config.toml` : 'config.toml в каталоге данных приложения'}</p>
-              <textarea className="config-editor" aria-label="Редактор config.toml" spellCheck={false} value={configDraft}
-                onChange={(event) => { closeUiState.current.configDraft = event.target.value; setConfigDraft(event.target.value); setConfigError(''); }} />
+              <textarea className="config-editor" aria-label="Редактор config.toml" spellCheck={false} value={configDraft} disabled={configLoading || !configReady}
+                onChange={(event) => { configEditRevision.current += 1; closeUiState.current.configDraft = event.target.value; setConfigDraft(event.target.value); setConfigError(''); }} />
               <div className="config-actions">
-                <span className="config-status" role="status">{configError || (configDraft === configSaved ? 'Сохранено' : 'Есть несохранённые изменения')}</span>
-                <button type="button" className="quiet-button" onClick={() => void reloadCustomConfig()}>Обновить с диска</button>
-                <button type="button" className="primary-button" disabled={configBusy || configDraft === configSaved} onClick={() => void saveCustomConfig()}>{configBusy ? 'Сохранение…' : 'Сохранить'}</button>
+                <span className="config-status" role="status">{configLoading ? 'Чтение…' : configError || (!configReady ? 'Ожидание загрузки' : configDraft === configSaved ? 'Сохранено' : 'Есть несохранённые изменения')}</span>
+                <button type="button" className="quiet-button" disabled={configBusy || configLoading} onClick={() => void reloadCustomConfig()}>Обновить с диска</button>
+                <button type="button" className="primary-button" disabled={configBusy || configLoading || !configReady || configDraft === configSaved} onClick={() => void saveCustomConfig()}>{configBusy ? 'Сохранение…' : 'Сохранить'}</button>
               </div>
             </section>
           </>
