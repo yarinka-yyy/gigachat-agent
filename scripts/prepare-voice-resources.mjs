@@ -256,16 +256,17 @@ try {
   if (!Array.isArray(modelFiles) || modelFiles.length !== 4) throw new Error('Recognition model manifest is incomplete.');
   for (const file of modelFiles) await downloadAsset(file, file.url);
   await downloadAsset(manifest.vad.file, manifest.vad.url);
+  await downloadAsset(manifest.vad.licenseFile, manifest.vad.licenseFile?.url);
 
   const expectedNames = new Set([
     'manifest.json', 'gigastt.exe', 'LICENSE', 'NOTICE',
-    ...modelFiles.map((file) => file.name), manifest.vad.file.name,
+    ...modelFiles.map((file) => file.name), manifest.vad.file.name, manifest.vad.licenseFile.name,
   ]);
   const actualNames = await readdir(resourcesDirectory);
   if (actualNames.some((name) => name !== `.stage-${buildId}` && !expectedNames.has(name))) {
     throw new Error('Voice resource directory contains an unlisted file.');
   }
-  for (const file of [...runtimeFiles, ...modelFiles, manifest.vad.file]) {
+  for (const file of [...runtimeFiles, ...modelFiles, manifest.vad.file, manifest.vad.licenseFile]) {
     if (!(await isVerified(join(resourcesDirectory, file.name), file))) {
       throw new Error(`Voice resource verification failed: ${file.name}`);
     }
