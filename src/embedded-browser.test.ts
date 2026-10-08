@@ -4,6 +4,72 @@ import { test } from 'node:test';
 import type { BrowserWindow, WebContentsView } from 'electron';
 import { createEmbeddedBrowser, isAllowedPageUrl, resolveBrowserAddress } from './embedded-browser';
 
+function navigationFixture() {
+  const pending: { url: string; reject: (error: Error) => void }[] = [];
+  const attached = new Set<WebContentsView>();
+  const contents = Object.assign(new EventEmitter(), {
+    isDestroyed: () => false,
+    canGoBack: () => false,
+    canGoForward: () => false,
+    setWindowOpenHandler: () => undefined,
+    loadURL: (url: string) => new Promise<void>((_resolve, reject) => { pending.push({ url, reject }); }),
+    close: () => undefined,
+  });
+  const view = { webContents: contents, setVisible: () => undefined, setBounds: () => undefined } as unknown as WebContentsView;
+  const host = {
+    isDestroyed: () => false,
+    contentView: { addChildView: (value: WebContentsView) => attached.add(value), removeChildView: (value: WebContentsView) => attached.delete(value) },
+    getContentBounds: () => ({ width: 1200, height: 800 }),
+    webContents: { getZoomFactor: () => 1 },
+  } as unknown as BrowserWindow;
+  const browser = createEmbeddedBrowser(() => host, {
+    createSession: () => Object.assign(new EventEmitter(), {
+      setPermissionRequestHandler: () => undefined, setPermissionCheckHandler: () => undefined,
+    }) as never,
+    createView: () => view,
+    persist: async () => undefined,
+  }, [], null);
+  browser.navigate('https://loaded.example/');
+  browser.setBounds({ x: 400, y: 90, width: 420, height: 600 });
+  contents.emit('did-start-navigation', { url: 'https://loaded.example/', isMainFrame: true });
+  contents.emit('did-navigate', {}, 'https://loaded.example/');
+  contents.emit('did-finish-load');
+  return { browser, contents, pending, attached };
+}
+
+test('current native link and redirect failure is visible while stale and subframe failures are ignored', () => {
+  const { browser, contents, attached } = navigationFixture();
+  contents.emit('did-start-loading');
+  contents.emit('did-start-navigation', { url: 'https://linked.example/', isMainFrame: true });
+  contents.emit('did-fail-load', {}, -102, 'stale', 'https://loaded.example/', true);
+  contents.emit('did-fail-load', {}, -102, 'subframe', 'https://linked.example/', false);
+  assert.equal(browser.getStatus().tabs[0]?.error, null);
+  contents.emit('did-redirect-navigation', { url: 'https://redirected.example/', isMainFrame: true });
+  contents.emit('did-fail-load', {}, -102, 'stale redirect source', 'https://linked.example/', true);
+  assert.equal(browser.getStatus().tabs[0]?.error, null);
+  contents.emit('did-fail-load', {}, -102, 'connection refused', 'https://redirected.example/', true);
+  contents.emit('did-stop-loading');
+  assert.match(browser.getStatus().tabs[0]?.error ?? '', /Страница не загрузилась/);
+  assert.equal(browser.getStatus().tabs[0]?.loading, false);
+  assert.equal(browser.getStatus().tabs[0]?.url, 'https://redirected.example/', 'reload must retry the failed target');
+  assert.equal(attached.size, 0, 'failed native page must expose the app error view');
+  browser.destroy();
+});
+
+test('superseded same-address load and aborted native navigation do not replace a successful page', async () => {
+  const { browser, contents, pending } = navigationFixture();
+  browser.navigate('https://same.example/');
+  browser.navigate('https://same.example/');
+  contents.emit('did-start-navigation', { url: 'https://same.example/', isMainFrame: true });
+  contents.emit('did-fail-load', {}, -3, 'ERR_ABORTED', 'https://same.example/', true);
+  contents.emit('did-navigate', {}, 'https://same.example/');
+  contents.emit('did-finish-load');
+  pending[1].reject(new Error('older request failed'));
+  await Promise.resolve();
+  assert.equal(browser.getStatus().tabs[0]?.error, null);
+  browser.destroy();
+});
+
 test('browser address accepts sites, searches with Google, and rejects local or script URLs', () => {
   assert.equal(resolveBrowserAddress('example.com/path'), 'https://example.com/path');
   assert.equal(resolveBrowserAddress('http://localhost:3000/'), 'http://localhost:3000/');

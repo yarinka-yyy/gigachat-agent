@@ -72,6 +72,7 @@ export function createOnboardingBrowser(
   let currentUrl = '';
   let loading = false;
   let error: string | null = null;
+  let navigationGeneration = 0;
   const popups = new Set<BrowserWindow>();
   const listeners = new Set<(status: BrowserStatus) => void>();
 
@@ -212,6 +213,7 @@ export function createOnboardingBrowser(
   };
 
   const close = async (): Promise<void> => {
+    navigationGeneration += 1;
     for (const popup of popups) if (!popup.isDestroyed()) popup.close();
     popups.clear();
     if (view) {
@@ -236,12 +238,16 @@ export function createOnboardingBrowser(
   const openStudio = async (): Promise<BrowserStatus> => {
     const target = ensureView();
     if (!isStudioLandingUrl(currentUrl)) {
+      const generation = ++navigationGeneration;
       error = null;
       loading = true;
       publish();
       try {
         await target.webContents.loadURL(STUDIO_URL);
-      } catch {
+      } catch (failure) {
+        const aborted = failure as { code?: string; errno?: number } | null;
+        if (view !== target || generation !== navigationGeneration
+          || aborted?.code === 'ERR_ABORTED' || aborted?.errno === -3) return getStatus();
         loading = false;
         error = 'Страница не загрузилась. Проверьте подключение и повторите попытку.';
         publish();
@@ -252,7 +258,10 @@ export function createOnboardingBrowser(
 
   return {
     back(): void {
-      if (view && !view.webContents.isDestroyed() && view.webContents.canGoBack()) view.webContents.goBack();
+      if (view && !view.webContents.isDestroyed() && view.webContents.canGoBack()) {
+        navigationGeneration += 1;
+        view.webContents.goBack();
+      }
     },
     close,
     getStatus,
@@ -262,7 +271,10 @@ export function createOnboardingBrowser(
     },
     openStudio,
     reload(): void {
-      if (view && !view.webContents.isDestroyed()) view.webContents.reload();
+      if (view && !view.webContents.isDestroyed()) {
+        navigationGeneration += 1;
+        view.webContents.reload();
+      }
     },
     setBounds(bounds: BrowserBounds | null): void {
       currentBounds = bounds;

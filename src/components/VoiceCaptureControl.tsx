@@ -14,6 +14,9 @@ interface VoiceCaptureControlProps {
 
 type CapturePhase = 'idle' | 'starting' | 'recording' | 'transcribing' | 'cancelling';
 
+// A failed unmount cleanup remains owned across composer instances until cancel confirms release.
+const pendingCleanupRequests = new Set<string>();
+
 export function getCaptureError(reason: unknown): string {
   if (reason instanceof DOMException) {
     if (reason.name === 'NotAllowedError' || reason.name === 'SecurityError') return 'Доступ к микрофону отклонён при проверке записи.';
@@ -30,16 +33,16 @@ function formatElapsed(milliseconds: number): string {
 }
 
 export default function VoiceCaptureControl({ available, reason, canContinue, suspended, onTranscript, onError, onSuccess }: VoiceCaptureControlProps) {
-  const [phase, setPhase] = useState<CapturePhase>('idle');
+  const [phase, setPhase] = useState<CapturePhase>(pendingCleanupRequests.size > 0 ? 'transcribing' : 'idle');
   const phaseRef = useRef<CapturePhase>(phase);
   phaseRef.current = phase;
   const [elapsed, setElapsed] = useState(0);
-  const [statusText, setStatusText] = useState('');
+  const [statusText, setStatusText] = useState(pendingCleanupRequests.size > 0 ? 'Очистка не подтверждена — повторите отмену.' : '');
   const recorder = useRef<MediaRecorder | null>(null);
   const stream = useRef<MediaStream | null>(null);
   const chunks = useRef<Blob[]>([]);
   const chunkBytes = useRef(0);
-  const requestId = useRef<string | null>(null);
+  const requestId = useRef<string | null>(pendingCleanupRequests.values().next().value ?? null);
   const cancelledRequestId = useRef<string | null>(null);
   const cancelledCapture = useRef(false);
   const captureGeneration = useRef(0);
@@ -62,16 +65,24 @@ export default function VoiceCaptureControl({ available, reason, canContinue, su
     elapsedInterval.current = null;
   }
 
-  useEffect(() => () => {
-    mounted.current = false;
-    captureGeneration.current += 1;
-    clearRecordingTimers();
-    cancelledCapture.current = true;
-    if (recorder.current?.state === 'recording') recorder.current.stop();
-    stopStream();
-    const activeRequest = requestId.current;
-    requestId.current = null;
-    if (activeRequest) void window.gigaChat.voice.cancel(activeRequest).catch(() => undefined);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      captureGeneration.current += 1;
+      clearRecordingTimers();
+      cancelledCapture.current = true;
+      if (recorder.current?.state === 'recording') recorder.current.stop();
+      stopStream();
+      const activeRequest = requestId.current;
+      if (activeRequest) {
+        pendingCleanupRequests.add(activeRequest);
+        void window.gigaChat.voice.cancel(activeRequest).then(() => {
+          pendingCleanupRequests.delete(activeRequest);
+          if (requestId.current === activeRequest) requestId.current = null;
+        }).catch(() => undefined);
+      }
+    };
   }, []);
 
   function stopRecording(): void {
@@ -133,9 +144,19 @@ export default function VoiceCaptureControl({ available, reason, canContinue, su
       onSuccess('Текст добавлен в черновик. Проверьте его перед отправкой.');
     } catch (error) {
       if (requestId.current !== activeRequestId || !mounted.current || generation !== captureGeneration.current) return;
-      requestId.current = null;
-      setPhase('idle');
-      setStatusText('');
+      setPhase('cancelling');
+      setStatusText('Очищаем временную запись…');
+      try {
+        await window.gigaChat.voice.cancel(activeRequestId);
+        if (requestId.current !== activeRequestId || !mounted.current || generation !== captureGeneration.current) return;
+        requestId.current = null;
+        setPhase('idle');
+        setStatusText('');
+      } catch {
+        if (requestId.current !== activeRequestId || !mounted.current || generation !== captureGeneration.current) return;
+        setPhase('transcribing');
+        setStatusText('Очистка не подтверждена — повторите отмену.');
+      }
       if (cancelledRequestId.current === activeRequestId || !canContinue()) return;
       onError(error instanceof Error ? error.message : 'Не удалось распознать запись локально.');
     }
@@ -270,6 +291,7 @@ export default function VoiceCaptureControl({ available, reason, canContinue, su
     setPhase('cancelling');
     setStatusText('Останавливаем распознавание…');
     void window.gigaChat.voice.cancel(activeRequestId).then(() => {
+      pendingCleanupRequests.delete(activeRequestId);
       if (mounted.current && requestId.current === activeRequestId) {
         requestId.current = null;
         setPhase('idle');

@@ -3,7 +3,7 @@ import type { BrowserWindow, Session, WebContentsView } from 'electron';
 import type { BrowserBounds, BrowserTabRecord, EmbeddedBrowserStatus } from './contracts';
 import { clampBrowserBounds } from './onboarding-browser';
 
-type Tab = BrowserTabRecord & { view: WebContentsView | null; loading: boolean; error: string | null };
+type Tab = BrowserTabRecord & { view: WebContentsView | null; loading: boolean; error: string | null; navigationTarget: string; navigationGeneration: number };
 
 export function isAllowedPageUrl(value: string): boolean {
   try {
@@ -39,7 +39,7 @@ export function createEmbeddedBrowser(
   browserSession.setPermissionCheckHandler(() => false);
   browserSession.on('will-download', (event) => event.preventDefault());
 
-  const tabs: Tab[] = savedTabs.map((tab) => ({ ...tab, view: null, loading: false, error: null }));
+  const tabs: Tab[] = savedTabs.map((tab) => ({ ...tab, view: null, loading: false, error: null, navigationTarget: tab.url, navigationGeneration: 0 }));
   let activeTabId = savedActiveTabId && tabs.some((tab) => tab.id === savedActiveTabId) ? savedActiveTabId : tabs[0]?.id ?? null;
   let bounds: BrowserBounds | null = null;
   let attachedView: WebContentsView | null = null;
@@ -127,12 +127,21 @@ export function createEmbeddedBrowser(
       }
       return { action: 'deny' };
     });
+    contents.on('did-start-navigation', (details) => {
+      if (!details.isMainFrame || !isAllowedPageUrl(details.url)) return;
+      tab.navigationGeneration += 1;
+      tab.navigationTarget = details.url;
+    });
+    contents.on('did-redirect-navigation', (details) => {
+      if (details.isMainFrame && isAllowedPageUrl(details.url)) tab.navigationTarget = details.url;
+    });
     contents.on('did-start-loading', () => { tab.loading = true; tab.error = null; showActive(); publish(); });
     contents.on('did-stop-loading', () => { tab.loading = false; publish(); });
     contents.on('did-finish-load', () => { tab.loading = false; tab.error = null; showActive(); publish(); });
     const recordNavigation = (_event: unknown, url: string): void => {
       if (metadataPaused || !isAllowedPageUrl(url)) return;
       tab.url = url;
+      tab.navigationTarget = url;
       persist();
       publish();
     };
@@ -145,9 +154,11 @@ export function createEmbeddedBrowser(
       publish();
     });
     contents.on('did-fail-load', (_event, code, _description, failedUrl, isMainFrame) => {
-      if (!isMainFrame || code === -3 || failedUrl !== tab.url) return;
+      if (!isMainFrame || code === -3 || failedUrl !== tab.navigationTarget) return;
+      tab.url = failedUrl;
       tab.loading = false;
       tab.error = 'Страница не загрузилась. Проверьте адрес и подключение.';
+      persist();
       showActive();
       publish();
     });
@@ -155,6 +166,8 @@ export function createEmbeddedBrowser(
   };
 
   const load = (tab: Tab, url: string): void => {
+    const generation = ++tab.navigationGeneration;
+    tab.navigationTarget = url;
     tab.url = url;
     tab.title = new URL(url).hostname;
     tab.error = null;
@@ -163,8 +176,9 @@ export function createEmbeddedBrowser(
     showActive();
     persist();
     publish();
-    void view.webContents.loadURL(url).catch(() => {
-      if (tab.url !== url) return;
+    void view.webContents.loadURL(url).catch((error: { code?: string; errno?: number }) => {
+      if (tab.view !== view || view.webContents.isDestroyed() || generation !== tab.navigationGeneration
+        || error?.code === 'ERR_ABORTED' || error?.errno === -3) return;
       tab.loading = false;
       tab.error = 'Страница не загрузилась. Проверьте адрес и подключение.';
       showActive();
@@ -174,7 +188,7 @@ export function createEmbeddedBrowser(
 
   const createTab = (url = ''): EmbeddedBrowserStatus => {
     if (tabs.length >= 20) throw new Error('Можно открыть не более 20 вкладок.');
-    const tab: Tab = { id: randomUUID(), title: 'Новая вкладка', url: '', view: null, loading: false, error: null };
+    const tab: Tab = { id: randomUUID(), title: 'Новая вкладка', url: '', view: null, loading: false, error: null, navigationTarget: '', navigationGeneration: 0 };
     tabs.push(tab);
     activeTabId = tab.id;
     if (url) load(tab, url);

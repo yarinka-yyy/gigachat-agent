@@ -4,6 +4,60 @@ import { test } from 'node:test';
 import type { BrowserWindow, WebContentsView } from 'electron';
 import { clampBrowserBounds, createOnboardingBrowser, getOnboardingPopupTitle, isAllowedOnboardingUrl, isStudioLandingUrl } from './onboarding-browser';
 
+function pendingStudioFixture() {
+  let rejectLoad: (error: Error) => void = () => { throw new Error('load did not start'); };
+  const contents = Object.assign(new EventEmitter(), {
+    isDestroyed: () => false, canGoBack: () => false, setWindowOpenHandler: () => undefined, close: () => undefined,
+    loadURL: () => {
+      contents.emit('did-start-loading');
+      return new Promise<void>((_resolve, reject) => { rejectLoad = reject; });
+    },
+    reload: () => {
+      contents.emit('did-start-loading');
+      rejectLoad(Object.assign(new Error('ERR_ABORTED (-3)'), { code: 'ERR_ABORTED', errno: -3 }));
+    },
+  });
+  const browser = createOnboardingBrowser(() => ({
+    isDestroyed: () => false, contentView: { addChildView: () => undefined, removeChildView: () => undefined },
+  }) as unknown as BrowserWindow, {
+    createSession: () => Object.assign(new EventEmitter(), {
+      setPermissionRequestHandler: () => undefined, setPermissionCheckHandler: () => undefined,
+      webRequest: { onBeforeRequest: () => undefined },
+      clearStorageData: async () => undefined, clearCache: async () => undefined, clearAuthCache: async () => undefined,
+    }) as never,
+    createView: () => ({ webContents: contents, setVisible: () => undefined, setBounds: () => undefined }) as unknown as WebContentsView,
+  });
+  return { browser, contents, reject: (error: Error) => rejectLoad(error) };
+}
+
+test('successful Studio reload does not retain the aborted initial load error', async () => {
+  const { browser, contents } = pendingStudioFixture();
+  const opening = browser.openStudio();
+  browser.reload();
+  await opening;
+  assert.equal(browser.getStatus().loading, true, 'old promise must not stop the replacement load');
+  contents.emit('did-navigate', {}, 'https://developers.sber.ru/studio/');
+  contents.emit('did-stop-loading');
+  assert.equal(browser.getStatus().atStudio, true);
+  assert.equal(browser.getStatus().error, null);
+  await browser.close();
+});
+
+test('closed Studio load cannot republish an error, while current genuine failures remain visible', async () => {
+  const { browser, reject } = pendingStudioFixture();
+  const opening = browser.openStudio();
+  await browser.close();
+  reject(new Error('connection failed after close'));
+  await opening;
+  assert.equal(browser.getStatus().open, false);
+  assert.equal(browser.getStatus().error, null);
+  const current = browser.openStudio();
+  reject(new Error('current connection failed'));
+  await current;
+  assert.match(browser.getStatus().error ?? '', /Страница не загрузилась/);
+  await browser.close();
+});
+
 test('onboarding browser accepts only HTTPS URLs without embedded credentials', () => {
   assert.equal(isAllowedOnboardingUrl('https://developers.sber.ru/studio/'), true);
   assert.equal(isAllowedOnboardingUrl('https://login.example.test/continue'), true);
