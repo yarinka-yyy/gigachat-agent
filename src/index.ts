@@ -19,6 +19,7 @@ import { createOnboardingBrowser, type BrowserBounds } from './onboarding-browse
 import { createEmbeddedBrowser } from './embedded-browser';
 import { createNumberedProjectFolder, prepareProjectFolders, removeEmptyCreatedFolder } from './project-folders';
 import { createVoiceRuntime, VOICE_MAX_OUTPUT_BYTES, type VoiceRuntime } from './voice';
+import { prepareVoiceModelCache } from './voice-model-cache';
 import {
   acquirePrimaryInstance,
   createCloseAdmission,
@@ -520,10 +521,7 @@ async function createVoiceService(userDataPath: string): Promise<{ runtime: Voic
       const entry = await lstat(join(voiceDirectory, name));
       if (!entry.isFile() || entry.isSymbolicLink()) throw new Error('resource file unavailable');
     }
-    const cacheDirectory = join(userDataPath, 'voice-cache');
-    await mkdir(cacheDirectory, { recursive: true });
-    const cacheInfo = await lstat(cacheDirectory);
-    if (!cacheInfo.isDirectory() || cacheInfo.isSymbolicLink()) throw new Error('cache directory unavailable');
+    const modelCache = await prepareVoiceModelCache(userDataPath, voiceDirectory);
     const audioTempRoot = join(userDataPath, 'voice-temp');
     await mkdir(audioTempRoot, { recursive: true });
     const audioTempInfo = await lstat(audioTempRoot);
@@ -548,8 +546,7 @@ async function createVoiceService(userDataPath: string): Promise<{ runtime: Voic
     };
     const runtime = createVoiceRuntime({
       executable: join(voiceDirectory, 'gigastt.exe'),
-      modelDirectory: voiceDirectory,
-      cacheDirectory,
+      modelDirectory: modelCache.modelDirectory,
     }, {
       async prepareAudio(audio) {
         const rootInfo = await lstat(audioTempRoot);
@@ -579,7 +576,9 @@ async function createVoiceService(userDataPath: string): Promise<{ runtime: Voic
           },
         };
       },
-      run(executable, args, environment, signal) {
+      async run(executable, args, environment, signal) {
+        await modelCache.validate();
+        if (signal.aborted) throw new Error('Распознавание отменено.');
         return new Promise<string>((resolve, reject) => {
           const systemRoot = process.env.SystemRoot ?? 'C:\\Windows';
           const temp = app.getPath('temp');

@@ -12,7 +12,7 @@ import {
 
 const requestId = 'bf83023d-ef8d-44d3-992a-8bd235fd2a67';
 const audio = new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 1, 2, 3]);
-const paths = { executable: 'voice/gigastt.exe', modelDirectory: 'voice', cacheDirectory: 'cache' };
+const paths = { executable: 'voice/gigastt.exe', modelDirectory: 'profile/voice-cache/models-pinned' };
 
 function fakeHost(overrides: Partial<VoiceRuntimeHost> = {}): VoiceRuntimeHost {
   return {
@@ -75,10 +75,10 @@ test('transcription uses the fixed offline e2e/VAD command and cleans the tempor
   assert.equal(text, 'Проверь локальный GigaAM API.');
   assert.equal(receivedExecutable, paths.executable);
   assert.deepEqual(receivedArgs, [
-    'transcribe', 'temp/recording.webm', '--model-dir', 'voice', '--model-variant', 'e2e_rnnt',
-    '--offline', '--vad', '--vad-model-dir', 'voice', '--format', 'json',
+    'transcribe', 'temp/recording.webm', '--model-dir', paths.modelDirectory, '--model-variant', 'e2e_rnnt',
+    '--offline', '--vad', '--vad-model-dir', paths.modelDirectory, '--format', 'json',
   ]);
-  assert.deepEqual(receivedEnvironment, { GIGASTT_OPTIMIZED_CACHE_DIR: 'cache' });
+  assert.deepEqual(receivedEnvironment, {});
   assert.equal(cleanupCount, 1);
 });
 

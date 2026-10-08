@@ -10,7 +10,6 @@ export interface VoicePreparedAudio {
 export interface VoiceRuntimePaths {
   executable: string;
   modelDirectory: string;
-  cacheDirectory: string;
 }
 
 export interface VoiceRuntimeHost {
@@ -141,7 +140,7 @@ export function createVoiceRuntime(paths: VoiceRuntimePaths, host: VoiceRuntimeH
         const stdout = await host.run(
           paths.executable,
           buildTranscriptionArgs(prepared.filePath, paths),
-          { GIGASTT_OPTIMIZED_CACHE_DIR: paths.cacheDirectory },
+          {},
           entry.controller.signal,
         );
         if (entry.controller.signal.aborted) throw new Error('Распознавание отменено.');

@@ -567,7 +567,7 @@ test('close cancels an owned voice transcribe outside the IPC drain and waits fo
   let cancelVoiceCalls = 0;
   let destroyed = false;
   const order: string[] = [];
-  const runtime = createVoiceRuntime({ executable: 'synthetic', modelDirectory: 'synthetic', cacheDirectory: 'synthetic' }, {
+  const runtime = createVoiceRuntime({ executable: 'synthetic', modelDirectory: 'synthetic' }, {
     prepareAudio: async () => ({ filePath: 'synthetic.webm', cleanup: async () => { cleanupCount += 1; } }),
     run: (_executable, _args, _environment, signal) => new Promise<string>((_resolve, reject) => {
       runStarted?.();
