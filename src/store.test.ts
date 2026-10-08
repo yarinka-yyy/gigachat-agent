@@ -160,6 +160,55 @@ test('migrates v2 chats with archive and draft without changing their UUIDs', as
   assert.equal((await (await openStore(directory)).getChat(chat.id)).draft, 'Текст');
 });
 
+test('unfinished legacy migration preserves existing invalid chat details', async (t) => {
+  const cases = [
+    { kind: 'corrupt', migrated: false },
+    { kind: 'unknown-version', migrated: false },
+    { kind: 'id-mismatch', migrated: false },
+    { kind: 'valid', migrated: false },
+    { kind: 'missing', migrated: false },
+    { kind: 'corrupt', migrated: true },
+  ];
+  for (const { kind, migrated } of cases) {
+    await t.test(`${kind}, marker ${migrated ? 'present' : 'absent'}`, async (t) => {
+      const directory = await mkdtemp(join(tmpdir(), 'gigachat-unfinished-migration-'));
+      t.after(() => rm(directory, { recursive: true, force: true }));
+      const legacy = { id: 'chat-1', title: 'Legacy chat', projectId: null, pinned: false, archived: false,
+        createdAt: timestamp, updatedAt: timestamp, draft: 'legacy draft', kind: 'text' };
+      const detail = { schemaVersion: 6, ...legacy, draft: 'newer draft', nextTurnPermissionProfile: null,
+        nextTurnSkillId: null, modelId: null,
+        messages: [{ id: 'message-1', role: 'user', text: 'newer history', createdAt: timestamp }], artifacts: [] };
+      const legacyContents = JSON.stringify({ schemaVersion: 2, chats: [legacy] });
+      const detailPath = join(directory, 'chats', legacy.id, 'chat.json');
+      await mkdir(dirname(detailPath), { recursive: true });
+      await writeFile(join(directory, 'chats.json'), legacyContents);
+      if (migrated) await writeFile(join(directory, 'chats.migrated'), '3\n');
+      const contents = kind === 'missing' ? null
+        : kind === 'corrupt' ? JSON.stringify(detail).slice(0, -1)
+          : JSON.stringify({ ...detail, ...(kind === 'unknown-version' ? { schemaVersion: 99 }
+            : kind === 'id-mismatch' ? { id: 'another-chat' } : {}) });
+      if (contents !== null) await writeFile(detailPath, contents);
+
+      const store = await openStore(directory);
+      if (contents !== null) assert.equal(await readFile(detailPath, 'utf8'), contents, 'existing bytes must survive migration');
+      if (kind === 'valid' || kind === 'missing') {
+        const restored = await store.getChat(legacy.id);
+        assert.equal(restored.draft, kind === 'valid' ? 'newer draft' : 'legacy draft');
+        assert.deepEqual(restored.messages, kind === 'valid' ? detail.messages : []);
+        assert.deepEqual(await store.getStorageIssues(), []);
+      } else {
+        assert.deepEqual(await store.listChats(), []);
+        assert.match((await store.getStorageIssues()).join('\n'), /chat-1.*повреждён/);
+        const reopened = await openStore(directory);
+        assert.equal(await readFile(detailPath, 'utf8'), contents);
+        assert.deepEqual(await reopened.listChats(), []);
+      }
+      assert.equal(await readFile(join(directory, 'chats.json'), 'utf8'), legacyContents);
+      if (!migrated) assert.equal(await readFile(join(directory, 'chats.json.bak'), 'utf8'), legacyContents);
+    });
+  }
+});
+
 test('saves a local message and clears its draft in one chat file, then reopens history', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-message-'));
   t.after(() => rm(directory, { recursive: true, force: true }));

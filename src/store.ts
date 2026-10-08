@@ -992,6 +992,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     throw error;
   });
   const loadedChats: ChatDetail[] = [];
+  const existingChatDetails = new Set<string>();
   const chatsNeedingMigration: ChatDetail[] = [];
   const storageIssues: string[] = [];
   for (const entry of entries) {
@@ -1009,6 +1010,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       }
       throw error;
     }
+    existingChatDetails.add(entry.name);
     try {
       const detail = validateChatDetail(JSON.parse(contents) as unknown);
       if (detail.value.id !== entry.name) throw new Error('Chat ID mismatch.');
@@ -1050,7 +1052,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         .catch((error: unknown) => { if (!isRecord(error) || error.code !== 'EEXIST') throw error; });
     }
     for (const legacy of legacyChats) {
-      if (loadedChats.some((chat) => chat.id === legacy.id)) continue;
+      if (existingChatDetails.has(legacy.id)) continue;
       const detail: ChatDetail = { ...legacy, nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [] };
       await writeOwnedAtomic(join(chatsDirectory, legacy.id, 'chat.json'), detailFile(detail));
       loadedChats.push(detail);
