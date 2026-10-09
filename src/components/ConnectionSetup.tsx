@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { ArrowLeft, ArrowRight, KeyRound, LoaderCircle, RotateCw, ShieldCheck } from 'lucide-react';
-import type { OnboardingBrowserStatus, SecureStoreStatus } from '../contracts';
+import type { OnboardingBrowserStatus, ProviderConnectionSnapshot, ProviderErrorCategory, SecureStoreStatus } from '../contracts';
 
 interface ConnectionSetupProps {
   firstRun: boolean;
@@ -23,6 +23,31 @@ function keyStatusText(status: SecureStoreStatus | null): string {
   return 'Значение сохранено с шифрованием средствами ОС.';
 }
 
+function connectionErrorText(category: ProviderErrorCategory | null): string {
+  switch (category) {
+    case 'auth': return 'Ключ отклонён или доступ не разрешён.';
+    case 'tls': return 'Не удалось подтвердить TLS-сертификат сервера.';
+    case 'network': return 'Сетевая ошибка или превышено время ожидания.';
+    case 'rate-limit': return 'Сервис временно ограничил запросы.';
+    case 'quota': return 'У аккаунта нет доступной квоты.';
+    case 'model': return 'Список моделей недоступен или пуст.';
+    case 'context': return 'Запрос превышает ограничение контекста.';
+    case 'protocol': return 'Сервер вернул ответ в неподдерживаемом формате.';
+    case 'storage': return 'Не удалось прочитать ключ из защищённого хранилища.';
+    case 'cancel': return 'Подключение отменено.';
+    case 'tool': return 'Локальный инструмент завершился с ошибкой.';
+    default: return 'Проверьте ключ и подключение к сети.';
+  }
+}
+
+function connectionStatusText(status: ProviderConnectionSnapshot | null): string {
+  if (!status) return 'Проверяем состояние подключения…';
+  if (status.state === 'connecting') return 'Проверяем ключ и список моделей…';
+  if (status.state === 'connected') return 'OAuth и список моделей проверены.';
+  if (status.state === 'error') return connectionErrorText(status.errorCategory);
+  return 'GigaChat API не подключён.';
+}
+
 const EMPTY_BROWSER_STATUS: OnboardingBrowserStatus = {
   open: false,
   loading: false,
@@ -42,8 +67,10 @@ export default function ConnectionSetup({
 }: ConnectionSetupProps) {
   const [keyValue, setKeyValue] = useState('');
   const [keyStatus, setKeyStatus] = useState<SecureStoreStatus | null>(null);
+  const [connectionStatus, setConnectionStatus] = useState<ProviderConnectionSnapshot | null>(null);
   const [browserStatus, setBrowserStatus] = useState(EMPTY_BROWSER_STATUS);
   const [saving, setSaving] = useState(false);
+  const [connecting, setConnecting] = useState(false);
   const [continuing, setContinuing] = useState(false);
   const [busyBrowser, setBusyBrowser] = useState(false);
   const [error, setError] = useState('');
@@ -53,6 +80,8 @@ export default function ConnectionSetup({
   const keySaveFailed = useRef(false);
   const keyValueRef = useRef('');
   const keySaveGeneration = useRef(0);
+  const connectGeneration = useRef(0);
+  const connectingRef = useRef(false);
   const mounted = useRef(false);
   const reportOperationFailureRef = useRef(reportOperationFailure);
   const keySaveFailureChangeRef = useRef(onKeySaveFailureChange);
@@ -65,6 +94,8 @@ export default function ConnectionSetup({
     return () => {
       mounted.current = false;
       keySaveGeneration.current += 1;
+      connectGeneration.current += 1;
+      if (connectingRef.current) void window.gigaChat.onboarding.cancelConnect().catch(() => undefined);
       keySaveFailureChangeRef.current?.(false);
     };
   }, []);
@@ -78,6 +109,11 @@ export default function ConnectionSetup({
     });
     void window.gigaChat.onboarding.getKeyStatus().then((status) => {
       if (alive) setKeyStatus(status);
+    }).catch((reason: unknown) => {
+      if (alive) setError(errorText(reason));
+    });
+    void window.gigaChat.onboarding.getConnectionStatus().then((status) => {
+      if (alive) setConnectionStatus(status);
     }).catch((reason: unknown) => {
       if (alive) setError(errorText(reason));
     });
@@ -150,6 +186,13 @@ export default function ConnectionSetup({
     event.preventDefault();
     setError('');
     setSaving(true);
+    connectGeneration.current += 1;
+    if (connectingRef.current) {
+      connectingRef.current = false;
+      void window.gigaChat.onboarding.cancelConnect().catch(() => undefined);
+    }
+    setConnecting(false);
+    setConnectionStatus({ state: 'not-configured', errorCategory: null });
     const value = keyValueRef.current;
     const generation = ++keySaveGeneration.current;
     try {
@@ -157,6 +200,7 @@ export default function ConnectionSetup({
       const status = await (runAcceptedOperation ? runAcceptedOperation(save) : save());
       if (!mounted.current || generation !== keySaveGeneration.current) return;
       setKeyStatus(status);
+      setConnectionStatus({ state: 'not-configured', errorCategory: null });
       if (keyValueRef.current === value) {
         keyValueRef.current = '';
         setKeyValue('');
@@ -174,6 +218,51 @@ export default function ConnectionSetup({
       setError(errorText(reason));
     } finally {
       if (mounted.current && generation === keySaveGeneration.current) setSaving(false);
+    }
+  }
+
+  async function connect(): Promise<void> {
+    setError('');
+    const generation = ++connectGeneration.current;
+    connectingRef.current = true;
+    setConnecting(true);
+    setConnectionStatus({ state: 'connecting', errorCategory: null });
+    try {
+      const status = await window.gigaChat.onboarding.connect();
+      if (mounted.current && generation === connectGeneration.current) setConnectionStatus(status);
+    } catch (reason) {
+      if (mounted.current && generation === connectGeneration.current) setError(errorText(reason));
+    } finally {
+      if (generation === connectGeneration.current) {
+        connectingRef.current = false;
+        if (mounted.current) setConnecting(false);
+      }
+    }
+  }
+
+  async function cancelConnect(): Promise<void> {
+    setError('');
+    const generation = ++connectGeneration.current;
+    connectingRef.current = false;
+    setConnecting(false);
+    try {
+      const status = await window.gigaChat.onboarding.cancelConnect();
+      if (mounted.current && generation === connectGeneration.current) setConnectionStatus(status);
+    } catch (reason) {
+      if (mounted.current && generation === connectGeneration.current) setError(errorText(reason));
+    }
+  }
+
+  async function disconnect(): Promise<void> {
+    setError('');
+    const generation = ++connectGeneration.current;
+    connectingRef.current = false;
+    setConnecting(false);
+    try {
+      const status = await window.gigaChat.onboarding.disconnect();
+      if (mounted.current && generation === connectGeneration.current) setConnectionStatus(status);
+    } catch (reason) {
+      if (mounted.current && generation === connectGeneration.current) setError(errorText(reason));
     }
   }
 
@@ -208,7 +297,7 @@ export default function ConnectionSetup({
       <header className="connection-heading">
         {firstRun && <span className="eyebrow">Первый запуск</span>}
         <h1>{firstRun ? 'Настройте GigaChat Agents' : 'Подключение GigaChat API'}</h1>
-        <p>API пока не подключён. Эти шаги не проверяют ключ и не отправляют данные в GigaChat.</p>
+        <p>Сохранение ключа выполняется отдельно от проверки подключения. Connect проверяет OAuth и доступность списка моделей.</p>
       </header>
 
       <div className="connection-layout">
@@ -224,9 +313,9 @@ export default function ConnectionSetup({
 
           <section className="setup-card">
             <div className="setup-card-title"><span className="connection-step-number">2</span><h2>Authorization Key</h2></div>
-            <p className="connection-caution">Не вводите настоящий ключ на этом этапе. Проверка API появится отдельно; сейчас можно проверить только локальное шифрованное хранение.</p>
+            <p className="connection-caution">Ключ шифруется средствами ОС и остаётся в main process. Connect отправляет его только в OAuth GigaChat; access token хранится только в памяти.</p>
             <form className="connection-key-form" onSubmit={(event) => void saveKey(event)}>
-              <label htmlFor="connection-key">Значение для защищённого хранения</label>
+              <label htmlFor="connection-key">Authorization Key</label>
               <div className="connection-key-control">
                 <KeyRound aria-hidden="true" />
                 <input
@@ -246,18 +335,29 @@ export default function ConnectionSetup({
                   autoCapitalize="off"
                   spellCheck={false}
                   maxLength={16384}
-                  placeholder="Не вставляйте действующий ключ"
+                  placeholder="Вставьте Authorization Key из Studio"
                   aria-describedby="connection-key-status"
                 />
-                <button type="submit" className="secondary-button" disabled={saving || !keyValue.trim()}>{saving ? 'Сохраняем…' : 'Сохранить локально'}</button>
+                <button type="submit" className="secondary-button" disabled={saving || !keyValue.trim()}>{saving ? 'Сохраняем…' : 'Сохранить защищённо'}</button>
               </div>
               <p id="connection-key-status" className="connection-key-status" role="status">{keyStatusText(keyStatus)}</p>
             </form>
+            <p className="connection-key-status" role="status">{connectionStatusText(connectionStatus)}</p>
+            {connectionStatus?.state === 'connecting' || connecting
+              ? <button type="button" className="secondary-button" onClick={() => void cancelConnect()}>Отменить Connect</button>
+              : connectionStatus?.state === 'connected'
+                ? <button type="button" className="secondary-button" onClick={() => void disconnect()}>Отключить</button>
+                : <button
+                  type="button"
+                  className="primary-button"
+                  onClick={() => void connect()}
+                  disabled={saving || connecting || !keyStatus?.saved || !keyStatus.usable || Boolean(keyValue.trim())}
+                >Проверить подключение</button>}
           </section>
 
           <section className="setup-card connection-finish">
             <div className="setup-card-title"><span className="connection-step-number">3</span><h2>Выберите, как продолжить</h2></div>
-            <p>Локальные чаты и проекты доступны без API. Подключение и проверка ключа станут доступны после отдельного API-этапа.</p>
+            <p>Локальные чаты и проекты доступны без API. После проверки подключения можно продолжить локально.</p>
             {firstRun && <button type="button" className="primary-button" onClick={() => void finishLocally()} disabled={continuing}>
               {continuing ? 'Сохраняем…' : 'Продолжить локально'}
             </button>}

@@ -18,6 +18,7 @@ const config: ForgeConfig = {
     icon: 'src/assets/gigachat-icon.ico',
     extraResource: [
       'src/assets/gigachat-icon.ico',
+      'resources/gigachat/',
       ...(process.platform === 'win32' ? ['resources/native/LocalPowerShell.exe'] : []),
       ...(process.platform === 'win32' ? ['resources/voice/'] : []),
     ],

@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, Notification, safeStorage, screen, session, shell, systemPreferences, Tray, WebContentsView, type IpcMainInvokeEvent, type MediaAccessPermissionRequest } from 'electron';
 import { openStore, type LocalStore } from './store';
@@ -15,6 +15,7 @@ import { createPermissionApprovals } from './permission-approvals';
 import { createSkillRegistry, isSkillId } from './skills';
 import { createHookRegistry } from './hooks';
 import { createSecureStore } from './secure-store';
+import { createGigaChatProvider, createHttpsTransport, GIGACHAT_ROOT_CA_SHA256, type GigaChatProviderConnection, type ProviderTransport } from './gigachat-provider';
 import { createOnboardingBrowser, type BrowserBounds } from './onboarding-browser';
 import { createEmbeddedBrowser } from './embedded-browser';
 import { createNumberedProjectFolder, prepareProjectFolders, removeEmptyCreatedFolder } from './project-folders';
@@ -491,6 +492,7 @@ function requirePreferredOpener(value: unknown): PreferredOpener {
 interface MainRuntimeBundle {
   runtime: TurnRuntime;
   availability: RuntimeAvailability;
+  providerConnection: GigaChatProviderConnection;
   voiceRuntime: VoiceRuntime | null;
   voiceAvailability: VoiceAvailability;
   skills: ReturnType<typeof createSkillRegistry>;
@@ -640,6 +642,7 @@ async function createMainRuntime(
   customPermissions: Awaited<ReturnType<typeof openCustomPermissions>>,
   approvals: ReturnType<typeof createPermissionApprovals>,
   helperCandidate: ReturnType<typeof createPowerShellHelper> | undefined,
+  secureStore: ReturnType<typeof createSecureStore>,
 ): Promise<MainRuntimeBundle> {
   const skills = createSkillRegistry({ userDataPath: app.getPath('userData'), listProjects: () => store.listProjects() });
   const hooks = createHookRegistry({
@@ -660,6 +663,21 @@ async function createMainRuntime(
   } else unavailableReason = 'Ограниченные локальные инструменты доступны только в Windows-сборке.';
 
   const voiceService = await createVoiceService(app.getPath('userData'));
+
+  const caBasePath = app.isPackaged ? process.resourcesPath : app.getAppPath();
+  const caPath = join(caBasePath, app.isPackaged ? 'gigachat' : 'resources/gigachat', 'russian_trusted_root_ca_pem.crt');
+  let transport: ProviderTransport;
+  try {
+    const additionalCa = await readFile(caPath, 'utf8');
+    transport = createHttpsTransport({ additionalCa, expectedAdditionalCaSha256: GIGACHAT_ROOT_CA_SHA256 });
+  } catch {
+    // Local use remains available; network access still requires a valid system-trusted HTTPS chain.
+    transport = createHttpsTransport();
+  }
+  const providerConnection = createGigaChatProvider({
+    loadAuthorizationKey: () => secureStore.load(),
+    transport,
+  });
 
   let runtime: TurnRuntime | null = null;
   const tools: LocalTools = createLocalTools({
@@ -747,6 +765,7 @@ async function createMainRuntime(
   runtime = turnRuntime;
   return {
     runtime: turnRuntime,
+    providerConnection,
     availability: {
       providerConfigured: false,
       helperRecovered: Boolean(helper),
@@ -769,13 +788,14 @@ async function registerIpcHandlers(
   customPermissions: Awaited<ReturnType<typeof openCustomPermissions>>,
   approvals: ReturnType<typeof createPermissionApprovals>,
 ): Promise<void> {
-  const { runtime, availability, voiceRuntime, voiceAvailability, skills, hooks } = mainRuntime;
+  const { runtime, availability, providerConnection, voiceRuntime, voiceAvailability, skills, hooks } = mainRuntime;
   const nonCriticalChannels = new Set([
     'projects:list', 'projects:pick-folder', 'projects:open-folder', 'projects:read-instructions', 'projects:instructions-backup-path',
     'chats:list', 'chats:get', 'chats:open-artifact', 'chats:open-folder',
     'runtime:list', 'runtime:status', 'permissions:read-config', 'permissions:respond',
     'voice:status', 'voice:cancel', 'skills:list', 'skills:read-source', 'skills:open-folder', 'hooks:list',
     'onboarding:key-status', 'onboarding:browser-status', 'onboarding:browser-open', 'onboarding:browser-close',
+    'onboarding:connection-status',
     'onboarding:browser-back', 'onboarding:browser-reload', 'onboarding:browser-bounds',
     'browser:status', 'browser:bounds', 'runtime:cancel',
     'settings:get', 'usage:local-stats', 'settings:open-projects-folder', 'settings:list-openers', 'settings:app-info',
@@ -784,7 +804,7 @@ async function registerIpcHandlers(
   const readOnlyChannels = new Set([
     'projects:list', 'projects:read-instructions', 'projects:instructions-backup-path',
     'chats:list', 'chats:get', 'runtime:list', 'runtime:status', 'permissions:read-config',
-    'voice:status', 'skills:list', 'skills:read-source', 'hooks:list', 'onboarding:key-status',
+    'voice:status', 'skills:list', 'skills:read-source', 'hooks:list', 'onboarding:key-status', 'onboarding:connection-status',
     'onboarding:browser-status', 'browser:status', 'settings:get', 'usage:local-stats',
     'settings:list-openers', 'settings:app-info', 'settings:get-auto-start', 'settings:read-instructions',
   ]);
@@ -823,7 +843,10 @@ async function registerIpcHandlers(
   closeController = createCloseController(closeAdmission, {
     pauseBrowserMetadata: () => userBrowser.pauseMetadata(),
     resumeBrowserMetadata: () => userBrowser.resumeMetadata(),
-    cancelRuntime: async () => { await runtime.cancelAll(); },
+    cancelRuntime: async () => {
+      providerConnection.disconnect();
+      await runtime.cancelAll();
+    },
     cancelVoice: async () => { await voiceRuntime?.cancelAll(); },
     flushBrowser: () => userBrowser.flush(),
     drainStore: async () => { await store.getSettings(); },
@@ -1006,9 +1029,14 @@ async function registerIpcHandlers(
 
   handle('onboarding:key-status', () => secureStore.status());
   handle('onboarding:key-save', async (key) => {
+    providerConnection.invalidateSavedKey();
     await secureStore.save(key);
     return secureStore.status();
   });
+  handle('onboarding:connection-status', () => providerConnection.getConnectionStatus());
+  handle('onboarding:connect', () => providerConnection.connect(), { track: false });
+  handle('onboarding:connect-cancel', () => providerConnection.cancelConnect());
+  handle('onboarding:disconnect', () => providerConnection.disconnect());
   handle('onboarding:browser-status', () => browser.getStatus());
   handle('onboarding:browser-open', () => browser.openStudio());
   handle('onboarding:browser-close', () => browser.close());
@@ -1065,6 +1093,7 @@ async function registerIpcHandlers(
       : await dialog.showMessageBox(options);
     if (confirmation.response !== 1) return false;
 
+    providerConnection.disconnect();
     await runtime.cancelAll();
     await voiceRuntime?.cancelAll();
     await browser.close();
@@ -1344,7 +1373,7 @@ if (isPrimaryInstance) void app.whenReady().then(async () => {
     }, initialSettings.browserTabs, initialSettings.browserActiveTabId);
     currentTheme = initialSettings.theme;
     nativeTheme.on('updated', syncTitleBarOverlay);
-    const mainRuntime = await createMainRuntime(store, customPermissions, approvals, helperCandidate);
+    const mainRuntime = await createMainRuntime(store, customPermissions, approvals, helperCandidate, secureStore);
     await registerIpcHandlers(store, mainRuntime, secureStore, onboardingBrowser, embeddedBrowser, customPermissions, approvals);
     createMainWindow = createWindow;
     createWindow();

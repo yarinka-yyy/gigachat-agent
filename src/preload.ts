@@ -19,6 +19,7 @@ import type {
   PermissionApprovalRequest,
   OnboardingBrowserStatus,
   SecureStoreStatus,
+  ProviderConnectionSnapshot,
   SkillRegistrySnapshot,
   SkillScope,
   SkillSource,
@@ -113,6 +114,10 @@ const api: AppApi = {
   onboarding: {
     getKeyStatus: () => ipcRenderer.invoke('onboarding:key-status') as Promise<SecureStoreStatus>,
     saveKey: (key) => ipcRenderer.invoke('onboarding:key-save', key) as Promise<SecureStoreStatus>,
+    getConnectionStatus: () => ipcRenderer.invoke('onboarding:connection-status') as Promise<ProviderConnectionSnapshot>,
+    connect: () => ipcRenderer.invoke('onboarding:connect') as Promise<ProviderConnectionSnapshot>,
+    cancelConnect: () => ipcRenderer.invoke('onboarding:connect-cancel') as Promise<ProviderConnectionSnapshot>,
+    disconnect: () => ipcRenderer.invoke('onboarding:disconnect') as Promise<ProviderConnectionSnapshot>,
     getBrowserStatus: () => ipcRenderer.invoke('onboarding:browser-status') as Promise<OnboardingBrowserStatus>,
     openStudio: () => ipcRenderer.invoke('onboarding:browser-open') as Promise<OnboardingBrowserStatus>,
     closeBrowser: () => ipcRenderer.invoke('onboarding:browser-close') as Promise<void>,

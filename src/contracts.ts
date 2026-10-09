@@ -107,6 +107,18 @@ export interface ProviderTurnRequest {
   modelId: GigaChatModelId | null;
 }
 
+export const PROVIDER_ERROR_CATEGORIES = [
+  'auth', 'tls', 'network', 'rate-limit', 'quota', 'model', 'context', 'protocol', 'tool', 'storage', 'cancel',
+] as const;
+export type ProviderErrorCategory = typeof PROVIDER_ERROR_CATEGORIES[number];
+
+export type ProviderConnectionState = 'not-configured' | 'connecting' | 'connected' | 'error';
+
+export interface ProviderConnectionSnapshot {
+  state: ProviderConnectionState;
+  errorCategory: ProviderErrorCategory | null;
+}
+
 export interface AcceptedTurnInput {
   turnId: string;
   chatId: string;
@@ -127,7 +139,7 @@ export type ProviderEvent =
   | { type: 'activity'; activity: 'connecting' | 'receiving' | 'waiting-for-tool' | 'tool-started' | 'tool-finished'; tool?: ProviderToolName }
   | { type: 'text-delta'; text: string }
   | { type: 'completed'; responseId?: string }
-  | { type: 'error'; code: string; retryable: boolean };
+  | { type: 'error'; category: ProviderErrorCategory; retryable: boolean };
 
 export interface GigaChatProvider {
   stream(request: ProviderTurnRequest, signal: AbortSignal): AsyncIterable<ProviderEvent>;
@@ -150,6 +162,7 @@ export interface RuntimeTurnSnapshot {
   activeDurationMs?: number;
   activity: RuntimeActivity[];
   error?: string;
+  errorCategory?: ProviderErrorCategory;
 }
 
 export interface RuntimeAvailability {
@@ -380,6 +393,10 @@ export interface AppApi {
   onboarding: {
     getKeyStatus(): Promise<SecureStoreStatus>;
     saveKey(key: string): Promise<SecureStoreStatus>;
+    getConnectionStatus(): Promise<ProviderConnectionSnapshot>;
+    connect(): Promise<ProviderConnectionSnapshot>;
+    cancelConnect(): Promise<ProviderConnectionSnapshot>;
+    disconnect(): Promise<ProviderConnectionSnapshot>;
     getBrowserStatus(): Promise<OnboardingBrowserStatus>;
     openStudio(): Promise<OnboardingBrowserStatus>;
     closeBrowser(): Promise<void>;

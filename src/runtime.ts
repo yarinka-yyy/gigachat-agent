@@ -1,11 +1,13 @@
 import type {
   AcceptedTurnInput,
   GigaChatProvider,
+  ProviderErrorCategory,
   ProviderEvent,
   ProviderTurnRequest,
   RuntimeActivity,
   RuntimeTurnSnapshot,
 } from './contracts';
+import { PROVIDER_ERROR_CATEGORIES } from './contracts';
 import type { LocalToolEvent, LocalTools } from './local-tools';
 
 const MAX_ACTIVITY_PER_TURN = 50;
@@ -77,7 +79,12 @@ function copyTurn(turn: RuntimeTurn): RuntimeTurnSnapshot {
     ...(turn.activeDurationMs === undefined ? {} : { activeDurationMs: turn.activeDurationMs }),
     activity: structuredClone(turn.activity),
     ...(turn.error ? { error: turn.error } : {}),
+    ...(turn.errorCategory ? { errorCategory: turn.errorCategory } : {}),
   };
+}
+
+function isProviderErrorCategory(value: unknown): value is ProviderErrorCategory {
+  return typeof value === 'string' && (PROVIDER_ERROR_CATEGORIES as readonly string[]).includes(value);
 }
 
 function isAbortError(error: unknown): boolean {
@@ -119,7 +126,7 @@ function assertProviderEvent(value: unknown): asserts value is ProviderEvent {
   }
   if (event.type === 'text-delta' && typeof event.text === 'string') return;
   if (event.type === 'completed') return;
-  if (event.type === 'error' && typeof event.code === 'string' && typeof event.retryable === 'boolean') return;
+  if (event.type === 'error' && isProviderErrorCategory(event.category) && typeof event.retryable === 'boolean') return;
   throw new Error('BAD_PROVIDER_EVENT');
 }
 
@@ -383,7 +390,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           if (answer.length + rawEvent.text.length > MAX_ASSISTANT_CHARS) throw new Error('RESPONSE_LIMIT');
           answer += rawEvent.text;
         } else if (rawEvent.type === 'error') {
-          throw new Error('PROVIDER_ERROR');
+          throw Object.assign(new Error('PROVIDER_ERROR'), { category: rawEvent.category });
         } else completed = true;
       }
       if (controller.signal.aborted) throw abortError();
@@ -425,6 +432,11 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         turn.status = turn.cancelRequested || isAbortError(error) ? 'cancelled' : 'failed';
         turn.endedAt = new Date().toISOString();
         turn.activeDurationMs = Math.max(0, Date.now() - started);
+        const category = typeof error === 'object' && error !== null && 'category' in error
+          && isProviderErrorCategory(error.category) ? error.category : undefined;
+        if (turn.status === 'cancelled') turn.errorCategory = 'cancel';
+        else if (category) turn.errorCategory = category;
+        else delete turn.errorCategory;
         if (turn.status === 'failed') {
           turn.error = error instanceof Error && error.message === 'PROVIDER_UNAVAILABLE'
             ? 'GigaChat API пока не подключён.'

@@ -224,7 +224,7 @@ test('records a safe failure and starts the next turn after adapter error', asyn
     const chatId = request.messages[0]?.text ?? '';
     started.push(chatId);
     if (chatId === 'chat-one') {
-      yield { type: 'error', code: 'PRIVATE_PROVIDER_DETAIL', retryable: false };
+      yield { type: 'error', category: 'auth', retryable: false };
       return;
     }
     yield { type: 'text-delta', text: 'Восстановились' };
@@ -239,7 +239,7 @@ test('records a safe failure and starts the next turn after adapter error', asyn
   assert.deepEqual(started, ['chat-one', 'chat-two']);
   assert.equal(runtime.list('chat-one')[0]?.status, 'failed');
   assert.match(runtime.list('chat-one')[0]?.error ?? '', /ошибкой/);
-  assert.doesNotMatch(runtime.list('chat-one')[0]?.error ?? '', /PRIVATE_PROVIDER_DETAIL/);
+  assert.equal(runtime.list('chat-one')[0]?.errorCategory, 'auth');
   assert.equal(runtime.list('chat-two')[0]?.status, 'completed');
   assert.deepEqual(saved, ['Восстановились']);
 });
