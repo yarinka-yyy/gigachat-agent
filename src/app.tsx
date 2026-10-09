@@ -63,6 +63,7 @@ import type {
   HookRegistrySnapshot,
   InstructionSaveResult,
   LocalUsageStats,
+  ModelRegistrySnapshot,
   Project,
   ProjectPatch,
   RuntimeActivity,
@@ -79,7 +80,7 @@ import type {
   VoiceAvailability,
 } from './contracts';
 import type { PermissionProfile } from './permissions';
-import { GIGACHAT_MODELS, type GigaChatModelId } from './models';
+import { isModelAvailable, modelIdsForSelection, unavailableModelRegistry, type GigaChatModelId } from './models';
 import gigaChatLogo from './assets/gigachat-logo.png';
 import { createInstructionAutosave, type SaveStatus } from './instruction-autosave';
 import { createChatForDraftSession, createNewChatDraftSession, createRendererOperationTracker, persistDraftSession, shouldOpenCreatedDraftChat, type NewChatDraftSession } from './renderer-operations';
@@ -699,6 +700,8 @@ export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [chats, setChats] = useState<ChatSummary[]>([]);
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
+  const [modelRegistry, setModelRegistry] = useState<ModelRegistrySnapshot>(() => unavailableModelRegistry());
+  const [modelRegistryLoading, setModelRegistryLoading] = useState(false);
   const settingsRef = useRef<Settings>(DEFAULT_SETTINGS);
   const [runtimeMode, setRuntimeMode] = useState<'api' | 'web'>('api');
   const [navigation, setNavigation] = useState<Navigation>({ history: [{ page: 'home' }], index: 0 });
@@ -783,6 +786,7 @@ export default function App() {
   const globalInstructionLoadGeneration = useRef(0);
   const projectInstructionLoadGeneration = useRef(0);
   const chatDetailLoadGeneration = useRef(0);
+  const modelRegistryRequestGeneration = useRef(0);
   const routeGeneration = useRef(0);
   const draftRevision = useRef(0);
   const dialogGeneration = useRef(0);
@@ -989,6 +993,19 @@ export default function App() {
     });
     return () => { cancelled = true; };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const generation = ++modelRegistryRequestGeneration.current;
+    void window.gigaChat.models.getRegistry().then((snapshot) => {
+      if (!cancelled && generation === modelRegistryRequestGeneration.current) setModelRegistry(snapshot);
+    }).catch((error: unknown) => {
+      if (!cancelled && generation === modelRegistryRequestGeneration.current) setNotice(getErrorMessage(error));
+    }).finally(() => {
+      if (!cancelled && generation === modelRegistryRequestGeneration.current) setModelRegistryLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [route.page, settingsSection]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1419,6 +1436,9 @@ export default function App() {
     || Boolean(selectedChat && chatDetail?.id === selectedChat.id);
   const composerModelId = selectedChat && chatDetail?.id === selectedChat.id
     ? chatDetail.modelId ?? settings.defaultModelId : settings.defaultModelId;
+  const settingsModelIds = modelIdsForSelection(modelRegistry, settings.defaultModelId);
+  const composerModelIds = modelIdsForSelection(modelRegistry, composerModelId);
+  const composerModelAvailable = isModelAvailable(modelRegistry, composerModelId);
   const composerProjectId = route.page === 'chat' ? selectedChat?.projectId ?? null
     : route.page === 'home' ? selectedProjectId || null : null;
   const composerSkills = skillRegistry.skills
@@ -2298,6 +2318,19 @@ export default function App() {
     else await updateLocalSettings({ defaultModelId: modelId });
   }
 
+  async function refreshModelRegistry(): Promise<void> {
+    const generation = ++modelRegistryRequestGeneration.current;
+    setModelRegistryLoading(true);
+    try {
+      const snapshot = await window.gigaChat.models.refresh();
+      if (generation === modelRegistryRequestGeneration.current) setModelRegistry(snapshot);
+    } catch (error) {
+      if (generation === modelRegistryRequestGeneration.current) setNotice(getErrorMessage(error));
+    } finally {
+      if (generation === modelRegistryRequestGeneration.current) setModelRegistryLoading(false);
+    }
+  }
+
   function saveCustomConfig(): Promise<void> {
     return trackRendererOperation(() => saveCustomConfigOperation());
   }
@@ -2723,15 +2756,33 @@ export default function App() {
       case 'models':
         return (
           <>
-            <div className="settings-section-heading"><h2>Модели и лимиты</h2><p>Выбор модели сохранится для следующих ходов. Доступность проверим после подключения API.</p></div>
-            <div className="settings-card connection-card"><div><strong>GigaChat API</strong><p>Провайдер не подключён. Список моделей и их доступность пока не загружены.</p></div><span className="status-pill"><i />Не подключён</span></div>
+            <div className="settings-section-heading"><h2>Модели и лимиты</h2><p>Список загружается из API. Контекст, цены и возможности моделей не предполагаются без подтверждённых данных.</p></div>
+            <div className="settings-card connection-card">
+              <div><strong>GigaChat API</strong><p>{modelRegistry.state === 'ready'
+                ? 'Список моделей загружен. Лимиты и дополнительные возможности неизвестны.'
+                : modelRegistry.state === 'error'
+                  ? 'Не удалось получить актуальный список. Проверьте подключение API.'
+                  : 'Подключите API на экране «Подключение API», чтобы загрузить модели.'}</p></div>
+              <span className="status-pill"><i />{modelRegistry.state === 'ready' ? 'Список загружен' : modelRegistry.state === 'error' ? 'Ошибка списка' : 'Не подключён'}</span>
+              <button type="button" className="quiet-button" onClick={() => void refreshModelRegistry()} disabled={modelRegistryLoading}>
+                {modelRegistryLoading ? 'Загружаем…' : 'Обновить список'}
+              </button>
+            </div>
             <div className="model-settings-list">
-              {GIGACHAT_MODELS.map((model) => <button type="button" key={model.id}
-                className={`permission-profile permission-profile-selectable${settings.defaultModelId === model.id ? ' selected' : ''}`}
-                aria-pressed={settings.defaultModelId === model.id} onClick={() => void updateLocalSettings({ defaultModelId: model.id })}>
-                <span className="permission-profile-copy"><strong>{model.name}</strong><span>{model.description} · Доступ не проверен</span></span>
-                <span className="status-label">{settings.defaultModelId === model.id ? 'По умолчанию' : 'Выбрать'}</span>
-              </button>)}
+              {settingsModelIds.map((modelId) => {
+                const available = isModelAvailable(modelRegistry, modelId);
+                const selected = settings.defaultModelId === modelId;
+                const unavailableDescription = modelRegistry.state === 'ready'
+                  ? 'Модель исчезла из списка; сохранённый выбор оставлен без замены'
+                  : 'Доступ не подтверждён; сохранённый выбор оставлен без замены';
+                return <button type="button" key={modelId} disabled={!available}
+                  className={`permission-profile permission-profile-selectable${selected ? ' selected' : ''}`}
+                  aria-pressed={selected} onClick={() => available && void updateLocalSettings({ defaultModelId: modelId })}>
+                  <span className="permission-profile-copy"><strong>{modelId}</strong><span>{available ? 'Доступна по текущему списку API' : unavailableDescription}</span></span>
+                  <span className="status-label">{selected ? 'По умолчанию' : available ? 'Выбрать' : 'Недоступна'}</span>
+                </button>;
+              })}
+              {settingsModelIds.length === 0 && <p className="picker-caption">Список моделей появится после успешного подключения API.</p>}
               {settings.defaultModelId && <button type="button" className="quiet-button model-clear-button" onClick={() => void updateLocalSettings({ defaultModelId: null })}>Снять выбор модели по умолчанию</button>}
             </div>
             <EmptyState title="Лимиты пока неизвестны" description="Подтверждённые данные о лимитах появятся после подключения API." icon="gauge" />
@@ -3308,16 +3359,27 @@ export default function App() {
                   <span className="toolbar-mode-slot" aria-hidden="true" />
                   </div>
                   <div className="toolbar-trailing">
-                  <ActionMenu className="composer-model-menu" placement="below" label="Выбрать модель GigaChat" onVisibilityChange={trackNativeOverlay}
+                  <ActionMenu className="composer-model-menu" placement="below" label="Выбрать модель GigaChat" onVisibilityChange={(id, visible) => {
+                    trackNativeOverlay(id, visible);
+                    if (visible && modelRegistry.state !== 'ready' && !modelRegistryLoading) void refreshModelRegistry();
+                  }}
                     disabled={!canChangeComposerPermissionProfile}
-                    trigger={<><span>{GIGACHAT_MODELS.find((model) => model.id === composerModelId)?.name ?? 'Выбрать модель'}</span><Icon name="chevron" /></>}>
+                    trigger={<><span>{composerModelId ? `${composerModelAvailable ? '' : modelRegistry.state === 'ready' ? 'Недоступна · ' : 'Доступ не подтверждён · '}${composerModelId}` : 'Выбрать модель'}</span><Icon name="chevron" /></>}>
                     <div className="model-picker-popup"><p className="picker-heading">Модель для следующих ходов</p>
-                      <p className="picker-caption">Доступность будет проверена после подключения API.</p>
-                      {GIGACHAT_MODELS.map((model) => <button type="button" className="model-picker-option" key={model.id}
-                        aria-current={model.id === composerModelId} onClick={() => void changeComposerModel(model.id)}>
-                        <span><strong>{model.name}</strong><small>{model.description}</small></span>
-                        {model.id === composerModelId && <Icon name="check" />}
-                      </button>)}
+                      <p className="picker-caption">{modelRegistry.state === 'ready'
+                        ? 'Список проверен; лимиты и дополнительные возможности неизвестны.'
+                        : 'Модели появятся после подключения API. Недоступная сохранённая модель не заменяется.'}</p>
+                      {composerModelIds.map((modelId) => {
+                        const available = isModelAvailable(modelRegistry, modelId);
+                        const unavailableDescription = modelRegistry.state === 'ready'
+                          ? 'Модель исчезла из списка; выбор сохранён'
+                          : 'Доступ не подтверждён; выбор сохранён';
+                        return <button type="button" className="model-picker-option" key={modelId} disabled={!available}
+                          aria-current={modelId === composerModelId} onClick={() => available && void changeComposerModel(modelId)}>
+                          <span><strong>{modelId}</strong><small>{available ? 'Доступна по текущему списку API' : unavailableDescription}</small></span>
+                          {modelId === composerModelId && <Icon name="check" />}
+                        </button>;
+                      })}
                     </div>
                   </ActionMenu>
                   <span className="context-indicator" role="img" tabIndex={0} aria-label="Использование контекста станет доступно после подключения API" title="Контекст станет доступен после подключения API."><ContextRing /></span>

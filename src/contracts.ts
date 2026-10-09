@@ -119,6 +119,12 @@ export interface ProviderConnectionSnapshot {
   errorCategory: ProviderErrorCategory | null;
 }
 
+export interface ModelRegistrySnapshot {
+  state: 'unavailable' | 'ready' | 'error';
+  modelIds: GigaChatModelId[];
+  errorCategory: ProviderErrorCategory | null;
+}
+
 export interface AcceptedTurnInput {
   turnId: string;
   chatId: string;
@@ -389,6 +395,10 @@ export interface AppApi {
   };
   hooks: {
     list(): Promise<HookRegistrySnapshot>;
+  };
+  models: {
+    getRegistry(): Promise<ModelRegistrySnapshot>;
+    refresh(): Promise<ModelRegistrySnapshot>;
   };
   onboarding: {
     getKeyStatus(): Promise<SecureStoreStatus>;

@@ -29,6 +29,16 @@ test('omits empty optional instruction layers without moving chat messages into 
   assert.equal(request.messages[0]?.text, 'Задача');
 });
 
+test('keeps a provider model ID outside the former static list in the accepted request', () => {
+  const request = buildInstructionRequest({
+    globalText: '',
+    messages: [userMessage],
+    permissionProfile: 'ask',
+    modelId: 'vendor/model.v4:preview',
+  });
+  assert.equal(request.modelId, 'vendor/model.v4:preview');
+});
+
 test('rejects malformed project instruction sources', () => {
   assert.throws(() => buildInstructionRequest({
     globalText: '',

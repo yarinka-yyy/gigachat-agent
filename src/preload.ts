@@ -20,6 +20,7 @@ import type {
   OnboardingBrowserStatus,
   SecureStoreStatus,
   ProviderConnectionSnapshot,
+  ModelRegistrySnapshot,
   SkillRegistrySnapshot,
   SkillScope,
   SkillSource,
@@ -110,6 +111,10 @@ const api: AppApi = {
   },
   hooks: {
     list: () => ipcRenderer.invoke('hooks:list') as Promise<HookRegistrySnapshot>,
+  },
+  models: {
+    getRegistry: () => ipcRenderer.invoke('models:get-registry') as Promise<ModelRegistrySnapshot>,
+    refresh: () => ipcRenderer.invoke('models:refresh') as Promise<ModelRegistrySnapshot>,
   },
   onboarding: {
     getKeyStatus: () => ipcRenderer.invoke('onboarding:key-status') as Promise<SecureStoreStatus>,

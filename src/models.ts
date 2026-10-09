@@ -1,15 +1,38 @@
-export const GIGACHAT_MODELS = [
-  { id: 'GigaChat-2-Lite', name: 'GigaChat 2 Lite', description: 'Быстрая модель для повседневных задач' },
-  { id: 'GigaChat-2-Pro', name: 'GigaChat 2 Pro', description: 'Для более сложных задач' },
-  { id: 'GigaChat-2-Max', name: 'GigaChat 2 Max', description: 'Для наиболее сложных задач' },
-  { id: 'GigaChat-3-Ultra', name: 'GigaChat 3 Ultra', description: 'Доступность зависит от учётной записи' },
-] as const;
+import type { ModelRegistrySnapshot, ProviderErrorCategory } from './contracts';
 
-export type GigaChatModelId = typeof GIGACHAT_MODELS[number]['id'];
+export type GigaChatModelId = string;
 
 export function requireModelId(value: unknown): GigaChatModelId {
-  if (typeof value !== 'string' || !GIGACHAT_MODELS.some((model) => model.id === value)) {
-    throw new Error('Неизвестная модель GigaChat.');
+  if (typeof value !== 'string' || !value.trim() || value.length > 200 || /[\u0000-\u001F\u007F-\u009F]/.test(value)) {
+    throw new Error('Некорректный идентификатор модели GigaChat.');
   }
-  return value as GigaChatModelId;
+  return value;
+}
+
+export function unavailableModelRegistry(errorCategory: ProviderErrorCategory | null = null): ModelRegistrySnapshot {
+  return { state: 'unavailable', modelIds: [], errorCategory };
+}
+
+export function failedModelRegistry(errorCategory: ProviderErrorCategory): ModelRegistrySnapshot {
+  return { state: 'error', modelIds: [], errorCategory };
+}
+
+export function discoveredModelRegistry(ids: readonly unknown[]): ModelRegistrySnapshot {
+  const modelIds = [...new Set(ids.map(requireModelId))];
+  return modelIds.length
+    ? { state: 'ready', modelIds, errorCategory: null }
+    : failedModelRegistry('model');
+}
+
+export function isModelAvailable(registry: ModelRegistrySnapshot, modelId: GigaChatModelId | null): boolean {
+  return modelId !== null && registry.state === 'ready' && registry.modelIds.includes(modelId);
+}
+
+export function modelIdsForSelection(
+  registry: ModelRegistrySnapshot,
+  selectedModelId: GigaChatModelId | null,
+): GigaChatModelId[] {
+  const ids = registry.state === 'ready' ? [...registry.modelIds] : [];
+  if (selectedModelId !== null && !ids.includes(selectedModelId)) ids.push(selectedModelId);
+  return ids;
 }

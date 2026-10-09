@@ -52,7 +52,7 @@ test('persists projects, chats, relationships, drafts, image kind, and settings'
     defaultProjectsFolder: 'C:\\projects',
     preferredOpener: 'explorer',
     defaultPermissionProfile: 'approve',
-    defaultModelId: 'GigaChat-2-Pro',
+    defaultModelId: 'vendor/model.v4:preview',
     onboardingCompleted: false,
     microphoneConsent: 'allowed',
     notifications: { taskStarted: true, taskCompleted: false, failures: true },
@@ -66,8 +66,8 @@ test('persists projects, chats, relationships, drafts, image kind, and settings'
   assert.equal((await restored.getChat(chat.id)).nextTurnSkillId, 'global/review');
   assert.equal((await restored.getChat(chat.id)).projectId, project.id);
   assert.equal((await restored.getChat(chat.id)).modelId, null);
-  await restored.updateChat(chat.id, { modelId: 'GigaChat-3-Ultra' });
-  assert.equal((await (await openStore(directory)).getChat(chat.id)).modelId, 'GigaChat-3-Ultra');
+  await restored.updateChat(chat.id, { modelId: 'legacy/model-v1' });
+  assert.equal((await (await openStore(directory)).getChat(chat.id)).modelId, 'legacy/model-v1');
   assert.equal((await restored.getChat(imageChat.id)).kind, 'image');
   assert.deepEqual(await restored.getSettings(), {
     theme: 'warm',
@@ -81,7 +81,7 @@ test('persists projects, chats, relationships, drafts, image kind, and settings'
     defaultProjectsFolder: 'C:\\projects',
     preferredOpener: 'explorer',
     defaultPermissionProfile: 'approve',
-    defaultModelId: 'GigaChat-2-Pro',
+    defaultModelId: 'vendor/model.v4:preview',
     onboardingCompleted: false,
     microphoneConsent: 'allowed',
     notifications: { taskStarted: true, taskCompleted: false, failures: true },
@@ -90,7 +90,21 @@ test('persists projects, chats, relationships, drafts, image kind, and settings'
   await assert.rejects(store.updateSettings({ notifications: { taskStarted: true, taskCompleted: false, failures: 'yes' } } as never));
   await assert.rejects(store.updateChat(chat.id, { nextTurnPermissionProfile: 'unknown' } as never));
   await assert.rejects(store.updateChat(chat.id, { nextTurnSkillId: 'global/../outside' } as never));
-  await assert.rejects(store.updateChat(chat.id, { modelId: 'not-a-model' } as never));
+  await assert.rejects(store.updateChat(chat.id, { modelId: '\0invalid' } as never));
+});
+
+test('retains an older unavailable model ID when reading a chat after reload', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-legacy-model-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const path = join(directory, 'chats', chat.id, 'chat.json');
+  const detail = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+  detail.modelId = 'retired/model-v0';
+  await writeFile(path, JSON.stringify(detail));
+
+  const restored = await openStore(directory);
+  assert.equal((await restored.getChat(chat.id)).modelId, 'retired/model-v0');
 });
 
 test('migrates v1 projects, chats, drafts, and theme without losing data', async (t) => {
@@ -234,16 +248,16 @@ test('accepts an immutable turn snapshot with the local message and its project 
   await store.updateProject(project.id, { workingFolder });
   const chat = await store.createChat(project.id);
   await store.appendLocalMessage(chat.id, 'Первая реплика');
-  await store.updateSettings({ defaultPermissionProfile: 'approve', defaultModelId: 'GigaChat-3-Ultra' });
+  await store.updateSettings({ defaultPermissionProfile: 'approve', defaultModelId: 'next/model-v5' });
   await store.updateChat(chat.id, {
-    modelId: 'GigaChat-2-Pro',
+    modelId: 'vendor/model.v4:preview',
     nextTurnPermissionProfile: 'full',
     nextTurnSkillId: `project/${project.id}/review`,
   });
 
   const accepted = await store.acceptLocalMessage(chat.id, 'Ответьте на первую реплику', 'turn-b1');
   await store.appendLocalMessage(chat.id, 'Это уже следующий ход');
-  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Ultra', nextTurnPermissionProfile: 'ask', nextTurnSkillId: null });
+  await store.updateChat(chat.id, { modelId: 'legacy/model-v1', nextTurnPermissionProfile: 'ask', nextTurnSkillId: null });
 
   assert.equal(accepted.detail.messages[accepted.detail.messages.length - 1]?.text, 'Ответьте на первую реплику');
   assert.equal(accepted.detail.draft, '');
@@ -254,7 +268,7 @@ test('accepts an immutable turn snapshot with the local message and its project 
   assert.equal(accepted.turn.messageId, accepted.detail.messages[accepted.detail.messages.length - 1]?.id);
   assert.equal(accepted.turn.historyBoundary, 2);
   assert.deepEqual(accepted.turn.messages.map(({ text }) => text), ['Первая реплика', 'Ответьте на первую реплику']);
-  assert.equal(accepted.turn.modelId, 'GigaChat-2-Pro');
+  assert.equal(accepted.turn.modelId, 'vendor/model.v4:preview');
   assert.equal(accepted.turn.permissionProfile, 'full');
   assert.equal(accepted.turn.skillId, `project/${project.id}/review`);
 });

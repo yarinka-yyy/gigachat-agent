@@ -7,7 +7,7 @@ import { openStore, type LocalStore } from './store';
 import { buildInstructionRequest } from './instructions';
 import { createLocalTools, createPowerShellHelper, resolvePowerShellHelperPath, type LocalTools } from './local-tools';
 import { createTurnRuntime, type TurnRuntime } from './runtime';
-import type { AcceptedTurnInput, ChatPatch, FolderOpener, NotificationSettings, PreferredOpener, RuntimeAvailability, SettingsPatch, Theme, VoiceAvailability } from './contracts';
+import type { AcceptedTurnInput, ChatPatch, FolderOpener, ModelRegistrySnapshot, NotificationSettings, PreferredOpener, RuntimeAvailability, SettingsPatch, Theme, VoiceAvailability } from './contracts';
 import { requirePermissionProfile } from './permissions';
 import { requireModelId } from './models';
 import { openCustomPermissions, parseCustomConfig } from './custom-permissions';
@@ -796,6 +796,7 @@ async function registerIpcHandlers(
     'voice:status', 'voice:cancel', 'skills:list', 'skills:read-source', 'skills:open-folder', 'hooks:list',
     'onboarding:key-status', 'onboarding:browser-status', 'onboarding:browser-open', 'onboarding:browser-close',
     'onboarding:connection-status',
+    'models:get-registry', 'models:refresh',
     'onboarding:browser-back', 'onboarding:browser-reload', 'onboarding:browser-bounds',
     'browser:status', 'browser:bounds', 'runtime:cancel',
     'settings:get', 'usage:local-stats', 'settings:open-projects-folder', 'settings:list-openers', 'settings:app-info',
@@ -804,7 +805,7 @@ async function registerIpcHandlers(
   const readOnlyChannels = new Set([
     'projects:list', 'projects:read-instructions', 'projects:instructions-backup-path',
     'chats:list', 'chats:get', 'runtime:list', 'runtime:status', 'permissions:read-config',
-    'voice:status', 'skills:list', 'skills:read-source', 'hooks:list', 'onboarding:key-status', 'onboarding:connection-status',
+    'voice:status', 'skills:list', 'skills:read-source', 'hooks:list', 'onboarding:key-status', 'onboarding:connection-status', 'models:get-registry',
     'onboarding:browser-status', 'browser:status', 'settings:get', 'usage:local-stats',
     'settings:list-openers', 'settings:app-info', 'settings:get-auto-start', 'settings:read-instructions',
   ]);
@@ -826,6 +827,13 @@ async function registerIpcHandlers(
         track: options.track,
       });
     });
+  };
+
+  const refreshModelRegistry = async (): Promise<ModelRegistrySnapshot> => {
+    if (providerConnection.getConnectionStatus().state === 'connected') {
+      await providerConnection.listModels().catch(() => undefined);
+    }
+    return providerConnection.getModelRegistry();
   };
 
   ipcMain.handle('app:close-handler-ready', (event) => {
@@ -1037,6 +1045,8 @@ async function registerIpcHandlers(
   handle('onboarding:connect', () => providerConnection.connect(), { track: false });
   handle('onboarding:connect-cancel', () => providerConnection.cancelConnect());
   handle('onboarding:disconnect', () => providerConnection.disconnect());
+  handle('models:get-registry', () => providerConnection.getModelRegistry());
+  handle('models:refresh', () => refreshModelRegistry(), { track: false });
   handle('onboarding:browser-status', () => browser.getStatus());
   handle('onboarding:browser-open', () => browser.openStudio());
   handle('onboarding:browser-close', () => browser.close());

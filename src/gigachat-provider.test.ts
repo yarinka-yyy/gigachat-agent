@@ -124,6 +124,66 @@ test('connect uses OAuth Basic/RqUID/scope, then discovers models without exposi
   assert.doesNotMatch(JSON.stringify(status), /synthetic-authorization-key|synthetic-access-token/);
 });
 
+test('discovers future model IDs without inventing model capabilities', async () => {
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => request.url === GIGACHAT_OAUTH_URL
+      ? jsonResponse(200, token('synthetic-token'))
+      : jsonResponse(200, { data: [{ id: 'vendor/model.v4:preview', context_length: 999_999, functions: true, vision: true }] })),
+  });
+
+  assert.equal((await provider.connect()).state, 'connected');
+  assert.deepEqual(provider.getModelRegistry(), {
+    state: 'ready', modelIds: ['vendor/model.v4:preview'], errorCategory: null,
+  });
+  assert.deepEqual(Object.keys(provider.getModelRegistry()).sort(), ['errorCategory', 'modelIds', 'state']);
+});
+
+test('latest model refresh owns one provider registry even when replies finish in reverse order', async () => {
+  const firstRefresh = deferred<ProviderTransportResponse>();
+  const secondRefresh = deferred<ProviderTransportResponse>();
+  let modelRequests = 0;
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => {
+      if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
+      modelRequests += 1;
+      if (modelRequests === 1) return jsonResponse(200, { data: [{ id: 'initial/model' }] });
+      if (modelRequests === 2) return firstRefresh.promise;
+      return secondRefresh.promise;
+    }),
+  });
+
+  assert.equal((await provider.connect()).state, 'connected');
+  const first = provider.listModels();
+  const second = provider.listModels();
+  await waitFor(() => modelRequests === 3);
+
+  secondRefresh.resolve(jsonResponse(200, { data: [{ id: 'current/model-v2' }] }));
+  assert.deepEqual(await second, ['current/model-v2']);
+  firstRefresh.resolve(jsonResponse(200, { data: [{ id: 'stale/model-v1' }] }));
+  assert.deepEqual(await first, ['stale/model-v1']);
+
+  assert.deepEqual(provider.getModelRegistry(), {
+    state: 'ready', modelIds: ['current/model-v2'], errorCategory: null,
+  });
+});
+
+test('empty model discovery is an explicit error snapshot', async () => {
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => request.url === GIGACHAT_OAUTH_URL
+      ? jsonResponse(200, token('synthetic-token'))
+      : jsonResponse(200, { data: [] })),
+  });
+
+  assert.deepEqual(await provider.connect(), { state: 'error', errorCategory: 'model' });
+  assert.deepEqual(provider.getModelRegistry(), { state: 'error', modelIds: [], errorCategory: 'model' });
+});
+
 test('invalid authorization key returns only the safe auth category', async () => {
   const provider = createGigaChatProvider({
     loadAuthorizationKey: async () => 'synthetic-invalid-key',

@@ -3,7 +3,8 @@ import { randomUUID, X509Certificate } from 'node:crypto';
 import { type ClientRequest, type IncomingHttpHeaders, type IncomingMessage } from 'node:http';
 import { Agent, request as httpsRequest } from 'node:https';
 import * as tls from 'node:tls';
-import type { ProviderConnectionSnapshot, ProviderErrorCategory } from './contracts';
+import type { ModelRegistrySnapshot, ProviderConnectionSnapshot, ProviderErrorCategory } from './contracts';
+import { discoveredModelRegistry, failedModelRegistry, requireModelId, unavailableModelRegistry } from './models';
 
 export const GIGACHAT_API_BASE_URL = 'https://api.giga.chat/v1';
 export const GIGACHAT_OAUTH_URL = 'https://ngw.devices.sberbank.ru:9443/api/v2/oauth';
@@ -37,6 +38,7 @@ export interface ProviderTransport {
 
 export interface GigaChatProviderConnection {
   getConnectionStatus(): ProviderConnectionSnapshot;
+  getModelRegistry(): ModelRegistrySnapshot;
   connect(): Promise<ProviderConnectionSnapshot>;
   cancelConnect(): ProviderConnectionSnapshot;
   disconnect(): ProviderConnectionSnapshot;
@@ -184,8 +186,11 @@ export function createGigaChatProvider(options: {
   let connectController: AbortController | null = null;
   let accessToken: AccessToken | null = null;
   let refreshFlight: RefreshFlight | null = null;
+  let modelRegistry = unavailableModelRegistry();
+  let modelRegistryGeneration = 0;
 
   const getStatus = (): ProviderConnectionSnapshot => ({ ...connectionStatus });
+  const getModelRegistry = (): ModelRegistrySnapshot => ({ ...modelRegistry, modelIds: [...modelRegistry.modelIds] });
   const setStatus = (status: ProviderConnectionSnapshot): void => { connectionStatus = status; };
   const assertCurrent = (expectedGeneration: number, signal: AbortSignal): void => {
     if (generation !== expectedGeneration || signal.aborted) throw new GigaChatProviderError('cancel');
@@ -204,6 +209,7 @@ export function createGigaChatProvider(options: {
 
   const reset = (): number => {
     generation += 1;
+    modelRegistryGeneration += 1;
     const previousSession = sessionController;
     sessionController = new AbortController();
     previousSession.abort();
@@ -214,6 +220,7 @@ export function createGigaChatProvider(options: {
     refreshFlight = null;
     activeRefresh?.controller.abort();
     accessToken = null;
+    modelRegistry = unavailableModelRegistry();
     setStatus({ state: 'not-configured', errorCategory: null });
     return generation;
   };
@@ -382,6 +389,7 @@ export function createGigaChatProvider(options: {
       const models = await listModelsWithAuthRetry(controller.signal, operationGeneration);
       assertCurrent(operationGeneration, controller.signal);
       if (models.length === 0) throw new GigaChatProviderError('model');
+      modelRegistry = discoveredModelRegistry(models);
       setStatus({ state: 'connected', errorCategory: null });
     } catch (error) {
       if (operationGeneration !== generation) return getStatus();
@@ -389,6 +397,7 @@ export function createGigaChatProvider(options: {
       if (controller.signal.aborted || category === 'cancel') {
         setStatus({ state: 'not-configured', errorCategory: null });
       } else {
+        modelRegistry = failedModelRegistry(category);
         setStatus({ state: 'error', errorCategory: category });
       }
     } finally {
@@ -405,14 +414,28 @@ export function createGigaChatProvider(options: {
 
   return {
     getConnectionStatus: getStatus,
+    getModelRegistry,
     connect,
     cancelConnect,
     disconnect: () => { reset(); return getStatus(); },
     invalidateSavedKey: () => { reset(); },
     listModels: async (signal) => {
+      const discoveryGeneration = ++modelRegistryGeneration;
       const operationGeneration = generation;
       const operation = linkAbortSignals(sessionController.signal, ...(signal ? [signal] : []));
-      try { return await listModelsWithAuthRetry(operation.controller.signal, operationGeneration); }
+      try {
+        const models = await listModelsWithAuthRetry(operation.controller.signal, operationGeneration);
+        assertCurrent(operationGeneration, operation.controller.signal);
+        if (discoveryGeneration === modelRegistryGeneration && connectionStatus.state === 'connected') {
+          modelRegistry = discoveredModelRegistry(models);
+        }
+        return models;
+      } catch (error) {
+        if (discoveryGeneration === modelRegistryGeneration && connectionStatus.state === 'connected') {
+          modelRegistry = failedModelRegistry(error instanceof GigaChatProviderError ? error.category : 'network');
+        }
+        throw error;
+      }
       finally { operation.dispose(); }
     },
   };
@@ -500,10 +523,9 @@ function awaitWithAbort<T>(promise: Promise<T>, signal: AbortSignal, onLate?: (v
 function parseModelIds(value: unknown): string[] {
   if (!isRecord(value) || !Array.isArray(value.data)) throw new GigaChatProviderError('protocol');
   const ids = value.data.map((entry: unknown) => {
-    if (!isRecord(entry) || typeof entry.id !== 'string' || !entry.id.trim() || entry.id.length > 200) {
-      throw new GigaChatProviderError('protocol');
-    }
-    return entry.id;
+    if (!isRecord(entry)) throw new GigaChatProviderError('protocol');
+    try { return requireModelId(entry.id); }
+    catch { throw new GigaChatProviderError('protocol'); }
   });
   if (new Set(ids).size !== ids.length) throw new GigaChatProviderError('protocol');
   return ids;
