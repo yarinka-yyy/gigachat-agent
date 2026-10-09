@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { evaluatePermission } from './permissions';
+import { evaluatePermission, type PermissionAction, type PermissionResource } from './permissions';
 
 test('allows verified project work and bounded process execution', () => {
   for (const resource of ['project-files', 'process'] as const) {
@@ -48,4 +48,40 @@ test('denies a target resolved to a sibling project', () => {
   });
   assert.equal(result.decision, 'deny');
   assert.match(result.reason, /не относится к проекту/);
+});
+
+test('Full allows every available supported action without a project binding', () => {
+  const supported: Array<[PermissionResource, PermissionAction]> = [
+    ['project-files', 'list'], ['project-files', 'search'], ['project-files', 'read'],
+    ['project-files', 'write'], ['project-files', 'open'],
+    ['machine-files', 'list'], ['machine-files', 'search'], ['machine-files', 'read'],
+    ['machine-files', 'write'], ['machine-files', 'open'],
+    ['process', 'execute'], ['network', 'connect'], ['browser', 'open'], ['browser', 'connect'],
+    ['application', 'open'], ['application', 'execute'],
+  ];
+  for (const [resource, action] of supported) {
+    assert.equal(evaluatePermission({
+      profile: 'full', resource, action,
+      projectId: null, targetProjectId: null, capabilityAvailable: true,
+    }).decision, 'allow', `${resource}/${action}`);
+  }
+  assert.equal(evaluatePermission({
+    profile: 'full', resource: 'project-files', action: 'read',
+    projectId: 'project-1', targetProjectId: 'project-2', capabilityAvailable: true,
+  }).decision, 'allow');
+});
+
+test('Ask and Approve keep exact external actions behind manual approval', () => {
+  for (const profile of ['ask', 'approve'] as const) {
+    const result = evaluatePermission({
+      profile, resource: 'network', action: 'connect',
+      projectId: 'project-1', targetProjectId: null, capabilityAvailable: true,
+    });
+    assert.equal(result.decision, 'ask');
+    if (profile === 'approve') assert.match(result.reason, /Автоматическая проверка.*не настроена/);
+  }
+  assert.equal(evaluatePermission({
+    profile: 'ask', resource: 'project-files', action: 'read',
+    projectId: 'project-1', targetProjectId: null, capabilityAvailable: true,
+  }).decision, 'ask');
 });

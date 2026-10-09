@@ -10,8 +10,14 @@ export function createPermissionApprovals(
   let generation = 0;
   return {
     request: (details: Omit<PermissionApprovalRequest, 'id' | 'expiresAt'>, signal?: AbortSignal): Promise<boolean> => {
+      const snapshot = Object.freeze({
+        resource: details.resource,
+        action: details.action,
+        target: details.target,
+        reason: details.reason,
+      });
       const requestedGeneration = generation;
-      const result = tail.then(() => requestedGeneration === generation ? ask(details, signal) : false);
+      const result = tail.then(() => requestedGeneration === generation ? ask(snapshot, signal) : false);
       tail = result.then(() => undefined);
       return result;
     },

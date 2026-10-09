@@ -141,6 +141,8 @@ test('sends PowerShell only as JSON stdin and keeps script text out of helper ar
     script,
     timeoutMs: 10_000,
     maxOutputBytes: 1024,
+    trustedFullAccess: true,
+    projectScoped: false,
   }), { exitCode: 0, stdout: 'ok', stderr: '', timedOut: false, outputLimited: false });
   assert.equal(calls.length, 1);
   assert.equal(calls[0]?.command, helperPath);
@@ -151,6 +153,8 @@ test('sends PowerShell only as JSON stdin and keeps script text out of helper ar
     Script: script,
     TimeoutMs: 10_000,
     MaxOutputBytes: 1024,
+    TrustedFullAccess: true,
+    ProjectScoped: false,
   });
   assert.equal(calls[0]?.options.shell, false);
   assert.deepEqual(calls[0]?.options.stdio, ['pipe', 'pipe', 'pipe']);
@@ -609,6 +613,78 @@ test('rechecks the working-folder path on every request and keeps PowerShell dis
   const unavailable = makeTools(fixture.project, [], []);
   await assert.rejects(unavailable.runPowerShell(projectId, 'full', 'Get-Location'), /пока недоступен/);
   assert.equal(events.filter((event) => event.phase === 'failed').length, 1);
+});
+
+test('Full PowerShell uses the selected project or verified cwd and Ask never selects native Full mode', async (t) => {
+  if (process.platform !== 'win32') {
+    t.skip('The native local-tool capability exists only on Windows.');
+    return;
+  }
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  const requests: PowerShellRequest[] = [];
+  const tools = createLocalTools({
+    resolveProject: async (id) => id === fixture.project.id ? fixture.project : null,
+    runPowerShell: async (request) => {
+      requests.push(request);
+      return { exitCode: 0, stdout: '', stderr: '', timedOut: false, outputLimited: false };
+    },
+  });
+
+  await tools.runPowerShell(null, 'full', 'Write-Output "full without project"');
+  assert.equal(requests[0]?.workingFolder, process.cwd());
+  assert.equal(requests[0]?.trustedFullAccess, true);
+  assert.equal(requests[0]?.projectScoped, false);
+
+  await tools.runPowerShell(projectId, 'full', 'Write-Output "full in project"');
+  assert.equal(requests[1]?.workingFolder, fixture.projectFolder);
+  assert.equal(requests[1]?.trustedFullAccess, true);
+  assert.equal(requests[1]?.projectScoped, true);
+
+  await tools.runPowerShell(projectId, 'ask', 'Write-Output "bounded"');
+  assert.equal(requests[2]?.trustedFullAccess, false);
+  assert.equal(requests[2]?.projectScoped, true);
+  await assert.rejects(tools.runPowerShell(null, 'ask', 'Write-Output "no project"'), /project|проект|идентификатор/i);
+  assert.equal(requests.length, 3);
+});
+
+test('one-time Full shell escape requires a whole-command approval and uses the manual fallback', async (t) => {
+  if (process.platform !== 'win32') {
+    t.skip('The native local-tool capability exists only on Windows.');
+    return;
+  }
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  const command = "Invoke-WebRequest -Uri 'http://127.0.0.1:8123/fixture'";
+  const approvals: Array<{ resource: string; action: string; target: string; reason: string }> = [];
+  const requests: PowerShellRequest[] = [];
+  let allow = false;
+  const tools = createLocalTools({
+    resolveProject: async (id) => id === fixture.project.id ? fixture.project : null,
+    requestApproval: async (request) => { approvals.push(request); return allow; },
+    runPowerShell: async (request) => {
+      requests.push(request);
+      return { exitCode: 0, stdout: 'ok', stderr: '', timedOut: false, outputLimited: false };
+    },
+  });
+
+  await assert.rejects(tools.runPowerShell(projectId, 'ask', command, { fullAccessOnce: true }), /не подтверждено/);
+  assert.equal(requests.length, 0, 'A denied full-access approval must not launch PowerShell.');
+  assert.deepEqual(approvals[0], {
+    resource: 'process',
+    action: 'execute',
+    target: `PowerShell без AppContainer\nРабочая папка: ${fixture.projectFolder}\nКоманда:\n${command}`,
+    reason: 'Действие выходит за границу проекта и требует вашего подтверждения. Команда получит доступ к файлам, доступным текущей учётной записи, и сети; доступ не ограничен одним путём.',
+  });
+
+  allow = true;
+  await tools.runPowerShell(projectId, 'approve', command, { fullAccessOnce: true });
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.script, command);
+  assert.equal(requests[0]?.workingFolder, fixture.projectFolder);
+  assert.equal(requests[0]?.trustedFullAccess, true);
+  assert.equal(requests[0]?.projectScoped, true);
+  assert.match(approvals[1]?.reason ?? '', /Автоматическая проверка не настроена/);
 });
 
 test('can cancel a long search between filesystem operations', async (t) => {

@@ -658,9 +658,9 @@ async function createMainRuntime(
     } catch {
       helper = undefined;
       // A runtime recovery failure disables tools but does not prevent local chats from opening.
-      unavailableReason = 'Не удалось восстановить ограниченный локальный runtime.';
+      unavailableReason = 'Не удалось восстановить локальный PowerShell runtime.';
     }
-  } else unavailableReason = 'Ограниченные локальные инструменты доступны только в Windows-сборке.';
+  } else unavailableReason = 'Локальный PowerShell helper доступен только в Windows-сборке.';
 
   const voiceService = await createVoiceService(app.getPath('userData'));
 

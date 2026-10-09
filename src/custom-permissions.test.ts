@@ -45,11 +45,12 @@ test('routes custom allow, ask, deny and additional roots through local tools', 
   let approvals = 0;
   let writes = 0;
   let allow = false;
+  const approvalRequests: Array<{ resource: string; action: string; target: string; reason: string }> = [];
   const tools = createLocalTools({
     resolveProject: async (id) => id === project.id ? project : null,
     protectedDirectory: data,
     getCustomPolicy: config.policy,
-    requestApproval: async () => { approvals++; return allow; },
+    requestApproval: async (request) => { approvals++; approvalRequests.push(request); return allow; },
     writeFile: async (request) => { writes++; return { bytes: Buffer.from(request.contentsBase64, 'base64').byteLength, replacedExisting: false }; },
   });
   await assert.rejects(tools.write(project.id, 'custom', 'file.md', 'text'), /не подтверждено/);
@@ -61,7 +62,17 @@ test('routes custom allow, ask, deny and additional roots through local tools', 
   await tools.write('root:extra', 'custom', 'file.md', 'text');
   assert.equal(approvals, 2);
   assert.equal(writes, 2);
-  await assert.rejects(tools.write('root:extra', 'ask', 'file.md', 'text'), /недоступен/);
+  allow = false;
+  await assert.rejects(tools.write('root:extra', 'ask', 'file.md', 'text'), /не подтверждено/);
+  assert.equal(writes, 2);
+  assert.deepEqual(approvalRequests[2], {
+    resource: 'project-files', action: 'write', target: join(extra, 'file.md'),
+    reason: 'Действие использует дополнительный каталог и требует отдельного подтверждения.',
+  });
+  allow = true;
+  await tools.write('root:extra', 'approve', 'file.md', 'text');
+  assert.equal(writes, 3);
+  assert.match(approvalRequests[3]?.reason ?? '', /Автоматическая проверка не настроена/);
   await assert.rejects(tools.write(project.id, 'custom', '..\\outside.md', 'text'), /путь/i);
   await assert.rejects(tools.write('root:missing', 'custom', 'file.md', 'text'), /не найдена/);
   assert.equal(evaluatePermission({ profile: 'custom', resource: 'project-files', action: 'open',

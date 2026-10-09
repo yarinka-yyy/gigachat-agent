@@ -38,6 +38,8 @@ export interface PowerShellRequest {
   script: string;
   timeoutMs: number;
   maxOutputBytes: number;
+  trustedFullAccess?: boolean;
+  projectScoped?: boolean;
   inputDataBase64?: string;
   signal?: AbortSignal;
 }
@@ -236,7 +238,7 @@ export function createPowerShellHelper(options: PowerShellHelperOptions): PowerS
     const result = await invokePowerShellHelper(helperPath,
       ['--recover', recoveryDirectory], undefined, HELPER_RECOVERY_TIMEOUT_MS, spawnProcess);
     if (result.processError || result.code !== 0 || result.timedOut || result.responseLimit) {
-      throw new LocalToolError('Не удалось восстановить ограниченный PowerShell runtime.');
+      throw new LocalToolError('Не удалось восстановить PowerShell runtime.');
     }
     const response = parseHelperJson(result.stdout);
     if (!isRecord(response) || response.recovered !== true) {
@@ -262,14 +264,18 @@ export function createPowerShellHelper(options: PowerShellHelperOptions): PowerS
     if (!isAbsolute(request.workingFolder) || request.workingFolder.includes('\0')
       || typeof request.script !== 'string' || request.script.length === 0 || request.script.length > MAX_SCRIPT_LENGTH
       || !Number.isSafeInteger(request.timeoutMs) || request.timeoutMs < 100 || request.timeoutMs > MAX_RUN_TIMEOUT_MS
-      || !Number.isSafeInteger(request.maxOutputBytes) || request.maxOutputBytes < 1 || request.maxOutputBytes > MAX_POWER_SHELL_OUTPUT_BYTES) {
-      throw new LocalToolError('Некорректные параметры ограниченного PowerShell.');
+      || !Number.isSafeInteger(request.maxOutputBytes) || request.maxOutputBytes < 1 || request.maxOutputBytes > MAX_POWER_SHELL_OUTPUT_BYTES
+      || (request.trustedFullAccess !== undefined && typeof request.trustedFullAccess !== 'boolean')
+      || (request.projectScoped !== undefined && typeof request.projectScoped !== 'boolean')) {
+      throw new LocalToolError('Некорректные параметры PowerShell.');
     }
     const input = JSON.stringify({
       WorkingFolder: request.workingFolder,
       Script: request.script,
       TimeoutMs: request.timeoutMs,
       MaxOutputBytes: request.maxOutputBytes,
+      TrustedFullAccess: request.trustedFullAccess === true,
+      ProjectScoped: request.projectScoped !== false,
       ...(inputDataBase64 === undefined ? {} : { InputDataBase64: inputDataBase64 }),
     });
     let result: HelperProcessResult;
@@ -278,9 +284,9 @@ export function createPowerShellHelper(options: PowerShellHelperOptions): PowerS
         ['--run', recoveryDirectory], input, request.timeoutMs + 15_000, spawnProcess, request.signal);
     } catch {
       await recoverUnlocked().catch(() => {
-        throw new LocalToolError('Не удалось восстановить ограниченный PowerShell runtime после ошибки запуска.');
+        throw new LocalToolError('Не удалось восстановить PowerShell runtime после ошибки запуска.');
       });
-      throw new LocalToolError('Не удалось запустить ограниченный PowerShell helper.');
+      throw new LocalToolError('Не удалось запустить PowerShell helper.');
     }
 
     if (result.aborted || result.timedOut || result.responseLimit || result.processError || result.code !== 0) {
@@ -289,7 +295,7 @@ export function createPowerShellHelper(options: PowerShellHelperOptions): PowerS
         try { return JSON.parse(result.stdout.trim()) as unknown; } catch { return null; }
       })();
       await recoverUnlocked().catch(() => {
-        throw new LocalToolError('Не удалось восстановить ограниченный PowerShell runtime после остановки.');
+        throw new LocalToolError('Не удалось восстановить PowerShell runtime после остановки.');
       });
       if (result.aborted) {
         const error = new Error('Локальная операция отменена.');
@@ -302,7 +308,7 @@ export function createPowerShellHelper(options: PowerShellHelperOptions): PowerS
       }
       if (result.responseLimit) throw new LocalToolError('Ответ локального PowerShell helper превысил безопасный лимит.');
       const code = isRecord(failure) && Number.isSafeInteger(failure.Code) ? ` (код ${failure.Code})` : '';
-      throw new LocalToolError(`Ограниченный PowerShell helper завершился с ошибкой${code}.`);
+      throw new LocalToolError(`PowerShell helper завершился с ошибкой${code}.`);
     }
 
     let response: unknown;
@@ -314,7 +320,7 @@ export function createPowerShellHelper(options: PowerShellHelperOptions): PowerS
     if (isRecord(response) && 'Error' in response) {
       await recoverUnlocked();
       const code = Number.isSafeInteger(response.Code) ? ` (${response.Code})` : '';
-      throw new LocalToolError(`Ограниченный PowerShell helper отклонил запрос${code}.`);
+      throw new LocalToolError(`PowerShell helper отклонил запрос${code}.`);
     }
     try {
       return requirePowerShellResult(response, request.maxOutputBytes);
@@ -493,6 +499,8 @@ export interface LocalTools {
   runPowerShell(projectId: unknown, profile: unknown, script: unknown, options?: {
     timeoutMs?: unknown;
     signal?: AbortSignal;
+    /** Main-process only: request one explicit user approval for this whole command without AppContainer. */
+    fullAccessOnce?: unknown;
   }): Promise<PowerShellResult>;
 }
 
@@ -830,17 +838,24 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
     }
   }
 
-  async function resolveRoot(referenceInput: unknown, profile: PermissionProfile) {
+  async function resolveRoot(referenceInput: unknown, profile: PermissionProfile, allowCurrentWorkingDirectory = false) {
     const rootName = typeof referenceInput === 'string' && /^root:[a-z][a-z0-9_-]{0,31}$/.test(referenceInput)
       ? referenceInput.slice(5) : null;
-    const projectId = rootName ? null : requireProjectId(referenceInput);
+    const canUseCurrentDirectory = referenceInput === null && (profile === 'full' || allowCurrentWorkingDirectory);
+    const projectId = rootName ? null : canUseCurrentDirectory ? null : requireProjectId(referenceInput);
     let folder: string | null = null;
     if (rootName) {
-      if (profile !== 'custom' || !options.getCustomPolicy) throw new LocalToolError('Дополнительный каталог недоступен для этого профиля.');
+      if ((profile !== 'custom' && profile !== 'ask' && profile !== 'approve') || !options.getCustomPolicy) {
+        throw new LocalToolError('Дополнительный каталог недоступен для этого профиля.');
+      }
       folder = (await options.getCustomPolicy()).roots.find((root) => root.name === rootName)?.path ?? null;
     } else {
-      const project = await options.resolveProject(projectId as string);
-      folder = project?.id === projectId ? project.workingFolder : null;
+      if (projectId) {
+        const project = await options.resolveProject(projectId);
+        folder = project?.id === projectId ? project.workingFolder : null;
+      } else if (canUseCurrentDirectory) {
+        folder = process.cwd();
+      }
     }
     if (!folder || !isAbsolute(folder)) throw new LocalToolError('рабочая папка не найдена или недоступна.');
     await assertNoReparseComponents(folder);
@@ -903,7 +918,7 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
     reference: unknown, profileInput: unknown, resource: PermissionResource, action: LocalAction,
     pathInput: unknown, allowRoot: boolean, allowMissing: boolean, available: boolean, signal?: AbortSignal,
     approvalDetails?: string,
-  ): Promise<{ root: string; target: string }> {
+  ): Promise<{ root: string; target: string; projectId: string | null }> {
     const profile = requirePermissionProfile(profileInput);
     const scope = await resolveRoot(reference, profile);
     const target = await targetPath(scope.root, pathInput, allowRoot, allowMissing);
@@ -912,7 +927,7 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
     const latest = await resolveRoot(reference, profile);
     if (latest.root !== scope.root) throw new LocalToolError('Рабочая папка изменилась во время подтверждения.');
     await targetPath(latest.root, pathInput, allowRoot, allowMissing);
-    return { root: latest.root, target };
+    return { root: latest.root, target, projectId: latest.projectId };
   }
 
   return {
@@ -997,19 +1012,64 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
 
     runPowerShell: (projectIdInput, profileInput, scriptInput, runOptions = {}) => activity('powershell', async () => {
       const available = process.platform === 'win32' && Boolean(options.runPowerShell);
-      if (!available || !options.runPowerShell) throw new LocalToolError('Ограниченный PowerShell helper пока недоступен.');
+      if (!available || !options.runPowerShell) throw new LocalToolError('PowerShell helper пока недоступен.');
+      const profile = requirePermissionProfile(profileInput);
+      if (runOptions.fullAccessOnce !== undefined && typeof runOptions.fullAccessOnce !== 'boolean') {
+        throw new LocalToolError('Некорректный режим однократного доступа PowerShell.');
+      }
+      const requestFullAccessOnce = runOptions.fullAccessOnce === true;
+      if (requestFullAccessOnce && profile === 'custom') {
+        throw new LocalToolError('Однократный выход за пользовательские правила недоступен.');
+      }
       const script = requireText(scriptInput, 'PowerShell script', MAX_SCRIPT_LENGTH);
       const timeoutMs = runOptions.timeoutMs === undefined ? 30_000 : runOptions.timeoutMs;
       if (typeof timeoutMs !== 'number' || !Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > MAX_RUN_TIMEOUT_MS) {
         throw new LocalToolError('Таймаут должен быть целым числом от 100 до 120000 мс.');
       }
-      const { root } = await prepareTarget(projectIdInput, profileInput, 'process', 'execute',
-        '', true, false, true, runOptions.signal, `PowerShell:\n${script}`);
+      let root: string;
+      let projectScoped: boolean;
+      let trustedFullAccess = profile === 'full';
+      if (requestFullAccessOnce && (profile === 'ask' || profile === 'approve')) {
+        const scope = await resolveRoot(projectIdInput, profile, true);
+        await targetPath(scope.root, '', true, false);
+        const permission = evaluatePermission({
+          profile,
+          resource: 'process',
+          action: 'execute',
+          projectId: scope.projectId,
+          targetProjectId: null,
+          targetRootName: scope.rootName,
+          capabilityAvailable: available,
+        });
+        if (permission.decision === 'deny') throw new LocalToolError(permission.reason);
+        const target = `PowerShell без AppContainer\nРабочая папка: ${scope.root}\nКоманда:\n${script}`;
+        const reason = `${permission.reason} Команда получит доступ к файлам, доступным текущей учётной записи, и сети; доступ не ограничен одним путём.`;
+        if (permission.decision !== 'ask' || !options.requestApproval
+          || !await options.requestApproval({ resource: 'process', action: 'execute', target, reason }, runOptions.signal)) {
+          throw new LocalToolError('Действие не подтверждено.');
+        }
+        throwIfAborted(runOptions.signal);
+        const latest = await resolveRoot(projectIdInput, profile, true);
+        if (latest.root !== scope.root || latest.projectId !== scope.projectId || latest.rootName !== scope.rootName) {
+          throw new LocalToolError('Рабочая папка изменилась во время подтверждения.');
+        }
+        await targetPath(latest.root, '', true, false);
+        root = latest.root;
+        projectScoped = latest.projectId !== null;
+        trustedFullAccess = true;
+      } else {
+        const scope = await prepareTarget(projectIdInput, profile, 'process', 'execute',
+          '', true, false, true, runOptions.signal, `PowerShell:\n${script}`);
+        root = scope.root;
+        projectScoped = scope.projectId !== null;
+      }
       return options.runPowerShell({
         workingFolder: root,
         script,
         timeoutMs,
         maxOutputBytes: MAX_LOCAL_FILE_BYTES,
+        trustedFullAccess,
+        projectScoped,
         ...(runOptions.signal ? { signal: runOptions.signal } : {}),
       });
     }),

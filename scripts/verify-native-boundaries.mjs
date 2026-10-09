@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { lstat, link, mkdtemp, mkdir, readFile, rm, symlink, unlink, writeFile } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { delimiter, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
@@ -34,7 +36,7 @@ function invoke(args, input) {
   });
 }
 
-function invokeAsync(args, input) {
+function startAsync(args, input) {
   const child = spawn(helper, args, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
   let stdout = '';
   let stderr = '';
@@ -46,13 +48,31 @@ function invokeAsync(args, input) {
     resolveResult({ error: spawnError, status, signal, stdout, stderr });
   }));
   child.stdin.end(`${JSON.stringify(input)}\n`);
-  return result;
+  return { child, result };
+}
+
+function invokeAsync(args, input) {
+  return startAsync(args, input).result;
 }
 
 function parseOutput(result) {
   assert.equal(result.error, undefined, result.error?.message);
   try { return JSON.parse((result.stdout ?? '').trim()); }
   catch { assert.fail(`Native helper returned no JSON response (exit ${result.status}).`); }
+}
+
+function psLiteral(value) {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+function isProcessRunning(pid) {
+  const tasklist = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tasklist.exe');
+  const result = spawnSync(tasklist, ['/FI', `PID eq ${pid}`], {
+    encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  assert.equal(result.error, undefined, result.error?.message);
+  assert.equal(result.status, 0, `Cannot inspect the isolated fixture child process: ${result.stderr}`);
+  return new RegExp(`\\b${pid}\\b`).test(result.stdout);
 }
 
 function snapshot(path) {
@@ -160,10 +180,163 @@ try {
   await assert.rejects(readFile(join(controlNested, 'before.txt')), { code: 'ENOENT' });
   process.stdout.write('PASS native AppContainer run remains available for a regular single-link project.\n');
 
+  const fullProject = join(root, 'full-project');
+  const fullRuntime = join(root, 'full-runtime');
+  const outside = join(root, 'outside');
+  await Promise.all([mkdir(fullProject), mkdir(fullRuntime), mkdir(outside)]);
+  const outsideTarget = join(outside, 'full-target.txt');
+  const originalOutside = 'bounded execution must preserve this file';
+  await writeFile(outsideTarget, originalOutside, { flag: 'wx' });
+  const boundedOutside = invoke(['--run', fullRuntime], {
+    WorkingFolder: fullProject,
+    Script: `[System.IO.File]::WriteAllText(${psLiteral(outsideTarget)}, 'bounded-write')`,
+    TimeoutMs: 5000,
+    MaxOutputBytes: 4096,
+  });
+  assert.equal(boundedOutside.status, 0,
+    `Bounded helper failed before reporting the outside-write result: stdout=${boundedOutside.stdout}; stderr=${boundedOutside.stderr}`);
+  assert.notEqual(parseOutput(boundedOutside).ExitCode, 0,
+    'Bounded AppContainer execution must reject an outside write.');
+  assert.equal(await readFile(outsideTarget, 'utf8'), originalOutside);
+  const fullOutside = invoke(['--run', fullRuntime], {
+    WorkingFolder: fullProject,
+    Script: `[System.IO.File]::WriteAllText(${psLiteral(outsideTarget)}, 'full-write'); Get-Content -Raw ${psLiteral(outsideTarget)}`,
+    TimeoutMs: 5000,
+    MaxOutputBytes: 4096,
+    TrustedFullAccess: true,
+    ProjectScoped: true,
+  });
+  assert.equal(fullOutside.status, 0, `Full execution failed: ${fullOutside.stdout}; ${fullOutside.stderr}`);
+  assert.equal(parseOutput(fullOutside).ExitCode, 0);
+  assert.equal(await readFile(outsideTarget, 'utf8'), 'full-write');
+  process.stdout.write('PASS Full executes as the current user outside the project while bounded AppContainer preserves the same target.\n');
+
+  const fullNoProject = invoke(['--run', fullRuntime], {
+    WorkingFolder: fullProject,
+    Script: "if (Test-Path Env:GIGACHAT_PROJECT_ROOT) { throw 'unexpected project root' }; 'FULL_NO_PROJECT'",
+    TimeoutMs: 5000,
+    MaxOutputBytes: 4096,
+    TrustedFullAccess: true,
+    ProjectScoped: false,
+  });
+  assert.equal(fullNoProject.status, 0, `Unbound Full execution failed: ${fullNoProject.stdout}; ${fullNoProject.stderr}`);
+  assert.equal(parseOutput(fullNoProject).ExitCode, 0);
+  assert.match(parseOutput(fullNoProject).Stdout, /FULL_NO_PROJECT/);
+  process.stdout.write('PASS Full without a project does not advertise the working directory as a project root.\n');
+
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+    response.end('fixture-http-ok');
+  });
+  await new Promise((resolveListen, rejectListen) => {
+    server.once('error', rejectListen);
+    server.listen(0, '127.0.0.1', resolveListen);
+  });
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address === 'object');
+    const localUrl = `http://127.0.0.1:${address.port}/health`;
+    const httpScript = `$response = Invoke-WebRequest -UseBasicParsing -Uri ${psLiteral(localUrl)} -TimeoutSec 2; $response.Content`;
+    const boundedNetwork = await invokeAsync(['--run', fullRuntime], {
+      WorkingFolder: fullProject,
+      Script: httpScript,
+      TimeoutMs: 5000,
+      MaxOutputBytes: 4096,
+    });
+    assert.equal(boundedNetwork.status, 0,
+      `Bounded helper failed before reporting the localhost result: ${boundedNetwork.stdout}; ${boundedNetwork.stderr}`);
+    const boundedNetworkResult = parseOutput(boundedNetwork);
+    assert.notEqual(boundedNetworkResult.ExitCode, 0, 'Bounded AppContainer must reject a network request.');
+    assert.doesNotMatch(boundedNetworkResult.Stdout, /fixture-http-ok/,
+      'Bounded AppContainer must not read the local network fixture.');
+    const fullNetwork = await invokeAsync(['--run', fullRuntime], {
+      WorkingFolder: fullProject,
+      Script: httpScript,
+      TimeoutMs: 5000,
+      MaxOutputBytes: 4096,
+      TrustedFullAccess: true,
+      ProjectScoped: true,
+    });
+    assert.equal(fullNetwork.status, 0, `Full local HTTP request failed: ${fullNetwork.stdout}; ${fullNetwork.stderr}`);
+    assert.equal(parseOutput(fullNetwork).ExitCode, 0);
+    assert.match(parseOutput(fullNetwork).Stdout, /fixture-http-ok/);
+    process.stdout.write('PASS only Full execution can reach a disposable localhost HTTP fixture.\n');
+  } finally {
+    await new Promise((resolveClose, rejectClose) => server.close((error) => error ? rejectClose(error) : resolveClose()));
+  }
+
+  const childProject = join(root, 'full-child-project');
+  const childRuntime = join(root, 'full-child-runtime');
+  await Promise.all([mkdir(childProject), mkdir(childRuntime)]);
+  const fullChildStarted = join(childProject, 'child-started.txt');
+  const fullChildPidPath = join(childProject, 'child-pid.txt');
+  const fullChildFinished = join(childProject, 'child-finished.txt');
+  const childScriptPath = join(childProject, 'child.ps1');
+  await writeFile(childScriptPath,
+    `Start-Sleep -Seconds 8; [System.IO.File]::WriteAllText(${psLiteral(fullChildFinished)}, 'finished')`, { flag: 'wx' });
+  const childRun = startAsync(['--run', childRuntime], {
+    WorkingFolder: childProject,
+    Script: `$powershell = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'; $child = Start-Process -FilePath $powershell -ArgumentList '-NoProfile -NonInteractive -File', ${psLiteral(childScriptPath)} -WindowStyle Hidden -PassThru; [System.IO.File]::WriteAllText(${psLiteral(fullChildPidPath)}, [string]$child.Id); [System.IO.File]::WriteAllText(${psLiteral(fullChildStarted)}, 'started'); $child.WaitForExit(); 'parent-finished'`,
+    TimeoutMs: 30_000,
+    MaxOutputBytes: 4096,
+    TrustedFullAccess: true,
+    ProjectScoped: true,
+  });
+  const startDeadline = Date.now() + 10_000;
+  try {
+    while (Date.now() < startDeadline) {
+      if (await readFile(fullChildStarted, 'utf8').then(() => true, () => false)) break;
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+    }
+    assert.equal(await readFile(fullChildStarted, 'utf8'), 'started', 'Full child process did not start.');
+  } finally {
+    childRun.child.kill();
+  }
+  const cancelledChildRun = await childRun.result;
+  assert.notEqual(cancelledChildRun.status, 0, 'Terminating the helper must cancel the active Full process tree.');
+  const childPid = Number(await readFile(fullChildPidPath, 'utf8'));
+  assert.ok(Number.isSafeInteger(childPid) && childPid > 0);
+  const childExitDeadline = Date.now() + 5000;
+  while (Date.now() < childExitDeadline && isProcessRunning(childPid)) {
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+  }
+  assert.equal(isProcessRunning(childPid), false, 'Closing the helper must terminate its child process through the Job.');
+  await assert.rejects(readFile(fullChildFinished), { code: 'ENOENT' }, 'The cancelled child must not finish its write.');
+  process.stdout.write('PASS terminating a Full helper stops its child process before the child can write.\n');
+
+  const cliProbe = invoke(['--run', fullRuntime], {
+    WorkingFolder: fullProject,
+    Script: `
+$cli = Get-Command dotnet.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($null -ne $cli) {
+  $version = & $cli.Path --version
+  if ($LASTEXITCODE -eq 0 -and ($version -join '').Trim() -match '^\\d+(\\.\\d+)+$') { 'DOTNET_OK' } else { 'CLI_UNAVAILABLE' }
+} else {
+  $python = Get-Command python.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($null -eq $python) { 'CLI_UNAVAILABLE' } else {
+    $result = & $python.Path -c 'print("PYTHON_OK")'
+    if ($LASTEXITCODE -eq 0 -and ($result -join '').Trim() -eq 'PYTHON_OK') { 'PYTHON_OK' } else { 'CLI_UNAVAILABLE' }
+  }
+}`,
+    TimeoutMs: 15_000,
+    MaxOutputBytes: 4096,
+    TrustedFullAccess: true,
+    ProjectScoped: true,
+  });
+  assert.equal(cliProbe.status, 0, `Safe Python capability probe failed: ${cliProbe.stdout}; ${cliProbe.stderr}`);
+  assert.equal(parseOutput(cliProbe).ExitCode, 0,
+    `Safe Python/CLI probe process failed: ${JSON.stringify(parseOutput(cliProbe))}`);
+  const cliStatus = parseOutput(cliProbe).Stdout.trim();
+  assert.match(cliStatus, /PYTHON_OK|DOTNET_OK|CLI_UNAVAILABLE/);
+  const hasOnPath = (executable) => (process.env.PATH ?? '').split(delimiter)
+    .some((entry) => existsSync(join(entry.trim().replace(/^"|"$/g, ''), executable)));
+  const expectedCliStatus = hasOnPath('dotnet.exe') ? 'DOTNET_OK' : hasOnPath('python.exe') ? 'PYTHON_OK' : 'CLI_UNAVAILABLE';
+  assert.equal(cliStatus, expectedCliStatus, 'Full must run an installed CLI from the configured PATH.');
+  process.stdout.write(`PASS Full safe Python/CLI probe: ${cliStatus}\n`);
+
   const project = join(root, 'hardlink-project');
   const runtime = join(root, 'hardlink-runtime');
-  const outside = join(root, 'outside');
-  await Promise.all([mkdir(project), mkdir(runtime), mkdir(outside)]);
+  await Promise.all([mkdir(project), mkdir(runtime)]);
   const sentinel = join(outside, 'sentinel.txt');
   const alias = join(project, 'alias.txt');
   const childStarted = join(project, 'child-started.txt');

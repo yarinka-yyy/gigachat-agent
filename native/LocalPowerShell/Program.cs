@@ -1423,12 +1423,13 @@ internal static class Program
         if (request.MaxOutputBytes is < 1 or > MaxOutputBytes)
             throw new InvalidDataException("Некорректный лимит вывода.");
 
+        bool trustedFullAccess = request.TrustedFullAccess;
         string recoveryDirectory = PrepareRecoveryDirectory(recoveryCandidate);
         using FileStream runtimeLock = AcquireRuntimeLock(recoveryDirectory, MaxRunLockWaitMs);
         workingFolder = ValidateDirectory(request.WorkingFolder, "Рабочая папка");
         Recover(recoveryDirectory);
         using var workingDirectoryPins = new PinnedDirectories(PinDirectoryChain(workingFolder));
-        ValidateWorkingTreeBeforeGrant(workingFolder);
+        if (!trustedFullAccess) ValidateWorkingTreeBeforeGrant(workingFolder);
         string runId = Guid.NewGuid().ToString("N");
         string profileName = ProfilePrefix + runId;
         string sessionDirectory = Path.Combine(recoveryDirectory, "run-" + runId);
@@ -1439,6 +1440,7 @@ internal static class Program
         IntPtr jobHandle = IntPtr.Zero;
         IntPtr processHandle = IntPtr.Zero;
         IntPtr threadHandle = IntPtr.Zero;
+        SafeFileHandle? stdinHandle = null;
         SafeFileHandle? stdoutRead = null;
         SafeFileHandle? stdoutWrite = null;
         SafeFileHandle? stderrRead = null;
@@ -1470,27 +1472,31 @@ internal static class Program
                 + "[Console]::OutputEncoding = $utf8\r\n$OutputEncoding = $utf8\r\n"
                 + request.Script;
             File.WriteAllText(scriptPath, script, new UTF8Encoding(true));
-            stage = "create AppContainer profile";
-            int createResult = Native.CreateAppContainerProfile(profileName, profileName,
-                "Temporary GigaChat Agents local tool", IntPtr.Zero, 0, out appContainerSid);
-            if (createResult < 0) throw new Win32Exception(createResult, "CreateAppContainerProfile");
-            profileCreated = true;
-            stage = "read AppContainer SID";
-            string sidText = new SecurityIdentifier(appContainerSid).Value;
+            if (!trustedFullAccess)
+            {
+                stage = "create AppContainer profile";
+                int createResult = Native.CreateAppContainerProfile(profileName, profileName,
+                    "Temporary GigaChat Agents local tool", IntPtr.Zero, 0, out appContainerSid);
+                if (createResult < 0) throw new Win32Exception(createResult, "CreateAppContainerProfile");
+                profileCreated = true;
+                stage = "read AppContainer SID";
+                string sidText = new SecurityIdentifier(appContainerSid).Value;
 
-            stage = "prepare ACL journal";
-            List<AclEntry> aclEntries = BuildAclEntries(workingFolder, recoveryDirectory, sessionDirectory);
-            journalPath = Path.Combine(recoveryDirectory, "acl-" + runId + ".json");
-            WriteJournal(journalPath, new AclJournal(profileName, sidText, aclEntries));
+                stage = "prepare ACL journal";
+                List<AclEntry> aclEntries = BuildAclEntries(workingFolder, recoveryDirectory, sessionDirectory);
+                journalPath = Path.Combine(recoveryDirectory, "acl-" + runId + ".json");
+                WriteJournal(journalPath, new AclJournal(profileName, sidText, aclEntries));
 
-            stage = "grant temporary project boundary";
-            foreach (AclEntry entry in aclEntries) AddRule(entry, sidText);
+                stage = "grant temporary project boundary";
+                foreach (AclEntry entry in aclEntries) AddRule(entry, sidText);
+            }
 
             string systemRoot = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
             string powershellPath = Path.Combine(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
             if (!File.Exists(powershellPath)) throw new FileNotFoundException("Windows PowerShell 5.1 is unavailable.");
 
             stage = "prepare bounded output pipes";
+            stdinHandle = CreateNullInput();
             CreatePipe(out stdoutRead, out stdoutWrite);
             CreatePipe(out stderrRead, out stderrWrite);
             IntPtr attributeList = IntPtr.Zero;
@@ -1499,28 +1505,33 @@ internal static class Program
             IntPtr environmentPointer = IntPtr.Zero;
             try
             {
-                stage = "prepare AppContainer process attributes";
-                attributeList = CreateAttributeList(2);
-                var capabilities = new SecurityCapabilities
+                stage = trustedFullAccess ? "prepare current-user process attributes" : "prepare AppContainer process attributes";
+                attributeList = CreateAttributeList(trustedFullAccess ? 1 : 2);
+                if (!trustedFullAccess)
                 {
-                    AppContainerSid = appContainerSid,
-                    Capabilities = IntPtr.Zero,
-                    CapabilityCount = 0,
-                    Reserved = 0,
-                };
-                capabilitiesPointer = Marshal.AllocHGlobal(Marshal.SizeOf<SecurityCapabilities>());
-                Marshal.StructureToPtr(capabilities, capabilitiesPointer, false);
-                UpdateAttribute(attributeList, ProcThreadAttributeSecurityCapabilities,
-                    capabilitiesPointer, (UIntPtr)Marshal.SizeOf<SecurityCapabilities>());
+                    var capabilities = new SecurityCapabilities
+                    {
+                        AppContainerSid = appContainerSid,
+                        Capabilities = IntPtr.Zero,
+                        CapabilityCount = 0,
+                        Reserved = 0,
+                    };
+                    capabilitiesPointer = Marshal.AllocHGlobal(Marshal.SizeOf<SecurityCapabilities>());
+                    Marshal.StructureToPtr(capabilities, capabilitiesPointer, false);
+                    UpdateAttribute(attributeList, ProcThreadAttributeSecurityCapabilities,
+                        capabilitiesPointer, (UIntPtr)Marshal.SizeOf<SecurityCapabilities>());
+                }
 
-                handleListPointer = Marshal.AllocHGlobal(IntPtr.Size * 2);
-                Marshal.WriteIntPtr(handleListPointer, 0, stdoutWrite.DangerousGetHandle());
-                Marshal.WriteIntPtr(handleListPointer, IntPtr.Size, stderrWrite.DangerousGetHandle());
+                handleListPointer = Marshal.AllocHGlobal(IntPtr.Size * 3);
+                Marshal.WriteIntPtr(handleListPointer, 0, stdinHandle.DangerousGetHandle());
+                Marshal.WriteIntPtr(handleListPointer, IntPtr.Size, stdoutWrite.DangerousGetHandle());
+                Marshal.WriteIntPtr(handleListPointer, IntPtr.Size * 2, stderrWrite.DangerousGetHandle());
                 UpdateAttribute(attributeList, ProcThreadAttributeHandleList, handleListPointer,
-                    (UIntPtr)(IntPtr.Size * 2));
+                    (UIntPtr)(IntPtr.Size * 3));
 
                 string commandLine = $"\"{powershellPath}\" -NoLogo -NoProfile -NonInteractive -File \"{scriptPath}\"";
-                string environment = BuildEnvironment(systemRoot, sessionDirectory, toolInputPath, workingFolder);
+                string environment = BuildEnvironment(systemRoot, sessionDirectory, toolInputPath,
+                    request.ProjectScoped ? workingFolder : null, trustedFullAccess);
                 environmentPointer = Marshal.StringToHGlobalUni(environment);
                 var startup = new StartupInfoEx
                 {
@@ -1528,13 +1539,13 @@ internal static class Program
                     {
                         Size = Marshal.SizeOf<StartupInfoEx>(),
                         Flags = StartfUseStdHandles,
-                        StdInput = IntPtr.Zero,
+                        StdInput = stdinHandle.DangerousGetHandle(),
                         StdOutput = stdoutWrite.DangerousGetHandle(),
                         StdError = stderrWrite.DangerousGetHandle(),
                     },
                     AttributeList = attributeList,
                 };
-                stage = "launch PowerShell in AppContainer";
+                stage = trustedFullAccess ? "launch PowerShell with current-user access" : "launch PowerShell in AppContainer";
                 if (!Native.CreateProcessW(powershellPath, new StringBuilder(commandLine), IntPtr.Zero,
                         IntPtr.Zero, true,
                         ExtendedStartupInfoPresent | CreateUnicodeEnvironment | CreateNoWindow | CreateSuspended,
@@ -1545,7 +1556,7 @@ internal static class Program
                 stdoutWrite.Dispose(); stdoutWrite = null;
                 stderrWrite.Dispose(); stderrWrite = null;
 
-                stage = "assign bounded process tree";
+                stage = trustedFullAccess ? "assign Full process tree" : "assign bounded process tree";
                 jobHandle = Native.CreateJobObject(IntPtr.Zero, null);
                 if (jobHandle == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateJobObject");
                 var jobLimits = new JobObjectExtendedLimitInformation
@@ -1578,7 +1589,7 @@ internal static class Program
                 }
             }
 
-            stage = "restore temporary project boundary";
+            stage = "cleanup PowerShell session";
             if (journalPath is not null) CleanupJournal(journalPath);
             journalPath = null;
             profileCreated = false;
@@ -1610,6 +1621,7 @@ internal static class Program
             }
             if (threadHandle != IntPtr.Zero) Native.CloseHandle(threadHandle);
             if (processHandle != IntPtr.Zero) Native.CloseHandle(processHandle);
+            stdinHandle?.Dispose();
             stdoutRead?.Dispose(); stdoutWrite?.Dispose();
             stderrRead?.Dispose(); stderrWrite?.Dispose();
             if (profileCreated && journalPath is null)
@@ -1887,7 +1899,8 @@ internal static class Program
             && !Path.IsPathFullyQualified(relative);
     }
 
-    private static string BuildEnvironment(string systemRoot, string temp, string toolInputPath, string projectRoot)
+    private static string BuildEnvironment(string systemRoot, string temp, string toolInputPath,
+        string? projectRoot, bool trustedFullAccess)
     {
         string drive = Path.GetPathRoot(temp) ?? throw new InvalidDataException("Runtime path has no drive root.");
         var values = new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -1895,11 +1908,11 @@ internal static class Program
             ["APPDATA"] = temp,
             ["ComSpec"] = Path.Combine(systemRoot, "System32", "cmd.exe"),
             ["GIGACHAT_LOCAL_TOOL_INPUT"] = toolInputPath,
-            ["GIGACHAT_PROJECT_ROOT"] = projectRoot,
             ["HOMEDRIVE"] = drive.TrimEnd(Path.DirectorySeparatorChar),
             ["HOMEPATH"] = temp[(drive.Length - 1)..],
             ["LOCALAPPDATA"] = temp,
-            ["PATH"] = Path.Combine(systemRoot, "System32"),
+            ["PATHEXT"] = ".COM;.EXE;.BAT;.CMD",
+            ["PATH"] = trustedFullAccess ? BuildFullPath(systemRoot) : Path.Combine(systemRoot, "System32"),
             ["SystemDrive"] = drive.TrimEnd(Path.DirectorySeparatorChar),
             ["SystemRoot"] = systemRoot,
             ["TEMP"] = temp,
@@ -1907,7 +1920,39 @@ internal static class Program
             ["USERPROFILE"] = temp,
             ["WINDIR"] = systemRoot,
         };
+        if (projectRoot is not null) values["GIGACHAT_PROJECT_ROOT"] = projectRoot;
         return string.Join('\0', values.Select(pair => $"{pair.Key}={pair.Value}")) + "\0\0";
+    }
+
+    private static string BuildFullPath(string systemRoot)
+    {
+        const int MaxPathLength = 16_000;
+        var directories = new List<string> { Path.Combine(systemRoot, "System32") };
+        string? configuredPath = Environment.GetEnvironmentVariable("PATH");
+        if (configuredPath is null || configuredPath.Length > MaxPathLength) return directories[0];
+        int totalLength = directories[0].Length;
+
+        foreach (string entry in configuredPath.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            string candidate = entry.Trim().Trim('"');
+            if (candidate.Length == 0) continue;
+            try
+            {
+                string directory = ValidateDirectory(candidate, "PATH");
+                if (!directories.Contains(directory, StringComparer.OrdinalIgnoreCase))
+                {
+                    if (totalLength + directory.Length + 1 > MaxPathLength) break;
+                    directories.Add(directory);
+                    totalLength += directory.Length + 1;
+                }
+            }
+            catch
+            {
+                // Skip missing, non-local, or reparse-backed search paths.
+            }
+            if (totalLength >= MaxPathLength) break;
+        }
+        return string.Join(Path.PathSeparator, directories);
     }
 
     private static IntPtr CreateAttributeList(int attributeCount)
@@ -1943,6 +1988,17 @@ internal static class Program
             read.Dispose(); write.Dispose();
             throw new Win32Exception(error, "SetHandleInformation");
         }
+    }
+
+    private static SafeFileHandle CreateNullInput()
+    {
+        var attributes = new SecurityAttributes { Length = Marshal.SizeOf<SecurityAttributes>(), InheritHandle = true };
+        SafeFileHandle handle = Native.CreateFileW("NUL", GenericRead, FileShareRead | FileShareWrite,
+            ref attributes, OpenExisting, FileAttributeNormal, IntPtr.Zero);
+        if (!handle.IsInvalid) return handle;
+        int error = Marshal.GetLastWin32Error();
+        handle.Dispose();
+        throw new Win32Exception(error, "CreateFileW(NUL)");
     }
 
     private static void DeleteDirectorySafely(string path, string allowedRoot)
@@ -2031,7 +2087,7 @@ internal static class Program
     }
 
     private sealed record RunRequest(string WorkingFolder, string Script, int TimeoutMs, int MaxOutputBytes,
-        string? InputDataBase64 = null);
+        string? InputDataBase64 = null, bool TrustedFullAccess = false, bool ProjectScoped = true);
     private sealed record RunResult(int ExitCode, string Stdout, string Stderr, bool TimedOut, bool OutputLimited);
     private sealed record ErrorResult(string Error, int Code, string? Stage = null);
     private sealed record BrokerWriteRequest(string WorkingFolder, string RelativePath, string ContentsBase64);
@@ -2155,6 +2211,9 @@ internal static class Program
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "CreateFileW")]
         internal static extern SafeFileHandle CreateFileW(string fileName, uint desiredAccess, uint shareMode,
             IntPtr securityAttributes, uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "CreateFileW")]
+        internal static extern SafeFileHandle CreateFileW(string fileName, uint desiredAccess, uint shareMode,
+            ref SecurityAttributes securityAttributes, uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool GetFileInformationByHandle(
             SafeFileHandle handle, out ByHandleFileInformation information);

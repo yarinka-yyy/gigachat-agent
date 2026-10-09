@@ -61,6 +61,9 @@ export function evaluatePermission(request: PermissionRequest): PermissionEvalua
   if (!request.capabilityAvailable) {
     return { decision: 'deny', reason: 'Инструмент для этого действия пока недоступен.' };
   }
+  if (profile === 'full') {
+    return { decision: 'allow', reason: 'Действие разрешено выбранным профилем Full access.' };
+  }
   if (profile === 'custom') {
     if (!request.customPolicy) return { decision: 'deny', reason: 'Конфигурация пользовательского профиля недоступна.' };
     const root = request.targetRootName
@@ -75,13 +78,22 @@ export function evaluatePermission(request: PermissionRequest): PermissionEvalua
       ? 'Пользовательский профиль требует вашего подтверждения.'
       : decision === 'allow' ? 'Разрешено пользовательским профилем.' : 'Запрещено пользовательским профилем.' };
   }
-  if (request.targetRootName) return { decision: 'deny', reason: 'Дополнительные каталоги доступны только пользовательскому профилю.' };
+  if (request.targetRootName) {
+    if (profile === 'ask' || profile === 'approve') {
+      return { decision: 'ask', reason: profile === 'approve'
+        ? 'Автоматическая проверка не настроена; действие с дополнительным каталогом требует вашего подтверждения.'
+        : 'Действие использует дополнительный каталог и требует отдельного подтверждения.' };
+    }
+    return { decision: 'deny', reason: 'Дополнительные каталоги доступны только пользовательскому профилю.' };
+  }
   if (isProjectAction(request.resource)
     && (!request.projectId || request.targetProjectId !== request.projectId)) {
+    if ((profile === 'ask' || profile === 'approve') && request.targetProjectId === null) {
+      return { decision: 'ask', reason: profile === 'approve'
+        ? 'Автоматическая проверка не настроена; внешнее действие требует вашего подтверждения.'
+        : 'Действие выходит за границу проекта и требует вашего подтверждения.' };
+    }
     return { decision: 'deny', reason: 'Действие не относится к проекту текущего чата.' };
-  }
-  if (profile === 'full') {
-    return { decision: 'allow', reason: 'Действие разрешено выбранным профилем Full access.' };
   }
   if (isProjectAction(request.resource)) {
     return { decision: 'allow', reason: 'Действие остаётся внутри проверенной границы проекта.' };
