@@ -3,8 +3,8 @@ import { randomUUID, X509Certificate } from 'node:crypto';
 import { type ClientRequest, type IncomingHttpHeaders, type IncomingMessage } from 'node:http';
 import { Agent, request as httpsRequest } from 'node:https';
 import * as tls from 'node:tls';
-import type { ModelRegistrySnapshot, ProviderConnectionSnapshot, ProviderErrorCategory } from './contracts';
-import { discoveredModelRegistry, failedModelRegistry, requireModelId, unavailableModelRegistry } from './models';
+import type { GigaChatProvider, ModelRegistrySnapshot, ProviderConnectionSnapshot, ProviderErrorCategory, ProviderEvent, ProviderTurnRequest } from './contracts';
+import { discoveredModelRegistry, failedModelRegistry, isModelAvailable, requireModelId, unavailableModelRegistry } from './models';
 
 export const GIGACHAT_API_BASE_URL = 'https://api.giga.chat/v1';
 export const GIGACHAT_OAUTH_URL = 'https://ngw.devices.sberbank.ru:9443/api/v2/oauth';
@@ -22,6 +22,7 @@ export interface ProviderTransportRequest {
   headers: Record<string, string>;
   body?: string;
   signal: AbortSignal;
+  streaming?: boolean;
 }
 
 export interface ProviderTransportResponse {
@@ -36,7 +37,7 @@ export interface ProviderTransport {
   close(): void;
 }
 
-export interface GigaChatProviderConnection {
+export interface GigaChatProviderConnection extends GigaChatProvider {
   getConnectionStatus(): ProviderConnectionSnapshot;
   getModelRegistry(): ModelRegistrySnapshot;
   connect(): Promise<ProviderConnectionSnapshot>;
@@ -118,9 +119,18 @@ export function createHttpsTransport(options: {
         let response: IncomingMessage | null = null;
         let headersReceived = false;
         let deadline: ReturnType<typeof setTimeout> | null = null;
+        let idleDeadline: ReturnType<typeof setTimeout> | null = null;
+        const streaming = requestOptions.streaming === true;
+        const timeoutError = (): Error => Object.assign(new Error('request-timeout'), { code: 'ETIMEDOUT' });
         const cleanup = (): void => {
           if (deadline) clearTimeout(deadline);
+          if (idleDeadline) clearTimeout(idleDeadline);
           requestOptions.signal.removeEventListener('abort', onAbort);
+        };
+        const resetIdleDeadline = (): void => {
+          if (!streaming || !response) return;
+          if (idleDeadline) clearTimeout(idleDeadline);
+          idleDeadline = setTimeout(() => response?.destroy(timeoutError()), timeoutMs);
         };
         const onAbort = (): void => {
           const abort = abortError();
@@ -136,9 +146,17 @@ export function createHttpsTransport(options: {
         }, (incoming) => {
           headersReceived = true;
           response = incoming;
+          if (streaming) {
+            if (deadline) clearTimeout(deadline);
+            deadline = null;
+            resetIdleDeadline();
+          }
           const body = (async function* (): AsyncGenerator<Uint8Array> {
             try {
-              for await (const chunk of incoming) yield Buffer.from(chunk as Uint8Array);
+              for await (const chunk of incoming) {
+                resetIdleDeadline();
+                yield Buffer.from(chunk as Uint8Array);
+              }
             } catch (error) {
               throw transportError(error, requestOptions.signal);
             } finally {
@@ -157,9 +175,8 @@ export function createHttpsTransport(options: {
         });
         requestOptions.signal.addEventListener('abort', onAbort, { once: true });
         deadline = setTimeout(() => {
-          const timeoutError = Object.assign(new Error('request-timeout'), { code: 'ETIMEDOUT' });
-          if (response) response.destroy(timeoutError);
-          else clientRequest?.destroy(timeoutError);
+          if (response) response.destroy(timeoutError());
+          else clientRequest?.destroy(timeoutError());
         }, timeoutMs);
         clientRequest.once('error', (error) => {
           cleanup();
@@ -412,6 +429,101 @@ export function createGigaChatProvider(options: {
     return getStatus();
   };
 
+  const stream = async function* (request: ProviderTurnRequest, signal: AbortSignal): AsyncGenerator<ProviderEvent> {
+    const operationGeneration = generation;
+    const operation = linkAbortSignals(sessionController.signal, signal);
+    let response: ProviderTransportResponse | null = null;
+    let cancelResponseOnAbort: (() => void) | null = null;
+    try {
+      assertCurrent(operationGeneration, operation.controller.signal);
+      let modelId: string | null;
+      try { modelId = request.modelId === null ? null : requireModelId(request.modelId); }
+      catch { throw new GigaChatProviderError('model'); }
+      if (connectionStatus.state !== 'connected' || !modelId || !isModelAvailable(modelRegistry, modelId)) {
+        throw new GigaChatProviderError('model');
+      }
+      if (!Array.isArray(request.system) || !Array.isArray(request.messages)) throw new GigaChatProviderError('protocol');
+      const systemPrompt = request.system.map((layer) => {
+        if (!layer || typeof layer.label !== 'string' || typeof layer.text !== 'string') throw new GigaChatProviderError('protocol');
+        return `[${layer.label}]\n${layer.text}`;
+      }).join('\n\n');
+      const messages = [
+        ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+        ...request.messages.map((message) => {
+          if (!message || (message.role !== 'user' && message.role !== 'assistant') || typeof message.text !== 'string') {
+            throw new GigaChatProviderError('protocol');
+          }
+          return { role: message.role, content: message.text };
+        }),
+      ];
+      let opened = false;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const access = await getAccessToken(operation.controller.signal, operationGeneration);
+        assertCurrent(operationGeneration, operation.controller.signal);
+        try {
+          response = await awaitWithAbort(options.transport.request({
+            url: `${GIGACHAT_API_BASE_URL}/chat/completions`,
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${access.value}`,
+              Accept: 'text/event-stream',
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ model: modelId, messages, stream: true, function_call: 'none' }),
+            signal: operation.controller.signal,
+            streaming: true,
+          }), operation.controller.signal, (lateResponse) => lateResponse.cancel());
+        } catch (error) {
+          throw transportError(error, operation.controller.signal);
+        }
+        assertCurrent(operationGeneration, operation.controller.signal);
+        if (response.statusCode === 401 && attempt === 0) {
+          response.cancel();
+          response = null;
+          if (accessToken?.value === access.value) accessToken = null;
+          continue;
+        }
+        if (response.statusCode !== 200) throw statusError(response.statusCode);
+        const contentType = response.headers['content-type'];
+        const contentTypeValue = Array.isArray(contentType) ? contentType.join(',') : contentType ?? '';
+        if (!contentTypeValue.toLowerCase().includes('text/event-stream')) throw new GigaChatProviderError('protocol');
+        cancelResponseOnAbort = () => response?.cancel();
+        operation.controller.signal.addEventListener('abort', cancelResponseOnAbort, { once: true });
+        opened = true;
+        break;
+      }
+      if (!opened || !response) throw new GigaChatProviderError('auth');
+
+      yield { type: 'activity', activity: 'receiving' };
+      let receivedStop = false;
+      let receivedDone = false;
+      for await (const data of readSseData(response.body, operation.controller.signal)) {
+        assertCurrent(operationGeneration, operation.controller.signal);
+        if (data === '[DONE]') {
+          if (!receivedStop || receivedDone) throw new GigaChatProviderError('protocol');
+          receivedDone = true;
+          break;
+        }
+        if (receivedStop || receivedDone) throw new GigaChatProviderError('protocol');
+        const chunk = parseCompletionChunk(data);
+        if (chunk.content) yield { type: 'text-delta', text: chunk.content };
+        if (chunk.errorCategory) throw new GigaChatProviderError(chunk.errorCategory);
+        if (chunk.finishReasonStop) receivedStop = true;
+      }
+      assertCurrent(operationGeneration, operation.controller.signal);
+      if (!receivedStop || !receivedDone) throw new GigaChatProviderError('protocol');
+      yield { type: 'completed' };
+    } catch (error) {
+      const normalized = error instanceof GigaChatProviderError
+        ? error : transportError(error, operation.controller.signal);
+      yield { type: 'error', category: normalized.category, retryable: normalized.retryable };
+    } finally {
+      if (cancelResponseOnAbort) operation.controller.signal.removeEventListener('abort', cancelResponseOnAbort);
+      response?.cancel();
+      operation.dispose();
+    }
+  };
+
   return {
     getConnectionStatus: getStatus,
     getModelRegistry,
@@ -419,6 +531,7 @@ export function createGigaChatProvider(options: {
     cancelConnect,
     disconnect: () => { reset(); return getStatus(); },
     invalidateSavedKey: () => { reset(); },
+    stream,
     listModels: async (signal) => {
       const discoveryGeneration = ++modelRegistryGeneration;
       const operationGeneration = generation;
@@ -472,6 +585,116 @@ async function readJsonResponse(response: ProviderTransportResponse, signal: Abo
   } finally {
     signal.removeEventListener('abort', cancelOnAbort);
   }
+}
+
+async function* readSseData(body: AsyncIterable<Uint8Array>, signal: AbortSignal): AsyncGenerator<string> {
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  const iterator = body[Symbol.asyncIterator]();
+  let buffer = '';
+  let totalBytes = 0;
+  let dataLines: string[] = [];
+  let dataLength = 0;
+  const consumeLine = (line: string): string | null => {
+    if (line === '') {
+      if (dataLines.length === 0) return null;
+      const data = dataLines.join('\n');
+      dataLines = [];
+      dataLength = 0;
+      return data;
+    }
+    if (line.startsWith(':')) return null;
+    const separator = line.indexOf(':');
+    const field = separator < 0 ? line : line.slice(0, separator);
+    let value = separator < 0 ? '' : line.slice(separator + 1);
+    if (value.startsWith(' ')) value = value.slice(1);
+    if (field === 'data') {
+      dataLength += value.length + (dataLines.length ? 1 : 0);
+      if (dataLength > MAX_RESPONSE_BYTES) throw new GigaChatProviderError('protocol');
+      dataLines.push(value);
+    }
+    return null;
+  };
+  const appendBytes = (chunk: Uint8Array): void => {
+    totalBytes += chunk.byteLength;
+    if (totalBytes > MAX_RESPONSE_BYTES) throw new GigaChatProviderError('protocol');
+    try { buffer += decoder.decode(chunk, { stream: true }); }
+    catch { throw new GigaChatProviderError('protocol'); }
+  };
+
+  try {
+    for (;;) {
+      const pending = Promise.resolve(iterator.next());
+      const result = await awaitWithAbort(pending, signal);
+      if (result.done) break;
+      appendBytes(result.value);
+      let start = 0;
+      for (let index = 0; index < buffer.length; index += 1) {
+        const character = buffer[index];
+        if (character !== '\r' && character !== '\n') continue;
+        if (character === '\r' && index === buffer.length - 1) break;
+        const line = buffer.slice(start, index);
+        if (character === '\r' && buffer[index + 1] === '\n') index += 1;
+        start = index + 1;
+        const data = consumeLine(line);
+        if (data !== null) yield data;
+      }
+      buffer = buffer.slice(start);
+      if (Buffer.byteLength(buffer, 'utf8') > MAX_RESPONSE_BYTES) throw new GigaChatProviderError('protocol');
+    }
+    try { buffer += decoder.decode(); }
+    catch { throw new GigaChatProviderError('protocol'); }
+    if (buffer) {
+      const data = consumeLine(buffer);
+      if (data !== null) yield data;
+      buffer = '';
+    }
+    if (dataLines.length) yield dataLines.join('\n');
+  } catch (error) {
+    if (error instanceof GigaChatProviderError) throw error;
+    throw transportError(error, signal);
+  } finally {
+    if (signal.aborted && iterator.return) {
+      await Promise.resolve(iterator.return()).catch(() => undefined);
+    }
+  }
+}
+
+function parseCompletionChunk(value: string): {
+  content: string | null;
+  finishReasonStop: boolean;
+  errorCategory?: ProviderErrorCategory;
+} {
+  let parsed: unknown;
+  try { parsed = JSON.parse(value) as unknown; }
+  catch { throw new GigaChatProviderError('protocol'); }
+  if (!isRecord(parsed) || !Array.isArray(parsed.choices) || parsed.choices.length !== 1) {
+    throw new GigaChatProviderError('protocol');
+  }
+  const choice = parsed.choices[0];
+  if (!isRecord(choice) || !isRecord(choice.delta)
+    || (choice.index !== undefined && choice.index !== 0)) {
+    throw new GigaChatProviderError('protocol');
+  }
+  let errorCategory: ProviderErrorCategory | undefined;
+  if ('function_call' in choice.delta) errorCategory = 'tool';
+  const finishReason = choice.finish_reason;
+  let finishReasonStop = false;
+  if (finishReason !== undefined && finishReason !== null) {
+    if (finishReason === 'length') errorCategory = 'context';
+    else if (finishReason === 'function_call') errorCategory = 'tool';
+    else if (finishReason === 'blacklist') errorCategory = 'model';
+    else if (finishReason === 'stop') finishReasonStop = true;
+    else throw new GigaChatProviderError('protocol');
+  }
+  const content = choice.delta.content;
+  if (content !== undefined && content !== null && typeof content !== 'string') {
+    throw new GigaChatProviderError('protocol');
+  }
+  return {
+    content: typeof content === 'string' ? content : null,
+    finishReasonStop,
+    ...(errorCategory ? { errorCategory } : {}),
+  };
 }
 
 function linkAbortSignals(...signals: AbortSignal[]): { controller: AbortController; dispose(): void } {

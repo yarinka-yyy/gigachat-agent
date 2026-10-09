@@ -53,6 +53,7 @@ export interface LocalStore {
   deleteProject(id: unknown): Promise<void>;
   listChats(): Promise<ChatSummary[]>;
   getChat(id: unknown): Promise<ChatDetail>;
+  getMessagesThrough(chatId: unknown, messageId: unknown): Promise<ChatMessage[]>;
   createChat(projectId?: unknown, kind?: unknown): Promise<ChatSummary>;
   updateChat(id: unknown, patch: unknown): Promise<ChatSummary>;
   appendLocalMessage(id: unknown, text: unknown): Promise<ChatDetail>;
@@ -60,7 +61,7 @@ export interface LocalStore {
   releaseTurnReservation(turnId: unknown): void;
   consumeTurnReservation(turn: AcceptedTurnInput, signal?: AbortSignal): Promise<void>;
   validateAcceptedTurn(turn: AcceptedTurnInput): Promise<void>;
-  appendAssistantMessageFromRuntime(id: unknown, text: unknown, signal?: AbortSignal): Promise<ChatDetail>;
+  appendAssistantMessageFromRuntime(id: unknown, messageId: unknown, text: unknown, signal?: AbortSignal): Promise<ChatDetail>;
   importFile(id: unknown, sourcePath: string, projectId?: unknown): Promise<ChatDetail>;
   getArtifactPath(id: unknown, artifactId: unknown): Promise<string>;
   getChatFolder(id: unknown): Promise<string>;
@@ -402,7 +403,11 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
     if (!isRecord(entry) || (entry.role !== 'user' && entry.role !== 'assistant') || typeof entry.text !== 'string') {
       throw new Error('Invalid chat message.');
     }
-    return { id: requireId(entry.id), role: entry.role, text: entry.text, createdAt: requireTimestamp(entry.createdAt) };
+    if (entry.source !== undefined && entry.source !== 'runtime' && entry.source !== 'example') throw new Error('Invalid chat message source.');
+    return {
+      id: requireId(entry.id), role: entry.role, text: entry.text, createdAt: requireTimestamp(entry.createdAt),
+      ...(entry.source === undefined ? {} : { source: entry.source }),
+    };
   });
   const artifacts: ChatArtifact[] = value.artifacts.map((entry: unknown) => {
     if (!isRecord(entry) || typeof entry.name !== 'string' || !entry.name.trim() || entry.name.length > 255
@@ -1255,6 +1260,13 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     }),
     listChats: () => serialize(async () => chats.map(summary)),
     getChat: (id) => serialize(async () => structuredClone(findChat(id))),
+    getMessagesThrough: (chatId, messageId) => serialize(async () => {
+      const detail = findChat(chatId);
+      const anchor = requireId(messageId);
+      const endIndex = detail.messages.findIndex((message) => message.id === anchor && message.role === 'user');
+      if (endIndex < 0) throw new Error('Принятое сообщение не найдено в истории чата.');
+      return structuredClone(detail.messages.slice(0, endIndex + 1));
+    }),
     createChat: (projectIdInput = null, kindInput = 'text') => serialize(async () => {
       const projectId = projectIdInput === null || projectIdInput === undefined
         ? null
@@ -1365,15 +1377,20 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       if (signal?.aborted) throw createAbortError();
       turnReservations.delete(turn.turnId);
     }),
-    appendAssistantMessageFromRuntime: (id, textInput, signal) => serialize(async () => {
+    appendAssistantMessageFromRuntime: (id, messageIdInput, textInput, signal) => serialize(async () => {
       if (signal?.aborted) throw createAbortError();
       const chat = findChat(id);
+      const messageId = requireId(messageIdInput);
+      const anchor = chat.messages.findIndex((message) => message.id === messageId && message.role === 'user');
+      if (anchor < 0) throw new Error('Ответ не привязан к принятому сообщению чата.');
       if (typeof textInput !== 'string' || !textInput.trim() || textInput.length > 100_000) {
         throw new Error('Ответ должен содержать от 1 до 100 000 символов.');
       }
       const now = new Date().toISOString();
-      const message: ChatMessage = { id: randomUUID(), role: 'assistant', text: textInput.trim(), createdAt: now };
-      const updated = { ...chat, updatedAt: now, messages: [...chat.messages, message] };
+      const message: ChatMessage = { id: randomUUID(), role: 'assistant', source: 'runtime', text: textInput.trim(), createdAt: now };
+      const messages = [...chat.messages];
+      messages.splice(anchor + 1, 0, message);
+      const updated = { ...chat, updatedAt: now, messages };
       await saveChat(updated, signal);
       return structuredClone(updated);
     }),

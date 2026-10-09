@@ -12,6 +12,7 @@ import type { LocalToolEvent, LocalTools } from './local-tools';
 
 const MAX_ACTIVITY_PER_TURN = 50;
 const MAX_ASSISTANT_CHARS = 100_000;
+const DRAFT_UPDATE_INTERVAL_MS = 50;
 const DEFAULT_PREPARE_TIMEOUT_MS = 15_000;
 const DEFAULT_NEXT_TIMEOUT_MS = 120_000;
 const DEFAULT_STOP_TIMEOUT_MS = 10_000;
@@ -78,6 +79,7 @@ function copyTurn(turn: RuntimeTurn): RuntimeTurnSnapshot {
     ...(turn.queueDurationMs === undefined ? {} : { queueDurationMs: turn.queueDurationMs }),
     ...(turn.activeDurationMs === undefined ? {} : { activeDurationMs: turn.activeDurationMs }),
     activity: structuredClone(turn.activity),
+    ...(turn.draft === undefined ? {} : { draft: turn.draft }),
     ...(turn.error ? { error: turn.error } : {}),
     ...(turn.errorCategory ? { errorCategory: turn.errorCategory } : {}),
   };
@@ -205,6 +207,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     if (turn && state.pendingOutcome) {
       turn.status = state.pendingOutcome.status;
       turn.endedAt = new Date().toISOString();
+      if (state.pendingOutcome.status === 'completed') delete turn.draft;
       if (state.pendingOutcome.error) turn.error = state.pendingOutcome.error;
       else delete turn.error;
       turn.controller = undefined;
@@ -337,6 +340,23 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     let pendingNext: Promise<IteratorResult<ProviderEvent>> | null = null;
     let naturallyDone = false;
     let reservationConsumed = false;
+    let answer = '';
+    let draftTimer: ReturnType<typeof setTimeout> | null = null;
+    let lastDraftPublishedAt = 0;
+    const flushDraft = (): void => {
+      if (draftTimer) clearTimeout(draftTimer);
+      draftTimer = null;
+      if (!answer) return;
+      turn.draft = answer;
+      lastDraftPublishedAt = Date.now();
+      publish(turn);
+    };
+    const scheduleDraftPublish = (): void => {
+      turn.draft = answer;
+      const delayMs = DRAFT_UPDATE_INTERVAL_MS - (Date.now() - lastDraftPublishedAt);
+      if (delayMs <= 0) flushDraft();
+      else if (!draftTimer) draftTimer = setTimeout(flushDraft, delayMs);
+    };
     try {
       if (!options.provider) throw new Error('PROVIDER_UNAVAILABLE');
       if (!turn.input.modelId) throw new Error('MODEL_NOT_SELECTED');
@@ -348,7 +368,6 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       const stream = options.provider.stream(request, controller.signal);
       const activeIterator = stream[Symbol.asyncIterator]();
       iterator = activeIterator;
-      let answer = '';
       let completed = false;
       for (;;) {
         pendingNext = Promise.resolve().then(() => activeIterator.next());
@@ -389,7 +408,9 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         } else if (rawEvent.type === 'text-delta') {
           if (answer.length + rawEvent.text.length > MAX_ASSISTANT_CHARS) throw new Error('RESPONSE_LIMIT');
           answer += rawEvent.text;
+          scheduleDraftPublish();
         } else if (rawEvent.type === 'error') {
+          if (rawEvent.category === 'cancel') throw abortError();
           throw Object.assign(new Error('PROVIDER_ERROR'), { category: rawEvent.category });
         } else completed = true;
       }
@@ -397,10 +418,12 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       if (!completed || !answer.trim()) throw new Error('INCOMPLETE_PROVIDER_RESPONSE');
       if (!(await confirmStop(turn, iterator, pendingNext, naturallyDone))) {
         controller.abort();
+        flushDraft();
         markStopUnconfirmed(turn);
         return;
       }
       if (controller.signal.aborted) throw abortError();
+      flushDraft();
       const appending = options.appendAssistant(turn.input, answer, controller.signal);
       const appendOutcome = appending.then(
         () => ({ status: 'completed' as const }),
@@ -413,14 +436,17 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         holdForPendingOperation(turn, stopState, appendOutcome, 'Подтверждение сохранения ответа ожидается; очередь приостановлена.');
         return;
       }
+      delete turn.draft;
       turn.status = 'completed';
       turn.endedAt = new Date().toISOString();
       turn.activeDurationMs = Math.max(0, Date.now() - started);
       publish(turn);
     } catch (error) {
+      flushDraft();
       if (!turn.cancelRequested && !isAbortError(error) && !naturallyDone) controller.abort();
       if (!(await confirmStop(turn, iterator, pendingNext, naturallyDone))) {
         controller.abort();
+        flushDraft();
         markStopUnconfirmed(turn);
       } else if (stopState.pendingOperation) {
         if (blockedTurnId !== turn.id) holdForPendingOperation(turn, stopState, Promise.resolve({
@@ -453,6 +479,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         publish(turn);
       }
     } finally {
+      if (draftTimer) clearTimeout(draftTimer);
+      draftTimer = null;
       if (!reservationConsumed) options.releaseTurn(turn.input);
       if (!stopState.pendingOperation && blockedTurnId !== turn.id) turn.controller = undefined;
       if (blockedTurnId !== turn.id && stopConfirmed(stopState)) stopStates.delete(turn.id);

@@ -4,8 +4,9 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { openStore as openStoreProduction, type StoreFaultStage, type StoreOpenOptions } from './store';
-import type { InstructionCommitRequest, InstructionCommitResult } from './contracts';
+import type { GigaChatProvider, InstructionCommitRequest, InstructionCommitResult, ProviderTurnRequest } from './contracts';
 import { instructionFileHash } from './instruction-documents';
+import { createTurnRuntime } from './runtime';
 
 const timestamp = '2026-09-24T10:00:00.000Z';
 
@@ -105,6 +106,75 @@ test('retains an older unavailable model ID when reading a chat after reload', a
 
   const restored = await openStore(directory);
   assert.equal((await restored.getChat(chat.id)).modelId, 'retired/model-v0');
+});
+
+test('inserts a queued reply after its user anchor and assembles only history through the next anchor', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-queued-history-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const first = await store.acceptLocalMessage(chat.id, 'user1', 'turn-queued-1');
+  const second = await store.acceptLocalMessage(chat.id, 'user2', 'turn-queued-2');
+  const third = await store.acceptLocalMessage(chat.id, 'user3', 'turn-queued-3');
+
+  assert.deepEqual(second.turn.messages.map((message) => message.text), ['user1', 'user2']);
+  assert.deepEqual(third.turn.messages.map((message) => message.text), ['user1', 'user2', 'user3']);
+  const updated = await store.appendAssistantMessageFromRuntime(chat.id, first.turn.messageId, 'answer1');
+  assert.deepEqual(updated.messages.map((message) => message.text), ['user1', 'answer1', 'user2', 'user3']);
+  assert.equal(updated.messages[1]?.source, 'runtime');
+  assert.deepEqual((await store.getMessagesThrough(chat.id, second.turn.messageId)).map((message) => message.text), [
+    'user1', 'answer1', 'user2',
+  ]);
+  for (const turn of [first.turn, second.turn, third.turn]) store.releaseTurnReservation(turn.turnId);
+});
+
+test('queued fake provider turns see prior replies but never later accepted prompts', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-queued-runtime-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { modelId: 'test-model' });
+  const accepted = [
+    await store.acceptLocalMessage(chat.id, 'user1', 'turn-queued-1'),
+    await store.acceptLocalMessage(chat.id, 'user2', 'turn-queued-2'),
+    await store.acceptLocalMessage(chat.id, 'user3', 'turn-queued-3'),
+  ];
+  const requests: ProviderTurnRequest[] = [];
+  const provider: GigaChatProvider = {
+    stream: async function* (request) {
+      requests.push(structuredClone(request));
+      const prompt = request.messages[request.messages.length - 1]?.text;
+      yield { type: 'text-delta', text: `answer${prompt?.slice(-1) ?? ''}` };
+      yield { type: 'completed' };
+    },
+  };
+  const runtime = createTurnRuntime({
+    provider,
+    tools: {} as never,
+    prepareTurn: async (turn): Promise<ProviderTurnRequest> => ({
+      system: [],
+      modelId: turn.modelId,
+      permissionProfile: turn.permissionProfile,
+      messages: await store.getMessagesThrough(turn.chatId, turn.messageId),
+    }),
+    consumeTurn: (turn, signal) => store.consumeTurnReservation(turn, signal),
+    releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
+    appendAssistant: async (turn, text, signal) => {
+      await store.appendAssistantMessageFromRuntime(turn.chatId, turn.messageId, text, signal);
+    },
+  });
+
+  for (const item of accepted) assert.ok(runtime.enqueue(item.turn));
+  await runtime.whenIdle();
+
+  assert.deepEqual(requests.map((request) => request.messages.map((message) => message.text)), [
+    ['user1'],
+    ['user1', 'answer1', 'user2'],
+    ['user1', 'answer1', 'user2', 'answer2', 'user3'],
+  ]);
+  assert.deepEqual((await store.getChat(chat.id)).messages.map((message) => message.text), [
+    'user1', 'answer1', 'user2', 'answer2', 'user3', 'answer3',
+  ]);
 });
 
 test('migrates v1 projects, chats, drafts, and theme without losing data', async (t) => {
@@ -367,10 +437,12 @@ test('trusted runtime assistant append preserves draft and writes only a supplie
   t.after(() => rm(directory, { recursive: true, force: true }));
   const store = await openStore(directory);
   const chat = await store.createChat();
+  const accepted = await store.acceptLocalMessage(chat.id, 'Запрос пользователя', 'turn-runtime-assistant');
   await store.updateChat(chat.id, { draft: 'Черновик остаётся' });
-  const detail = await store.appendAssistantMessageFromRuntime(chat.id, 'Ответ провайдера');
-  assert.equal(detail.messages[0]?.role, 'assistant');
-  assert.equal(detail.messages[0]?.text, 'Ответ провайдера');
+  const detail = await store.appendAssistantMessageFromRuntime(chat.id, accepted.turn.messageId, 'Ответ провайдера');
+  assert.equal(detail.messages[1]?.role, 'assistant');
+  assert.equal(detail.messages[1]?.source, 'runtime');
+  assert.equal(detail.messages[1]?.text, 'Ответ провайдера');
   assert.equal(detail.draft, 'Черновик остаётся');
   assert.deepEqual((await (await openStore(directory)).getChat(chat.id)).messages, detail.messages);
 });

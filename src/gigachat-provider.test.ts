@@ -5,6 +5,7 @@ import { createServer as createHttpsServer } from 'node:https';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createServer as createTcpServer, type AddressInfo, type Socket } from 'node:net';
 import { test } from 'node:test';
+import type { ProviderEvent } from './contracts';
 import {
   createGigaChatProvider,
   createHttpsTransport,
@@ -69,6 +70,15 @@ function jsonResponse(statusCode: number, value: unknown): ProviderTransportResp
     statusCode,
     headers: { 'content-type': 'application/json' },
     body: (async function* () { yield bytes; }()),
+    cancel() {},
+  };
+}
+
+function eventStreamResponse(chunks: readonly Uint8Array[], statusCode = 200, contentType = 'text/event-stream'): ProviderTransportResponse {
+  return {
+    statusCode,
+    headers: { 'content-type': contentType },
+    body: (async function* () { for (const chunk of chunks) yield chunk; }()),
     cancel() {},
   };
 }
@@ -182,6 +192,214 @@ test('empty model discovery is an explicit error snapshot', async () => {
 
   assert.deepEqual(await provider.connect(), { state: 'error', errorCategory: 'model' });
   assert.deepEqual(provider.getModelRegistry(), { state: 'error', modelIds: [], errorCategory: 'model' });
+});
+
+test('streams GigaChat v1 SSE across split UTF-8, CRLF and multiline data frames', async () => {
+  const completionRequests: ProviderTransportRequest[] = [];
+  const firstFrame = Buffer.from('data: {"id":"response-1","choices":[\r\ndata: {"index":0,"delta":{"role":"assistant","content":"Привет "}}]}\r\n\r\n');
+  const splitAt = firstFrame.indexOf(Buffer.from('Привет')) + 1;
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => {
+      if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'future/model-v2' }] });
+      completionRequests.push(request);
+      return eventStreamResponse([
+        firstFrame.subarray(0, splitAt), firstFrame.subarray(splitAt),
+        Buffer.from('data: {"choices":[{"index":0,"delta":{"content":"мир"},"finish_reason":"stop"}]}\r\n\r\n'),
+        Buffer.from('data: [DONE]\r\n\r\n'),
+      ]);
+    }),
+  });
+
+  assert.equal((await provider.connect()).state, 'connected');
+  const events: ProviderEvent[] = [];
+  for await (const event of provider.stream({
+    system: [
+      { source: 'runtime', label: 'Runtime', text: 'Runtime rules' },
+      { source: 'global', label: 'Rules', text: 'Правила' },
+    ],
+    messages: [{ id: 'message-1', role: 'user', text: 'Вопрос', createdAt: '2026-10-09T00:00:00.000Z' }],
+    permissionProfile: 'ask',
+    modelId: 'future/model-v2',
+  }, new AbortController().signal)) events.push(event);
+
+  assert.deepEqual(events, [
+    { type: 'activity', activity: 'receiving' },
+    { type: 'text-delta', text: 'Привет ' },
+    { type: 'text-delta', text: 'мир' },
+    { type: 'completed' },
+  ]);
+  assert.equal(completionRequests[0]?.method, 'POST');
+  assert.equal(completionRequests[0]?.headers.Accept, 'text/event-stream');
+  assert.equal(completionRequests[0]?.headers.Authorization, 'Bearer synthetic-token');
+  const requestBody = JSON.parse(completionRequests[0]?.body ?? '{}') as { messages: Array<{ role: string; content: string }> };
+  assert.deepEqual(requestBody, {
+    model: 'future/model-v2',
+    messages: [{ role: 'system', content: '[Runtime]\nRuntime rules\n\n[Rules]\nПравила' }, { role: 'user', content: 'Вопрос' }],
+    stream: true,
+    function_call: 'none',
+  });
+  assert.equal(requestBody.messages.filter((message) => message.role === 'system').length, 1);
+});
+
+test('rejects malformed, incomplete, oversized, and unsupported terminal SSE events safely', async (t) => {
+  const cases: Array<{ name: string; response: ProviderTransportResponse; category: string }> = [
+    {
+      name: 'malformed JSON', response: eventStreamResponse([Buffer.from('data: not-json\n\ndata: [DONE]\n\n')]), category: 'protocol',
+    },
+    {
+      name: 'missing DONE', response: eventStreamResponse([Buffer.from('data: {"choices":[{"index":0,"delta":{"content":"часть"},"finish_reason":"stop"}]}\n\n')]), category: 'protocol',
+    },
+    {
+      name: 'DONE without stop', response: eventStreamResponse([Buffer.from('data: [DONE]\n\n')]), category: 'protocol',
+    },
+    {
+      name: 'DONE without any terminal finish reason', response: eventStreamResponse([Buffer.from('data: {"choices":[{"index":0,"delta":{"content":"часть"}}]}\n\ndata: [DONE]\n\n')]), category: 'protocol',
+    },
+    {
+      name: 'data after stop', response: eventStreamResponse([Buffer.from('data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: {"choices":[{"index":0,"delta":{"content":"поздно"}}]}\n\ndata: [DONE]\n\n')]), category: 'protocol',
+    },
+    {
+      name: 'length finish reason', response: eventStreamResponse([Buffer.from('data: {"choices":[{"index":0,"delta":{"content":"часть"},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n')]), category: 'context',
+    },
+    {
+      name: 'unsupported function call', response: eventStreamResponse([Buffer.from('data: {"choices":[{"index":0,"delta":{"function_call":{"name":"read"}},"finish_reason":"function_call"}]}\n\ndata: [DONE]\n\n')]), category: 'tool',
+    },
+    {
+      name: 'oversized stream', response: eventStreamResponse([Buffer.from(`data: ${'x'.repeat(2 * 1024 * 1024)}\n\n`)]), category: 'protocol',
+    },
+  ];
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const provider = createGigaChatProvider({
+        loadAuthorizationKey: async () => 'synthetic-key',
+        now: () => FIXED_NOW,
+        transport: fakeTransport((request) => request.url === GIGACHAT_OAUTH_URL
+          ? jsonResponse(200, token('synthetic-token'))
+          : request.url.endsWith('/models')
+            ? jsonResponse(200, { data: [{ id: 'test-model' }] })
+            : item.response),
+      });
+      assert.equal((await provider.connect()).state, 'connected');
+      const events: ProviderEvent[] = [];
+      for await (const event of provider.stream({
+        system: [], messages: [{ id: 'message-1', role: 'user', text: 'Задача', createdAt: '2026-10-09T00:00:00.000Z' }],
+        permissionProfile: 'ask', modelId: 'test-model',
+      }, new AbortController().signal)) events.push(event);
+      assert.deepEqual(events[events.length - 1], { type: 'error', category: item.category, retryable: false });
+      assert.equal(events.some((event) => event.type === 'completed'), false);
+      if (item.category === 'context') assert.ok(events.some((event) => event.type === 'text-delta' && event.text === 'часть'));
+    });
+  }
+});
+
+test('DONE closes a healthy SSE stream without waiting for HTTP EOF', async () => {
+  let nextCalls = 0;
+  let responseCancelled = false;
+  const responseBytes = Buffer.from('data: {"choices":[{"index":0,"delta":{"content":"готово"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => {
+      if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'test-model' }] });
+      return {
+        statusCode: 200,
+        headers: { 'content-type': 'text/event-stream' },
+        body: {
+          [Symbol.asyncIterator]: () => ({
+            next: async (): Promise<IteratorResult<Uint8Array>> => {
+              nextCalls += 1;
+              if (nextCalls === 1) return { done: false, value: responseBytes };
+              return new Promise<IteratorResult<Uint8Array>>(() => undefined);
+            },
+            return: async () => ({ done: true, value: undefined }),
+          }),
+        },
+        cancel: () => { responseCancelled = true; },
+      };
+    }),
+  });
+  assert.equal((await provider.connect()).state, 'connected');
+  const events: ProviderEvent[] = [];
+  for await (const event of provider.stream({
+    system: [], messages: [{ id: 'message-1', role: 'user', text: 'Задача', createdAt: '2026-10-09T00:00:00.000Z' }],
+    permissionProfile: 'ask', modelId: 'test-model',
+  }, new AbortController().signal)) events.push(event);
+
+  assert.deepEqual(events, [
+    { type: 'activity', activity: 'receiving' },
+    { type: 'text-delta', text: 'готово' },
+    { type: 'completed' },
+  ]);
+  assert.equal(nextCalls, 1);
+  assert.equal(responseCancelled, true);
+});
+
+test('does not send a model request for an ID removed by the latest registry refresh', async () => {
+  let modelRequests = 0;
+  let completionRequests = 0;
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => {
+      if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
+      if (request.url.endsWith('/models')) {
+        modelRequests += 1;
+        return jsonResponse(200, { data: [{ id: modelRequests === 1 ? 'old-model' : 'current-model' }] });
+      }
+      completionRequests += 1;
+      return eventStreamResponse([Buffer.from('data: [DONE]\n\n')]);
+    }),
+  });
+  assert.equal((await provider.connect()).state, 'connected');
+  await provider.listModels();
+  const events: ProviderEvent[] = [];
+  for await (const event of provider.stream({
+    system: [], messages: [{ id: 'message-1', role: 'user', text: 'Задача', createdAt: '2026-10-09T00:00:00.000Z' }],
+    permissionProfile: 'ask', modelId: 'old-model',
+  }, new AbortController().signal)) events.push(event);
+  assert.deepEqual(events, [{ type: 'error', category: 'model', retryable: false }]);
+  assert.equal(completionRequests, 0);
+});
+
+test('disconnect aborts an active SSE response with a safe cancel event', async () => {
+  const pendingBody = deferred<IteratorResult<Uint8Array>>();
+  let bodyReadStarted = false;
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => {
+      if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'test-model' }] });
+      return {
+        statusCode: 200,
+        headers: { 'content-type': 'text/event-stream' },
+        body: {
+          [Symbol.asyncIterator]: () => ({
+            next: () => { bodyReadStarted = true; return pendingBody.promise; },
+            return: async () => ({ done: true, value: undefined }),
+          }),
+        },
+        cancel() {},
+      };
+    }),
+  });
+  assert.equal((await provider.connect()).state, 'connected');
+  const iterator = provider.stream({
+    system: [], messages: [{ id: 'message-1', role: 'user', text: 'Задача', createdAt: '2026-10-09T00:00:00.000Z' }],
+    permissionProfile: 'ask', modelId: 'test-model',
+  }, new AbortController().signal)[Symbol.asyncIterator]();
+
+  assert.deepEqual(await iterator.next(), { done: false, value: { type: 'activity', activity: 'receiving' } });
+  const nextEvent = iterator.next();
+  await waitFor(() => bodyReadStarted);
+  provider.disconnect();
+
+  assert.deepEqual(await nextEvent, { done: false, value: { type: 'error', category: 'cancel', retryable: false } });
+  assert.deepEqual(await iterator.next(), { done: true, value: undefined });
 });
 
 test('invalid authorization key returns only the safe auth category', async () => {
@@ -494,6 +712,53 @@ test('bounds the TLS handshake with an absolute request deadline', async () => {
   } finally {
     transport.close();
     for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test('keeps SSE streams bounded by idle time while preserving a whole-response deadline for JSON', async () => {
+  const server = createHttpsServer({ key: TEST_SERVER_KEY, cert: TEST_SERVER_CA }, (request, response) => {
+    if (request.url === '/stream') {
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.write(': start\n\n');
+      void (async () => {
+        for (let index = 0; index < 7; index += 1) {
+          await delay(25);
+          response.write(`data: ${index}\n\n`);
+        }
+        response.end();
+      })();
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.write('{"data":[');
+    void delay(250).then(() => response.end('{"id":"late"}]}'));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address() as AddressInfo;
+  const transport = createHttpsTransport({ additionalCa: TEST_SERVER_CA, timeoutMs: 100 });
+
+  try {
+    const start = Date.now();
+    const streamResponse = await transport.request({
+      url: `https://127.0.0.1:${address.port}/stream`, method: 'GET', headers: {},
+      signal: new AbortController().signal, streaming: true,
+    });
+    let streamBody = '';
+    for await (const chunk of streamResponse.body) streamBody += Buffer.from(chunk).toString('utf8');
+    assert.match(streamBody, /data: 6/);
+    assert.ok(Date.now() - start > 100, 'a healthy stream may outlive the handshake timeout');
+
+    const jsonResponseBody = await transport.request({
+      url: `https://127.0.0.1:${address.port}/json`, method: 'GET', headers: {},
+      signal: new AbortController().signal,
+    });
+    await assert.rejects(async () => {
+      for await (const _chunk of jsonResponseBody.body) { /* consume bounded JSON body */ }
+    }, (error: unknown) => error instanceof GigaChatProviderError && error.category === 'network');
+  } finally {
+    transport.close();
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
 });

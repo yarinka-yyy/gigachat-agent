@@ -482,6 +482,9 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .runtime-cancel { min-height: 30px; margin-left: auto; }
 .runtime-activity-list { display: flex; flex-wrap: wrap; gap: 4px 17px; margin: 0; padding-left: 18px; color: var(--muted); font-size: 12px; }
 .runtime-error { margin: 0; color: var(--danger); font-size: 13px; line-height: 1.4; }
+.runtime-turn-draft { display: grid; gap: 5px; padding: 11px 13px; border-left: 2px solid var(--accent); background: var(--surface); color: var(--text); }
+.runtime-turn-draft p { margin: 0; font-size: 14px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.runtime-turn-draft small { color: var(--muted); font-size: 12px; }
 .chat-message { width: min(88%, 680px); padding: 14px 17px; border: 1px solid var(--line); border-radius: 17px; background: var(--surface); }
 .chat-message.message-user { margin-left: auto; background: var(--accent-soft); }
 .message-author { color: var(--muted); font-size: 13px; font-weight: 650; }

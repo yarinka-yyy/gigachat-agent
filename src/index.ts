@@ -9,13 +9,13 @@ import { createLocalTools, createPowerShellHelper, resolvePowerShellHelperPath, 
 import { createTurnRuntime, type TurnRuntime } from './runtime';
 import type { AcceptedTurnInput, ChatPatch, FolderOpener, ModelRegistrySnapshot, NotificationSettings, PreferredOpener, RuntimeAvailability, SettingsPatch, Theme, VoiceAvailability } from './contracts';
 import { requirePermissionProfile } from './permissions';
-import { requireModelId } from './models';
+import { isModelAvailable, requireModelId } from './models';
 import { openCustomPermissions, parseCustomConfig } from './custom-permissions';
 import { createPermissionApprovals } from './permission-approvals';
 import { createSkillRegistry, isSkillId } from './skills';
 import { createHookRegistry } from './hooks';
 import { createSecureStore } from './secure-store';
-import { createGigaChatProvider, createHttpsTransport, GIGACHAT_ROOT_CA_SHA256, type GigaChatProviderConnection, type ProviderTransport } from './gigachat-provider';
+import { createGigaChatProvider, createHttpsTransport, GIGACHAT_ROOT_CA_SHA256, GigaChatProviderError, type GigaChatProviderConnection, type ProviderTransport } from './gigachat-provider';
 import { createOnboardingBrowser, type BrowserBounds } from './onboarding-browser';
 import { createEmbeddedBrowser } from './embedded-browser';
 import { createNumberedProjectFolder, prepareProjectFolders, removeEmptyCreatedFolder } from './project-folders';
@@ -706,11 +706,14 @@ async function createMainRuntime(
 
   const lastNotifiedStatus = new Map<string, string>();
   const turnRuntime = createTurnRuntime({
-    provider: null,
+    provider: providerConnection,
     tools,
     prepareTurn: async (turn, signal) => {
       if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
       await store.validateAcceptedTurn(turn);
+      if (!turn.modelId || !isModelAvailable(providerConnection.getModelRegistry(), turn.modelId)) {
+        throw new GigaChatProviderError('model');
+      }
       const projects = await store.listProjects();
       const project = turn.projectId ? projects.find((item) => item.id === turn.projectId) : null;
       if (turn.projectId && (!project || project.workingFolder !== turn.projectWorkingFolder)) {
@@ -728,6 +731,8 @@ async function createMainRuntime(
       const globalText = await store.readGlobalInstructions();
       if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
       await store.validateAcceptedTurn(turn);
+      const messages = await store.getMessagesThrough(turn.chatId, turn.messageId);
+      if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
       const request = buildInstructionRequest({
         globalText,
         projectInstructions: project ? [{ scope: project.name, text: projectInstructions }] : [],
@@ -736,7 +741,7 @@ async function createMainRuntime(
           scope: selectedSkill.scope === 'global' ? 'Global' : `Project · ${selectedSkill.projectName ?? project?.name ?? 'неизвестный проект'}`,
           text: selectedSkill.instructions,
         } : null,
-        messages: turn.messages,
+        messages,
         permissionProfile: turn.permissionProfile,
         modelId: turn.modelId,
       });
@@ -744,7 +749,9 @@ async function createMainRuntime(
     },
     consumeTurn: (turn: AcceptedTurnInput, signal) => store.consumeTurnReservation(turn, signal),
     releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
-    appendAssistant: async (turn, text, signal) => { await store.appendAssistantMessageFromRuntime(turn.chatId, text, signal); },
+    appendAssistant: async (turn, text, signal) => {
+      await store.appendAssistantMessageFromRuntime(turn.chatId, turn.messageId, text, signal);
+    },
     onUpdate: (turn) => {
       if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('runtime:update', turn);
       if (lastNotifiedStatus.get(turn.id) === turn.status) return;
@@ -976,7 +983,10 @@ async function registerIpcHandlers(
     await store.getChat(chatId);
     return runtime.cancel(requireId(turnIdInput), chatId);
   });
-  handle('runtime:status', () => availability);
+  handle('runtime:status', () => ({
+    ...availability,
+    providerConfigured: providerConnection.getConnectionStatus().state === 'connected',
+  }));
   handle('permissions:read-config', async () => {
     const contents = await customPermissions.read();
     try { parseCustomConfig(contents); return { contents, error: null }; }

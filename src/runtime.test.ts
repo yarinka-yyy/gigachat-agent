@@ -467,21 +467,89 @@ test('never calls a provider with an unset model', async () => {
   assert.match(runtime.list('chat-one')[0]?.error ?? '', /Выберите модель/);
 });
 
-test('keeps observable activity metadata and omits provider text from timeline snapshots', async () => {
+test('publishes partial provider text while streaming and clears the draft after a completed save', async () => {
+  const finishStream = deferred();
+  const updates: RuntimeTurnSnapshot[] = [];
   const provider = makeProvider(async function* () {
     yield { type: 'activity', activity: 'tool-started', tool: 'read' };
     yield { type: 'text-delta', text: 'Промежуточный текст ответа' };
+    await finishStream.promise;
     yield { type: 'completed' };
   });
-  const runtime = makeRuntime(provider);
+  const runtime = makeRuntime(provider, { onUpdate: (turn) => updates.push(turn) });
   const id = runtime.enqueue(turnFor('chat-one'));
   assert.ok(id);
+  await waitUntil(() => runtime.list('chat-one')[0]?.draft === 'Промежуточный текст ответа');
+  const streaming = runtime.list('chat-one')[0];
+  assert.equal(streaming?.status, 'running');
+  assert.equal(streaming?.activity[0]?.kind, 'provider');
+  assert.equal(JSON.stringify(streaming).includes('Промежуточный текст ответа'), true);
+
+  finishStream.resolve();
   await runtime.whenIdle();
   const snapshot = runtime.list('chat-one')[0];
   assert.equal(snapshot?.status, 'completed');
-  assert.equal(snapshot?.activity[0]?.kind, 'provider');
+  assert.equal(snapshot?.draft, undefined);
   assert.equal(JSON.stringify(snapshot).includes('Промежуточный текст ответа'), false);
   assert.equal(typeof snapshot?.activeDurationMs, 'number');
+  assert.ok(updates.some((turn) => turn.status === 'running' && turn.draft === 'Промежуточный текст ответа'));
+});
+
+test('provider session cancellation keeps the partial draft and waits for stream stop before the next FIFO turn', async () => {
+  const reset = deferred();
+  const stopStarted = deferred();
+  const allowStop = deferred();
+  const started: string[] = [];
+  const saved: string[] = [];
+  const provider = makeProvider((request) => {
+    const prompt = request.messages[0]?.text ?? '';
+    started.push(prompt);
+    if (prompt !== 'chat-one') {
+      return (async function* () {
+        yield { type: 'text-delta', text: 'Ответ второго хода' } as const;
+        yield { type: 'completed' } as const;
+      })();
+    }
+    return {
+      [Symbol.asyncIterator]: () => {
+        let state = 0;
+        return {
+          next: async (): Promise<IteratorResult<ProviderEvent>> => {
+            if (state === 0) { state += 1; return { done: false, value: { type: 'text-delta', text: 'Частичный ответ' } }; }
+            if (state === 1) {
+              state += 1;
+              await reset.promise;
+              return { done: false, value: { type: 'error', category: 'cancel', retryable: false } };
+            }
+            return { done: true, value: undefined };
+          },
+          return: async (): Promise<IteratorResult<ProviderEvent>> => {
+            stopStarted.resolve();
+            await allowStop.promise;
+            return { done: true, value: undefined };
+          },
+        };
+      },
+    };
+  });
+  const runtime = makeRuntime(provider, { appendAssistant: async (_chatId, text) => { saved.push(text); } });
+  const firstId = runtime.enqueue(turnFor('chat-one'));
+  const secondId = runtime.enqueue(turnFor('chat-two'));
+  assert.ok(firstId && secondId);
+  await waitUntil(() => runtime.list('chat-one')[0]?.draft === 'Частичный ответ');
+
+  reset.resolve();
+  await stopStarted.promise;
+  assert.deepEqual(started, ['chat-one']);
+  assert.deepEqual(saved, []);
+
+  allowStop.resolve();
+  await runtime.whenIdle();
+  assert.deepEqual(started, ['chat-one', 'chat-two']);
+  assert.equal(runtime.list('chat-one')[0]?.status, 'cancelled');
+  assert.equal(runtime.list('chat-one')[0]?.draft, 'Частичный ответ');
+  assert.equal(runtime.list('chat-two')[0]?.status, 'completed');
+  assert.deepEqual(saved, ['Ответ второго хода']);
 });
 
 test('rejects provider events after completion and does not append an incomplete answer', async () => {

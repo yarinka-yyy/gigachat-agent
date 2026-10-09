@@ -632,7 +632,7 @@ function getErrorMessage(error: unknown): string {
 }
 
 function runtimeStatusLabel(status: RuntimeTurnSnapshot['status']): string {
-  if (status === 'queued') return 'В очереди';
+  if (status === 'queued') return 'Ожидает завершения активного хода';
   if (status === 'running') return 'Выполняется';
   if (status === 'completed') return 'Завершено';
   if (status === 'cancelled') return 'Отменено';
@@ -1849,7 +1849,10 @@ export default function App() {
         pendingSkillChatIdRef.current = chatId;
       }
       setChats(await window.gigaChat.chats.list());
-      if (stillCurrent) showSuccess('Не отправлено в GigaChat API. Сообщение сохранено локально.');
+      const connectionStatus = await window.gigaChat.onboarding.getConnectionStatus().catch(() => null);
+      if (stillCurrent) showSuccess(connectionStatus?.state === 'connected'
+        ? 'Сообщение сохранено и поставлено в очередь GigaChat.'
+        : 'Сообщение сохранено локально; подключите GigaChat перед отправкой.');
     } catch (error) {
       rendererOperations.current.reportFailure(error);
       setNotice(getErrorMessage(error));
@@ -3050,7 +3053,7 @@ export default function App() {
             </div>}
             {chatDetail?.id === selectedChat.id && chatLoadState.status === 'ready' && chatDetail.messages.length ? <div className="chat-history" aria-label="История сообщений">
               {chatDetail.messages.map((message) => <article key={message.id} className={`chat-message message-${message.role}`}>
-                <span className="message-author">{message.role === 'user' ? 'Вы' : 'GigaChat · тестовый пример'}</span>
+                <span className="message-author">{message.role === 'user' ? 'Вы' : message.source === 'runtime' ? 'GigaChat' : 'GigaChat · пример'}</span>
                 <p>{message.text}</p>
               </article>)}
             </div> : null}
@@ -3067,6 +3070,11 @@ export default function App() {
                 {turn.activity.length > 0 && <ul className="runtime-activity-list">
                   {turn.activity.map((activity, index) => <li key={`${turn.id}-${index}`}>{runtimeActivityLabel(activity)}{activity.kind === 'tool' && activity.durationMs !== undefined ? ` · ${elapsedLabel(activity.durationMs)}` : ''}</li>)}
                 </ul>}
+                {turn.draft && <div className="runtime-turn-draft" aria-live="polite">
+                  <span className="message-author">{turn.status === 'running' ? 'Ответ от GigaChat' : 'GigaChat · незавершённый ответ'}</span>
+                  <p>{turn.draft}</p>
+                  {(turn.status === 'failed' || turn.status === 'cancelled') && <small>Ответ не добавлен в историю чата.</small>}
+                </div>}
                 {turn.error && <p className="runtime-error" role="alert">{turn.error}</p>}
               </article>)}
             </section> : null}

@@ -58,6 +58,7 @@ export interface ChatMessage {
   role: 'user' | 'assistant';
   text: string;
   createdAt: string;
+  source?: 'runtime' | 'example';
 }
 
 export type InstructionSource = 'runtime' | 'global' | 'project' | 'skill';
@@ -167,6 +168,7 @@ export interface RuntimeTurnSnapshot {
   queueDurationMs?: number;
   activeDurationMs?: number;
   activity: RuntimeActivity[];
+  draft?: string;
   error?: string;
   errorCategory?: ProviderErrorCategory;
 }
