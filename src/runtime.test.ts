@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { AcceptedTurnInput, ChatToolReceipt, GigaChatProvider, HookDispatchInput, HookRunResult, ProviderEvent, ProviderTurnRequest, RuntimeTurnSnapshot } from './contracts';
+import type { AcceptedTurnInput, ChatToolReceipt, GigaChatProvider, HookDispatchInput, HookRunResult, ProviderEvent, ProviderTurnRequest, RuntimeTurnSnapshot, UsageReceipt } from './contracts';
 import type { LocalTools } from './local-tools';
 import { LocalToolError } from './local-tools';
 import { HookDispatchAbortError } from './hooks';
 import { createTurnRuntime, type ToolReceiptInput, type ToolReceiptStart, type TurnRuntimeOptions } from './runtime';
+import { mergeUsageReceipt } from './usage';
 
 const testTools = {} as LocalTools;
 
@@ -39,10 +40,13 @@ function makeRuntime(provider: GigaChatProvider | null, options: {
   beginToolReceipt?: TurnRuntimeOptions['beginToolReceipt'];
   completeToolReceipt?: TurnRuntimeOptions['completeToolReceipt'];
   runHooks?: TurnRuntimeOptions['runHooks'];
+  recordUsageReceipt?: TurnRuntimeOptions['recordUsageReceipt'];
+  usageReceipts?: UsageReceipt[];
   timeouts?: TurnRuntimeOptions['timeouts'];
   onUpdate?: (turn: RuntimeTurnSnapshot) => void;
 } = {}) {
-  return createTurnRuntime({
+  const usageReceipts = options.usageReceipts ?? [];
+  const runtime = createTurnRuntime({
     provider,
     tools: options.tools ?? testTools,
     prepareTurn: async (turn) => requestFor(turn),
@@ -51,12 +55,18 @@ function makeRuntime(provider: GigaChatProvider | null, options: {
     appendAssistant: options.appendAssistant
       ? async (turn, text, signal, functionsStateId) => options.appendAssistant?.(turn.chatId, text, signal, functionsStateId)
       : async () => undefined,
+    recordUsageReceipt: options.recordUsageReceipt ?? (async (receipt) => {
+      const index = usageReceipts.findIndex((item) => item.localRequestId === receipt.localRequestId);
+      if (index < 0) usageReceipts.push(structuredClone(receipt));
+      else usageReceipts[index] = mergeUsageReceipt(usageReceipts[index]!, receipt);
+    }),
     ...(options.beginToolReceipt ? { beginToolReceipt: options.beginToolReceipt } : {}),
     ...(options.completeToolReceipt ? { completeToolReceipt: options.completeToolReceipt } : {}),
     ...(options.runHooks ? { runHooks: options.runHooks } : {}),
     ...(options.timeouts ? { timeouts: options.timeouts } : {}),
     ...(options.onUpdate ? { onUpdate: options.onUpdate } : {}),
   });
+  return Object.assign(runtime, { usageReceipts });
 }
 
 function makeReceiptStore() {
@@ -116,6 +126,11 @@ function deferredValue<T>(): { promise: Promise<T>; resolve(value: T): void } {
   return { promise, resolve };
 }
 
+function saveUsageReceipt(records: Map<string, UsageReceipt>, receipt: UsageReceipt): void {
+  const existing = records.get(receipt.localRequestId);
+  records.set(receipt.localRequestId, existing ? mergeUsageReceipt(existing, receipt) : structuredClone(receipt));
+}
+
 function functionCall(name: string, args: Record<string, unknown>, functionsStateId: string | null = null): ProviderEvent {
   return {
     type: 'function-call',
@@ -162,6 +177,359 @@ test('runs turns from two chats FIFO with one active adapter and appends only a 
   assert.equal(runtime.list('chat-two')[0]?.status, 'completed');
 });
 
+test('records separate raw usage receipts for chat and tool-continuation requests', async () => {
+  let streamCount = 0;
+  const provider = makeProvider(async function* () {
+    streamCount += 1;
+    if (streamCount === 1) {
+      yield { type: 'usage', promptTokens: 10, completionTokens: 2, totalTokens: 12, precachedPromptTokens: 3, providerRequestId: 'response-1' };
+      yield functionCall('future-tool', {}, 'function-state-1');
+      return;
+    }
+    yield { type: 'usage', promptTokens: 5, completionTokens: 1, totalTokens: 6, precachedPromptTokens: 1, providerRequestId: 'response-2' };
+    yield { type: 'text-delta', text: 'Ответ после инструмента' };
+    yield { type: 'completed' };
+  });
+  const receipts = makeReceiptStore();
+  const runtime = makeRuntime(provider, { beginToolReceipt: receipts.begin, completeToolReceipt: receipts.complete });
+  runtime.enqueue(turnFor('usage-chat'));
+  await runtime.whenIdle();
+
+  assert.equal(runtime.usageReceipts.length, 2);
+  assert.deepEqual(runtime.usageReceipts.map((receipt) => receipt.requestKind), ['chat', 'tool-continuation']);
+  assert.equal(new Set(runtime.usageReceipts.map((receipt) => receipt.localRequestId)).size, 2);
+  assert.deepEqual(runtime.usageReceipts.map((receipt) => receipt.providerRequestId), ['response-1', 'response-2']);
+  assert.deepEqual(runtime.usageReceipts.map((receipt) => receipt.totalTokens), [12, 6]);
+  assert.deepEqual(runtime.usageReceipts.map((receipt) => receipt.status), ['completed', 'completed']);
+});
+
+test('preserves measured usage when the provider later reports an error', async () => {
+  const provider = makeProvider(async function* (request) {
+    if (request.messages[0]?.text === 'without usage') {
+      yield { type: 'error', category: 'network', retryable: true };
+      return;
+    }
+    if (request.messages[0]?.text === 'missing done') {
+      yield { type: 'usage', promptTokens: 8, completionTokens: 2, totalTokens: 10, precachedPromptTokens: null };
+      yield { type: 'error', category: 'protocol', retryable: false };
+      return;
+    }
+    yield { type: 'usage', promptTokens: 21, completionTokens: null, totalTokens: 21, precachedPromptTokens: null };
+    yield { type: 'error', category: 'network', retryable: true };
+  });
+  const runtime = makeRuntime(provider);
+  runtime.enqueue(turnFor('usage-error', 'with usage'));
+  runtime.enqueue(turnFor('usage-error-empty', 'without usage'));
+  runtime.enqueue(turnFor('usage-error-missing-done', 'missing done'));
+  await runtime.whenIdle();
+
+  const measured = runtime.usageReceipts.find((receipt) => receipt.chatId === 'usage-error');
+  const empty = runtime.usageReceipts.find((receipt) => receipt.chatId === 'usage-error-empty');
+  const missingDone = runtime.usageReceipts.find((receipt) => receipt.chatId === 'usage-error-missing-done');
+  assert.equal(runtime.usageReceipts.length, 3);
+  assert.equal(measured?.status, 'failed');
+  assert.equal(measured?.promptTokens, 21);
+  assert.equal(measured?.completionTokens, null);
+  assert.equal(measured?.totalTokens, 21);
+  assert.equal(empty?.status, 'failed');
+  assert.equal(empty?.promptTokens, null);
+  assert.equal(empty?.totalTokens, null);
+  assert.equal(missingDone?.status, 'failed');
+  assert.equal(missingDone?.totalTokens, 10);
+});
+
+test('cancel during the initial usage save holds FIFO and never starts provider transport', async () => {
+  const saveStarted = deferred();
+  const saveGate = deferred();
+  const records = new Map<string, UsageReceipt>();
+  const started: string[] = [];
+  const provider = makeProvider(async function* (request) {
+    started.push(request.messages[0]?.text ?? '');
+    yield { type: 'text-delta', text: 'answer' };
+    yield { type: 'completed' };
+  });
+  let blockInitialSave = true;
+  const runtime = makeRuntime(provider, {
+    timeouts: { operationMs: 1000 },
+    recordUsageReceipt: async (receipt) => {
+      if (receipt.chatId === 'usage-start-cancel' && receipt.status === 'pending' && blockInitialSave) {
+        blockInitialSave = false;
+        saveStarted.resolve();
+        await saveGate.promise;
+      }
+      saveUsageReceipt(records, receipt);
+    },
+  });
+  const firstId = runtime.enqueue(turnFor('usage-start-cancel', 'first'));
+  runtime.enqueue(turnFor('usage-start-next', 'second'));
+  assert.ok(firstId);
+  await saveStarted.promise;
+  assert.equal(runtime.cancel(firstId), true);
+  await waitUntil(() => runtime.list('usage-start-cancel')[0]?.error?.includes('Сохранение usage') === true);
+  assert.deepEqual(started, []);
+  assert.equal(runtime.list('usage-start-next')[0]?.status, 'queued');
+  await assert.rejects(runtime.whenIdle(), /очередь приостановлена/i);
+
+  saveGate.resolve();
+  await waitUntil(() => runtime.list('usage-start-next')[0]?.status === 'completed');
+  await runtime.whenIdle();
+  assert.deepEqual(started, ['second']);
+  assert.equal([...records.values()].find((receipt) => receipt.chatId === 'usage-start-cancel')?.status, 'cancelled');
+});
+
+test('cancel during a measured usage save keeps counts and blocks the next FIFO stream until settlement', async () => {
+  const updateStarted = deferred();
+  const updateGate = deferred();
+  const records = new Map<string, UsageReceipt>();
+  const started: string[] = [];
+  let blocked = false;
+  const provider = makeProvider(async function* (request) {
+    const prompt = request.messages[0]?.text ?? '';
+    started.push(prompt);
+    if (prompt === 'first') {
+      yield { type: 'usage', promptTokens: 17, completionTokens: 4, totalTokens: 21, precachedPromptTokens: 6 };
+      yield { type: 'text-delta', text: 'partial' };
+      yield { type: 'completed' };
+      return;
+    }
+    yield { type: 'text-delta', text: 'second response' };
+    yield { type: 'completed' };
+  });
+  const runtime = makeRuntime(provider, {
+    timeouts: { operationMs: 1000 },
+    recordUsageReceipt: async (receipt) => {
+      if (!blocked && receipt.chatId === 'usage-measure-cancel' && receipt.totalTokens === 21) {
+        blocked = true;
+        updateStarted.resolve();
+        await updateGate.promise;
+      }
+      saveUsageReceipt(records, receipt);
+    },
+  });
+  const firstId = runtime.enqueue(turnFor('usage-measure-cancel', 'first'));
+  runtime.enqueue(turnFor('usage-measure-next', 'second'));
+  assert.ok(firstId);
+  await updateStarted.promise;
+  assert.equal(runtime.cancel(firstId), true);
+  await waitUntil(() => runtime.list('usage-measure-cancel')[0]?.error?.includes('Сохранение usage') === true);
+  assert.deepEqual(started, ['first']);
+  assert.equal(runtime.list('usage-measure-next')[0]?.status, 'queued');
+
+  updateGate.resolve();
+  await waitUntil(() => runtime.list('usage-measure-next')[0]?.status === 'completed');
+  await runtime.whenIdle();
+  assert.deepEqual(started, ['first', 'second']);
+  const cancelled = [...records.values()].find((receipt) => receipt.chatId === 'usage-measure-cancel');
+  assert.equal(cancelled?.status, 'cancelled');
+  assert.equal(cancelled?.promptTokens, 17);
+  assert.equal(cancelled?.totalTokens, 21);
+  assert.equal(cancelled?.precachedPromptTokens, 6);
+});
+
+test('ordinary cancellation after usage persistence saves a terminal receipt without a false pending stop', async () => {
+  const waitingForStop = deferred();
+  const stopGate = deferred();
+  const records = new Map<string, UsageReceipt>();
+  const updates: RuntimeTurnSnapshot[] = [];
+  const started: string[] = [];
+  const provider = makeProvider(async function* (request) {
+    const prompt = request.messages[0]?.text ?? '';
+    started.push(prompt);
+    if (prompt === 'first') {
+      yield { type: 'usage', promptTokens: 7, completionTokens: 2, totalTokens: 9, precachedPromptTokens: 1 };
+      waitingForStop.resolve();
+      await stopGate.promise;
+      return;
+    }
+    yield { type: 'text-delta', text: 'second' };
+    yield { type: 'completed' };
+  });
+  const runtime = makeRuntime(provider, {
+    timeouts: { operationMs: 100, stopMs: 100 },
+    onUpdate: (turn) => updates.push(turn),
+    recordUsageReceipt: async (receipt) => saveUsageReceipt(records, receipt),
+  });
+  const firstId = runtime.enqueue(turnFor('usage-fast-cancel', 'first'));
+  runtime.enqueue(turnFor('usage-fast-cancel-next', 'second'));
+  assert.ok(firstId);
+  await waitingForStop.promise;
+  assert.equal(runtime.cancel(firstId), true);
+  stopGate.resolve();
+  await waitUntil(() => runtime.list('usage-fast-cancel-next')[0]?.status === 'completed');
+  await runtime.whenIdle();
+
+  const receipt = [...records.values()].find((item) => item.chatId === 'usage-fast-cancel');
+  assert.deepEqual(started, ['first', 'second']);
+  assert.equal(receipt?.status, 'cancelled');
+  assert.equal(receipt?.totalTokens, 9);
+  assert.equal(updates.some((turn) => turn.chatId === 'usage-fast-cancel' && turn.error?.includes('Сохранение usage')), false);
+});
+
+test('cancel during final usage receipt save holds FIFO without discarding completed measurements', async () => {
+  const finalSaveStarted = deferred();
+  const finalSaveGate = deferred();
+  const records = new Map<string, UsageReceipt>();
+  const started: string[] = [];
+  const appended: string[] = [];
+  const provider = makeProvider(async function* (request) {
+    started.push(request.messages[0]?.text ?? '');
+    yield { type: 'usage', promptTokens: 9, completionTokens: 3, totalTokens: 12, precachedPromptTokens: 2 };
+    yield { type: 'text-delta', text: 'answer' };
+    yield { type: 'completed' };
+  });
+  const runtime = makeRuntime(provider, {
+    timeouts: { operationMs: 1000 },
+    appendAssistant: async (chatId) => { appended.push(chatId); },
+    recordUsageReceipt: async (receipt) => {
+      if (receipt.chatId === 'usage-final-cancel' && receipt.status === 'completed') {
+        finalSaveStarted.resolve();
+        await finalSaveGate.promise;
+      }
+      saveUsageReceipt(records, receipt);
+    },
+  });
+  const firstId = runtime.enqueue(turnFor('usage-final-cancel', 'first'));
+  runtime.enqueue(turnFor('usage-final-next', 'second'));
+  assert.ok(firstId);
+  await finalSaveStarted.promise;
+  assert.equal(runtime.cancel(firstId), true);
+  await waitUntil(() => runtime.list('usage-final-cancel')[0]?.error?.includes('Сохранение usage') === true);
+  assert.deepEqual(started, ['first']);
+  assert.equal(runtime.list('usage-final-next')[0]?.status, 'queued');
+
+  finalSaveGate.resolve();
+  await waitUntil(() => runtime.list('usage-final-next')[0]?.status === 'completed');
+  await runtime.whenIdle();
+  assert.deepEqual(started, ['first', 'second']);
+  assert.deepEqual(appended, ['usage-final-next']);
+  const completed = [...records.values()].find((receipt) => receipt.chatId === 'usage-final-cancel');
+  assert.equal(completed?.status, 'completed');
+  assert.equal(completed?.totalTokens, 12);
+});
+
+test('fails closed with storage category when initial usage receipt cannot be saved', async () => {
+  let providerCalls = 0;
+  const runtime = makeRuntime(makeProvider(async function* () {
+    providerCalls += 1;
+    yield { type: 'text-delta', text: 'must not run' };
+    yield { type: 'completed' };
+  }), {
+    recordUsageReceipt: async () => { throw new Error('synthetic storage failure'); },
+  });
+  runtime.enqueue(turnFor('usage-start-failure'));
+  await runtime.whenIdle();
+
+  assert.equal(providerCalls, 0);
+  assert.equal(runtime.list('usage-start-failure')[0]?.status, 'failed');
+  assert.equal(runtime.list('usage-start-failure')[0]?.errorCategory, 'storage');
+  assert.match(runtime.list('usage-start-failure')[0]?.error ?? '', /сохранить usage/i);
+});
+
+test('bounds a stalled initial usage save and holds the FIFO until it settles', async () => {
+  const saveStarted = deferred();
+  const saveGate = deferred();
+  const records = new Map<string, UsageReceipt>();
+  const started: string[] = [];
+  const provider = makeProvider(async function* (request) {
+    started.push(request.messages[0]?.text ?? '');
+    yield { type: 'text-delta', text: 'answer' };
+    yield { type: 'completed' };
+  });
+  let blockInitialSave = true;
+  const runtime = makeRuntime(provider, {
+    timeouts: { operationMs: 20 },
+    recordUsageReceipt: async (receipt) => {
+      if (receipt.chatId === 'usage-timeout' && receipt.status === 'pending' && blockInitialSave) {
+        blockInitialSave = false;
+        saveStarted.resolve();
+        await saveGate.promise;
+      }
+      saveUsageReceipt(records, receipt);
+    },
+  });
+  runtime.enqueue(turnFor('usage-timeout', 'first'));
+  runtime.enqueue(turnFor('usage-timeout-next', 'second'));
+  await saveStarted.promise;
+  await waitUntil(() => runtime.list('usage-timeout')[0]?.error?.includes('Сохранение usage') === true);
+
+  assert.deepEqual(started, []);
+  assert.equal(runtime.list('usage-timeout')[0]?.errorCategory, 'storage');
+  assert.equal(runtime.list('usage-timeout-next')[0]?.status, 'queued');
+  await assert.rejects(runtime.whenIdle(), /очередь приостановлена/i);
+
+  saveGate.resolve();
+  await waitUntil(() => runtime.list('usage-timeout-next')[0]?.status === 'completed');
+  await runtime.whenIdle();
+  assert.deepEqual(started, ['second']);
+  assert.equal(runtime.list('usage-timeout')[0]?.status, 'failed');
+  assert.equal(runtime.list('usage-timeout')[0]?.errorCategory, 'storage');
+  assert.equal([...records.values()].find((receipt) => receipt.chatId === 'usage-timeout')?.status, 'failed');
+});
+
+test('does not start a provider request or advance FIFO before the pending usage receipt is saved', async () => {
+  const saveStarted = deferred();
+  const saveGate = deferred();
+  const started: string[] = [];
+  const provider = makeProvider(async function* (request) {
+    started.push(request.messages[0]?.text ?? '');
+    yield { type: 'text-delta', text: 'saved' };
+    yield { type: 'completed' };
+  });
+  let firstSave = true;
+  const runtime = makeRuntime(provider, { recordUsageReceipt: async (receipt) => {
+    if (firstSave && receipt.status === 'pending') {
+      firstSave = false;
+      saveStarted.resolve();
+      await saveGate.promise;
+    }
+  } });
+  runtime.enqueue(turnFor('usage-save-one', 'first'));
+  runtime.enqueue(turnFor('usage-save-two', 'second'));
+  await saveStarted.promise;
+  assert.deepEqual(started, []);
+  assert.equal(runtime.list('usage-save-two')[0]?.status, 'queued');
+  saveGate.resolve();
+  await runtime.whenIdle();
+  assert.deepEqual(started, ['first', 'second']);
+});
+
+test('waits for usage update persistence before continuing after a function response', async () => {
+  const updateStarted = deferred();
+  const updateGate = deferred();
+  let streamCount = 0;
+  let blockedUpdate = false;
+  const provider = makeProvider(async function* () {
+    streamCount += 1;
+    if (streamCount === 1) {
+      yield { type: 'usage', promptTokens: 12, completionTokens: 2, totalTokens: 14, precachedPromptTokens: 4 };
+      yield functionCall('future-tool', {});
+      return;
+    }
+    yield { type: 'text-delta', text: 'done' };
+    yield { type: 'completed' };
+  });
+  const receipts = makeReceiptStore();
+  const runtime = makeRuntime(provider, {
+    beginToolReceipt: receipts.begin,
+    completeToolReceipt: receipts.complete,
+    recordUsageReceipt: async (receipt) => {
+      if (!blockedUpdate && receipt.totalTokens === 14) {
+        blockedUpdate = true;
+        updateStarted.resolve();
+        await updateGate.promise;
+      }
+    },
+  });
+  runtime.enqueue(turnFor('usage-save-round-one'));
+  runtime.enqueue(turnFor('usage-save-round-two'));
+  await updateStarted.promise;
+  assert.equal(streamCount, 1);
+  assert.equal(runtime.list('usage-save-round-two')[0]?.status, 'queued');
+  updateGate.resolve();
+  await runtime.whenIdle();
+  assert.equal(streamCount, 3);
+});
+
 test('keeps the accepted history boundary when preparation is delayed', async () => {
   const prepareGate = deferred();
   const started: string[][] = [];
@@ -181,6 +549,7 @@ test('keeps the accepted history boundary when preparation is delayed', async ()
     consumeTurn: async () => undefined,
     releaseTurn: () => undefined,
     appendAssistant: async () => undefined,
+    recordUsageReceipt: async () => undefined,
   });
   runtime.enqueue(accepted);
   accepted.messages.push({ id: 'message-b2', role: 'user', text: 'B2', createdAt: '2026-09-27T00:00:01.000Z' });
@@ -210,6 +579,7 @@ test('ignores a late prepare result after its deadline and does not consume its 
     consumeTurn: async (turn) => { consumed.push(turn.chatId); },
     releaseTurn: () => undefined,
     appendAssistant: async () => undefined,
+    recordUsageReceipt: async () => undefined,
     timeouts: { prepareMs: 8, stopMs: 20 },
   });
   runtime.enqueue(turnFor('chat-one'));
@@ -241,6 +611,7 @@ test('cancels a queued turn without starting it', async () => {
     consumeTurn: async (turn) => { consumed.push(turn.chatId); },
     releaseTurn: () => undefined,
     appendAssistant: async () => undefined,
+    recordUsageReceipt: async () => undefined,
   });
   runtime.enqueue(turnFor('chat-one'));
   const queuedId = runtime.enqueue(turnFor('chat-two'));
@@ -359,6 +730,7 @@ test('does not start the next stream until timed out iterator cleanup and its pe
     consumeTurn: async () => undefined,
     releaseTurn: () => undefined,
     appendAssistant: async () => undefined,
+    recordUsageReceipt: async () => undefined,
     timeouts: { nextMs: 5, stopMs: 8, operationMs: 30 },
   });
   runtime.enqueue(turnFor('chat-one'));
@@ -403,6 +775,7 @@ test('does not append or advance while a started local tool still lacks its term
     consumeTurn: async () => undefined,
     releaseTurn: () => undefined,
     appendAssistant: async (turn) => { appended.push(turn.chatId); },
+    recordUsageReceipt: async () => undefined,
     timeouts: { stopMs: 40 },
   });
   runtime.enqueue(turnFor('chat-one'));
@@ -454,6 +827,7 @@ test('aborted reservation commit does not consume a one-shot choice after a dela
     },
     releaseTurn: () => undefined,
     appendAssistant: async (turn) => { consumed.push(`append:${turn.chatId}`); },
+    recordUsageReceipt: async () => undefined,
     timeouts: { stopMs: 20, operationMs: 8 },
   });
   runtime.enqueue(turnFor('chat-one'));
@@ -491,6 +865,7 @@ test('does not append a response when cancellation arrives before the store comm
       if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
       saved.push(`${turn.chatId}:${text}`);
     },
+    recordUsageReceipt: async () => undefined,
     timeouts: { operationMs: 100 },
   });
   const id = runtime.enqueue(turnFor('chat-one'));
@@ -522,6 +897,7 @@ test('never calls a provider with an unset model', async () => {
     consumeTurn: async () => { consumed = true; },
     releaseTurn: () => undefined,
     appendAssistant: async () => undefined,
+    recordUsageReceipt: async () => undefined,
   });
   runtime.enqueue(turnFor('chat-one'));
   await runtime.whenIdle();

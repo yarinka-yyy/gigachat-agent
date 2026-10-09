@@ -3,7 +3,7 @@ import { randomUUID, X509Certificate } from 'node:crypto';
 import { type ClientRequest, type IncomingHttpHeaders, type IncomingMessage } from 'node:http';
 import { Agent, request as httpsRequest } from 'node:https';
 import * as tls from 'node:tls';
-import type { GigaChatProvider, ModelRegistrySnapshot, ProviderConnectionSnapshot, ProviderErrorCategory, ProviderEvent, ProviderProtocolExchange, ProviderTurnRequest } from './contracts';
+import type { GigaChatProvider, ModelRegistrySnapshot, ProviderConnectionSnapshot, ProviderErrorCategory, ProviderEvent, ProviderProtocolExchange, ProviderTurnRequest, ProviderUsageValues } from './contracts';
 import { discoveredModelRegistry, failedModelRegistry, isModelAvailable, requireModelId, unavailableModelRegistry } from './models';
 
 export const GIGACHAT_API_BASE_URL = 'https://api.giga.chat/v1';
@@ -544,7 +544,10 @@ export function createGigaChatProvider(options: {
           break;
         }
         if (terminalReason || receivedDone) throw new GigaChatProviderError('protocol');
-        const chunk = parseCompletionChunk(data);
+        const payload = parseSsePayload(data);
+        const usage = parseProviderUsage(payload);
+        if (usage) yield { type: 'usage', ...usage };
+        const chunk = parseCompletionChunk(payload);
         if (chunk.finishReason === 'function_call') {
           if (chunk.errorCategory) throw new GigaChatProviderError(chunk.errorCategory);
           if (!chunk.functionCall) throw new GigaChatProviderError('protocol');
@@ -708,16 +711,53 @@ async function* readSseData(body: AsyncIterable<Uint8Array>, signal: AbortSignal
   }
 }
 
-function parseCompletionChunk(value: string): {
+function parseSsePayload(value: string): unknown {
+  try { return JSON.parse(value) as unknown; }
+  catch { throw new GigaChatProviderError('protocol'); }
+}
+
+function parseProviderUsage(value: unknown): ProviderUsageValues | null {
+  if (!isRecord(value)) return null;
+  const rawUsage = value.usage;
+  if (rawUsage !== undefined && rawUsage !== null && !isRecord(rawUsage)) throw new GigaChatProviderError('protocol');
+  const hasIdentity = (value.id !== undefined && value.id !== null) || (value.model !== undefined && value.model !== null);
+  if (!rawUsage && !hasIdentity) return null;
+  const usage = isRecord(rawUsage) ? rawUsage : {};
+  const readCount = (key: string): number | null => {
+    const count = usage[key];
+    if (count === undefined || count === null) return null;
+    if (!Number.isSafeInteger(count) || (count as number) < 0 || (count as number) > 2_147_483_647) {
+      throw new GigaChatProviderError('protocol');
+    }
+    return count as number;
+  };
+  const readIdentity = (key: string): string | undefined => {
+    const metadata = value[key];
+    if (metadata === undefined || metadata === null) return undefined;
+    if (typeof metadata !== 'string' || metadata.length < 1 || metadata.length > 512 || /[\u0000-\u001f\u007f]/.test(metadata)) {
+      throw new GigaChatProviderError('protocol');
+    }
+    return metadata;
+  };
+  const providerRequestId = readIdentity('id');
+  const providerModel = readIdentity('model');
+  return {
+    promptTokens: readCount('prompt_tokens'),
+    completionTokens: readCount('completion_tokens'),
+    totalTokens: readCount('total_tokens'),
+    precachedPromptTokens: readCount('precached_prompt_tokens'),
+    ...(providerRequestId ? { providerRequestId } : {}),
+    ...(providerModel ? { providerModel } : {}),
+  };
+}
+
+function parseCompletionChunk(parsed: unknown): {
   content: string | null;
   functionsStateId: string | null;
   finishReason: 'stop' | 'function_call' | null;
   functionCall?: { name: string; arguments: Record<string, unknown>; content: string | null; functionsStateId: string | null; terminalReason: 'function_call' };
   errorCategory?: ProviderErrorCategory;
 } {
-  let parsed: unknown;
-  try { parsed = JSON.parse(value) as unknown; }
-  catch { throw new GigaChatProviderError('protocol'); }
   if (!isRecord(parsed) || !Array.isArray(parsed.choices) || parsed.choices.length !== 1) {
     throw new GigaChatProviderError('protocol');
   }

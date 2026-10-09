@@ -801,6 +801,7 @@ async function createMainRuntime(
     appendAssistant: async (turn, text, signal, functionsStateId) => {
       await store.appendAssistantMessageFromRuntime(turn.chatId, turn.messageId, text, signal, functionsStateId);
     },
+    recordUsageReceipt: (receipt) => store.recordUsageReceipt(receipt),
     runHooks: async (turn, input, signal) => {
       const context: HookExecutionContext = {
         projectId: turn.projectId,
@@ -930,14 +931,14 @@ async function registerIpcHandlers(
     'models:get-registry', 'models:refresh',
     'onboarding:browser-back', 'onboarding:browser-reload', 'onboarding:browser-bounds',
     'browser:status', 'browser:bounds', 'runtime:cancel',
-    'settings:get', 'usage:local-stats', 'settings:open-projects-folder', 'settings:list-openers', 'settings:app-info',
+    'settings:get', 'usage:local-stats', 'usage:get-ledger', 'settings:open-projects-folder', 'settings:list-openers', 'settings:app-info',
     'settings:get-auto-start', 'settings:read-instructions',
   ]);
   const readOnlyChannels = new Set([
     'projects:list', 'projects:read-instructions', 'projects:instructions-backup-path',
     'chats:list', 'chats:get', 'runtime:list', 'runtime:status', 'permissions:read-config',
     'voice:status', 'skills:list', 'skills:read-source', 'hooks:list', 'hooks:inspect', 'onboarding:key-status', 'onboarding:connection-status', 'models:get-registry',
-    'onboarding:browser-status', 'browser:status', 'settings:get', 'usage:local-stats',
+    'onboarding:browser-status', 'browser:status', 'settings:get', 'usage:local-stats', 'usage:get-ledger',
     'settings:list-openers', 'settings:app-info', 'settings:get-auto-start', 'settings:read-instructions',
   ]);
   const availableDuringClose = new Set([
@@ -1216,6 +1217,7 @@ async function registerIpcHandlers(
 
   handle('settings:get', () => store.getSettings());
   handle('usage:local-stats', () => store.getLocalUsageStats());
+  handle('usage:get-ledger', () => store.getUsageLedger());
   handle('settings:update', async (patchInput) => {
     const patch = requireSettingsPatch(patchInput);
     if (patch.preferredOpener !== undefined) requirePreferredOpener(patch.preferredOpener);

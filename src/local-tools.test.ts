@@ -811,6 +811,7 @@ test('runs GigaChat read and approved write through the actual native helper in 
     consumeTurn: async () => undefined,
     releaseTurn: () => undefined,
     appendAssistant: async () => undefined,
+    recordUsageReceipt: async () => undefined,
     beginToolReceipt: async (turn, input) => {
       const receipt = { input, result: null, status: 'pending' as const };
       receipts.set(input.receiptId, receipt);

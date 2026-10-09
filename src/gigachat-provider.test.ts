@@ -196,7 +196,7 @@ test('empty model discovery is an explicit error snapshot', async () => {
 
 test('streams GigaChat v1 SSE across split UTF-8, CRLF and multiline data frames', async () => {
   const completionRequests: ProviderTransportRequest[] = [];
-  const firstFrame = Buffer.from('data: {"id":"response-1","choices":[\r\ndata: {"index":0,"delta":{"role":"assistant","content":"Привет "}}]}\r\n\r\n');
+  const firstFrame = Buffer.from('data: {"choices":[\r\ndata: {"index":0,"delta":{"role":"assistant","content":"Привет "}}]}\r\n\r\n');
   const splitAt = firstFrame.indexOf(Buffer.from('Привет')) + 1;
   const provider = createGigaChatProvider({
     loadAuthorizationKey: async () => 'synthetic-key',
@@ -207,7 +207,7 @@ test('streams GigaChat v1 SSE across split UTF-8, CRLF and multiline data frames
       completionRequests.push(request);
       return eventStreamResponse([
         firstFrame.subarray(0, splitAt), firstFrame.subarray(splitAt),
-        Buffer.from('data: {"choices":[{"index":0,"delta":{"content":"мир","functions_state_id":"state-final"},"finish_reason":"stop"}]}\r\n\r\n'),
+        Buffer.from('data: {"id":"response-1","model":"future/model-v2","usage":{"prompt_tokens":100,"completion_tokens":40,"total_tokens":140,"precached_prompt_tokens":25},"choices":[{"index":0,"delta":{"content":"мир","functions_state_id":"state-final"},"finish_reason":"stop"}]}\r\n\r\n'),
         Buffer.from('data: [DONE]\r\n\r\n'),
       ]);
     }),
@@ -236,6 +236,7 @@ test('streams GigaChat v1 SSE across split UTF-8, CRLF and multiline data frames
   assert.deepEqual(events, [
     { type: 'activity', activity: 'receiving' },
     { type: 'text-delta', text: 'Привет ' },
+    { type: 'usage', promptTokens: 100, completionTokens: 40, totalTokens: 140, precachedPromptTokens: 25, providerRequestId: 'response-1', providerModel: 'future/model-v2' },
     { type: 'text-delta', text: 'мир' },
     { type: 'completed', functionsStateId: 'state-final' },
   ]);
@@ -258,6 +259,57 @@ test('streams GigaChat v1 SSE across split UTF-8, CRLF and multiline data frames
   assert.equal(requestBody.function_call, 'auto');
   assert.deepEqual(requestBody.functions.map((fn) => fn.name), ['list', 'search', 'read', 'write', 'open', 'powershell']);
   assert.equal(requestBody.messages.filter((message) => message.role === 'system').length, 1);
+});
+
+test('emits validated terminal usage before a later missing-DONE protocol error', async () => {
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => request.url === GIGACHAT_OAUTH_URL
+      ? jsonResponse(200, token('synthetic-token'))
+      : request.url.endsWith('/models')
+        ? jsonResponse(200, { data: [{ id: 'test-model' }] })
+        : eventStreamResponse([Buffer.from(`data: ${JSON.stringify({
+          id: 'response-usage', model: 'provider-model-v3',
+          usage: { prompt_tokens: 8, total_tokens: 10 },
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+        })}\n\n`) ])),
+  });
+  assert.equal((await provider.connect()).state, 'connected');
+  const events: ProviderEvent[] = [];
+  for await (const event of provider.stream({
+    system: [], messages: [{ id: 'message-1', role: 'user', text: 'Question', createdAt: '2026-10-09T00:00:00.000Z' }],
+    permissionProfile: 'ask', modelId: 'test-model',
+  }, new AbortController().signal)) events.push(event);
+
+  assert.deepEqual(events, [
+    { type: 'activity', activity: 'receiving' },
+    { type: 'usage', promptTokens: 8, completionTokens: null, totalTokens: 10, precachedPromptTokens: null,
+      providerRequestId: 'response-usage', providerModel: 'provider-model-v3' },
+    { type: 'error', category: 'protocol', retryable: false },
+  ]);
+});
+
+test('rejects malformed usage counts without emitting an unvalidated receipt', async () => {
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => request.url === GIGACHAT_OAUTH_URL
+      ? jsonResponse(200, token('synthetic-token'))
+      : request.url.endsWith('/models')
+        ? jsonResponse(200, { data: [{ id: 'test-model' }] })
+        : eventStreamResponse([Buffer.from(`data: ${JSON.stringify({
+          usage: { prompt_tokens: -1 }, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+        })}\n\n`), Buffer.from('data: [DONE]\n\n') ])),
+  });
+  assert.equal((await provider.connect()).state, 'connected');
+  const events: ProviderEvent[] = [];
+  for await (const event of provider.stream({
+    system: [], messages: [{ id: 'message-1', role: 'user', text: 'Question', createdAt: '2026-10-09T00:00:00.000Z' }],
+    permissionProfile: 'ask', modelId: 'test-model',
+  }, new AbortController().signal)) events.push(event);
+  assert.equal(events.some((event) => event.type === 'usage'), false);
+  assert.equal(events[events.length - 1]?.type, 'error');
 });
 
 test('normalizes an unknown bounded function call with object arguments only after DONE', async () => {

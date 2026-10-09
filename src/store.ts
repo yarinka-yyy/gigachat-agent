@@ -3,17 +3,19 @@ import { Buffer } from 'node:buffer';
 import { constants } from 'node:fs';
 import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { DEFAULT_NOTIFICATION_SETTINGS, type AcceptedTurnInput, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderProtocolExchange, type Settings, type SettingsPatch, type Theme } from './contracts';
+import { DEFAULT_NOTIFICATION_SETTINGS, type AcceptedTurnInput, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderProtocolExchange, type Settings, type SettingsPatch, type Theme, type UsageLedgerSummary, type UsageReceipt } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { requireModelId } from './models';
 import { isSkillId } from './skills';
 import { validateProjectFolder, validateProjectInstructionsPath } from './project-paths';
 import { createInstructionDocument, instructionFileHash } from './instruction-documents';
+import { MAX_USAGE_RECEIPTS, mergeUsageReceipt, summarizeUsage, validateUsageReceipt } from './usage';
 
 type ProjectFile = { schemaVersion: 2; projects: Project[] };
 type LegacyChat = ChatSummary & { draft: string };
 type ChatFile = { schemaVersion: 2; chats: LegacyChat[] };
 type SettingsFile = { schemaVersion: 10; settings: Settings };
+type UsageFile = { schemaVersion: 1; receipts: UsageReceipt[] };
 type ProjectDeleteState = { projects: ProjectFile; chats: ChatDetail[]; instructionText: string | null };
 type ProjectDeleteJournal = {
   schemaVersion: 1;
@@ -38,6 +40,7 @@ export interface StoreOpenOptions {
 
 const MAX_IMPORTED_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_INSTRUCTION_BYTES = 64 * 1024;
+const MAX_USAGE_LEDGER_BYTES = 32 * 1024 * 1024;
 const MAX_TOOL_RECEIPTS_PER_CHAT = 256;
 const MAX_TOOL_ARGUMENTS_BYTES = 1_900_000;
 const MAX_TOOL_RESULT_BYTES = 32 * 1024;
@@ -81,6 +84,8 @@ export interface LocalStore {
   getSettings(): Promise<Settings>;
   updateSettings(patch: unknown): Promise<Settings>;
   getLocalUsageStats(): Promise<LocalUsageStats>;
+  recordUsageReceipt(receipt: unknown): Promise<void>;
+  getUsageLedger(): Promise<UsageLedgerSummary>;
   getStorageIssues(): Promise<string[]>;
   readGlobalInstructions(): Promise<string>;
   readGlobalInstructionDocument(): Promise<InstructionDocument>;
@@ -376,6 +381,20 @@ async function loadVersioned<T>(
   }
 }
 
+async function loadUsageLedger(filePath: string): Promise<Loaded<UsageFile>> {
+  let info;
+  try { info = await lstat(filePath); }
+  catch (error) {
+    if (isMissingFile(error)) return { value: { schemaVersion: 1, receipts: [] }, needsWrite: true };
+    throw error;
+  }
+  if (!info.isFile() || info.size > MAX_USAGE_LEDGER_BYTES) throw storageError(filePath);
+  const bytes = await readFile(filePath);
+  if (bytes.byteLength > MAX_USAGE_LEDGER_BYTES) throw storageError(filePath);
+  try { return parseUsageFile(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as unknown); }
+  catch { throw storageError(filePath); }
+}
+
 function parseProjectFile(value: unknown): Loaded<ProjectFile> {
   if (!isRecord(value)) throw new Error('Invalid projects file.');
   if (value.schemaVersion === 1) {
@@ -388,6 +407,16 @@ function parseProjectFile(value: unknown): Loaded<ProjectFile> {
     value: { schemaVersion: 2, projects: validateRows(value, 'projects', 2, validateProject) },
     needsWrite: false,
   };
+}
+
+function parseUsageFile(value: unknown): Loaded<UsageFile> {
+  if (!isRecord(value) || value.schemaVersion !== 1 || !Array.isArray(value.receipts)
+    || value.receipts.length > MAX_USAGE_RECEIPTS) throw new Error('Invalid usage ledger.');
+  const receipts = value.receipts.map(validateUsageReceipt);
+  if (new Set(receipts.map((receipt) => receipt.localRequestId)).size !== receipts.length) {
+    throw new Error('Duplicate usage request.');
+  }
+  return { value: { schemaVersion: 1, receipts }, needsWrite: false };
 }
 
 function parseChatFile(value: unknown): Loaded<ChatFile> {
@@ -710,6 +739,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
   const projectDeleteJournalPath = join(storageRoot, 'project-delete.journal.json');
   const migrationMarker = join(storageRoot, 'chats.migrated');
   const settingsPath = join(storageRoot, 'settings.json');
+  const usagePath = join(storageRoot, 'usage.json');
   const writeOwnedAtomic = async (filePath: string, value: unknown, signal?: AbortSignal): Promise<void> => {
     await assertOwnedPath(storageRoot, filePath);
     await mkdir(dirname(filePath), { recursive: true });
@@ -1003,6 +1033,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     assertOwnedPath(storageRoot, projectDeleteJournalPath),
     assertOwnedPath(storageRoot, migrationMarker),
     assertOwnedPath(storageRoot, settingsPath),
+    assertOwnedPath(storageRoot, usagePath),
   ]);
 
   const journalContents = await readFile(projectDeleteJournalPath, 'utf8').catch((error: unknown) => {
@@ -1017,7 +1048,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
   }
 
   // Parse every existing file before creating or migrating any of them.
-  const [projectFile, settingsFile] = await Promise.all([
+  const [projectFile, settingsFile, usageFile] = await Promise.all([
     loadVersioned<ProjectFile>(projectPath, { schemaVersion: 2, projects: [] }, parseProjectFile),
     loadVersioned<SettingsFile>(settingsPath, {
       schemaVersion: 10,
@@ -1039,6 +1070,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         notifications: { ...DEFAULT_NOTIFICATION_SETTINGS },
       },
     }, parseSettingsFile),
+    loadUsageLedger(usagePath),
   ]);
 
   await assertOwnedPath(storageRoot, migrationMarker);
@@ -1136,10 +1168,12 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
 
   if (projectFile.needsWrite) await writeOwnedAtomic(projectPath, projectFile.value);
   if (settingsFile.needsWrite) await writeOwnedAtomic(settingsPath, settingsFile.value);
+  if (usageFile.needsWrite) await writeOwnedAtomic(usagePath, usageFile.value);
 
   let projects = projectFile.value.projects;
   let chats = loadedChats;
   let settings = settingsFile.value.settings;
+  let usageReceipts = usageFile.value.receipts;
   const selectionRevisions = new Map(chats.map((chat) => [chat.id, { permissionProfile: 0, skill: 0 }]));
   const turnReservations = new Map<string, {
     chatId: string;
@@ -1167,6 +1201,15 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
   const saveProjects = async (next: Project[]): Promise<void> => {
     await writeOwnedAtomic(projectPath, { schemaVersion: 2, projects: next });
     projects = next;
+  };
+  const saveUsageReceipts = async (next: UsageReceipt[]): Promise<void> => {
+    if (next.length > MAX_USAGE_RECEIPTS) throw new Error('Лимит истории usage достигнут; существующие измерения сохранены.');
+    const value = { schemaVersion: 1 as const, receipts: next };
+    if (Buffer.byteLength(`${JSON.stringify(value, null, 2)}\n`, 'utf8') > MAX_USAGE_LEDGER_BYTES) {
+      throw new Error('Usage ledger превысил безопасный размер; существующие измерения сохранены.');
+    }
+    await writeOwnedAtomic(usagePath, value);
+    usageReceipts = next;
   };
   const chatFolder = (id: string): string => join(chatsDirectory, requireId(id));
   const saveChat = async (chat: ChatDetail, signal?: AbortSignal): Promise<void> => {
@@ -1689,6 +1732,25 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       }
       return { chatCount: chats.length, projectCount: projects.length, activityDayCount: activityDays.size };
     }),
+    recordUsageReceipt: (receiptInput) => {
+      const incoming = validateUsageReceipt(receiptInput);
+      return serialize(async () => {
+        const index = usageReceipts.findIndex((receipt) => receipt.localRequestId === incoming.localRequestId);
+        if (index >= 0) {
+          const merged = mergeUsageReceipt(usageReceipts[index]!, incoming);
+          if (sameJson(merged, usageReceipts[index])) return;
+          const next = [...usageReceipts];
+          next[index] = merged;
+          await saveUsageReceipts(next);
+          return;
+        }
+        if (usageReceipts.length >= MAX_USAGE_RECEIPTS) {
+          throw new Error('Лимит истории usage достигнут; существующие измерения сохранены.');
+        }
+        await saveUsageReceipts([...usageReceipts, incoming]);
+      });
+    },
+    getUsageLedger: () => serialize(async () => structuredClone(summarizeUsage(usageReceipts))),
     getStorageIssues: () => serialize(async () => [...instructionIssues, ...storageIssues]),
     readGlobalInstructions: () => serialize(() => readOwnedInstructions(join(storageRoot, 'GIGACHAT.md'))),
     readGlobalInstructionDocument: () => serialize(async () =>

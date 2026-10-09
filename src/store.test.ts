@@ -94,6 +94,58 @@ test('persists projects, chats, relationships, drafts, image kind, and settings'
   await assert.rejects(store.updateChat(chat.id, { modelId: '\0invalid' } as never));
 });
 
+test('persists deduplicated usage outside chat lifetime, including pending usage after chat deletion', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-usage-ledger-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const base = {
+    localRequestId: '11111111-1111-4111-8111-111111111111',
+    chatId: chat.id,
+    requestKind: 'chat' as const,
+    modelId: 'GigaChat-test',
+    providerRequestId: null,
+    providerModel: null,
+    createdAt: '2026-10-09T00:00:00.000Z',
+    status: 'pending' as const,
+    promptTokens: null,
+    completionTokens: null,
+    totalTokens: null,
+    precachedPromptTokens: null,
+    conflictedFields: [],
+  };
+  await store.recordUsageReceipt(base);
+  await store.recordUsageReceipt({
+    ...base, status: 'completed', providerRequestId: 'provider-response-1', providerModel: 'GigaChat-v3',
+    promptTokens: 20, completionTokens: 3, totalTokens: 23, precachedPromptTokens: 5,
+  });
+  await store.deleteChat(chat.id);
+  await store.recordUsageReceipt({
+    ...base, localRequestId: '22222222-2222-4222-8222-222222222222', requestKind: 'tool-continuation',
+  });
+
+  const restored = await openStore(directory);
+  const ledger = await restored.getUsageLedger();
+  assert.equal(ledger.requestCount, 2);
+  assert.equal(ledger.totalTokens.knownTokens, 23);
+  assert.equal(ledger.totalTokens.unknownRequests, 1);
+  assert.equal(ledger.precachedPromptTokens.knownTokens, 5);
+  assert.equal(ledger.byChat.length, 1);
+  assert.equal(ledger.byChat[0]?.key, chat.id);
+  assert.equal(ledger.pendingRequestCount, 1);
+});
+
+test('fails closed on a corrupt usage ledger without rewriting it', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-usage-corrupt-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, 'usage.json');
+  const contents = JSON.stringify({ schemaVersion: 2, receipts: [] });
+  await writeFile(path, contents, 'utf8');
+
+  await assert.rejects(openStore(directory), /повреждён или имеет неизвестный формат/);
+  assert.equal(await readFile(path, 'utf8'), contents);
+});
+
 test('retains an older unavailable model ID when reading a chat after reload', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-legacy-model-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -162,6 +214,7 @@ test('queued fake provider turns see prior replies but never later accepted prom
     appendAssistant: async (turn, text, signal) => {
       await store.appendAssistantMessageFromRuntime(turn.chatId, turn.messageId, text, signal);
     },
+    recordUsageReceipt: (receipt) => store.recordUsageReceipt(receipt),
   });
 
   for (const item of accepted) assert.ok(runtime.enqueue(item.turn));

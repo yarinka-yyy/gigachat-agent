@@ -1,5 +1,5 @@
 import { Buffer } from 'node:buffer';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type {
   AcceptedTurnInput,
   ChatToolReceipt,
@@ -14,10 +14,13 @@ import type {
   ProviderToolName,
   RuntimeActivity,
   RuntimeTurnSnapshot,
+  UsageReceipt,
+  UsageReceiptStatus,
 } from './contracts';
 import { PROVIDER_ERROR_CATEGORIES } from './contracts';
 import { LocalToolError, type LocalToolEvent, type LocalTools } from './local-tools';
 import { HookDispatchAbortError } from './hooks';
+import { MAX_USAGE_COUNT, mergeUsageReceipt } from './usage';
 
 const MAX_ACTIVITY_PER_TURN = 50;
 const MAX_ASSISTANT_CHARS = 100_000;
@@ -44,6 +47,7 @@ export interface TurnRuntimeOptions {
   consumeTurn(turn: AcceptedTurnInput, signal: AbortSignal): Promise<void>;
   releaseTurn(turn: AcceptedTurnInput): void;
   appendAssistant(turn: AcceptedTurnInput, text: string, signal: AbortSignal, functionsStateId?: string): Promise<void>;
+  recordUsageReceipt(receipt: UsageReceipt): Promise<void>;
   beginToolReceipt?(turn: AcceptedTurnInput, receipt: ToolReceiptInput): Promise<ToolReceiptStart>;
   completeToolReceipt?(turn: AcceptedTurnInput, receiptId: string, status: 'completed' | 'unknown', result: string): Promise<void>;
   runHooks?(turn: AcceptedTurnInput, input: HookDispatchInput, signal: AbortSignal): Promise<HookRunResult[]>;
@@ -153,6 +157,15 @@ function assertProviderEvent(value: unknown): asserts value is ProviderEvent {
     return;
   }
   if (event.type === 'text-delta' && typeof event.text === 'string') return;
+  if (event.type === 'usage'
+    && ['promptTokens', 'completionTokens', 'totalTokens', 'precachedPromptTokens'].every((field) => {
+      const count = event[field];
+      return count === null || typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 && count <= MAX_USAGE_COUNT;
+    })
+    && (event.providerRequestId === undefined || typeof event.providerRequestId === 'string'
+      && event.providerRequestId.length > 0 && event.providerRequestId.length <= 512 && !/[\u0000-\u001f\u007f]/.test(event.providerRequestId))
+    && (event.providerModel === undefined || typeof event.providerModel === 'string'
+      && event.providerModel.length > 0 && event.providerModel.length <= 512 && !/[\u0000-\u001f\u007f]/.test(event.providerModel))) return;
   if (event.type === 'completed' && (event.functionsStateId === undefined
     || typeof event.functionsStateId === 'string' && event.functionsStateId.length > 0 && event.functionsStateId.length <= 4096)) return;
   if (event.type === 'function-call' && isFunctionCall(event.functionCall)) return;
@@ -468,6 +481,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     let reservationConsumed = false;
     let turnTimedOut = false;
     let answer = '';
+    let activeUsageReceipt: UsageReceipt | null = null;
+    let usagePersistenceTimedOut = false;
     let draftTimer: ReturnType<typeof setTimeout> | null = null;
     let lastDraftPublishedAt = 0;
     const turnTimer = setTimeout(() => { turnTimedOut = true; controller.abort(); }, turnTimeoutMs);
@@ -485,12 +500,18 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       if (delayMs <= 0) flushDraft();
       else if (!draftTimer) draftTimer = setTimeout(flushDraft, delayMs);
     };
-    const waitTracked = async <T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string, pendingMessage: string): Promise<T> => {
-      try { return await waitFor(promise, controller.signal, timeoutMs, timeoutMessage); }
+    const waitTracked = async <T>(
+      promise: Promise<T>, timeoutMs: number, timeoutMessage: string, pendingMessage: string,
+      signal = controller.signal,
+    ): Promise<T> => {
+      try { return await waitFor(promise, signal, timeoutMs, timeoutMessage); }
       catch (error) {
         const timedOut = error instanceof Error && error.message === timeoutMessage;
         if (!timedOut && !isAbortError(error)) throw error;
-        if (timedOut) controller.abort();
+        if (timedOut) {
+          if (timeoutMessage === 'USAGE_RECEIPT_SAVE_TIMEOUT') usagePersistenceTimedOut = true;
+          controller.abort();
+        }
         const pendingOutcome = promise.then(
           () => turn.cancelRequested || !timedOut && controller.signal.aborted && !turnTimedOut
             ? ({ status: 'cancelled' as const })
@@ -502,6 +523,48 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         holdForPendingOperation(turn, stopState, pendingOutcome, pendingMessage);
         throw timedOut ? new Error(timeoutMessage) : error;
       }
+    };
+    const saveUsageReceipt = async (receipt: UsageReceipt): Promise<void> => {
+      try { await options.recordUsageReceipt(receipt); }
+      catch (error) {
+        if (isAbortError(error)) throw error;
+        throw new Error('USAGE_RECEIPT_WRITE_FAILED');
+      }
+    };
+    const persistUsageReceipt = async (persistence: Promise<void>, signal = controller.signal): Promise<void> => {
+      try {
+        await waitTracked(
+          persistence,
+          operationTimeoutMs,
+          'USAGE_RECEIPT_SAVE_TIMEOUT',
+          'Сохранение usage не завершено; очередь приостановлена.',
+          signal,
+        );
+      } catch (error) {
+        if (isAbortError(error)) throw error;
+        const timeout = error instanceof Error && error.message === 'USAGE_RECEIPT_SAVE_TIMEOUT';
+        turn.errorCategory = 'storage';
+        publish(turn);
+        throw Object.assign(new Error(timeout ? 'USAGE_RECEIPT_SAVE_TIMEOUT' : 'USAGE_RECEIPT_SAVE_FAILED'), { category: 'storage' });
+      }
+    };
+    const updateActiveUsage = async (patch: Partial<UsageReceipt>, signal = controller.signal): Promise<void> => {
+      if (!activeUsageReceipt) return;
+      const updated = mergeUsageReceipt(activeUsageReceipt, { ...activeUsageReceipt, ...patch });
+      activeUsageReceipt = updated;
+      const persistence = Promise.resolve().then(() => saveUsageReceipt(updated)).then(async () => {
+        if (updated.status !== 'pending' || !controller.signal.aborted) return;
+        const cancelled = turn.cancelRequested || !turnTimedOut && !usagePersistenceTimedOut;
+        const terminal = { ...updated, status: cancelled ? 'cancelled' as const : 'failed' as const };
+        await saveUsageReceipt(terminal);
+        if (activeUsageReceipt?.localRequestId === terminal.localRequestId) activeUsageReceipt = terminal;
+      });
+      await persistUsageReceipt(persistence, signal);
+    };
+    const finishActiveUsage = async (status: UsageReceiptStatus, signal = controller.signal): Promise<void> => {
+      if (!activeUsageReceipt) return;
+      if (activeUsageReceipt.status === 'pending') await updateActiveUsage({ status }, signal);
+      activeUsageReceipt = null;
     };
     const runHookEvent = async (
       input: HookDispatchInput,
@@ -564,9 +627,36 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       for (;;) {
         if (controller.signal.aborted) throw abortError();
         if (stopState.pendingToolIds.size || stopState.pendingOperation) throw new Error('TOOL_STOP_STATE');
-        stopState.streamConfirmed = false;
+        stopState.streamConfirmed = true;
         stopState.streamStop = null;
         naturallyDone = false;
+        if (!request.modelId) throw new Error('MODEL_NOT_SELECTED');
+        const usageReceipt: UsageReceipt = {
+          localRequestId: randomUUID(),
+          chatId: turn.input.chatId,
+          requestKind: toolRounds > 0 ? 'tool-continuation' : request.usageKind ?? 'chat',
+          modelId: request.modelId,
+          providerRequestId: null,
+          providerModel: null,
+          createdAt: new Date().toISOString(),
+          status: 'pending',
+          promptTokens: null,
+          completionTokens: null,
+          totalTokens: null,
+          precachedPromptTokens: null,
+          conflictedFields: [],
+        };
+        const initialUsagePersistence = Promise.resolve().then(() => saveUsageReceipt(usageReceipt)).then(async () => {
+          if (!controller.signal.aborted) return;
+          await saveUsageReceipt({
+            ...usageReceipt,
+            status: turn.cancelRequested || !turnTimedOut && !usagePersistenceTimedOut ? 'cancelled' : 'failed',
+          });
+        });
+        await persistUsageReceipt(initialUsagePersistence);
+        activeUsageReceipt = usageReceipt;
+        if (controller.signal.aborted) throw abortError();
+        stopState.streamConfirmed = false;
         iterator = options.provider.stream(request, controller.signal)[Symbol.asyncIterator]();
         let completed = false;
         let completedFunctionsStateId: string | undefined;
@@ -606,6 +696,15 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
               kind: 'provider', at: new Date().toISOString(), activity: rawEvent.activity,
               ...(rawEvent.tool ? { tool: rawEvent.tool } : {}),
             });
+          } else if (rawEvent.type === 'usage') {
+            await updateActiveUsage({
+              promptTokens: rawEvent.promptTokens,
+              completionTokens: rawEvent.completionTokens,
+              totalTokens: rawEvent.totalTokens,
+              precachedPromptTokens: rawEvent.precachedPromptTokens,
+              ...(rawEvent.providerRequestId ? { providerRequestId: rawEvent.providerRequestId } : {}),
+              ...(rawEvent.providerModel ? { providerModel: rawEvent.providerModel } : {}),
+            });
           } else if (rawEvent.type === 'text-delta') {
             if (answer.length + rawEvent.text.length > MAX_ASSISTANT_CHARS) throw new Error('RESPONSE_LIMIT');
             answer += rawEvent.text;
@@ -634,6 +733,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
             markStopUnconfirmed(turn);
             return;
           }
+          await finishActiveUsage('completed');
           addActivity(turn, {
             kind: 'provider', at: new Date().toISOString(), activity: 'waiting-for-tool',
             ...(isProviderToolName(functionCall.name) ? { tool: functionCall.name } : {}),
@@ -766,6 +866,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           return;
         }
         if (controller.signal.aborted) throw abortError();
+        await finishActiveUsage('completed');
         stopHooksRan = true;
         await runHookEvent({ event: 'stop', projectId: turn.input.projectId }, new AbortController().signal).catch(() => undefined);
         flushDraft();
@@ -804,6 +905,12 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       } else {
         const terminalSignal = new AbortController().signal;
         const cancelled = turn.cancelRequested || isAbortError(error) && !turnTimedOut;
+        try { await finishActiveUsage(cancelled ? 'cancelled' : 'failed', terminalSignal); }
+        catch (usageError) { error = usageError; }
+        if (stopState.pendingOperation || stopState.pendingOutcome || blockedTurnId === turn.id) {
+          if (!stopState.pendingOperation) maybeUnblock(turn.id);
+          return;
+        }
         if (cancelled && !interruptHooksRan) {
           interruptHooksRan = true;
           await runHookEvent({ event: 'interrupt', projectId: turn.input.projectId, outcome: 'cancelled' }, terminalSignal).catch(() => undefined);
@@ -844,9 +951,13 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
                             ? 'Локальный инструмент превысил лимит времени; очередь ожидает подтверждённой остановки.'
                             : error instanceof Error && error.message === 'TOOL_INTENT_SAVE_TIMEOUT'
                               ? 'Не удалось вовремя зафиксировать намерение инструмента.'
-                              : error instanceof Error && error.message === 'TOOL_RECEIPT_STORE_UNAVAILABLE'
-                                ? 'Сохранение истории инструментов недоступно; действие не выполнено.'
-                                : 'Ход завершился ошибкой. Сообщение пользователя сохранено локально.';
+                              : error instanceof Error && error.message === 'USAGE_RECEIPT_SAVE_TIMEOUT'
+                                ? 'Не удалось вовремя сохранить usage; очередь ожидает завершения записи.'
+                                : error instanceof Error && error.message === 'USAGE_RECEIPT_SAVE_FAILED'
+                                  ? 'Не удалось сохранить usage; запрос не будет продолжен.'
+                                  : error instanceof Error && error.message === 'TOOL_RECEIPT_STORE_UNAVAILABLE'
+                                    ? 'Сохранение истории инструментов недоступно; действие не выполнено.'
+                                    : 'Ход завершился ошибкой. Сообщение пользователя сохранено локально.';
         }
         publish(turn);
       }

@@ -108,6 +108,57 @@ export interface ProviderTurnRequest {
   protocolHistory?: ProviderProtocolExchange[];
   permissionProfile: PermissionProfile;
   modelId: GigaChatModelId | null;
+  usageKind?: UsageRequestKind;
+}
+
+export type UsageRequestKind = 'chat' | 'tool-continuation' | 'compaction';
+export type UsageReceiptStatus = 'pending' | 'completed' | 'failed' | 'cancelled';
+export type UsageCountField = 'promptTokens' | 'completionTokens' | 'totalTokens' | 'precachedPromptTokens';
+
+export interface ProviderUsageValues {
+  promptTokens: number | null;
+  completionTokens: number | null;
+  totalTokens: number | null;
+  precachedPromptTokens: number | null;
+  providerRequestId?: string;
+  providerModel?: string;
+}
+
+export interface UsageReceipt extends Omit<ProviderUsageValues, 'providerRequestId' | 'providerModel'> {
+  localRequestId: string;
+  chatId: string;
+  requestKind: UsageRequestKind;
+  modelId: GigaChatModelId;
+  providerRequestId: string | null;
+  providerModel: string | null;
+  createdAt: string;
+  status: UsageReceiptStatus;
+  conflictedFields: UsageCountField[];
+}
+
+export interface UsageCounterSummary {
+  knownTokens: number;
+  unknownRequests: number;
+  conflictedRequests: number;
+}
+
+export interface UsageAggregate {
+  key: string;
+  requestCount: number;
+  completedRequestCount: number;
+  pendingRequestCount: number;
+  failedRequestCount: number;
+  cancelledRequestCount: number;
+  promptTokens: UsageCounterSummary;
+  completionTokens: UsageCounterSummary;
+  totalTokens: UsageCounterSummary;
+  precachedPromptTokens: UsageCounterSummary;
+}
+
+export interface UsageLedgerSummary extends UsageAggregate {
+  byChat: UsageAggregate[];
+  byModel: UsageAggregate[];
+  byDay: UsageAggregate[];
 }
 
 export const PROVIDER_ERROR_CATEGORIES = [
@@ -171,6 +222,7 @@ export type ProviderToolName = 'list' | 'search' | 'read' | 'write' | 'open' | '
 
 export type ProviderEvent =
   | { type: 'activity'; activity: 'connecting' | 'receiving' | 'waiting-for-tool' | 'tool-started' | 'tool-finished'; tool?: ProviderToolName }
+  | ({ type: 'usage' } & ProviderUsageValues)
   | { type: 'text-delta'; text: string }
   | { type: 'function-call'; functionCall: ProviderFunctionCall }
   | { type: 'completed'; responseId?: string; functionsStateId?: string }
@@ -513,6 +565,7 @@ export interface AppApi {
   };
   usage: {
     getLocalStats(): Promise<LocalUsageStats>;
+    getLedger(): Promise<UsageLedgerSummary>;
   };
   onCloseRequested(flush: () => Promise<void>, onFailure: (result: CloseFailure) => void): () => void;
   retryClose(discardBrowserMetadata?: boolean): Promise<CloseAttemptResult>;

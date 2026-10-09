@@ -65,6 +65,8 @@ import type {
   HookRunResult,
   InstructionSaveResult,
   LocalUsageStats,
+  UsageCounterSummary,
+  UsageLedgerSummary,
   ModelRegistrySnapshot,
   Project,
   ProjectPatch,
@@ -260,6 +262,19 @@ function ScrollingRowTitle({ value, pinned = false }: { value: string; pinned?: 
   return <span ref={viewportRef} className="list-row-title-viewport" title={value}>
     <span ref={textRef} className="list-row-title" style={{ '--title-shift': `${overflow}px`, '--title-duration': `${Math.max(1.8, overflow / 40)}s` } as CSSProperties}>{value}</span>
   </span>;
+}
+
+function knownUsageLabel(counter: UsageCounterSummary, requestCount: number): string {
+  return requestCount === 0 ? '—' : counter.knownTokens.toLocaleString('ru-RU');
+}
+
+function unknownUsageLabel(counter: UsageCounterSummary, requestCount: number): string {
+  if (requestCount === 0) return 'нет запросов';
+  const notes = [
+    counter.unknownRequests ? `неизвестно: ${counter.unknownRequests}` : '',
+    counter.conflictedRequests ? `конфликт: ${counter.conflictedRequests}` : '',
+  ].filter(Boolean);
+  return notes.length ? notes.join(' · ') : 'все значения получены';
 }
 
 function ActionMenu({ children, label, trigger, className = '', placement = 'side', initialFocus, onOpen, onVisibilityChange, disabled = false, popupRole, popupLabel, triggerHasPopup, onTriggerKeyDown }: {
@@ -759,6 +774,7 @@ export default function App() {
   const [openers, setOpeners] = useState<FolderOpener[]>([]);
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [localUsageStats, setLocalUsageStats] = useState<LocalUsageStats | null>(null);
+  const [usageLedger, setUsageLedger] = useState<UsageLedgerSummary | null>(null);
   const [voiceAvailability, setVoiceAvailability] = useState<VoiceAvailability>({ available: false, reason: 'Проверяем локальный runtime диктовки…' });
   const [homeVoiceGeneration, setHomeVoiceGeneration] = useState(0);
   const [skillRegistry, setSkillRegistry] = useState<SkillRegistrySnapshot>({ skills: [], issues: [] });
@@ -1091,13 +1107,19 @@ export default function App() {
     if (route.page !== 'profile') return undefined;
     let cancelled = false;
     setLocalUsageStats(null);
+    setUsageLedger(null);
     void window.gigaChat.usage.getLocalStats().then((stats) => {
       if (!cancelled) setLocalUsageStats(stats);
     }).catch((error: unknown) => {
       if (!cancelled) setNotice(getErrorMessage(error));
     });
+    void window.gigaChat.usage.getLedger().then((ledger) => {
+      if (!cancelled) setUsageLedger(ledger);
+    }).catch((error: unknown) => {
+      if (!cancelled) setNotice(getErrorMessage(error));
+    });
     return () => { cancelled = true; };
-  }, [route.page, chats.length, projects.length]);
+  }, [route.page, chats.length, projects.length, runtimeTurns.map((turn) => `${turn.id}:${turn.status}`).join('|')]);
 
   useEffect(() => window.gigaChat.onCloseRequested(async () => {
     setCloseFailure(null);
@@ -3191,19 +3213,59 @@ export default function App() {
         return <section className="content-page"><div className="page-heading"><span className="eyebrow">Будущая функция</span><h1>Подкасты</h1></div><EmptyState title="Раздел подготовлен" description="Создание подкастов появится после отдельной проверки возможностей API." icon="podcast" /><span className="future-badge">FUTURE</span></section>;
       case 'archive':
         return renderArchive();
-      case 'profile':
+      case 'profile': {
+        const usageDays = new Map((usageLedger?.byDay ?? []).map((day) => [day.key, day]));
+        const today = new Date();
+        today.setUTCHours(0, 0, 0, 0);
+        const usageHeatmap = Array.from({ length: 28 }, (_, index) => {
+          const date = new Date(today);
+          date.setUTCDate(date.getUTCDate() - (27 - index));
+          const key = date.toISOString().slice(0, 10);
+          const day = usageDays.get(key);
+          const count = day?.requestCount ?? 0;
+          return { key, count, day, level: count === 0 ? 0 : count === 1 ? 1 : count < 4 ? 2 : 3 };
+        });
         return (
           <section className="content-page profile-page">
-            <div className="page-heading"><span className="eyebrow">Профиль и использование</span><h1>Локальный профиль</h1><p>Данные принадлежат этому устройству. Учётная запись не подключена.</p></div>
-            <div className="profile-summary"><span className="profile-avatar large"><Icon name="user" /></span><div><strong>На этом компьютере</strong><p>GigaChat API не подключён</p></div><span className="status-pill"><i />Локально</span></div>
+            <div className="page-heading"><span className="eyebrow">Профиль и использование</span><h1>Локальный профиль</h1><p>Данные использования хранятся только на этом устройстве.</p></div>
+            <div className="profile-summary"><span className="profile-avatar large"><Icon name="user" /></span><div><strong>На этом компьютере</strong><p>Локальная история использования GigaChat API</p></div><span className="status-pill"><i />Локально</span></div>
             <div className="usage-grid">
               <article><span>Всего чатов</span><strong>{localUsageStats?.chatCount ?? '…'}</strong><small>Включая архив</small></article>
               <article><span>Всего проектов</span><strong>{localUsageStats?.projectCount ?? '…'}</strong><small>Включая архив</small></article>
               <article><span>Дни локальной активности</span><strong>{localUsageStats?.activityDayCount ?? '…'}</strong><small>UTC-даты проектов, чатов и сообщений</small></article>
+              <article><span>Запросы API</span><strong>{usageLedger?.requestCount ?? '…'}</strong><small>{usageLedger ? `${usageLedger.completedRequestCount} завершено · ${usageLedger.pendingRequestCount} ожидают · ${usageLedger.failedRequestCount + usageLedger.cancelledRequestCount} с ошибкой или отменой` : 'Загружаем сохранённые receipts'}</small></article>
+              <article><span>Известные prompt-токены</span><strong>{usageLedger ? knownUsageLabel(usageLedger.promptTokens, usageLedger.requestCount) : '…'}</strong><small>{usageLedger ? unknownUsageLabel(usageLedger.promptTokens, usageLedger.requestCount) : 'По валидированным receipts'}</small></article>
+              <article><span>Известные completion-токены</span><strong>{usageLedger ? knownUsageLabel(usageLedger.completionTokens, usageLedger.requestCount) : '…'}</strong><small>{usageLedger ? unknownUsageLabel(usageLedger.completionTokens, usageLedger.requestCount) : 'По валидированным receipts'}</small></article>
+              <article><span>Известные total-токены</span><strong>{usageLedger ? knownUsageLabel(usageLedger.totalTokens, usageLedger.requestCount) : '…'}</strong><small>{usageLedger ? unknownUsageLabel(usageLedger.totalTokens, usageLedger.requestCount) : 'Значения API сохранены без повторного вычета cache'}</small></article>
+              <article><span>Известные precached prompt-токены</span><strong>{usageLedger ? knownUsageLabel(usageLedger.precachedPromptTokens, usageLedger.requestCount) : '…'}</strong><small>{usageLedger ? unknownUsageLabel(usageLedger.precachedPromptTokens, usageLedger.requestCount) : 'Raw поле API; повторно не вычитается'}</small></article>
+              <article className="usage-unavailable"><span>Баланс API</span><strong>Неизвестен</strong><small>Нет подтверждённой allocation или ответа баланса</small></article>
             </div>
-            <EmptyState title="Данные API пока недоступны" description="Токены, модели, баланс и тепловая карта появятся только после подключения и реальных измерений." icon="gauge" />
+            <section aria-label="Тепловая карта запросов по UTC-дням">
+              <h2>Запросы за последние 28 дней (UTC)</h2>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 14px)', gap: 5, margin: '12px 0 22px' }}>
+                {usageHeatmap.map(({ key, count, day, level }) => <span key={key} role="img"
+                  aria-label={`${key}: ${count} запросов${day ? `, известно total-токенов ${day.totalTokens.knownTokens}, неизвестно запросов ${day.totalTokens.unknownRequests}, конфликтных ${day.totalTokens.conflictedRequests}` : ''}`}
+                  title={`${key}: ${count} запросов`}
+                  style={{ width: 14, height: 14, borderRadius: 4, background: count ? 'var(--accent)' : 'var(--surface)', opacity: level ? 0.3 + level * 0.2 : 0.45, border: '1px solid var(--line)' }} />)}
+              </div>
+            </section>
+            {usageLedger?.requestCount ? <>
+              <section aria-label="Использование по моделям">
+                <h2>По моделям</h2>
+                <ul>{usageLedger.byModel.map((model) => <li key={model.key}>
+                  <strong>{model.key}</strong> — {model.requestCount} запросов; известно total-токенов: {knownUsageLabel(model.totalTokens, model.requestCount)} ({unknownUsageLabel(model.totalTokens, model.requestCount)})
+                </li>)}</ul>
+              </section>
+              <section aria-label="Использование по чатам">
+                <h2>По чатам</h2>
+                <ul>{usageLedger.byChat.map((chat) => <li key={chat.key}>
+                  <strong>{chats.find((item) => item.id === chat.key)?.title ?? 'Удалённый чат'}</strong> — {chat.requestCount} запросов; известно total-токенов: {knownUsageLabel(chat.totalTokens, chat.requestCount)} ({unknownUsageLabel(chat.totalTokens, chat.requestCount)})
+                </li>)}</ul>
+              </section>
+            </> : <EmptyState title={usageLedger ? 'Пока нет измерений API' : 'Usage ledger не загружен'} description={usageLedger ? 'Данные появятся после реальных запросов к API. Значения не выводятся из тарифных таблиц или fixtures.' : 'Проверьте локальное хранилище и откройте профиль снова.'} icon="gauge" />}
           </section>
         );
+      }
     }
   }
 
@@ -3468,7 +3530,7 @@ export default function App() {
                       })}
                     </div>
                   </ActionMenu>
-                  <span className="context-indicator" role="img" tabIndex={0} aria-label="Использование контекста станет доступно после подключения API" title="Контекст станет доступен после подключения API."><ContextRing /></span>
+                  <span className="context-indicator" role="img" tabIndex={0} aria-label="Размер контекста неизвестен" title="Точный размер следующего контекста пока неизвестен."><ContextRing /></span>
                   <VoiceCaptureControl
                     key={route.page === 'chat' ? route.id ?? 'chat' : `home-${homeVoiceGeneration}`}
                     available={voiceAvailability.available && chatComposerReady && !sending}

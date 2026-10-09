@@ -5,6 +5,7 @@ import type {
   CloseFailure,
   CloseAttemptResult,
   LocalUsageStats,
+  UsageLedgerSummary,
   BrowserBounds,
   EmbeddedBrowserStatus,
   ChatDetail,
@@ -179,6 +180,7 @@ const api: AppApi = {
   },
   usage: {
     getLocalStats: () => ipcRenderer.invoke('usage:local-stats') as Promise<LocalUsageStats>,
+    getLedger: () => ipcRenderer.invoke('usage:get-ledger') as Promise<UsageLedgerSummary>,
   },
   onCloseRequested: (flush, onFailure) => {
     closeFlush = flush;
