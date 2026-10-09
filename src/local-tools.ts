@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { lstat, realpath } from 'node:fs/promises';
 import { extname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import type { InstructionCommitRequest, InstructionCommitResult, PermissionApprovalRequest, Project } from './contracts';
-import { evaluatePermission, requirePermissionProfile, type PermissionProfile, type PermissionResource } from './permissions';
+import { evaluatePermission, requirePermissionProfile, type PermissionAction, type PermissionProfile, type PermissionResource } from './permissions';
 import type { CustomPolicy, LocalAction } from './custom-permissions';
 
 export const MAX_LOCAL_FILE_BYTES = 1024 * 1024;
@@ -17,6 +17,7 @@ const MAX_ENUMERATION_OUTPUT_BYTES = 1024 * 1024;
 const MAX_TOOL_PATH_LENGTH = 2048;
 const MAX_SCRIPT_LENGTH = 16 * 1024;
 const MAX_RUN_TIMEOUT_MS = 120_000;
+const MAX_HOOK_EVENT_BYTES = 16 * 1024;
 const LOCAL_TOOL_TIMEOUT_MS = 30_000;
 const LOCAL_FILE_WRITE_TIMEOUT_MS = 30_000;
 const OPEN_TEXT_EXTENSIONS = new Set(['.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.jsonl', '.yaml', '.yml', '.toml', '.ini', '.log']);
@@ -470,7 +471,11 @@ export interface LocalToolsOptions {
   resolveProject(id: string): Promise<Project | null>;
   protectedDirectory?: string;
   getCustomPolicy?(): Promise<CustomPolicy>;
-  requestApproval?(details: Omit<PermissionApprovalRequest, 'id' | 'expiresAt'>, signal?: AbortSignal): Promise<boolean>;
+  requestApproval?(
+    details: Omit<PermissionApprovalRequest, 'id' | 'expiresAt'>,
+    signal?: AbortSignal,
+    context?: { projectId: string | null; profile: PermissionProfile; skillId: string | null; workingFolder: string; resource: PermissionResource; action: PermissionAction },
+  ): Promise<boolean>;
   revealItem?(path: string): Promise<void>;
   openTextFile?(path: string): Promise<void>;
   runPowerShell?: PowerShellRunner;
@@ -491,15 +496,18 @@ export interface LocalSearchMatch {
 }
 
 export interface LocalTools {
-  list(projectId: unknown, profile: unknown, path?: unknown, options?: { signal?: AbortSignal; expectedWorkingFolder?: string | null }): Promise<LocalFileEntry[]>;
-  search(projectId: unknown, profile: unknown, query: unknown, path?: unknown, options?: { signal?: AbortSignal; expectedWorkingFolder?: string | null }): Promise<LocalSearchMatch[]>;
-  read(projectId: unknown, profile: unknown, path: unknown, options?: { signal?: AbortSignal; expectedWorkingFolder?: string | null }): Promise<string>;
-  write(projectId: unknown, profile: unknown, path: unknown, contents: unknown, options?: { signal?: AbortSignal; expectedWorkingFolder?: string | null }): Promise<{ bytes: number }>;
-  open(projectId: unknown, profile: unknown, path?: unknown, options?: { signal?: AbortSignal; expectedWorkingFolder?: string | null }): Promise<void>;
+  list(projectId: unknown, profile: unknown, path?: unknown, options?: { signal?: AbortSignal; expectedWorkingFolder?: string | null; skillId?: string | null }): Promise<LocalFileEntry[]>;
+  search(projectId: unknown, profile: unknown, query: unknown, path?: unknown, options?: { signal?: AbortSignal; expectedWorkingFolder?: string | null; skillId?: string | null }): Promise<LocalSearchMatch[]>;
+  read(projectId: unknown, profile: unknown, path: unknown, options?: { signal?: AbortSignal; expectedWorkingFolder?: string | null; skillId?: string | null }): Promise<string>;
+  write(projectId: unknown, profile: unknown, path: unknown, contents: unknown, options?: { signal?: AbortSignal; expectedWorkingFolder?: string | null; skillId?: string | null }): Promise<{ bytes: number }>;
+  open(projectId: unknown, profile: unknown, path?: unknown, options?: { signal?: AbortSignal; expectedWorkingFolder?: string | null; skillId?: string | null }): Promise<void>;
   runPowerShell(projectId: unknown, profile: unknown, script: unknown, options?: {
     timeoutMs?: unknown;
+    maxOutputBytes?: unknown;
     signal?: AbortSignal;
     expectedWorkingFolder?: string | null;
+    skillId?: string | null;
+    inputDataBase64?: unknown;
     /** Main-process only: request one explicit user approval for this whole command without AppContainer. */
     fullAccessOnce?: unknown;
   }): Promise<PowerShellResult>;
@@ -911,6 +919,7 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
     target: string,
     available: boolean,
     signal?: AbortSignal,
+    skillId: string | null = null,
   ): Promise<void> {
     const evaluate = async () => evaluatePermission({
       profile, resource, action,
@@ -923,7 +932,10 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
     const result = await evaluate();
     if (result.decision === 'deny') throw new LocalToolError(result.reason, 'PERMISSION_DENIED');
     if (result.decision === 'ask') {
-      if (!options.requestApproval || !await options.requestApproval({ resource, action, target, reason: result.reason }, signal)) {
+      if (!options.requestApproval || !await options.requestApproval(
+        { resource, action, target, reason: result.reason }, signal,
+        { projectId: scope.projectId, profile, skillId, workingFolder: scope.root, resource, action },
+      )) {
         throw new LocalToolError('Действие не подтверждено.', 'PERMISSION_DENIED');
       }
       const latest = await evaluate();
@@ -935,13 +947,13 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
   async function prepareTarget(
     reference: unknown, profileInput: unknown, resource: PermissionResource, action: LocalAction,
     pathInput: unknown, allowRoot: boolean, allowMissing: boolean, available: boolean, signal?: AbortSignal,
-    approvalDetails?: string, expectedWorkingFolder?: string | null,
+    approvalDetails?: string, expectedWorkingFolder?: string | null, skillId: string | null = null,
   ): Promise<{ root: string; target: string; projectId: string | null }> {
     const profile = requirePermissionProfile(profileInput);
     const scope = await resolveRoot(reference, profile, false, expectedWorkingFolder);
     const target = await targetPath(scope.root, pathInput, allowRoot, allowMissing);
     await authorize(scope, profile, resource, action,
-      approvalDetails ? `${target}\n\n${approvalDetails}` : target, available, signal);
+      approvalDetails ? `${target}\n\n${approvalDetails}` : target, available, signal, skillId);
     const latest = await resolveRoot(reference, profile, false, expectedWorkingFolder);
     if (latest.root !== scope.root) throw new LocalToolError('Рабочая папка изменилась во время подтверждения.');
     await targetPath(latest.root, pathInput, allowRoot, allowMissing);
@@ -952,7 +964,7 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
     list: (projectIdInput, profileInput, pathInput = '', listOptions = {}) => activity('list', async () => {
       const pathParts = requireRelativePath(pathInput, true);
       const { root } = await prepareTarget(projectIdInput, profileInput, 'project-files', 'list',
-        pathParts.join(sep), true, false, true, listOptions.signal, undefined, listOptions.expectedWorkingFolder);
+        pathParts.join(sep), true, false, true, listOptions.signal, undefined, listOptions.expectedWorkingFolder, listOptions.skillId ?? null);
       throwIfAborted(listOptions.signal);
       const output = await runBoundedFileScript(options.runPowerShell, root,
         buildListScript(root, pathParts), listOptions.signal, MAX_ENUMERATION_OUTPUT_BYTES);
@@ -964,7 +976,7 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
       const query = requireText(queryInput, 'Поисковая строка', 256).toLocaleLowerCase();
       const pathParts = requireRelativePath(pathInput, true);
       const { root } = await prepareTarget(projectIdInput, profileInput, 'project-files', 'search',
-        pathParts.join(sep), true, false, true, searchOptions.signal, undefined, searchOptions.expectedWorkingFolder);
+        pathParts.join(sep), true, false, true, searchOptions.signal, undefined, searchOptions.expectedWorkingFolder, searchOptions.skillId ?? null);
       const output = await runBoundedFileScript(options.runPowerShell, root,
         buildSearchScript(root, pathParts, query), searchOptions.signal, MAX_ENUMERATION_OUTPUT_BYTES);
       return parseSearchRows(output, pathParts);
@@ -972,7 +984,7 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
 
     read: (projectIdInput, profileInput, pathInput, readOptions = {}) => activity('read', async () => {
       const { root } = await prepareTarget(projectIdInput, profileInput, 'project-files', 'read',
-        pathInput, false, false, true, readOptions.signal, undefined, readOptions.expectedWorkingFolder);
+        pathInput, false, false, true, readOptions.signal, undefined, readOptions.expectedWorkingFolder, readOptions.skillId ?? null);
       throwIfAborted(readOptions.signal);
       const output = await runBoundedFileScript(options.runPowerShell, root, buildReadScript(root, requireRelativePath(pathInput, false)),
         readOptions.signal, 2 * 1024 * 1024);
@@ -981,7 +993,7 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
 
     write: (projectIdInput, profileInput, pathInput, contentsInput, writeOptions = {}) => activity('write', async () => {
       const { root } = await prepareTarget(projectIdInput, profileInput, 'project-files', 'write',
-        pathInput, false, true, Boolean(options.writeFile), writeOptions.signal, undefined, writeOptions.expectedWorkingFolder);
+        pathInput, false, true, Boolean(options.writeFile), writeOptions.signal, undefined, writeOptions.expectedWorkingFolder, writeOptions.skillId ?? null);
       throwIfAborted(writeOptions.signal);
       if (typeof contentsInput !== 'string' || contentsInput.includes('\0')) {
         throw new LocalToolError('Содержимое файла должно быть текстом без NUL.');
@@ -1006,7 +1018,7 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
 
     open: (projectIdInput, profileInput, pathInput = '', openOptions = {}) => activity('open', async () => {
       const { root, target } = await prepareTarget(projectIdInput, profileInput, 'application', 'open',
-        pathInput, true, false, Boolean(options.revealItem || options.openTextFile), openOptions.signal, undefined, openOptions.expectedWorkingFolder);
+        pathInput, true, false, Boolean(options.revealItem || options.openTextFile), openOptions.signal, undefined, openOptions.expectedWorkingFolder, openOptions.skillId ?? null);
       throwIfAborted(openOptions.signal);
       const targetInfo = await lstat(target).catch(() => null);
       if (!targetInfo || targetInfo.isSymbolicLink()) throw new LocalToolError('Файл или папка проекта недоступны.');
@@ -1022,7 +1034,7 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
       if (!options.openTextFile) throw new LocalToolError('Просмотр текста пока недоступен.');
 
       const readTarget = await prepareTarget(projectIdInput, profileInput, 'project-files', 'read',
-        pathInput, false, false, Boolean(options.runPowerShell), openOptions.signal, undefined, openOptions.expectedWorkingFolder);
+        pathInput, false, false, Boolean(options.runPowerShell), openOptions.signal, undefined, openOptions.expectedWorkingFolder, openOptions.skillId ?? null);
       if (readTarget.root !== root) throw new LocalToolError('Рабочая папка изменилась во время открытия файла.');
       const output = await runBoundedFileScript(options.runPowerShell, root,
         buildReadScript(root, requireRelativePath(pathInput, false)), openOptions.signal, 2 * 1024 * 1024);
@@ -1047,6 +1059,27 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
       if (typeof timeoutMs !== 'number' || !Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > MAX_RUN_TIMEOUT_MS) {
         throw new LocalToolError('Таймаут должен быть целым числом от 100 до 120000 мс.');
       }
+      const maxOutputBytes = runOptions.maxOutputBytes === undefined ? MAX_LOCAL_FILE_BYTES : runOptions.maxOutputBytes;
+      if (typeof maxOutputBytes !== 'number' || !Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1 || maxOutputBytes > MAX_LOCAL_FILE_BYTES) {
+        throw new LocalToolError('Лимит вывода должен быть целым числом от 1 байта до 1 МиБ.');
+      }
+      let inputDataBase64: string | undefined;
+      if (runOptions.inputDataBase64 !== undefined) {
+        const input = runOptions.inputDataBase64;
+        if (typeof input !== 'string' || input.length > Math.ceil(MAX_HOOK_EVENT_BYTES / 3) * 4 || input.length % 4 !== 0
+          || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(input)) {
+          throw new LocalToolError('Данные Hook должны быть ограниченным base64 JSON.');
+        }
+        const decoded = Buffer.from(input, 'base64');
+        if (decoded.byteLength > MAX_HOOK_EVENT_BYTES || decoded.toString('base64') !== input) {
+          throw new LocalToolError('Данные Hook превышают допустимый размер.');
+        }
+        inputDataBase64 = input;
+      }
+      const skillId = runOptions.skillId ?? null;
+      if (skillId !== null && (typeof skillId !== 'string' || skillId.length > 256 || /[\r\n\0]/.test(skillId))) {
+        throw new LocalToolError('Некорректный контекст Skill.');
+      }
       let root: string;
       let projectScoped: boolean;
       let trustedFullAccess = profile === 'full';
@@ -1066,7 +1099,8 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
         const target = `PowerShell без AppContainer\nРабочая папка: ${scope.root}\nКоманда:\n${script}`;
         const reason = `${permission.reason} Команда получит доступ к файлам, доступным текущей учётной записи, и сети; доступ не ограничен одним путём.`;
         if (permission.decision !== 'ask' || !options.requestApproval
-          || !await options.requestApproval({ resource: 'process', action: 'execute', target, reason }, runOptions.signal)) {
+          || !await options.requestApproval({ resource: 'process', action: 'execute', target, reason }, runOptions.signal,
+            { projectId: scope.projectId, profile, skillId, workingFolder: scope.root, resource: 'process', action: 'execute' })) {
           throw new LocalToolError('Действие не подтверждено.', 'PERMISSION_DENIED');
         }
         throwIfAborted(runOptions.signal);
@@ -1080,7 +1114,7 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
         trustedFullAccess = true;
       } else {
         const scope = await prepareTarget(projectIdInput, profile, 'process', 'execute',
-          '', true, false, true, runOptions.signal, `PowerShell:\n${script}`, runOptions.expectedWorkingFolder);
+          '', true, false, true, runOptions.signal, `PowerShell:\n${script}`, runOptions.expectedWorkingFolder, skillId);
         root = scope.root;
         projectScoped = scope.projectId !== null;
       }
@@ -1088,9 +1122,10 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
         workingFolder: root,
         script,
         timeoutMs,
-        maxOutputBytes: MAX_LOCAL_FILE_BYTES,
+        maxOutputBytes,
         trustedFullAccess,
         projectScoped,
+        ...(inputDataBase64 === undefined ? {} : { inputDataBase64 }),
         ...(runOptions.signal ? { signal: runOptions.signal } : {}),
       });
     }),

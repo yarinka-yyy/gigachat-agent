@@ -184,7 +184,8 @@ export type RuntimeTurnStatus = 'queued' | 'running' | 'completed' | 'failed' | 
 
 export type RuntimeActivity =
   | { kind: 'provider'; at: string; activity: Extract<ProviderEvent, { type: 'activity' }>['activity']; tool?: ProviderToolName }
-  | { kind: 'tool'; at: string; tool: ProviderToolName; phase: 'started' | 'completed' | 'failed' | 'cancelled'; durationMs?: number };
+  | { kind: 'tool'; at: string; tool: ProviderToolName; phase: 'started' | 'completed' | 'failed' | 'cancelled'; durationMs?: number }
+  | { kind: 'hook'; at: string; hookId: string; hookName: string; event: HookEvent; status: HookRunResult['status']; reason?: string };
 
 export interface RuntimeTurnSnapshot {
   id: string;
@@ -289,11 +290,40 @@ export interface HookRecord {
   origin: HookOrigin;
   scope: string;
   owner: string;
+  ownerId: string | null;
   source: string;
-  enabled: false;
-  verified: false;
+  enabled: boolean;
+  trusted: boolean;
+  available: boolean;
+  contentHash: string;
   actionFile: string;
   unavailableReason: string;
+  lastRun?: { event: HookEvent; status: HookRunResult['status']; reason?: string; at: string };
+}
+
+export interface HookInspection {
+  id: string;
+  contentHash: string;
+  manifestContents: string;
+  actionContents: string;
+}
+
+export interface HookDispatchInput {
+  event: HookEvent;
+  projectId: string | null;
+  tool?: ProviderToolName;
+  resource?: PermissionResource;
+  action?: PermissionAction;
+  outcome?: 'completed' | 'failed' | 'cancelled';
+}
+
+export interface HookRunResult {
+  hookId: string;
+  hookName: string;
+  event: HookEvent;
+  status: 'completed' | 'blocked' | 'failed' | 'skipped' | 'cancelled';
+  decision?: 'allow' | 'block';
+  reason?: string;
 }
 
 export interface HookIssue {
@@ -426,6 +456,9 @@ export interface AppApi {
   };
   hooks: {
     list(): Promise<HookRegistrySnapshot>;
+    inspect(id: string): Promise<HookInspection & { name: string; event: HookEvent; source: string }>;
+    trust(id: string, expectedHash: string): Promise<HookRegistrySnapshot>;
+    setEnabled(id: string, enabled: boolean): Promise<HookRegistrySnapshot>;
   };
   models: {
     getRegistry(): Promise<ModelRegistrySnapshot>;

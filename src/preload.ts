@@ -11,6 +11,8 @@ import type {
   ChatSummary,
   ChatKind,
   FolderOpener,
+  HookInspection,
+  HookEvent,
   HookRegistrySnapshot,
   Project,
   ProjectUpdateResult,
@@ -111,6 +113,9 @@ const api: AppApi = {
   },
   hooks: {
     list: () => ipcRenderer.invoke('hooks:list') as Promise<HookRegistrySnapshot>,
+    inspect: (id) => ipcRenderer.invoke('hooks:inspect', id) as Promise<HookInspection & { name: string; event: HookEvent; source: string }>,
+    trust: (id, expectedHash) => ipcRenderer.invoke('hooks:trust', id, expectedHash) as Promise<HookRegistrySnapshot>,
+    setEnabled: (id, enabled) => ipcRenderer.invoke('hooks:set-enabled', id, enabled) as Promise<HookRegistrySnapshot>,
   },
   models: {
     getRegistry: () => ipcRenderer.invoke('models:get-registry') as Promise<ModelRegistrySnapshot>,

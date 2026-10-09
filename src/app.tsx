@@ -60,7 +60,9 @@ import type {
   ChatPatch,
   FolderOpener,
   HookEvent,
+  HookInspection,
   HookRegistrySnapshot,
+  HookRunResult,
   InstructionSaveResult,
   LocalUsageStats,
   ModelRegistrySnapshot,
@@ -650,10 +652,22 @@ function runtimeActivityLabel(activity: RuntimeActivity): string {
     };
     return `${names[activity.tool]}: ${phases[activity.phase]}`;
   }
+  if (activity.kind === 'hook') {
+    const status = hookStatusLabel(activity.status);
+    return `Hook ${activity.hookName}: ${hookEventLabel(activity.event)} · ${status}${activity.reason ? ` — ${activity.reason}` : ''}`;
+  }
   if (activity.activity === 'connecting') return 'Подключение к GigaChat';
   if (activity.activity === 'receiving') return 'Получение ответа';
   if (activity.activity === 'waiting-for-tool') return 'Ожидание инструмента';
   return activity.activity === 'tool-started' ? 'Запуск инструмента' : 'Инструмент завершён';
+}
+
+function hookStatusLabel(status: HookRunResult['status']): string {
+  if (status === 'completed') return 'завершён';
+  if (status === 'blocked') return 'заблокирован';
+  if (status === 'skipped') return 'пропущен';
+  if (status === 'cancelled') return 'отменён';
+  return 'ошибка';
 }
 
 function elapsedLabel(durationMs: number | undefined): string | null {
@@ -749,6 +763,9 @@ export default function App() {
   const [homeVoiceGeneration, setHomeVoiceGeneration] = useState(0);
   const [skillRegistry, setSkillRegistry] = useState<SkillRegistrySnapshot>({ skills: [], issues: [] });
   const [hookRegistry, setHookRegistry] = useState<HookRegistrySnapshot>({ hooks: [], issues: [] });
+  const [hookInspection, setHookInspection] = useState<(HookInspection & { name: string; event: HookEvent; source: string }) | null>(null);
+  const [hookInspectionLoading, setHookInspectionLoading] = useState<string | null>(null);
+  const [hookBusyId, setHookBusyId] = useState<string | null>(null);
   const [skillProjectId, setSkillProjectId] = useState('');
   const [pendingSkillId, setPendingSkillId] = useState<string | null>(null);
   const [skillSource, setSkillSource] = useState<SkillSource | null>(null);
@@ -2532,6 +2549,49 @@ export default function App() {
     finally { setSkillSourceLoading(null); }
   }
 
+  async function refreshHookRegistry(): Promise<void> {
+    try { setHookRegistry(await window.gigaChat.hooks.list()); }
+    catch (error) { setNotice(getErrorMessage(error)); }
+  }
+
+  async function inspectHook(hook: HookRegistrySnapshot['hooks'][number]): Promise<void> {
+    if (hookInspection?.id === hook.id) {
+      setHookInspection(null);
+      return;
+    }
+    setHookInspectionLoading(hook.id);
+    try { setHookInspection(await window.gigaChat.hooks.inspect(hook.id)); }
+    catch (error) { setNotice(getErrorMessage(error)); }
+    finally { setHookInspectionLoading(null); }
+  }
+
+  function trustHook(hook: HookRegistrySnapshot['hooks'][number]): Promise<void> {
+    return trackRendererOperation(() => trustHookOperation(hook));
+  }
+
+  async function trustHookOperation(hook: HookRegistrySnapshot['hooks'][number]): Promise<void> {
+    const inspected = hookInspection;
+    if (!inspected || inspected.id !== hook.id || inspected.contentHash !== hook.contentHash) {
+      setNotice('Содержимое изменилось или ещё не просмотрено. Откройте Hook заново перед подтверждением.');
+      return;
+    }
+    setHookBusyId(hook.id);
+    try { setHookRegistry(await window.gigaChat.hooks.trust(hook.id, inspected.contentHash)); }
+    catch (error) { rendererOperations.current.reportFailure(error); setNotice(getErrorMessage(error)); }
+    finally { setHookBusyId(null); }
+  }
+
+  function setHookEnabled(hook: HookRegistrySnapshot['hooks'][number], enabled: boolean): Promise<void> {
+    return trackRendererOperation(() => setHookEnabledOperation(hook, enabled));
+  }
+
+  async function setHookEnabledOperation(hook: HookRegistrySnapshot['hooks'][number], enabled: boolean): Promise<void> {
+    setHookBusyId(hook.id);
+    try { setHookRegistry(await window.gigaChat.hooks.setEnabled(hook.id, enabled)); }
+    catch (error) { rendererOperations.current.reportFailure(error); setNotice(getErrorMessage(error)); }
+    finally { setHookBusyId(null); }
+  }
+
   async function openSkillFolder(scope: SkillScope, projectId?: string | null): Promise<void> {
     try { await window.gigaChat.skills.openFolder(scope, projectId); }
     catch (error) { setNotice(getErrorMessage(error)); }
@@ -2918,17 +2978,35 @@ export default function App() {
       case 'hooks':
         return (
           <>
-            <div className="settings-section-heading"><h2>Hooks</h2><p>Реестр показывает только обнаруженные hook.json. Произвольные действия не запускаются и остаются выключенными до проверки источника и разрешения.</p></div>
+            <div className="settings-section-heading"><h2>Hooks</h2><p>Проверьте manifest и PowerShell-действие перед доверием. Доверие привязано к SHA-256 содержимого; включение выполняется отдельно. Hook получает ограниченное событие через <code>$env:GIGACHAT_LOCAL_TOOL_INPUT</code> и возвращает JSON с необязательным <code>decision</code>. Hook не может подтвердить запрос разрешения.</p><button type="button" className="quiet-button" onClick={() => void refreshHookRegistry()}>Обновить список</button></div>
             {hookRegistry.hooks.length === 0
-              ? <EmptyState title="Hook-записи не обнаружены" description="Реальные Global / Project / Skill / Plugin записи будут показаны здесь; события без настроенной записи не выдаются за установленный Hook." icon="plug" />
+              ? <EmptyState title="Hook-записи не обнаружены" description="Добавьте hook.json в каталог Global, Project или существующего Skill приложения. Plugins/MCP показываются как недоступные." icon="plug" />
               : <div className="settings-card settings-list">{hookRegistry.hooks.map((hook) => (
-                <div className="setting-row" key={hook.id}>
-                  <div className="setting-row-copy">
-                    <strong>{hook.name}</strong>
-                    <p>{hook.description}</p>
-                    <small className="hook-record-location">{hookEventLabel(hook.event)} · {hook.scope} · {hook.source} · {hook.actionFile}</small>
+                <div key={hook.id}>
+                  <div className="setting-row">
+                    <div className="setting-row-copy">
+                      <strong>{hook.name}</strong>
+                      <p>{hook.description}</p>
+                      <small className="hook-record-location">{hookEventLabel(hook.event)} · {hook.scope} · {hook.source} · {hook.actionFile}</small>
+                      {!hook.available && <small className="hook-record-location">{hook.unavailableReason}</small>}
+                      {hook.lastRun && <small className="hook-record-location">Последний запуск: {hookEventLabel(hook.lastRun.event)} · {hookStatusLabel(hook.lastRun.status)}{hook.lastRun.reason ? ` · ${hook.lastRun.reason}` : ''}</small>}
+                    </div>
+                    <div className="setting-row-control inline-actions">
+                      <span className={`status-label${hook.enabled && hook.trusted ? ' status-enabled' : ''}`}>
+                        {!hook.available ? 'Недоступен' : !hook.trusted ? 'Требует проверки' : hook.enabled ? 'Включён' : 'Доверен, выключен'}
+                      </span>
+                      <button type="button" className="quiet-button" disabled={hookInspectionLoading === hook.id} onClick={() => void inspectHook(hook)}>
+                        {hookInspectionLoading === hook.id ? 'Чтение…' : hookInspection?.id === hook.id ? 'Скрыть' : 'Просмотреть'}
+                      </button>
+                      {hook.available && !hook.trusted && <button type="button" className="quiet-button" disabled={hookBusyId === hook.id || hookInspection?.id !== hook.id || hookInspection.contentHash !== hook.contentHash} onClick={() => void trustHook(hook)}>Доверять этой версии</button>}
+                      {hook.available && hook.trusted && <label className="skill-enabled-toggle"><span>Включить</span><span className="switch-control"><input type="checkbox" aria-label={`${hook.enabled ? 'Выключить' : 'Включить'} Hook ${hook.name}`} checked={hook.enabled} disabled={hookBusyId === hook.id} onChange={(event) => void setHookEnabled(hook, event.target.checked)} /><span /></span></label>}
+                    </div>
                   </div>
-                  <div className="setting-row-control"><span className="status-label">Исполнение выключено</span></div>
+                  {hookInspection?.id === hook.id && <details className="skill-source" open>
+                    <summary>Просмотренное содержимое · SHA-256 {hookInspection.contentHash}</summary>
+                    <p>Manifest</p><pre>{hookInspection.manifestContents}</pre>
+                    <p>PowerShell action — выполняется как точная проверенная копия</p><pre>{hookInspection.actionContents}</pre>
+                  </details>}
                 </div>
               ))}</div>}
             {hookRegistry.issues.map((issue) => <p className="registry-issue" role="status" key={`${issue.source}:${issue.reason}`}>{issue.source}: {issue.reason}</p>)}

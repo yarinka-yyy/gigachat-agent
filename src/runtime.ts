@@ -4,6 +4,8 @@ import type {
   AcceptedTurnInput,
   ChatToolReceipt,
   GigaChatProvider,
+  HookDispatchInput,
+  HookRunResult,
   ProviderFunctionCall,
   ProviderErrorCategory,
   ProviderEvent,
@@ -15,6 +17,7 @@ import type {
 } from './contracts';
 import { PROVIDER_ERROR_CATEGORIES } from './contracts';
 import { LocalToolError, type LocalToolEvent, type LocalTools } from './local-tools';
+import { HookDispatchAbortError } from './hooks';
 
 const MAX_ACTIVITY_PER_TURN = 50;
 const MAX_ASSISTANT_CHARS = 100_000;
@@ -43,6 +46,7 @@ export interface TurnRuntimeOptions {
   appendAssistant(turn: AcceptedTurnInput, text: string, signal: AbortSignal, functionsStateId?: string): Promise<void>;
   beginToolReceipt?(turn: AcceptedTurnInput, receipt: ToolReceiptInput): Promise<ToolReceiptStart>;
   completeToolReceipt?(turn: AcceptedTurnInput, receiptId: string, status: 'completed' | 'unknown', result: string): Promise<void>;
+  runHooks?(turn: AcceptedTurnInput, input: HookDispatchInput, signal: AbortSignal): Promise<HookRunResult[]>;
   timeouts?: { prepareMs?: number; nextMs?: number; stopMs?: number; operationMs?: number; toolMs?: number; turnMs?: number };
   onUpdate?(turn: RuntimeTurnSnapshot): void;
 }
@@ -56,6 +60,7 @@ export interface TurnRuntime {
   whenIdle(): Promise<void>;
   onUpdate(listener: (turn: RuntimeTurnSnapshot) => void): () => void;
   recordToolEvent(event: LocalToolEvent): void;
+  recordHookResult(result: HookRunResult): void;
 }
 
 interface RuntimeTurn extends RuntimeTurnSnapshot {
@@ -458,6 +463,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     let iterator: AsyncIterator<ProviderEvent> | null = null;
     let pendingNext: Promise<IteratorResult<ProviderEvent>> | null = null;
     let naturallyDone = false;
+    let stopHooksRan = false;
+    let interruptHooksRan = false;
     let reservationConsumed = false;
     let turnTimedOut = false;
     let answer = '';
@@ -496,11 +503,39 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         throw timedOut ? new Error(timeoutMessage) : error;
       }
     };
+    const runHookEvent = async (
+      input: HookDispatchInput,
+      signal = controller.signal,
+      acceptedTurn = turn.input,
+    ): Promise<HookRunResult[]> => {
+      let results: HookRunResult[];
+      try {
+        results = await options.runHooks?.(acceptedTurn, input, signal) ?? [];
+      } catch (error) {
+        if (error instanceof HookDispatchAbortError) {
+          for (const result of error.hookResults) {
+            addActivity(turn, {
+              kind: 'hook', at: new Date().toISOString(), hookId: result.hookId, hookName: result.hookName,
+              event: result.event, status: result.status, ...(result.reason ? { reason: result.reason } : {}),
+            });
+          }
+        }
+        throw error;
+      }
+      for (const result of results) {
+        addActivity(turn, {
+          kind: 'hook', at: new Date().toISOString(), hookId: result.hookId, hookName: result.hookName,
+          event: result.event, status: result.status, ...(result.reason ? { reason: result.reason } : {}),
+        });
+      }
+      if (signal.aborted) throw abortError();
+      return results;
+    };
     const invokeTool = async (call: ProviderFunctionCall): Promise<unknown> => {
       const validation = validateToolArguments(call);
       if (!validation.ok) return { ok: false, error: validation.error, message: validation.message };
       const args = validation.args;
-      const scope = { signal: controller.signal, expectedWorkingFolder: turn.input.projectWorkingFolder };
+      const scope = { signal: controller.signal, expectedWorkingFolder: turn.input.projectWorkingFolder, skillId: turn.input.skillId };
       switch (call.name) {
         case 'list': return options.tools.list(turn.input.projectId, turn.input.permissionProfile, args.path ?? '', scope);
         case 'search': return options.tools.search(turn.input.projectId, turn.input.permissionProfile, args.query, args.path ?? '', scope);
@@ -522,6 +557,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       let request = await waitFor(preparation, controller.signal, prepareTimeoutMs, 'TURN_PREPARE_TIMEOUT');
       if (controller.signal.aborted) throw abortError();
       if (!request.modelId) throw new Error('MODEL_NOT_SELECTED');
+      await runHookEvent({ event: 'user-prompt-submitted', projectId: turn.input.projectId });
 
       let toolRounds = 0;
       let totalToolResultBytes = 0;
@@ -631,30 +667,72 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           } else {
             const validation = validateToolArguments(functionCall);
             const operation = (async (): Promise<ProviderProtocolExchange> => {
-              let resultText: string;
+              let resultText: string | null = null;
               let resultStatus: 'completed' | 'unknown' = 'completed';
+              let abortAfterSave = false;
+              let actualToolOutcome: HookDispatchInput['outcome'] = 'failed';
               if (!validation.ok) resultText = objectResult({ ok: false, error: validation.error, message: validation.message });
               else if (controller.signal.aborted) resultText = objectResult({ ok: false, error: 'cancelled', message: 'Инструмент отменён до запуска.' });
               else {
+                let beforeResults: HookRunResult[] = [];
                 try {
-                  const result = await invokeTool(functionCall!);
-                  const hasSideEffect = functionCall!.name === 'write' || functionCall!.name === 'powershell' || functionCall!.name === 'open';
-                  if (controller.signal.aborted && hasSideEffect) {
-                    resultStatus = 'unknown';
-                    resultText = errorResult(new Error('cancelled'), true);
-                  } else resultText = objectResult({ ok: true, result });
-                } catch (toolError) {
-                  const hasSideEffect = functionCall!.name === 'write' || functionCall!.name === 'powershell' || functionCall!.name === 'open';
-                  const permissionDenied = toolError instanceof LocalToolError && toolError.code === 'PERMISSION_DENIED';
-                  resultStatus = hasSideEffect && !permissionDenied ? 'unknown' : 'completed';
-                  resultText = errorResult(toolError, hasSideEffect && !permissionDenied);
+                  beforeResults = await runHookEvent({
+                    event: 'before-tool', projectId: turn.input.projectId,
+                    ...(isProviderToolName(functionCall!.name) ? { tool: functionCall!.name } : {}),
+                  });
+                } catch (hookError) {
+                  resultText = errorResult(hookError, false);
+                  abortAfterSave = isAbortError(hookError);
+                }
+                const failedCheck = beforeResults.find((result) => result.status !== 'completed' || result.decision === 'block');
+                if (resultText === null && failedCheck) {
+                  resultText = objectResult({
+                    ok: false,
+                    error: 'hook_blocked',
+                    message: failedCheck.reason ?? 'Проверка Hook не разрешила запуск инструмента.',
+                  });
+                }
+                if (resultText === null) {
+                  try {
+                    const result = await invokeTool(functionCall!);
+                    const hasSideEffect = functionCall!.name === 'write' || functionCall!.name === 'powershell' || functionCall!.name === 'open';
+                    if (controller.signal.aborted && hasSideEffect) {
+                      resultStatus = 'unknown';
+                      resultText = errorResult(new Error('cancelled'), true);
+                      actualToolOutcome = 'cancelled';
+                    } else {
+                      const commandFailed = functionCall!.name === 'powershell' && typeof result === 'object' && result !== null
+                        && (('exitCode' in result && typeof result.exitCode === 'number' && result.exitCode !== 0)
+                          || ('timedOut' in result && result.timedOut === true)
+                          || ('outputLimited' in result && result.outputLimited === true));
+                      actualToolOutcome = commandFailed ? 'failed' : 'completed';
+                      if (commandFailed && hasSideEffect) resultStatus = 'unknown';
+                      resultText = objectResult({ ok: !commandFailed, result });
+                    }
+                  } catch (toolError) {
+                    const hasSideEffect = functionCall!.name === 'write' || functionCall!.name === 'powershell' || functionCall!.name === 'open';
+                    const permissionDenied = toolError instanceof LocalToolError && toolError.code === 'PERMISSION_DENIED';
+                    resultStatus = hasSideEffect && !permissionDenied ? 'unknown' : 'completed';
+                    actualToolOutcome = isAbortError(toolError) ? 'cancelled' : 'failed';
+                    resultText = errorResult(toolError, hasSideEffect && !permissionDenied);
+                  }
+                  try {
+                    await runHookEvent({
+                      event: 'after-tool', projectId: turn.input.projectId,
+                      ...(isProviderToolName(functionCall!.name) ? { tool: functionCall!.name } : {}),
+                      outcome: actualToolOutcome,
+                    });
+                  } catch (hookError) {
+                    if (isAbortError(hookError)) abortAfterSave = true;
+                  }
                 }
               }
+              if (resultText === null) resultText = objectResult({ ok: false, error: 'hook_blocked', message: 'Проверка Hook не завершилась.' });
               if (Buffer.byteLength(resultText, 'utf8') > MAX_TOOL_RESULT_BYTES) {
                 resultText = objectResult({ ok: false, error: 'result_limit', message: 'Результат инструмента превышает лимит 16 КиБ.' });
               }
               await options.completeToolReceipt!(turn.input, receiptInput.receiptId, resultStatus, resultText);
-              return {
+              const exchange = {
                 anchorMessageId: turn.input.messageId,
                 name: functionCall!.name,
                 arguments: structuredClone(functionCall!.arguments),
@@ -662,6 +740,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
                 functionsStateId: functionCall!.functionsStateId,
                 result: resultText,
               };
+              if (abortAfterSave || controller.signal.aborted) throw abortError();
+              return exchange;
             })();
             exchange = await waitTracked(operation, toolTimeoutMs, 'LOCAL_TOOL_TIMEOUT', 'Локальный инструмент или сохранение результата ещё не остановились; очередь приостановлена.');
           }
@@ -686,6 +766,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           return;
         }
         if (controller.signal.aborted) throw abortError();
+        stopHooksRan = true;
+        await runHookEvent({ event: 'stop', projectId: turn.input.projectId }, new AbortController().signal).catch(() => undefined);
         flushDraft();
         const appending = options.appendAssistant(turn.input, answer, controller.signal, completedFunctionsStateId);
         const appendOutcome = appending.then(
@@ -720,6 +802,19 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       } else if (stopState.pendingOutcome) {
         maybeUnblock(turn.id);
       } else {
+        const terminalSignal = new AbortController().signal;
+        const cancelled = turn.cancelRequested || isAbortError(error) && !turnTimedOut;
+        if (cancelled && !interruptHooksRan) {
+          interruptHooksRan = true;
+          await runHookEvent({ event: 'interrupt', projectId: turn.input.projectId, outcome: 'cancelled' }, terminalSignal).catch(() => undefined);
+        }
+        if (!stopHooksRan) {
+          stopHooksRan = true;
+          await runHookEvent({
+            event: 'stop', projectId: turn.input.projectId,
+            outcome: cancelled ? 'cancelled' : 'failed',
+          }, terminalSignal).catch(() => undefined);
+        }
         turn.status = turn.cancelRequested || isAbortError(error) && !turnTimedOut ? 'cancelled' : 'failed';
         turn.endedAt = new Date().toISOString();
         turn.activeDurationMs = Math.max(0, Date.now() - started);
@@ -881,6 +976,14 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       if (owner) addActivity(owner, {
         kind: 'tool', at: event.at, tool: event.tool, phase: event.phase,
         ...(event.durationMs === undefined ? {} : { durationMs: event.durationMs }),
+      });
+    },
+    recordHookResult: (result) => {
+      const turn = activeTurn;
+      if (!turn) return;
+      addActivity(turn, {
+        kind: 'hook', at: new Date().toISOString(), hookId: result.hookId, hookName: result.hookName,
+        event: result.event, status: result.status, ...(result.reason ? { reason: result.reason } : {}),
       });
     },
   };

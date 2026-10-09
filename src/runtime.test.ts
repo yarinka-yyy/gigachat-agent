@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { AcceptedTurnInput, ChatToolReceipt, GigaChatProvider, ProviderEvent, ProviderTurnRequest, RuntimeTurnSnapshot } from './contracts';
+import type { AcceptedTurnInput, ChatToolReceipt, GigaChatProvider, HookDispatchInput, HookRunResult, ProviderEvent, ProviderTurnRequest, RuntimeTurnSnapshot } from './contracts';
 import type { LocalTools } from './local-tools';
 import { LocalToolError } from './local-tools';
+import { HookDispatchAbortError } from './hooks';
 import { createTurnRuntime, type ToolReceiptInput, type ToolReceiptStart, type TurnRuntimeOptions } from './runtime';
 
 const testTools = {} as LocalTools;
@@ -37,6 +38,7 @@ function makeRuntime(provider: GigaChatProvider | null, options: {
   tools?: LocalTools;
   beginToolReceipt?: TurnRuntimeOptions['beginToolReceipt'];
   completeToolReceipt?: TurnRuntimeOptions['completeToolReceipt'];
+  runHooks?: TurnRuntimeOptions['runHooks'];
   timeouts?: TurnRuntimeOptions['timeouts'];
   onUpdate?: (turn: RuntimeTurnSnapshot) => void;
 } = {}) {
@@ -51,6 +53,7 @@ function makeRuntime(provider: GigaChatProvider | null, options: {
       : async () => undefined,
     ...(options.beginToolReceipt ? { beginToolReceipt: options.beginToolReceipt } : {}),
     ...(options.completeToolReceipt ? { completeToolReceipt: options.completeToolReceipt } : {}),
+    ...(options.runHooks ? { runHooks: options.runHooks } : {}),
     ...(options.timeouts ? { timeouts: options.timeouts } : {}),
     ...(options.onUpdate ? { onUpdate: options.onUpdate } : {}),
   });
@@ -1054,4 +1057,121 @@ test('holds FIFO until a timed-out protocol result save settles after the write'
   assert.equal(runtime.list('save-second')[0]?.status, 'completed');
   assert.equal(writes, 1);
   assert.equal([...receipts.receipts.values()][0]?.status, 'completed');
+});
+
+test('blocks a tool when its before-hook fails and stores a completed non-side-effect receipt', async () => {
+  const receipts = makeReceiptStore();
+  const requests: ProviderTurnRequest[] = [];
+  const hookInputs: HookDispatchInput[] = [];
+  let writes = 0;
+  const provider = makeProvider(async function* (request) {
+    requests.push(structuredClone(request));
+    if (!request.protocolHistory?.length) yield functionCall('write', { path: 'blocked.txt', contents: 'no' }, 'state-before-hook');
+    else {
+      yield { type: 'text-delta', text: 'Проверка остановила запись' };
+      yield { type: 'completed' };
+    }
+  });
+  const runtime = makeRuntime(provider, {
+    tools: { write: async () => { writes += 1; return { bytes: 2 }; } } as unknown as LocalTools,
+    beginToolReceipt: receipts.begin,
+    completeToolReceipt: receipts.complete,
+    runHooks: async (_turn, input) => {
+      hookInputs.push(input);
+      return input.event === 'before-tool'
+        ? [{ hookId: 'global/guard', hookName: 'Guard', event: input.event, status: 'failed', reason: 'invalid output' }]
+        : [];
+    },
+  });
+  runtime.enqueue(turnFor('chat-hook-before'));
+  await runtime.whenIdle();
+
+  assert.equal(runtime.list('chat-hook-before')[0]?.status, 'completed');
+  assert.equal(writes, 0);
+  assert.deepEqual(hookInputs.map((input) => input.event), ['user-prompt-submitted', 'before-tool', 'stop']);
+  assert.equal(JSON.parse(requests[1]?.protocolHistory?.[0]?.result ?? '{}').error, 'hook_blocked');
+  const receipt = [...receipts.receipts.values()][0];
+  assert.equal(receipt?.status, 'completed');
+  assert.equal(JSON.parse(receipt?.result ?? '{}').error, 'hook_blocked');
+});
+
+test('after-hook failure records the real tool outcome and does not repeat a completed write', async () => {
+  const receipts = makeReceiptStore();
+  const requests: ProviderTurnRequest[] = [];
+  const hookInputs: HookDispatchInput[] = [];
+  let writes = 0;
+  const provider = makeProvider(async function* (request) {
+    requests.push(structuredClone(request));
+    if (!request.protocolHistory?.length) yield functionCall('write', { path: 'once.txt', contents: 'once' }, 'state-after-hook');
+    else {
+      yield { type: 'text-delta', text: 'Запись выполнена один раз' };
+      yield { type: 'completed' };
+    }
+  });
+  const runtime = makeRuntime(provider, {
+    tools: { write: async () => { writes += 1; return { bytes: 4 }; } } as unknown as LocalTools,
+    beginToolReceipt: receipts.begin,
+    completeToolReceipt: receipts.complete,
+    runHooks: async (_turn, input): Promise<HookRunResult[]> => {
+      hookInputs.push(input);
+      return input.event === 'after-tool'
+        ? [{ hookId: 'global/audit', hookName: 'Audit', event: input.event, status: 'failed', reason: 'invalid output' }]
+        : [];
+    },
+  });
+  runtime.enqueue(turnFor('chat-hook-after'));
+  await runtime.whenIdle();
+
+  assert.equal(runtime.list('chat-hook-after')[0]?.status, 'completed');
+  assert.equal(writes, 1);
+  assert.equal(hookInputs.find((input) => input.event === 'after-tool')?.outcome, 'completed');
+  assert.equal(JSON.parse(requests[1]?.protocolHistory?.[0]?.result ?? '{}').ok, true);
+  assert.equal([...receipts.receipts.values()][0]?.status, 'completed');
+  assert.ok(runtime.list('chat-hook-after')[0]?.activity.some((activity) => activity.kind === 'hook' && activity.status === 'failed'));
+});
+
+test('a failing stop-hook does not discard an already completed provider answer', async () => {
+  const saved: string[] = [];
+  const provider = makeProvider(async function* () {
+    yield { type: 'text-delta', text: 'Ответ уже завершён' };
+    yield { type: 'completed' };
+  });
+  const runtime = makeRuntime(provider, {
+    appendAssistant: async (_chatId, text) => { saved.push(text); },
+    runHooks: async (_turn, input) => {
+      if (input.event === 'stop') throw new Error('hook failed');
+      return [];
+    },
+  });
+  runtime.enqueue(turnFor('chat-hook-stop'));
+  await runtime.whenIdle();
+
+  assert.deepEqual(saved, ['Ответ уже завершён']);
+  assert.equal(runtime.list('chat-hook-stop')[0]?.status, 'completed');
+});
+
+test('records hook results once when an active dispatcher aborts its turn', async () => {
+  const provider = makeProvider(async function* () {
+    yield { type: 'completed' };
+  });
+  const runtime = makeRuntime(provider, {
+    runHooks: async (_turn, input) => {
+      if (input.event === 'user-prompt-submitted') {
+        throw new HookDispatchAbortError([
+          { hookId: 'global/first', hookName: 'First', event: input.event, status: 'completed' },
+          { hookId: 'global/cancelled', hookName: 'Cancelled', event: input.event, status: 'cancelled', reason: 'Hook отменён вместе с текущим ходом.' },
+        ]);
+      }
+      return [];
+    },
+  });
+  runtime.enqueue(turnFor('chat-hook-abort'));
+  await runtime.whenIdle();
+
+  const turn = runtime.list('chat-hook-abort')[0];
+  const hookActivity = turn?.activity.filter((activity) => activity.kind === 'hook') ?? [];
+  assert.equal(turn?.status, 'cancelled');
+  assert.equal(hookActivity.length, 2);
+  assert.equal(hookActivity.filter((activity) => activity.kind === 'hook' && activity.hookId === 'global/first').length, 1);
+  assert.equal(hookActivity.filter((activity) => activity.kind === 'hook' && activity.hookId === 'global/cancelled' && activity.status === 'cancelled').length, 1);
 });

@@ -7,13 +7,13 @@ import { openStore, type LocalStore } from './store';
 import { buildInstructionRequest } from './instructions';
 import { createLocalTools, createPowerShellHelper, resolvePowerShellHelperPath, type LocalTools } from './local-tools';
 import { createTurnRuntime, type TurnRuntime } from './runtime';
-import type { AcceptedTurnInput, ChatPatch, FolderOpener, ModelRegistrySnapshot, NotificationSettings, PreferredOpener, RuntimeAvailability, SettingsPatch, Theme, VoiceAvailability } from './contracts';
-import { requirePermissionProfile } from './permissions';
+import type { AcceptedTurnInput, ChatPatch, FolderOpener, HookRunResult, ModelRegistrySnapshot, NotificationSettings, PreferredOpener, RuntimeAvailability, SettingsPatch, Theme, VoiceAvailability } from './contracts';
+import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { isModelAvailable, requireModelId } from './models';
 import { openCustomPermissions, parseCustomConfig } from './custom-permissions';
 import { createPermissionApprovals } from './permission-approvals';
 import { createSkillRegistry, isSkillId } from './skills';
-import { createHookRegistry } from './hooks';
+import { createHookApprovalGate, createHookDispatcher, createHookRegistry, transitionProjectHookContext, type HookApprovalRequestContext, type HookExecutionContext } from './hooks';
 import { createSecureStore } from './secure-store';
 import { createGigaChatProvider, createHttpsTransport, GIGACHAT_ROOT_CA_SHA256, GigaChatProviderError, type GigaChatProviderConnection, type ProviderTransport } from './gigachat-provider';
 import { createOnboardingBrowser, type BrowserBounds } from './onboarding-browser';
@@ -250,6 +250,11 @@ async function withLocalFailureNotification<T>(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isAbortError(value: unknown): boolean {
+  return value instanceof Error && value.name === 'AbortError'
+    || isRecord(value) && value.code === 'ABORT_ERR';
 }
 
 function requireText(value: unknown, label: string, maxLength = 128): string {
@@ -497,6 +502,10 @@ interface MainRuntimeBundle {
   voiceAvailability: VoiceAvailability;
   skills: ReturnType<typeof createSkillRegistry>;
   hooks: ReturnType<typeof createHookRegistry>;
+  startSessionHooks(): Promise<void>;
+  beginCloseHooks(): void;
+  endSessionHooks(): Promise<void>;
+  resumeSessionHooks(): void;
 }
 
 const VOICE_FILES = [
@@ -679,12 +688,36 @@ async function createMainRuntime(
     transport,
   });
 
+  let activeProjectContext: HookExecutionContext | null = null;
+  let currentAcceptedHookContext: HookExecutionContext | null = null;
+  let hookApprovalSuppressionDepth = 0;
+  let closingHooks = false;
+  let sessionStartAttempted = false;
+  let sessionEndAttempted = false;
+  let tools!: LocalTools;
+  let dispatchHookHandlers!: ReturnType<typeof createHookDispatcher>;
+  let hookApprovalGate: {
+    request(details: Parameters<typeof approvals.request>[0], signal?: AbortSignal, context?: HookApprovalRequestContext): Promise<boolean>;
+  };
+
+  const requestLocalApproval = async (
+    details: Parameters<typeof approvals.request>[0],
+    signal?: AbortSignal,
+    requestContext?: { projectId: string | null; profile: PermissionProfile; skillId: string | null; workingFolder: string; resource: HookApprovalRequestContext['resource']; action: HookApprovalRequestContext['action'] },
+  ): Promise<boolean> => {
+    const acceptedContext = currentAcceptedHookContext;
+    const context = requestContext && acceptedContext
+      ? { execution: acceptedContext, ...requestContext }
+      : undefined;
+    return hookApprovalGate.request(details, signal, context);
+  };
+
   let runtime: TurnRuntime | null = null;
-  const tools: LocalTools = createLocalTools({
+  tools = createLocalTools({
     resolveProject: async (id) => (await store.listProjects()).find((project) => project.id === id) ?? null,
     protectedDirectory: app.getPath('userData'),
     getCustomPolicy: customPermissions.policy,
-    requestApproval: approvals.request,
+    requestApproval: requestLocalApproval,
     revealItem: async (path) => {
       shell.showItemInFolder(path);
     },
@@ -702,6 +735,18 @@ async function createMainRuntime(
         void showLocalNotification(store, 'failures', 'Локальный инструмент завершился с ошибкой', 'Откройте чат, чтобы проверить состояние.');
       }
     },
+  });
+  dispatchHookHandlers = createHookDispatcher({
+    registry: hooks,
+    tools,
+    isAvailable: () => Boolean(helper),
+    onResult: (result) => hooks.recordResult(result),
+  });
+  hookApprovalGate = createHookApprovalGate({
+    dispatch: dispatchHookHandlers,
+    isSuppressed: () => closingHooks || hookApprovalSuppressionDepth > 0,
+    requestApproval: approvals.request,
+    onResult: (result) => runtime?.recordHookResult(result),
   });
 
   const lastNotifiedStatus = new Map<string, string>();
@@ -756,6 +801,38 @@ async function createMainRuntime(
     appendAssistant: async (turn, text, signal, functionsStateId) => {
       await store.appendAssistantMessageFromRuntime(turn.chatId, turn.messageId, text, signal, functionsStateId);
     },
+    runHooks: async (turn, input, signal) => {
+      const context: HookExecutionContext = {
+        projectId: turn.projectId,
+        projectWorkingFolder: turn.projectWorkingFolder,
+        permissionProfile: turn.permissionProfile,
+        skillId: turn.skillId,
+      };
+      currentAcceptedHookContext = context;
+      const results: HookRunResult[] = [];
+      if (input.event === 'user-prompt-submitted') {
+        const transition = transitionProjectHookContext(activeProjectContext, context);
+        if (transition.end?.projectId) {
+          results.push(...await dispatchHookHandlers(transition.end, {
+            event: 'project-end', projectId: transition.end.projectId,
+          }, signal, { maxHandlers: 2, timeoutMs: 1_500 }));
+        }
+        if (transition.start?.projectId) {
+          results.push(...await dispatchHookHandlers(transition.start, {
+            event: 'project-start', projectId: transition.start.projectId,
+          }, signal, { maxHandlers: 2, timeoutMs: 1_500 }));
+        }
+        activeProjectContext = transition.active;
+      }
+      const terminalEvent = input.event === 'stop' || input.event === 'interrupt' || input.event === 'project-end';
+      if (input.event === 'stop' || input.event === 'interrupt') hookApprovalSuppressionDepth += 1;
+      try {
+        results.push(...await dispatchHookHandlers(context, input, signal, terminalEvent ? { maxHandlers: 2, timeoutMs: 1_500 } : undefined));
+      } finally {
+        if (input.event === 'stop' || input.event === 'interrupt') hookApprovalSuppressionDepth -= 1;
+      }
+      return results;
+    },
     onUpdate: (turn) => {
       if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('runtime:update', turn);
       if (lastNotifiedStatus.get(turn.id) === turn.status) return;
@@ -774,6 +851,45 @@ async function createMainRuntime(
     },
   });
   runtime = turnRuntime;
+  const startSessionHooks = async (): Promise<void> => {
+    if (sessionStartAttempted || closingHooks) return;
+    sessionStartAttempted = true;
+    const settings = await store.getSettings();
+    const context: HookExecutionContext = {
+      projectId: null, projectWorkingFolder: null,
+      permissionProfile: settings.defaultPermissionProfile, skillId: null,
+    };
+    await dispatchHookHandlers(context, { event: 'session-start', projectId: null }, new AbortController().signal, {
+      maxHandlers: 2, timeoutMs: 1_500,
+    });
+  };
+  const endSessionHooks = async (): Promise<void> => {
+    if (sessionEndAttempted) return;
+    sessionEndAttempted = true;
+    closingHooks = true;
+    const terminalSignal = new AbortController().signal;
+    if (activeProjectContext?.projectId) {
+      await dispatchHookHandlers(activeProjectContext, { event: 'project-end', projectId: activeProjectContext.projectId }, terminalSignal, {
+        maxHandlers: 2, timeoutMs: 1_500,
+      }).catch(() => undefined);
+      activeProjectContext = null;
+    }
+    const settings = await store.getSettings().catch(() => null);
+    if (!settings) return;
+    await dispatchHookHandlers({
+      projectId: null, projectWorkingFolder: null,
+      permissionProfile: settings.defaultPermissionProfile, skillId: null,
+    }, { event: 'session-end', projectId: null }, terminalSignal, {
+      maxHandlers: 2, timeoutMs: 1_500,
+    }).catch(() => undefined);
+  };
+  const beginCloseHooks = (): void => { closingHooks = true; };
+  const resumeSessionHooks = (): void => {
+    closingHooks = false;
+    hookApprovalSuppressionDepth = 0;
+    sessionEndAttempted = false;
+    currentAcceptedHookContext = null;
+  };
   return {
     runtime: turnRuntime,
     providerConnection,
@@ -787,6 +903,10 @@ async function createMainRuntime(
     voiceAvailability: voiceService.availability,
     skills,
     hooks,
+    startSessionHooks,
+    beginCloseHooks,
+    endSessionHooks,
+    resumeSessionHooks,
   };
 }
 
@@ -804,7 +924,7 @@ async function registerIpcHandlers(
     'projects:list', 'projects:pick-folder', 'projects:open-folder', 'projects:read-instructions', 'projects:instructions-backup-path',
     'chats:list', 'chats:get', 'chats:open-artifact', 'chats:open-folder',
     'runtime:list', 'runtime:status', 'permissions:read-config', 'permissions:respond',
-    'voice:status', 'voice:cancel', 'skills:list', 'skills:read-source', 'skills:open-folder', 'hooks:list',
+    'voice:status', 'voice:cancel', 'skills:list', 'skills:read-source', 'skills:open-folder', 'hooks:list', 'hooks:inspect',
     'onboarding:key-status', 'onboarding:browser-status', 'onboarding:browser-open', 'onboarding:browser-close',
     'onboarding:connection-status',
     'models:get-registry', 'models:refresh',
@@ -816,7 +936,7 @@ async function registerIpcHandlers(
   const readOnlyChannels = new Set([
     'projects:list', 'projects:read-instructions', 'projects:instructions-backup-path',
     'chats:list', 'chats:get', 'runtime:list', 'runtime:status', 'permissions:read-config',
-    'voice:status', 'skills:list', 'skills:read-source', 'hooks:list', 'onboarding:key-status', 'onboarding:connection-status', 'models:get-registry',
+    'voice:status', 'skills:list', 'skills:read-source', 'hooks:list', 'hooks:inspect', 'onboarding:key-status', 'onboarding:connection-status', 'models:get-registry',
     'onboarding:browser-status', 'browser:status', 'settings:get', 'usage:local-stats',
     'settings:list-openers', 'settings:app-info', 'settings:get-auto-start', 'settings:read-instructions',
   ]);
@@ -863,8 +983,10 @@ async function registerIpcHandlers(
     pauseBrowserMetadata: () => userBrowser.pauseMetadata(),
     resumeBrowserMetadata: () => userBrowser.resumeMetadata(),
     cancelRuntime: async () => {
+      mainRuntime.beginCloseHooks();
       providerConnection.disconnect();
       await runtime.cancelAll();
+      await mainRuntime.endSessionHooks();
     },
     cancelVoice: async () => { await voiceRuntime?.cancelAll(); },
     flushBrowser: () => userBrowser.flush(),
@@ -1048,6 +1170,9 @@ async function registerIpcHandlers(
     if (error) throw new Error('Не удалось открыть папку Skills приложения.');
   });
   handle('hooks:list', () => hooks.list());
+  handle('hooks:inspect', (id) => hooks.inspect(id));
+  handle('hooks:trust', (id, expectedHash) => withLocalFailureNotification(store, () => hooks.trust(id, expectedHash)));
+  handle('hooks:set-enabled', (id, enabled) => withLocalFailureNotification(store, () => hooks.setEnabled(id, enabled)));
 
   handle('onboarding:key-status', () => secureStore.status());
   handle('onboarding:key-save', async (key) => {
@@ -1158,6 +1283,7 @@ async function registerIpcHandlers(
     assertTrustedSender(event);
     if (!closeController?.resume()) throw new Error('Сейчас нельзя вернуться к работе: закрытие ещё выполняется.');
     trayLifecycle.returnToWork();
+    mainRuntime.resumeSessionHooks();
     return true;
   });
   handle('settings:choose-projects-folder', async () => {
@@ -1404,6 +1530,7 @@ if (isPrimaryInstance) void app.whenReady().then(async () => {
     nativeTheme.on('updated', syncTitleBarOverlay);
     const mainRuntime = await createMainRuntime(store, customPermissions, approvals, helperCandidate, secureStore);
     await registerIpcHandlers(store, mainRuntime, secureStore, onboardingBrowser, embeddedBrowser, customPermissions, approvals);
+    await mainRuntime.startSessionHooks();
     createMainWindow = createWindow;
     createWindow();
     createTray();
