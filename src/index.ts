@@ -732,6 +732,7 @@ async function createMainRuntime(
       if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
       await store.validateAcceptedTurn(turn);
       const messages = await store.getMessagesThrough(turn.chatId, turn.messageId);
+      const protocolHistory = await store.getToolProtocolThrough(turn.chatId, turn.messageId);
       if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
       const request = buildInstructionRequest({
         globalText,
@@ -742,6 +743,7 @@ async function createMainRuntime(
           text: selectedSkill.instructions,
         } : null,
         messages,
+        protocolHistory,
         permissionProfile: turn.permissionProfile,
         modelId: turn.modelId,
       });
@@ -749,8 +751,10 @@ async function createMainRuntime(
     },
     consumeTurn: (turn: AcceptedTurnInput, signal) => store.consumeTurnReservation(turn, signal),
     releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
-    appendAssistant: async (turn, text, signal) => {
-      await store.appendAssistantMessageFromRuntime(turn.chatId, turn.messageId, text, signal);
+    beginToolReceipt: (turn, receipt) => store.beginToolReceipt(turn.chatId, turn.messageId, receipt),
+    completeToolReceipt: (turn, receiptId, status, result) => store.completeToolReceipt(turn.chatId, turn.messageId, receiptId, status, result),
+    appendAssistant: async (turn, text, signal, functionsStateId) => {
+      await store.appendAssistantMessageFromRuntime(turn.chatId, turn.messageId, text, signal, functionsStateId);
     },
     onUpdate: (turn) => {
       if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('runtime:update', turn);
@@ -1048,13 +1052,18 @@ async function registerIpcHandlers(
   handle('onboarding:key-status', () => secureStore.status());
   handle('onboarding:key-save', async (key) => {
     providerConnection.invalidateSavedKey();
+    await runtime.cancelAll();
     await secureStore.save(key);
     return secureStore.status();
   });
   handle('onboarding:connection-status', () => providerConnection.getConnectionStatus());
   handle('onboarding:connect', () => providerConnection.connect(), { track: false });
   handle('onboarding:connect-cancel', () => providerConnection.cancelConnect());
-  handle('onboarding:disconnect', () => providerConnection.disconnect());
+  handle('onboarding:disconnect', async () => {
+    const status = providerConnection.disconnect();
+    await runtime.cancelAll();
+    return status;
+  });
   handle('models:get-registry', () => providerConnection.getModelRegistry());
   handle('models:refresh', () => refreshModelRegistry(), { track: false });
   handle('onboarding:browser-status', () => browser.getStatus());

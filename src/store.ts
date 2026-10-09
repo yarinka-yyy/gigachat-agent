@@ -3,7 +3,7 @@ import { Buffer } from 'node:buffer';
 import { constants } from 'node:fs';
 import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { DEFAULT_NOTIFICATION_SETTINGS, type AcceptedTurnInput, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type Settings, type SettingsPatch, type Theme } from './contracts';
+import { DEFAULT_NOTIFICATION_SETTINGS, type AcceptedTurnInput, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderProtocolExchange, type Settings, type SettingsPatch, type Theme } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { requireModelId } from './models';
 import { isSkillId } from './skills';
@@ -38,6 +38,15 @@ export interface StoreOpenOptions {
 
 const MAX_IMPORTED_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_INSTRUCTION_BYTES = 64 * 1024;
+const MAX_TOOL_RECEIPTS_PER_CHAT = 256;
+const MAX_TOOL_ARGUMENTS_BYTES = 1_900_000;
+const MAX_TOOL_RESULT_BYTES = 32 * 1024;
+const SIDE_EFFECT_TOOLS = new Set(['write', 'powershell', 'open']);
+const UNKNOWN_TOOL_RESULT = JSON.stringify({
+  ok: false,
+  status: 'unknown',
+  error: 'Результат локального инструмента неизвестен после прерывания; проверьте эффект перед повтором.',
+});
 
 interface InstructionSnapshot {
   document: InstructionDocument;
@@ -54,6 +63,9 @@ export interface LocalStore {
   listChats(): Promise<ChatSummary[]>;
   getChat(id: unknown): Promise<ChatDetail>;
   getMessagesThrough(chatId: unknown, messageId: unknown): Promise<ChatMessage[]>;
+  getToolProtocolThrough(chatId: unknown, messageId: unknown): Promise<ProviderProtocolExchange[]>;
+  beginToolReceipt(chatId: unknown, messageId: unknown, receipt: Omit<ChatToolReceipt, 'anchorMessageId' | 'status' | 'result' | 'createdAt'>): Promise<{ shouldExecute: boolean; receipt: ChatToolReceipt }>;
+  completeToolReceipt(chatId: unknown, messageId: unknown, receiptId: unknown, status: 'completed' | 'unknown', result: unknown): Promise<void>;
   createChat(projectId?: unknown, kind?: unknown): Promise<ChatSummary>;
   updateChat(id: unknown, patch: unknown): Promise<ChatSummary>;
   appendLocalMessage(id: unknown, text: unknown): Promise<ChatDetail>;
@@ -61,7 +73,7 @@ export interface LocalStore {
   releaseTurnReservation(turnId: unknown): void;
   consumeTurnReservation(turn: AcceptedTurnInput, signal?: AbortSignal): Promise<void>;
   validateAcceptedTurn(turn: AcceptedTurnInput): Promise<void>;
-  appendAssistantMessageFromRuntime(id: unknown, messageId: unknown, text: unknown, signal?: AbortSignal): Promise<ChatDetail>;
+  appendAssistantMessageFromRuntime(id: unknown, messageId: unknown, text: unknown, signal?: AbortSignal, functionsStateId?: unknown): Promise<ChatDetail>;
   importFile(id: unknown, sourcePath: string, projectId?: unknown): Promise<ChatDetail>;
   getArtifactPath(id: unknown, artifactId: unknown): Promise<string>;
   getChatFolder(id: unknown): Promise<string>;
@@ -393,8 +405,9 @@ function parseChatFile(value: unknown): Loaded<ChatFile> {
 }
 
 function validateChatDetail(value: unknown): Loaded<ChatDetail> {
-  if (!isRecord(value) || (value.schemaVersion !== 3 && value.schemaVersion !== 4 && value.schemaVersion !== 5 && value.schemaVersion !== 6)
-    || !Array.isArray(value.messages) || !Array.isArray(value.artifacts)) {
+  if (!isRecord(value) || (value.schemaVersion !== 3 && value.schemaVersion !== 4 && value.schemaVersion !== 5 && value.schemaVersion !== 6 && value.schemaVersion !== 7)
+    || !Array.isArray(value.messages) || !Array.isArray(value.artifacts)
+    || (value.schemaVersion === 7 && !Array.isArray(value.toolReceipts))) {
     throw new Error('Invalid chat detail.');
   }
   const version = value.schemaVersion;
@@ -404,9 +417,14 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
       throw new Error('Invalid chat message.');
     }
     if (entry.source !== undefined && entry.source !== 'runtime' && entry.source !== 'example') throw new Error('Invalid chat message source.');
+    if (entry.functionsStateId !== undefined && (version < 7 || entry.role !== 'assistant' || typeof entry.functionsStateId !== 'string'
+      || !entry.functionsStateId || entry.functionsStateId.length > 4096 || /[\u0000-\u001f\u007f]/.test(entry.functionsStateId))) {
+      throw new Error('Invalid assistant function state.');
+    }
     return {
       id: requireId(entry.id), role: entry.role, text: entry.text, createdAt: requireTimestamp(entry.createdAt),
       ...(entry.source === undefined ? {} : { source: entry.source }),
+      ...(entry.functionsStateId === undefined ? {} : { functionsStateId: entry.functionsStateId }),
     };
   });
   const artifacts: ChatArtifact[] = value.artifacts.map((entry: unknown) => {
@@ -421,9 +439,49 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
       createdAt: requireTimestamp(entry.createdAt), messageId: entry.messageId === null ? null : requireId(entry.messageId),
     };
   });
+  const toolReceipts: ChatToolReceipt[] = (value.schemaVersion >= 7 && Array.isArray(value.toolReceipts) ? value.toolReceipts : []).map((entry: unknown) => {
+    if (!isRecord(entry) || typeof entry.receiptId !== 'string' || !/^[a-f0-9]{64}$/.test(entry.receiptId)
+      || typeof entry.anchorMessageId !== 'string' || typeof entry.name !== 'string' || !entry.name || entry.name.length > 128
+      || (entry.effectId !== undefined && (typeof entry.effectId !== 'string' || !/^[a-f0-9]{64}$/.test(entry.effectId)))
+      || (value.schemaVersion === 7 && SIDE_EFFECT_TOOLS.has(entry.name) && typeof entry.effectId !== 'string')
+      || /[\u0000-\u001f\u007f]/.test(entry.name)
+      || !isRecord(entry.arguments) || (entry.content !== null && typeof entry.content !== 'string')
+      || (entry.functionsStateId !== null && typeof entry.functionsStateId !== 'string')
+      || (entry.status !== 'pending' && entry.status !== 'completed' && entry.status !== 'unknown')
+      || (entry.result !== null && typeof entry.result !== 'string')
+      || (entry.status === 'pending' && entry.result !== null)
+      || (entry.status !== 'pending' && typeof entry.result !== 'string')
+      || typeof entry.createdAt !== 'string') {
+      throw new Error('Invalid tool receipt.');
+    }
+    let argumentsText: string;
+    try { argumentsText = JSON.stringify(entry.arguments); }
+    catch { throw new Error('Invalid tool receipt arguments.'); }
+    if (Buffer.byteLength(argumentsText, 'utf8') > MAX_TOOL_ARGUMENTS_BYTES || (entry.content !== null && Buffer.byteLength(entry.content, 'utf8') > 16_000)
+      || (entry.functionsStateId !== null && (entry.functionsStateId.length === 0 || entry.functionsStateId.length > 4096
+        || /[\u0000-\u001f\u007f]/.test(entry.functionsStateId)))
+      || (entry.result !== null && (Buffer.byteLength(entry.result, 'utf8') > MAX_TOOL_RESULT_BYTES || !isJsonObjectText(entry.result)))) {
+      throw new Error('Tool receipt exceeds its limits.');
+    }
+    return {
+      receiptId: entry.receiptId,
+      ...(entry.effectId === undefined ? {} : { effectId: entry.effectId }),
+      anchorMessageId: requireId(entry.anchorMessageId),
+      name: entry.name,
+      arguments: structuredClone(entry.arguments),
+      content: entry.content as string | null,
+      functionsStateId: entry.functionsStateId as string | null,
+      status: entry.status,
+      result: entry.result as string | null,
+      createdAt: requireTimestamp(entry.createdAt),
+    };
+  });
   if (new Set(messages.map((message) => message.id)).size !== messages.length
     || new Set(artifacts.map((artifact) => artifact.id)).size !== artifacts.length
-    || artifacts.some((artifact) => artifact.messageId && !messages.some((message) => message.id === artifact.messageId))) {
+    || artifacts.some((artifact) => artifact.messageId && !messages.some((message) => message.id === artifact.messageId))
+    || toolReceipts.length > MAX_TOOL_RECEIPTS_PER_CHAT
+    || toolReceipts.some((receipt) => !messages.some((message) => message.id === receipt.anchorMessageId && message.role === 'user'))
+    || new Set(toolReceipts.map((receipt) => `${receipt.receiptId}:${receipt.anchorMessageId}`)).size !== toolReceipts.length) {
     throw new Error('Duplicate or unbound chat resource.');
   }
   const nextTurnPermissionProfile = version === 3
@@ -435,9 +493,9 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
     nextTurnSkillId = value.nextTurnSkillId;
   }
   return {
-    value: { ...chat, messages, artifacts, nextTurnPermissionProfile, nextTurnSkillId,
+    value: { ...chat, messages, artifacts, toolReceipts, nextTurnPermissionProfile, nextTurnSkillId,
       modelId: version >= 6 && value.modelId !== null ? requireModelId(value.modelId) : null },
-    needsWrite: version < 6,
+    needsWrite: version < 7,
   };
 }
 
@@ -449,7 +507,14 @@ function summary(chat: ChatDetail): ChatSummary {
 }
 
 function detailFile(chat: ChatDetail): Record<string, unknown> {
-  return { schemaVersion: 6, ...chat };
+  return { schemaVersion: 7, ...chat };
+}
+
+function isJsonObjectText(value: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return isRecord(parsed);
+  } catch { return false; }
 }
 
 function sameJson(left: unknown, right: unknown): boolean {
@@ -1058,7 +1123,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     }
     for (const legacy of legacyChats) {
       if (existingChatDetails.has(legacy.id)) continue;
-      const detail: ChatDetail = { ...legacy, nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [] };
+      const detail: ChatDetail = { ...legacy, nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], toolReceipts: [], artifacts: [] };
       await writeOwnedAtomic(join(chatsDirectory, legacy.id, 'chat.json'), detailFile(detail));
       loadedChats.push(detail);
     }
@@ -1130,7 +1195,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     const chat: ChatDetail = {
       id: randomUUID(), title: kind === 'image' ? 'Новое изображение' : 'Новый чат', projectId,
       pinned: false, archived: false, createdAt: now, updatedAt: now, draft: '', kind,
-      nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: settings.defaultModelId, messages: [], artifacts: [],
+      nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: settings.defaultModelId, messages: [], toolReceipts: [], artifacts: [],
     };
     await saveChat(chat);
     selectionRevisions.set(chat.id, { permissionProfile: 0, skill: 0 });
@@ -1267,6 +1332,125 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       if (endIndex < 0) throw new Error('Принятое сообщение не найдено в истории чата.');
       return structuredClone(detail.messages.slice(0, endIndex + 1));
     }),
+    getToolProtocolThrough: (chatId, messageId) => serialize(async () => {
+      const detail = findChat(chatId);
+      const anchor = requireId(messageId);
+      const endIndex = detail.messages.findIndex((message) => message.id === anchor && message.role === 'user');
+      if (endIndex < 0) throw new Error('Принятое сообщение не найдено в истории чата.');
+      const visibleAnchors = new Set(detail.messages.slice(0, endIndex + 1)
+        .filter((message) => message.role === 'user').map((message) => message.id));
+      return detail.toolReceipts.filter((receipt) => visibleAnchors.has(receipt.anchorMessageId)).map((receipt) => ({
+        anchorMessageId: receipt.anchorMessageId,
+        name: receipt.name,
+        arguments: structuredClone(receipt.arguments),
+        content: receipt.content,
+        functionsStateId: receipt.functionsStateId,
+        result: receipt.status === 'pending' ? UNKNOWN_TOOL_RESULT : receipt.result ?? UNKNOWN_TOOL_RESULT,
+      }));
+    }),
+    beginToolReceipt: (chatIdInput, messageIdInput, receiptInput) => serialize(async () => {
+      const chat = findChat(chatIdInput);
+      const messageId = requireId(messageIdInput);
+      if (!chat.messages.some((message) => message.id === messageId && message.role === 'user')) {
+        throw new Error('Инструмент не привязан к принятому сообщению.');
+      }
+      if (!receiptInput || typeof receiptInput.receiptId !== 'string' || !/^[a-f0-9]{64}$/.test(receiptInput.receiptId)
+        || typeof receiptInput.name !== 'string' || !receiptInput.name || receiptInput.name.length > 128
+        || (receiptInput.effectId !== undefined && (typeof receiptInput.effectId !== 'string' || !/^[a-f0-9]{64}$/.test(receiptInput.effectId)))
+        || (SIDE_EFFECT_TOOLS.has(receiptInput.name) && typeof receiptInput.effectId !== 'string')
+        || /[\u0000-\u001f\u007f]/.test(receiptInput.name) || !isRecord(receiptInput.arguments)
+        || (receiptInput.content !== null && typeof receiptInput.content !== 'string')
+        || (receiptInput.functionsStateId !== null && typeof receiptInput.functionsStateId !== 'string')) {
+        throw new Error('Некорректный идентификатор инструмента.');
+      }
+      let argumentText: string;
+      try { argumentText = JSON.stringify(receiptInput.arguments); }
+      catch { throw new Error('Некорректные аргументы инструмента.'); }
+      if (Buffer.byteLength(argumentText, 'utf8') > MAX_TOOL_ARGUMENTS_BYTES || (receiptInput.content !== null && Buffer.byteLength(receiptInput.content, 'utf8') > 16_000)
+        || (receiptInput.functionsStateId !== null && (receiptInput.functionsStateId.length === 0
+          || receiptInput.functionsStateId.length > 4096 || /[\u0000-\u001f\u007f]/.test(receiptInput.functionsStateId)))) {
+        throw new Error('Аргументы инструмента превышают допустимый размер.');
+      }
+      const existingRows = chat.toolReceipts.filter((receipt) => receipt.receiptId === receiptInput.receiptId);
+      if (existingRows.some((receipt) => receipt.name !== receiptInput.name
+        || !sameJson(receipt.arguments, receiptInput.arguments)
+        || receipt.effectId !== receiptInput.effectId
+        || (!SIDE_EFFECT_TOOLS.has(receiptInput.name)
+          && (receipt.content !== receiptInput.content || receipt.functionsStateId !== receiptInput.functionsStateId)))) {
+        throw new Error('Идентификатор запроса инструмента уже связан с другими аргументами.');
+      }
+      const sameAnchor = existingRows.find((receipt) => receipt.anchorMessageId === messageId);
+      if (sameAnchor) {
+        if (sameAnchor.status === 'pending') {
+          const recovered: ChatToolReceipt = { ...sameAnchor, status: 'unknown', result: UNKNOWN_TOOL_RESULT };
+          const updated = { ...chat, updatedAt: new Date().toISOString(), toolReceipts: chat.toolReceipts.map((row) => row === sameAnchor ? recovered : row) };
+          await saveChat(updated);
+          return { shouldExecute: false, receipt: structuredClone(recovered) };
+        }
+        return { shouldExecute: false, receipt: structuredClone(sameAnchor) };
+      }
+      const priorEffectRows = receiptInput.effectId
+        ? chat.toolReceipts.filter((receipt) => receipt.effectId === receiptInput.effectId)
+        : [];
+      if (priorEffectRows.some((receipt) => receipt.anchorMessageId !== messageId || receipt.name !== receiptInput.name
+        || !sameJson(receipt.arguments, receiptInput.arguments))) {
+        throw new Error('Идентификатор side effect уже связан с другим запросом.');
+      }
+      const priorEffect = priorEffectRows[0];
+      if (priorEffect) {
+        const now = new Date().toISOString();
+        const priorStatus = priorEffect.status === 'completed' ? 'completed' : 'unknown';
+        const receipt: ChatToolReceipt = {
+          ...structuredClone(receiptInput), anchorMessageId: messageId,
+          status: priorStatus,
+          result: priorStatus === 'completed' ? priorEffect.result : UNKNOWN_TOOL_RESULT,
+          createdAt: now,
+        };
+        const toolReceipts = chat.toolReceipts.map((row) => row === priorEffect && row.status === 'pending'
+          ? { ...row, status: 'unknown' as const, result: UNKNOWN_TOOL_RESULT }
+          : row);
+        if (toolReceipts.length >= MAX_TOOL_RECEIPTS_PER_CHAT) throw new Error('Лимит истории локальных инструментов чата достигнут.');
+        const updated = { ...chat, updatedAt: now, toolReceipts: [...toolReceipts, receipt] };
+        await saveChat(updated);
+        return { shouldExecute: false, receipt: structuredClone(receipt) };
+      }
+      const earlier = existingRows[0];
+      const now = new Date().toISOString();
+      const receipt: ChatToolReceipt = earlier
+        ? {
+          ...earlier,
+          anchorMessageId: messageId,
+          status: earlier.status === 'completed' ? 'completed' : 'unknown',
+          result: earlier.status === 'completed' ? earlier.result : UNKNOWN_TOOL_RESULT,
+          createdAt: now,
+        }
+        : {
+          ...structuredClone(receiptInput), anchorMessageId: messageId,
+          status: 'pending', result: null, createdAt: now,
+        };
+      if (chat.toolReceipts.length >= MAX_TOOL_RECEIPTS_PER_CHAT) throw new Error('Лимит истории локальных инструментов чата достигнут.');
+      const updated = { ...chat, updatedAt: now, toolReceipts: [...chat.toolReceipts, receipt] };
+      await saveChat(updated);
+      return { shouldExecute: !earlier, receipt: structuredClone(receipt) };
+    }),
+    completeToolReceipt: (chatIdInput, messageIdInput, receiptIdInput, statusInput, resultInput) => serialize(async () => {
+      const chat = findChat(chatIdInput);
+      const messageId = requireId(messageIdInput);
+      if (typeof receiptIdInput !== 'string' || !/^[a-f0-9]{64}$/.test(receiptIdInput)
+        || (statusInput !== 'completed' && statusInput !== 'unknown') || typeof resultInput !== 'string'
+        || Buffer.byteLength(resultInput, 'utf8') > MAX_TOOL_RESULT_BYTES || !isJsonObjectText(resultInput)) {
+        throw new Error('Некорректный результат инструмента.');
+      }
+      const receipt = chat.toolReceipts.find((row) => row.receiptId === receiptIdInput && row.anchorMessageId === messageId);
+      if (!receipt) throw new Error('Намерение инструмента не найдено.');
+      if (receipt.status !== 'pending') {
+        if (receipt.status === statusInput && receipt.result === resultInput) return;
+        throw new Error('Результат инструмента уже зафиксирован.');
+      }
+      const completed: ChatToolReceipt = { ...receipt, status: statusInput, result: resultInput };
+      const updated = { ...chat, updatedAt: new Date().toISOString(), toolReceipts: chat.toolReceipts.map((row) => row === receipt ? completed : row) };
+      await saveChat(updated);
+    }),
     createChat: (projectIdInput = null, kindInput = 'text') => serialize(async () => {
       const projectId = projectIdInput === null || projectIdInput === undefined
         ? null
@@ -1377,7 +1561,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       if (signal?.aborted) throw createAbortError();
       turnReservations.delete(turn.turnId);
     }),
-    appendAssistantMessageFromRuntime: (id, messageIdInput, textInput, signal) => serialize(async () => {
+    appendAssistantMessageFromRuntime: (id, messageIdInput, textInput, signal, functionsStateIdInput) => serialize(async () => {
       if (signal?.aborted) throw createAbortError();
       const chat = findChat(id);
       const messageId = requireId(messageIdInput);
@@ -1386,8 +1570,15 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       if (typeof textInput !== 'string' || !textInput.trim() || textInput.length > 100_000) {
         throw new Error('Ответ должен содержать от 1 до 100 000 символов.');
       }
+      if (functionsStateIdInput !== undefined && (typeof functionsStateIdInput !== 'string' || !functionsStateIdInput
+        || functionsStateIdInput.length > 4096 || /[\u0000-\u001f\u007f]/.test(functionsStateIdInput))) {
+        throw new Error('Некорректное состояние ответа GigaChat.');
+      }
       const now = new Date().toISOString();
-      const message: ChatMessage = { id: randomUUID(), role: 'assistant', source: 'runtime', text: textInput.trim(), createdAt: now };
+      const message: ChatMessage = {
+        id: randomUUID(), role: 'assistant', source: 'runtime', text: textInput.trim(), createdAt: now,
+        ...(functionsStateIdInput === undefined ? {} : { functionsStateId: functionsStateIdInput }),
+      };
       const messages = [...chat.messages];
       messages.splice(anchor + 1, 0, message);
       const updated = { ...chat, updatedAt: now, messages };

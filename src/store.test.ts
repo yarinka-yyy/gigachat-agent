@@ -205,7 +205,7 @@ test('migrates v1 projects, chats, drafts, and theme without losing data', async
   const store = await openStore(directory);
   assert.deepEqual(await store.listProjects(), [{ ...project, workingFolder: null }]);
   assert.equal((await store.listChats())[0]?.id, chat.id);
-  assert.deepEqual(await store.getChat(chat.id), { ...chat, kind: 'text', nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [] });
+  assert.deepEqual(await store.getChat(chat.id), { ...chat, kind: 'text', nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [], toolReceipts: [] });
   assert.deepEqual(await store.getSettings(), {
     theme: 'emerald',
     sidebarTransparent: false,
@@ -226,7 +226,7 @@ test('migrates v1 projects, chats, drafts, and theme without losing data', async
   assert.equal(JSON.parse(await readFile(join(directory, 'projects.json'), 'utf8')).schemaVersion, 2);
   assert.equal(JSON.parse(await readFile(join(directory, 'chats.json'), 'utf8')).schemaVersion, 1);
   assert.equal(await readFile(join(directory, 'chats.json.bak'), 'utf8'), await readFile(join(directory, 'chats.json'), 'utf8'));
-  assert.equal(JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')).schemaVersion, 6);
+  assert.equal(JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')).schemaVersion, 7);
   assert.equal(JSON.parse(await readFile(join(directory, 'settings.json'), 'utf8')).schemaVersion, 10);
   await store.deleteChat(chat.id);
   assert.deepEqual(await (await openStore(directory)).listChats(), []);
@@ -239,7 +239,7 @@ test('migrates v2 chats with archive and draft without changing their UUIDs', as
     pinned: true, archived: true, createdAt: timestamp, updatedAt: timestamp, draft: 'Текст', kind: 'image' };
   await writeFile(join(directory, 'chats.json'), JSON.stringify({ schemaVersion: 2, chats: [chat] }));
   const store = await openStore(directory);
-  assert.deepEqual(await store.getChat(chat.id), { ...chat, nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [] });
+  assert.deepEqual(await store.getChat(chat.id), { ...chat, nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [], toolReceipts: [] });
   assert.equal((await store.listChats())[0]?.id, chat.id);
   assert.equal((await (await openStore(directory)).getChat(chat.id)).draft, 'Текст');
 });
@@ -259,9 +259,9 @@ test('unfinished legacy migration preserves existing invalid chat details', asyn
       t.after(() => rm(directory, { recursive: true, force: true }));
       const legacy = { id: 'chat-1', title: 'Legacy chat', projectId: null, pinned: false, archived: false,
         createdAt: timestamp, updatedAt: timestamp, draft: 'legacy draft', kind: 'text' };
-      const detail = { schemaVersion: 6, ...legacy, draft: 'newer draft', nextTurnPermissionProfile: null,
+      const detail = { schemaVersion: 7, ...legacy, draft: 'newer draft', nextTurnPermissionProfile: null,
         nextTurnSkillId: null, modelId: null,
-        messages: [{ id: 'message-1', role: 'user', text: 'newer history', createdAt: timestamp }], artifacts: [] };
+        messages: [{ id: 'message-1', role: 'user', text: 'newer history', createdAt: timestamp }], artifacts: [], toolReceipts: [] };
       const legacyContents = JSON.stringify({ schemaVersion: 2, chats: [legacy] });
       const detailPath = join(directory, 'chats', legacy.id, 'chat.json');
       await mkdir(dirname(detailPath), { recursive: true });
@@ -432,19 +432,53 @@ test('does not consume a reservation aborted while queued behind an instruction 
   assert.equal(current.nextTurnSkillId, 'global/review');
 });
 
-test('trusted runtime assistant append preserves draft and writes only a supplied completed response', async (t) => {
+test('trusted runtime assistant append preserves draft and final provider state across reload', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-runtime-assistant-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const store = await openStore(directory);
   const chat = await store.createChat();
   const accepted = await store.acceptLocalMessage(chat.id, 'Запрос пользователя', 'turn-runtime-assistant');
   await store.updateChat(chat.id, { draft: 'Черновик остаётся' });
-  const detail = await store.appendAssistantMessageFromRuntime(chat.id, accepted.turn.messageId, 'Ответ провайдера');
+  const detail = await store.appendAssistantMessageFromRuntime(chat.id, accepted.turn.messageId, 'Ответ провайдера', undefined, 'state-final');
   assert.equal(detail.messages[1]?.role, 'assistant');
   assert.equal(detail.messages[1]?.source, 'runtime');
   assert.equal(detail.messages[1]?.text, 'Ответ провайдера');
+  assert.equal(detail.messages[1]?.functionsStateId, 'state-final');
   assert.equal(detail.draft, 'Черновик остаётся');
   assert.deepEqual((await (await openStore(directory)).getChat(chat.id)).messages, detail.messages);
+});
+
+test('persists each provider pairing while reusing a completed side effect for a new state ID', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-tool-receipt-state-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const first = await store.acceptLocalMessage(chat.id, 'Запиши файл', 'turn-write-first');
+  const firstReceipt = {
+    receiptId: 'a'.repeat(64), effectId: 'b'.repeat(64), name: 'write',
+    arguments: { path: 'result.txt', contents: 'содержимое' }, content: null, functionsStateId: 'state-one',
+  };
+  assert.equal((await store.beginToolReceipt(chat.id, first.turn.messageId, firstReceipt)).shouldExecute, true);
+  const result = JSON.stringify({ ok: true, result: { bytes: 22 } });
+  await store.completeToolReceipt(chat.id, first.turn.messageId, firstReceipt.receiptId, 'completed', result);
+
+  const retryReceipt = { ...firstReceipt, receiptId: 'c'.repeat(64), functionsStateId: 'state-two' };
+  const replay = await store.beginToolReceipt(chat.id, first.turn.messageId, retryReceipt);
+  assert.equal(replay.shouldExecute, false);
+  assert.equal(replay.receipt.result, result);
+  const next = await store.acceptLocalMessage(chat.id, 'Ещё одна отдельная запись', 'turn-write-next');
+  const independentReceipt = {
+    ...firstReceipt, receiptId: 'd'.repeat(64), effectId: 'e'.repeat(64), functionsStateId: 'state-three',
+  };
+  assert.equal((await store.beginToolReceipt(chat.id, next.turn.messageId, independentReceipt)).shouldExecute, true);
+
+  const reopened = await openStore(directory);
+  const history = await reopened.getToolProtocolThrough(chat.id, first.turn.messageId);
+  assert.deepEqual(history.map((exchange) => exchange.functionsStateId), ['state-one', 'state-two']);
+  assert.deepEqual(history.map((exchange) => exchange.result), [result, result]);
+  const detail = await reopened.getChat(chat.id);
+  assert.equal(detail.toolReceipts.length, 3);
+  assert.equal(detail.toolReceipts[1]?.effectId, firstReceipt.effectId);
 });
 
 test('migrates existing chat detail schema 3 and preserves its draft', async (t) => {
@@ -463,7 +497,7 @@ test('migrates existing chat detail schema 3 and preserves its draft', async (t)
   assert.equal((await restored.getChat(chat.id)).draft, 'Сохранённый черновик');
   assert.equal((await restored.getChat(chat.id)).nextTurnPermissionProfile, null);
   const migrated = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  assert.equal(migrated.schemaVersion, 6);
+  assert.equal(migrated.schemaVersion, 7);
   assert.equal(migrated.nextTurnPermissionProfile, null);
   assert.equal(migrated.nextTurnSkillId, null);
 });
@@ -487,7 +521,7 @@ test('migrates chat detail schema 4 to 5 without changing history or artifacts',
   assert.equal(detail.nextTurnSkillId, null);
   assert.equal(detail.draft, 'Черновик');
   assert.equal(detail.messages[0]?.text, 'Сохранённая история');
-  assert.equal(JSON.parse(await readFile(path, 'utf8')).schemaVersion, 6);
+  assert.equal(JSON.parse(await readFile(path, 'utf8')).schemaVersion, 7);
 });
 
 test('migrates previous settings and chat schemas with an empty model choice', async (t) => {
@@ -509,7 +543,7 @@ test('migrates previous settings and chat schemas with an empty model choice', a
   assert.equal((await restored.getChat(chat.id)).modelId, null);
   assert.equal((await restored.getSettings()).defaultModelId, null);
   assert.equal((await restored.getSettings()).microphoneConsent, 'unasked');
-  assert.equal(JSON.parse(await readFile(chatPath, 'utf8')).schemaVersion, 6);
+  assert.equal(JSON.parse(await readFile(chatPath, 'utf8')).schemaVersion, 7);
   assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).schemaVersion, 10);
 });
 

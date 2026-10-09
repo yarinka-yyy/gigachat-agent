@@ -1,14 +1,20 @@
+import { Buffer } from 'node:buffer';
+import { createHash } from 'node:crypto';
 import type {
   AcceptedTurnInput,
+  ChatToolReceipt,
   GigaChatProvider,
+  ProviderFunctionCall,
   ProviderErrorCategory,
   ProviderEvent,
+  ProviderProtocolExchange,
   ProviderTurnRequest,
+  ProviderToolName,
   RuntimeActivity,
   RuntimeTurnSnapshot,
 } from './contracts';
 import { PROVIDER_ERROR_CATEGORIES } from './contracts';
-import type { LocalToolEvent, LocalTools } from './local-tools';
+import { LocalToolError, type LocalToolEvent, type LocalTools } from './local-tools';
 
 const MAX_ACTIVITY_PER_TURN = 50;
 const MAX_ASSISTANT_CHARS = 100_000;
@@ -17,7 +23,16 @@ const DEFAULT_PREPARE_TIMEOUT_MS = 15_000;
 const DEFAULT_NEXT_TIMEOUT_MS = 120_000;
 const DEFAULT_STOP_TIMEOUT_MS = 10_000;
 const DEFAULT_OPERATION_TIMEOUT_MS = 10_000;
+const DEFAULT_TOOL_TIMEOUT_MS = 120_000;
+const DEFAULT_TURN_TIMEOUT_MS = 5 * 60_000;
+const MAX_FUNCTION_ROUNDS = 8;
+const MAX_TOOL_RESULT_BYTES = 16 * 1024;
+const MAX_TOTAL_TOOL_RESULT_BYTES = 128 * 1024;
 const STOP_TIMEOUT = Symbol('stop-timeout');
+const PROVIDER_TOOL_NAMES: readonly ProviderToolName[] = ['list', 'search', 'read', 'write', 'open', 'powershell'];
+
+export interface ToolReceiptInput extends Omit<ChatToolReceipt, 'anchorMessageId' | 'status' | 'result' | 'createdAt'> {}
+export interface ToolReceiptStart { shouldExecute: boolean; receipt: ChatToolReceipt }
 
 export interface TurnRuntimeOptions {
   provider?: GigaChatProvider | null;
@@ -25,8 +40,10 @@ export interface TurnRuntimeOptions {
   prepareTurn(turn: AcceptedTurnInput, signal: AbortSignal): Promise<ProviderTurnRequest>;
   consumeTurn(turn: AcceptedTurnInput, signal: AbortSignal): Promise<void>;
   releaseTurn(turn: AcceptedTurnInput): void;
-  appendAssistant(turn: AcceptedTurnInput, text: string, signal: AbortSignal): Promise<void>;
-  timeouts?: { prepareMs?: number; nextMs?: number; stopMs?: number; operationMs?: number };
+  appendAssistant(turn: AcceptedTurnInput, text: string, signal: AbortSignal, functionsStateId?: string): Promise<void>;
+  beginToolReceipt?(turn: AcceptedTurnInput, receipt: ToolReceiptInput): Promise<ToolReceiptStart>;
+  completeToolReceipt?(turn: AcceptedTurnInput, receiptId: string, status: 'completed' | 'unknown', result: string): Promise<void>;
+  timeouts?: { prepareMs?: number; nextMs?: number; stopMs?: number; operationMs?: number; toolMs?: number; turnMs?: number };
   onUpdate?(turn: RuntimeTurnSnapshot): void;
 }
 
@@ -89,6 +106,10 @@ function isProviderErrorCategory(value: unknown): value is ProviderErrorCategory
   return typeof value === 'string' && (PROVIDER_ERROR_CATEGORIES as readonly string[]).includes(value);
 }
 
+function isProviderToolName(value: string): value is ProviderToolName {
+  return (PROVIDER_TOOL_NAMES as readonly string[]).includes(value);
+}
+
 function isAbortError(error: unknown): boolean {
   return typeof error === 'object' && error !== null
     && ('name' in error && error.name === 'AbortError' || 'code' in error && error.code === 'ABORT_ERR');
@@ -127,9 +148,105 @@ function assertProviderEvent(value: unknown): asserts value is ProviderEvent {
     return;
   }
   if (event.type === 'text-delta' && typeof event.text === 'string') return;
-  if (event.type === 'completed') return;
+  if (event.type === 'completed' && (event.functionsStateId === undefined
+    || typeof event.functionsStateId === 'string' && event.functionsStateId.length > 0 && event.functionsStateId.length <= 4096)) return;
+  if (event.type === 'function-call' && isFunctionCall(event.functionCall)) return;
   if (event.type === 'error' && isProviderErrorCategory(event.category) && typeof event.retryable === 'boolean') return;
   throw new Error('BAD_PROVIDER_EVENT');
+}
+
+function isFunctionCall(value: unknown): value is ProviderFunctionCall {
+  if (typeof value !== 'object' || value === null || !('name' in value) || !('arguments' in value)) return false;
+  const call = value as Partial<ProviderFunctionCall>;
+  if (typeof call.name !== 'string' || !call.name || call.name.length > 128 || /[\u0000-\u001f\u007f]/.test(call.name)
+    || typeof call.arguments !== 'object' || call.arguments === null || Array.isArray(call.arguments)
+    || (call.content !== null && typeof call.content !== 'string')
+    || (call.functionsStateId !== null && typeof call.functionsStateId !== 'string')
+    || call.terminalReason !== 'function_call') return false;
+  try { return Buffer.byteLength(JSON.stringify(call.arguments), 'utf8') <= 1_900_000; }
+  catch { return false; }
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(',')}}`;
+}
+
+function isExternalEffect(name: string): boolean {
+  return name === 'write' || name === 'powershell' || name === 'open';
+}
+
+function receiptIdFor(turn: AcceptedTurnInput, call: ProviderFunctionCall, round: number): string {
+  const identity = call.functionsStateId ?? `${turn.turnId}:${round}`;
+  return createHash('sha256').update(stableJson([identity, call.name, call.arguments]), 'utf8').digest('hex');
+}
+
+function effectIdFor(turn: AcceptedTurnInput, call: ProviderFunctionCall): string | undefined {
+  if (!isExternalEffect(call.name)) return undefined;
+  return createHash('sha256').update(stableJson([turn.messageId, call.name, call.arguments]), 'utf8').digest('hex');
+}
+
+function objectResult(value: unknown): string {
+  const record = typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown> : { ok: true, result: value };
+  let encoded: string;
+  try { encoded = JSON.stringify(record); }
+  catch { encoded = JSON.stringify({ ok: false, error: 'invalid_tool_result', message: 'Инструмент вернул неподдерживаемый результат.' }); }
+  if (Buffer.byteLength(encoded, 'utf8') <= MAX_TOOL_RESULT_BYTES) return encoded;
+  return JSON.stringify({ ok: false, error: 'result_limit', message: 'Результат инструмента слишком велик для безопасного продолжения.' });
+}
+
+function errorResult(error: unknown, unknownSideEffect = false): string {
+  if (unknownSideEffect) return JSON.stringify({
+    ok: false, status: 'unknown', error: 'effect_unknown',
+    message: 'Выполнение было прервано или завершилось неоднозначно; проверьте состояние перед повтором.',
+  });
+  const message = error instanceof Error ? error.message.slice(0, 1000) : 'Локальный инструмент завершился ошибкой.';
+  return objectResult({ ok: false, error: error instanceof LocalToolError && error.code === 'PERMISSION_DENIED' ? 'permission_denied' : 'tool_error', message });
+}
+
+type ValidatedToolArguments =
+  | { ok: true; args: Record<string, unknown> }
+  | { ok: false; error: string; message: string };
+
+function validateToolArguments(call: ProviderFunctionCall): ValidatedToolArguments {
+  const args = call.arguments;
+  const allowed: Record<ProviderToolName, readonly string[]> = {
+    list: ['path'], search: ['query', 'path'], read: ['path'], write: ['path', 'contents'], open: ['path'],
+    powershell: ['script', 'external_access'],
+  };
+  if (!isProviderToolName(call.name)) return { ok: false, error: 'unknown_function', message: 'Эта функция недоступна в текущем приложении.' };
+  const keys = allowed[call.name];
+  if (Object.getPrototypeOf(args) !== Object.prototype || Object.keys(args).some((key) => !keys.includes(key))) {
+    return { ok: false, error: 'invalid_arguments', message: 'Аргументы функции не соответствуют поддерживаемой схеме.' };
+  }
+  const requireString = (key: string, required: boolean, maxLength: number, allowEmpty = false): string | null => {
+    const value = args[key];
+    if (value === undefined && !required) return null;
+    if (typeof value !== 'string' || (!allowEmpty && value.length === 0) || value.length > maxLength || value.includes('\0')) {
+      throw new Error(`Аргумент ${key} имеет неверный тип или превышает лимит.`);
+    }
+    return value;
+  };
+  try {
+    if (call.name === 'list') requireString('path', false, 2048, true);
+    else if (call.name === 'search') requireString('query', true, 256);
+    else if (call.name === 'read') requireString('path', true, 2048);
+    else if (call.name === 'write') {
+      requireString('path', true, 2048);
+      const contents = requireString('contents', true, 1_048_576, true) ?? '';
+      if (Buffer.byteLength(contents, 'utf8') > 1024 * 1024) throw new Error('Содержимое записи превышает лимит 1 МиБ в UTF-8.');
+    } else if (call.name === 'open') requireString('path', false, 2048, true);
+    else if (call.name === 'powershell') {
+      requireString('script', true, 16 * 1024);
+      if (args.external_access !== undefined && typeof args.external_access !== 'boolean') throw new Error('Аргумент external_access должен быть логическим.');
+    }
+  } catch (error) {
+    return { ok: false, error: 'invalid_arguments', message: error instanceof Error ? error.message : 'Аргументы функции некорректны.' };
+  }
+  return { ok: true, args };
 }
 
 function settle(promise: Promise<unknown>): Promise<void> {
@@ -178,6 +295,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
   const nextTimeoutMs = options.timeouts?.nextMs ?? DEFAULT_NEXT_TIMEOUT_MS;
   const stopTimeoutMs = options.timeouts?.stopMs ?? DEFAULT_STOP_TIMEOUT_MS;
   const operationTimeoutMs = options.timeouts?.operationMs ?? DEFAULT_OPERATION_TIMEOUT_MS;
+  const toolTimeoutMs = options.timeouts?.toolMs ?? DEFAULT_TOOL_TIMEOUT_MS;
+  const turnTimeoutMs = options.timeouts?.turnMs ?? DEFAULT_TURN_TIMEOUT_MS;
 
   const publish = (turn: RuntimeTurn): void => {
     const snapshot = copyTurn(turn);
@@ -340,9 +459,11 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     let pendingNext: Promise<IteratorResult<ProviderEvent>> | null = null;
     let naturallyDone = false;
     let reservationConsumed = false;
+    let turnTimedOut = false;
     let answer = '';
     let draftTimer: ReturnType<typeof setTimeout> | null = null;
     let lastDraftPublishedAt = 0;
+    const turnTimer = setTimeout(() => { turnTimedOut = true; controller.abort(); }, turnTimeoutMs);
     const flushDraft = (): void => {
       if (draftTimer) clearTimeout(draftTimer);
       draftTimer = null;
@@ -357,90 +478,234 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       if (delayMs <= 0) flushDraft();
       else if (!draftTimer) draftTimer = setTimeout(flushDraft, delayMs);
     };
+    const waitTracked = async <T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string, pendingMessage: string): Promise<T> => {
+      try { return await waitFor(promise, controller.signal, timeoutMs, timeoutMessage); }
+      catch (error) {
+        const timedOut = error instanceof Error && error.message === timeoutMessage;
+        if (!timedOut && !isAbortError(error)) throw error;
+        if (timedOut) controller.abort();
+        const pendingOutcome = promise.then(
+          () => turn.cancelRequested || !timedOut && controller.signal.aborted && !turnTimedOut
+            ? ({ status: 'cancelled' as const })
+            : ({ status: 'failed' as const, error: pendingMessage }),
+          (lateError: unknown) => turn.cancelRequested || !timedOut && controller.signal.aborted && !turnTimedOut
+            ? ({ status: 'cancelled' as const })
+            : ({ status: 'failed' as const, error: lateError instanceof Error ? lateError.message : pendingMessage }),
+        );
+        holdForPendingOperation(turn, stopState, pendingOutcome, pendingMessage);
+        throw timedOut ? new Error(timeoutMessage) : error;
+      }
+    };
+    const invokeTool = async (call: ProviderFunctionCall): Promise<unknown> => {
+      const validation = validateToolArguments(call);
+      if (!validation.ok) return { ok: false, error: validation.error, message: validation.message };
+      const args = validation.args;
+      const scope = { signal: controller.signal, expectedWorkingFolder: turn.input.projectWorkingFolder };
+      switch (call.name) {
+        case 'list': return options.tools.list(turn.input.projectId, turn.input.permissionProfile, args.path ?? '', scope);
+        case 'search': return options.tools.search(turn.input.projectId, turn.input.permissionProfile, args.query, args.path ?? '', scope);
+        case 'read': return options.tools.read(turn.input.projectId, turn.input.permissionProfile, args.path, scope);
+        case 'write': return options.tools.write(turn.input.projectId, turn.input.permissionProfile, args.path, args.contents, scope);
+        case 'open': return options.tools.open(turn.input.projectId, turn.input.permissionProfile, args.path ?? '', scope);
+        case 'powershell': return options.tools.runPowerShell(turn.input.projectId, turn.input.permissionProfile, args.script, {
+          signal: controller.signal,
+          expectedWorkingFolder: turn.input.projectWorkingFolder,
+          ...(args.external_access === true ? { fullAccessOnce: true } : {}),
+        });
+        default: return { ok: false, error: 'unknown_function', message: 'Эта функция недоступна в текущем приложении.' };
+      }
+    };
     try {
       if (!options.provider) throw new Error('PROVIDER_UNAVAILABLE');
       if (!turn.input.modelId) throw new Error('MODEL_NOT_SELECTED');
       const preparation = Promise.resolve().then(() => options.prepareTurn(turn.input, controller.signal));
-      const request = await waitFor(preparation, controller.signal, prepareTimeoutMs, 'TURN_PREPARE_TIMEOUT');
+      let request = await waitFor(preparation, controller.signal, prepareTimeoutMs, 'TURN_PREPARE_TIMEOUT');
       if (controller.signal.aborted) throw abortError();
       if (!request.modelId) throw new Error('MODEL_NOT_SELECTED');
 
-      const stream = options.provider.stream(request, controller.signal);
-      const activeIterator = stream[Symbol.asyncIterator]();
-      iterator = activeIterator;
-      let completed = false;
+      let toolRounds = 0;
+      let totalToolResultBytes = 0;
       for (;;) {
-        pendingNext = Promise.resolve().then(() => activeIterator.next());
-        const nextPromise = pendingNext;
-        const result = await waitFor(nextPromise, controller.signal, nextTimeoutMs, 'PROVIDER_STEP_TIMEOUT');
-        pendingNext = null;
         if (controller.signal.aborted) throw abortError();
-        if (result.done) {
-          naturallyDone = true;
-          stopState.streamConfirmed = true;
-          break;
-        }
-        if (completed) throw new Error('PROVIDER_PROTOCOL');
-        assertProviderEvent(result.value);
-        if (!reservationConsumed) {
-          const consuming = options.consumeTurn(turn.input, controller.signal);
-          const consumeOutcome = consuming.then(
-            () => ({ status: turn.cancelRequested ? 'cancelled' as const : 'failed' as const,
-              ...(turn.cancelRequested ? {} : { error: 'Не удалось вовремя подтвердить выбор параметров хода.' }) }),
-            (error: unknown) => ({ status: turn.cancelRequested ? 'cancelled' as const : 'failed' as const,
-              ...(turn.cancelRequested ? {} : { error: error instanceof Error ? error.message : 'Не удалось подтвердить выбор параметров хода.' }) }),
-          );
-          const consumed = await bounded(consuming.then(() => true), operationTimeoutMs);
-          if (consumed === STOP_TIMEOUT) {
-            holdForPendingOperation(turn, stopState, consumeOutcome, 'Ожидание фиксации параметров превысило срок; очередь приостановлена.');
-            controller.abort();
-            throw new Error('TURN_CONSUME_TIMEOUT');
-          }
-          reservationConsumed = true;
+        if (stopState.pendingToolIds.size || stopState.pendingOperation) throw new Error('TOOL_STOP_STATE');
+        stopState.streamConfirmed = false;
+        stopState.streamStop = null;
+        naturallyDone = false;
+        iterator = options.provider.stream(request, controller.signal)[Symbol.asyncIterator]();
+        let completed = false;
+        let completedFunctionsStateId: string | undefined;
+        let functionCall: ProviderFunctionCall | null = null;
+        for (;;) {
+          pendingNext = Promise.resolve().then(() => iterator!.next());
+          const result = await waitFor(pendingNext, controller.signal, nextTimeoutMs, 'PROVIDER_STEP_TIMEOUT');
+          pendingNext = null;
           if (controller.signal.aborted) throw abortError();
+          if (result.done) {
+            naturallyDone = true;
+            stopState.streamConfirmed = true;
+            break;
+          }
+          assertProviderEvent(result.value);
+          if (completed || functionCall) throw new Error('PROVIDER_PROTOCOL');
+          if (!reservationConsumed) {
+            const consuming = options.consumeTurn(turn.input, controller.signal);
+            const consumeOutcome = consuming.then(
+              () => ({ status: turn.cancelRequested ? 'cancelled' as const : 'failed' as const,
+                ...(turn.cancelRequested ? {} : { error: 'Не удалось вовремя подтвердить выбор параметров хода.' }) }),
+              (error: unknown) => ({ status: turn.cancelRequested ? 'cancelled' as const : 'failed' as const,
+                ...(turn.cancelRequested ? {} : { error: error instanceof Error ? error.message : 'Не удалось подтвердить выбор параметров хода.' }) }),
+            );
+            const consumed = await bounded(consuming.then(() => true), operationTimeoutMs);
+            if (consumed === STOP_TIMEOUT) {
+              holdForPendingOperation(turn, stopState, consumeOutcome, 'Ожидание фиксации параметров превысило срок; очередь приостановлена.');
+              controller.abort();
+              throw new Error('TURN_CONSUME_TIMEOUT');
+            }
+            reservationConsumed = true;
+            if (controller.signal.aborted) throw abortError();
+          }
+          const rawEvent = result.value;
+          if (rawEvent.type === 'activity') {
+            addActivity(turn, {
+              kind: 'provider', at: new Date().toISOString(), activity: rawEvent.activity,
+              ...(rawEvent.tool ? { tool: rawEvent.tool } : {}),
+            });
+          } else if (rawEvent.type === 'text-delta') {
+            if (answer.length + rawEvent.text.length > MAX_ASSISTANT_CHARS) throw new Error('RESPONSE_LIMIT');
+            answer += rawEvent.text;
+            scheduleDraftPublish();
+          } else if (rawEvent.type === 'error') {
+            if (rawEvent.category === 'cancel') throw abortError();
+            throw Object.assign(new Error('PROVIDER_ERROR'), { category: rawEvent.category });
+          } else if (rawEvent.type === 'function-call') {
+            if (completed || functionCall) throw new Error('PROVIDER_PROTOCOL');
+            functionCall = rawEvent.functionCall;
+          } else {
+            completed = true;
+            if (rawEvent.functionsStateId) completedFunctionsStateId = rawEvent.functionsStateId;
+          }
         }
-        const rawEvent = result.value;
-        if (rawEvent.type === 'activity') {
+
+        if (controller.signal.aborted) throw abortError();
+        if (functionCall) {
+          if (completed) throw new Error('PROVIDER_PROTOCOL');
+          if (toolRounds >= MAX_FUNCTION_ROUNDS || (request.protocolHistory?.length ?? 0) >= 256) {
+            throw Object.assign(new Error('TOOL_ROUND_LIMIT'), { category: 'tool' });
+          }
+          if (!(await confirmStop(turn, iterator, pendingNext, naturallyDone))) {
+            controller.abort();
+            flushDraft();
+            markStopUnconfirmed(turn);
+            return;
+          }
           addActivity(turn, {
-            kind: 'provider', at: new Date().toISOString(), activity: rawEvent.activity,
-            ...(rawEvent.tool ? { tool: rawEvent.tool } : {}),
+            kind: 'provider', at: new Date().toISOString(), activity: 'waiting-for-tool',
+            ...(isProviderToolName(functionCall.name) ? { tool: functionCall.name } : {}),
           });
-        } else if (rawEvent.type === 'text-delta') {
-          if (answer.length + rawEvent.text.length > MAX_ASSISTANT_CHARS) throw new Error('RESPONSE_LIMIT');
-          answer += rawEvent.text;
-          scheduleDraftPublish();
-        } else if (rawEvent.type === 'error') {
-          if (rawEvent.category === 'cancel') throw abortError();
-          throw Object.assign(new Error('PROVIDER_ERROR'), { category: rawEvent.category });
-        } else completed = true;
-      }
-      if (controller.signal.aborted) throw abortError();
-      if (!completed || !answer.trim()) throw new Error('INCOMPLETE_PROVIDER_RESPONSE');
-      if (!(await confirmStop(turn, iterator, pendingNext, naturallyDone))) {
-        controller.abort();
+          if (!options.beginToolReceipt || !options.completeToolReceipt) {
+            throw Object.assign(new Error('TOOL_RECEIPT_STORE_UNAVAILABLE'), { category: 'tool' });
+          }
+          const effectId = effectIdFor(turn.input, functionCall);
+          const receiptInput: ToolReceiptInput = {
+            receiptId: receiptIdFor(turn.input, functionCall, toolRounds),
+            ...(effectId ? { effectId } : {}),
+            name: functionCall.name,
+            arguments: structuredClone(functionCall.arguments),
+            content: functionCall.content,
+            functionsStateId: functionCall.functionsStateId,
+          };
+          if (controller.signal.aborted) throw abortError();
+          const beginPromise = options.beginToolReceipt(turn.input, receiptInput);
+          const begun = await waitTracked(beginPromise, operationTimeoutMs, 'TOOL_INTENT_SAVE_TIMEOUT', 'Подтверждение сохранения намерения инструмента ожидается; очередь приостановлена.');
+          const storedReceipt = begun.receipt;
+          let exchange: ProviderProtocolExchange;
+          if (!begun.shouldExecute) {
+            exchange = {
+              anchorMessageId: turn.input.messageId,
+              name: functionCall.name,
+              arguments: structuredClone(functionCall.arguments),
+              content: functionCall.content,
+              functionsStateId: functionCall.functionsStateId,
+              result: storedReceipt.result ?? errorResult(new Error('Результат инструмента неизвестен.'), true),
+            };
+          } else {
+            const validation = validateToolArguments(functionCall);
+            const operation = (async (): Promise<ProviderProtocolExchange> => {
+              let resultText: string;
+              let resultStatus: 'completed' | 'unknown' = 'completed';
+              if (!validation.ok) resultText = objectResult({ ok: false, error: validation.error, message: validation.message });
+              else if (controller.signal.aborted) resultText = objectResult({ ok: false, error: 'cancelled', message: 'Инструмент отменён до запуска.' });
+              else {
+                try {
+                  const result = await invokeTool(functionCall!);
+                  const hasSideEffect = functionCall!.name === 'write' || functionCall!.name === 'powershell' || functionCall!.name === 'open';
+                  if (controller.signal.aborted && hasSideEffect) {
+                    resultStatus = 'unknown';
+                    resultText = errorResult(new Error('cancelled'), true);
+                  } else resultText = objectResult({ ok: true, result });
+                } catch (toolError) {
+                  const hasSideEffect = functionCall!.name === 'write' || functionCall!.name === 'powershell' || functionCall!.name === 'open';
+                  const permissionDenied = toolError instanceof LocalToolError && toolError.code === 'PERMISSION_DENIED';
+                  resultStatus = hasSideEffect && !permissionDenied ? 'unknown' : 'completed';
+                  resultText = errorResult(toolError, hasSideEffect && !permissionDenied);
+                }
+              }
+              if (Buffer.byteLength(resultText, 'utf8') > MAX_TOOL_RESULT_BYTES) {
+                resultText = objectResult({ ok: false, error: 'result_limit', message: 'Результат инструмента превышает лимит 16 КиБ.' });
+              }
+              await options.completeToolReceipt!(turn.input, receiptInput.receiptId, resultStatus, resultText);
+              return {
+                anchorMessageId: turn.input.messageId,
+                name: functionCall!.name,
+                arguments: structuredClone(functionCall!.arguments),
+                content: functionCall!.content,
+                functionsStateId: functionCall!.functionsStateId,
+                result: resultText,
+              };
+            })();
+            exchange = await waitTracked(operation, toolTimeoutMs, 'LOCAL_TOOL_TIMEOUT', 'Локальный инструмент или сохранение результата ещё не остановились; очередь приостановлена.');
+          }
+          if (controller.signal.aborted) throw abortError();
+          totalToolResultBytes += Buffer.byteLength(exchange.result, 'utf8');
+          if (totalToolResultBytes > MAX_TOTAL_TOOL_RESULT_BYTES) throw Object.assign(new Error('TOOL_RESULT_LIMIT'), { category: 'tool' });
+          request = { ...request, protocolHistory: [...(request.protocolHistory ?? []), structuredClone(exchange)] };
+          toolRounds += 1;
+          if (draftTimer) clearTimeout(draftTimer);
+          draftTimer = null;
+          answer = '';
+          delete turn.draft;
+          publish(turn);
+          continue;
+        }
+
+        if (!completed || !answer.trim()) throw new Error('INCOMPLETE_PROVIDER_RESPONSE');
+        if (!(await confirmStop(turn, iterator, pendingNext, naturallyDone))) {
+          controller.abort();
+          flushDraft();
+          markStopUnconfirmed(turn);
+          return;
+        }
+        if (controller.signal.aborted) throw abortError();
         flushDraft();
-        markStopUnconfirmed(turn);
-        return;
+        const appending = options.appendAssistant(turn.input, answer, controller.signal, completedFunctionsStateId);
+        const appendOutcome = appending.then(
+          () => ({ status: 'completed' as const }),
+          (error: unknown) => turn.cancelRequested || isAbortError(error)
+            ? ({ status: 'cancelled' as const })
+            : ({ status: 'failed' as const, error: 'Ответ не удалось сохранить. Сообщение пользователя осталось в чате.' }),
+        );
+        const appended = await bounded(appending.then(() => true), operationTimeoutMs);
+        if (appended === STOP_TIMEOUT) {
+          holdForPendingOperation(turn, stopState, appendOutcome, 'Подтверждение сохранения ответа ожидается; очередь приостановлена.');
+          return;
+        }
+        delete turn.draft;
+        turn.status = 'completed';
+        turn.endedAt = new Date().toISOString();
+        turn.activeDurationMs = Math.max(0, Date.now() - started);
+        publish(turn);
+        break;
       }
-      if (controller.signal.aborted) throw abortError();
-      flushDraft();
-      const appending = options.appendAssistant(turn.input, answer, controller.signal);
-      const appendOutcome = appending.then(
-        () => ({ status: 'completed' as const }),
-        (error: unknown) => turn.cancelRequested || isAbortError(error)
-          ? ({ status: 'cancelled' as const })
-          : ({ status: 'failed' as const, error: 'Ответ не удалось сохранить. Сообщение пользователя осталось в чате.' }),
-      );
-      const appended = await bounded(appending.then(() => true), operationTimeoutMs);
-      if (appended === STOP_TIMEOUT) {
-        holdForPendingOperation(turn, stopState, appendOutcome, 'Подтверждение сохранения ответа ожидается; очередь приостановлена.');
-        return;
-      }
-      delete turn.draft;
-      turn.status = 'completed';
-      turn.endedAt = new Date().toISOString();
-      turn.activeDurationMs = Math.max(0, Date.now() - started);
-      publish(turn);
     } catch (error) {
       flushDraft();
       if (!turn.cancelRequested && !isAbortError(error) && !naturallyDone) controller.abort();
@@ -455,7 +720,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       } else if (stopState.pendingOutcome) {
         maybeUnblock(turn.id);
       } else {
-        turn.status = turn.cancelRequested || isAbortError(error) ? 'cancelled' : 'failed';
+        turn.status = turn.cancelRequested || isAbortError(error) && !turnTimedOut ? 'cancelled' : 'failed';
         turn.endedAt = new Date().toISOString();
         turn.activeDurationMs = Math.max(0, Date.now() - started);
         const category = typeof error === 'object' && error !== null && 'category' in error
@@ -464,21 +729,34 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         else if (category) turn.errorCategory = category;
         else delete turn.errorCategory;
         if (turn.status === 'failed') {
-          turn.error = error instanceof Error && error.message === 'PROVIDER_UNAVAILABLE'
-            ? 'GigaChat API пока не подключён.'
-            : error instanceof Error && error.message === 'MODEL_NOT_SELECTED'
-              ? 'Выберите модель GigaChat для следующего хода.'
-              : error instanceof Error && error.message === 'TURN_PREPARE_TIMEOUT'
-                ? 'Подготовка хода превысила ограниченное время ожидания.'
-                : error instanceof Error && error.message === 'PROVIDER_STEP_TIMEOUT'
-                  ? 'Поток не ответил в отведённое время.'
-                  : error instanceof Error && error.message === 'TURN_CONSUME_TIMEOUT'
-                    ? 'Не удалось зафиксировать параметры хода вовремя.'
-                  : 'Ход завершился ошибкой. Сообщение пользователя сохранено локально.';
+          turn.error = turnTimedOut
+            ? 'Ход превысил общий лимит времени.'
+            : error instanceof Error && error.message === 'PROVIDER_UNAVAILABLE'
+              ? 'GigaChat API пока не подключён.'
+              : error instanceof Error && error.message === 'MODEL_NOT_SELECTED'
+                ? 'Выберите модель GigaChat для следующего хода.'
+                : error instanceof Error && error.message === 'TURN_PREPARE_TIMEOUT'
+                  ? 'Подготовка хода превысила ограниченное время ожидания.'
+                  : error instanceof Error && error.message === 'PROVIDER_STEP_TIMEOUT'
+                    ? 'Поток не ответил в отведённое время.'
+                    : error instanceof Error && error.message === 'TURN_CONSUME_TIMEOUT'
+                      ? 'Не удалось зафиксировать параметры хода вовремя.'
+                      : error instanceof Error && error.message === 'TOOL_ROUND_LIMIT'
+                        ? 'Ход остановлен: достигнут лимит последовательных вызовов инструментов.'
+                        : error instanceof Error && error.message === 'TOOL_RESULT_LIMIT'
+                          ? 'Ход остановлен: суммарный результат инструментов превысил лимит.'
+                          : error instanceof Error && error.message === 'LOCAL_TOOL_TIMEOUT'
+                            ? 'Локальный инструмент превысил лимит времени; очередь ожидает подтверждённой остановки.'
+                            : error instanceof Error && error.message === 'TOOL_INTENT_SAVE_TIMEOUT'
+                              ? 'Не удалось вовремя зафиксировать намерение инструмента.'
+                              : error instanceof Error && error.message === 'TOOL_RECEIPT_STORE_UNAVAILABLE'
+                                ? 'Сохранение истории инструментов недоступно; действие не выполнено.'
+                                : 'Ход завершился ошибкой. Сообщение пользователя сохранено локально.';
         }
         publish(turn);
       }
     } finally {
+      clearTimeout(turnTimer);
       if (draftTimer) clearTimeout(draftTimer);
       draftTimer = null;
       if (!reservationConsumed) options.releaseTurn(turn.input);

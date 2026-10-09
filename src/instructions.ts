@@ -1,4 +1,4 @@
-import type { ChatMessage, InstructionLayer, ProviderTurnRequest } from './contracts';
+import type { ChatMessage, InstructionLayer, ProviderProtocolExchange, ProviderTurnRequest } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { requireModelId, type GigaChatModelId } from './models';
 
@@ -12,6 +12,7 @@ export interface InstructionInput {
   projectInstructions?: readonly ProjectInstructionSource[];
   selectedSkill?: { name: string; scope: string; text: string } | null;
   messages: readonly ChatMessage[];
+  protocolHistory?: readonly ProviderProtocolExchange[];
   permissionProfile: PermissionProfile;
   modelId?: GigaChatModelId | null;
 }
@@ -59,6 +60,7 @@ export function buildInstructionRequest(input: InstructionInput): ProviderTurnRe
   return {
     system: layers,
     messages: input.messages.map((message) => ({ ...message })),
+    protocolHistory: (input.protocolHistory ?? []).map((exchange) => structuredClone(exchange)),
     permissionProfile,
     modelId,
   };

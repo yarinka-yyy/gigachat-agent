@@ -5,10 +5,11 @@ import type { ChildProcessWithoutNullStreams, SpawnOptions } from 'node:child_pr
 import { join, relative, resolve, sep } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
-import type { Project } from './contracts';
+import type { GigaChatProvider, Project, ProviderTurnRequest } from './contracts';
 import { DEFAULT_CUSTOM_CONFIG, parseCustomConfig } from './custom-permissions';
 import {
   createLocalTools,
+  LocalToolError,
   createPowerShellHelper,
   MAX_LOCAL_FILE_BYTES,
   resolvePowerShellHelperPath,
@@ -17,6 +18,7 @@ import {
   type PowerShellRunner,
   type ProjectFileWriteRequest,
 } from './local-tools';
+import { createTurnRuntime, type ToolReceiptInput } from './runtime';
 
 const projectId = 'local-tools-project';
 
@@ -668,7 +670,8 @@ test('one-time Full shell escape requires a whole-command approval and uses the 
     },
   });
 
-  await assert.rejects(tools.runPowerShell(projectId, 'ask', command, { fullAccessOnce: true }), /не подтверждено/);
+  await assert.rejects(tools.runPowerShell(projectId, 'ask', command, { fullAccessOnce: true }), (error: unknown) =>
+    error instanceof LocalToolError && error.code === 'PERMISSION_DENIED' && /не подтверждено/.test(error.message));
   assert.equal(requests.length, 0, 'A denied full-access approval must not launch PowerShell.');
   assert.deepEqual(approvals[0], {
     resource: 'process',
@@ -729,4 +732,110 @@ test('rejects malformed or over-bound list/search helper output', async (t) => {
     path: `file-${index}.txt`, line: 1, text: 'match',
   })));
   await assert.rejects(tools.search(projectId, 'ask', 'match'), /слишком много результатов/);
+});
+
+test('rejects a project folder change from the accepted runtime tool scope before writing', async (t) => {
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  const acceptedFolder = fixture.projectFolder;
+  let writes = 0;
+  const tools = makeTools(fixture.project, [], [], undefined, async (request) => {
+    writes += 1;
+    return { bytes: Buffer.from(request.contentsBase64, 'base64').byteLength, replacedExisting: false };
+  });
+  fixture.project.workingFolder = fixture.outsideFolder;
+
+  await assert.rejects(
+    tools.write(projectId, 'full', 'guard.txt', 'must stay in accepted folder', { expectedWorkingFolder: acceptedFolder }),
+    /Рабочая папка проекта изменилась после принятия хода/,
+  );
+  assert.equal(writes, 0);
+});
+
+test('runs GigaChat read and approved write through the actual native helper in a disposable project', async (t) => {
+  if (process.platform !== 'win32') {
+    t.skip('The native local-tool capability exists only on Windows.');
+    return;
+  }
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  const recoveryDirectory = join(fixture.root, 'helper-recovery');
+  await mkdir(recoveryDirectory);
+  const helper = createPowerShellHelper({
+    helperPath: join(process.cwd(), 'resources', 'native', 'LocalPowerShell.exe'),
+    recoveryDirectory,
+  });
+  await helper.recover();
+  const approvals: Array<{ resource: string; action: string; target: string }> = [];
+  const policy = {
+    project: { list: 'allow', search: 'allow', read: 'allow', write: 'ask', open: 'ask', execute: 'ask' } as const,
+    roots: [],
+  };
+  const tools = createLocalTools({
+    resolveProject: async (id) => id === fixture.project.id ? fixture.project : null,
+    getCustomPolicy: async () => policy,
+    requestApproval: async (request) => { approvals.push(request); return true; },
+    runPowerShell: helper.run,
+    writeFile: helper.writeFile,
+  });
+  await writeFile(join(fixture.projectFolder, 'source.txt'), 'Исходный текст');
+  const requests: ProviderTurnRequest[] = [];
+  const provider: GigaChatProvider = {
+    async *stream(request) {
+      requests.push(structuredClone(request));
+      if (!request.protocolHistory?.length) {
+        yield { type: 'function-call', functionCall: {
+          name: 'read', arguments: { path: 'source.txt' }, content: null,
+          functionsStateId: 'helper-read-state', terminalReason: 'function_call',
+        } };
+      } else if (request.protocolHistory.length === 1) {
+        yield { type: 'function-call', functionCall: {
+          name: 'write', arguments: { path: 'result.txt', contents: 'Записано после подтверждения' }, content: null,
+          functionsStateId: 'helper-write-state', terminalReason: 'function_call',
+        } };
+      } else {
+        yield { type: 'text-delta', text: 'Запись завершена' };
+        yield { type: 'completed' };
+      }
+    },
+  };
+  const receipts = new Map<string, { input: ToolReceiptInput; result: string | null; status: 'pending' | 'completed' | 'unknown' }>();
+  const runtime = createTurnRuntime({
+    provider,
+    tools,
+    prepareTurn: async () => ({
+      system: [], modelId: 'GigaChat-2-Pro', permissionProfile: 'custom', messages: [{
+        id: 'message-helper', role: 'user', text: 'Прочитай и запиши файл', createdAt: '2026-09-27T00:00:00.000Z',
+      }],
+    }),
+    consumeTurn: async () => undefined,
+    releaseTurn: () => undefined,
+    appendAssistant: async () => undefined,
+    beginToolReceipt: async (turn, input) => {
+      const receipt = { input, result: null, status: 'pending' as const };
+      receipts.set(input.receiptId, receipt);
+      return { shouldExecute: true, receipt: {
+        ...input, anchorMessageId: turn.messageId, status: 'pending', result: null,
+        createdAt: '2026-09-27T00:00:00.000Z',
+      } };
+    },
+    completeToolReceipt: async (_turn, receiptId, status, result) => {
+      const receipt = receipts.get(receiptId);
+      assert.ok(receipt);
+      receipts.set(receiptId, { ...receipt, result, status });
+    },
+  });
+  runtime.enqueue({
+    turnId: 'turn-helper', chatId: 'chat-helper', projectId: fixture.project.id,
+    projectWorkingFolder: fixture.projectFolder, messageId: 'message-helper', historyBoundary: 1,
+    messages: [{ id: 'message-helper', role: 'user', text: 'Прочитай и запиши файл', createdAt: '2026-09-27T00:00:00.000Z' }],
+    modelId: 'GigaChat-2-Pro', permissionProfile: 'custom', skillId: null,
+    reservation: { permissionProfileRevision: null, skillRevision: null },
+  });
+  await runtime.whenIdle();
+
+  assert.equal(runtime.list('chat-helper')[0]?.status, 'completed');
+  assert.ok(approvals.some((approval) => approval.action === 'write' && approval.target.endsWith('result.txt')));
+  assert.equal(JSON.parse(requests[1]?.protocolHistory?.[0]?.result ?? '{}').result, 'Исходный текст');
+  assert.equal(await readFile(join(fixture.projectFolder, 'result.txt'), 'utf8'), 'Записано после подтверждения');
 });

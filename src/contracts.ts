@@ -59,6 +59,7 @@ export interface ChatMessage {
   text: string;
   createdAt: string;
   source?: 'runtime' | 'example';
+  functionsStateId?: string;
 }
 
 export type InstructionSource = 'runtime' | 'global' | 'project' | 'skill';
@@ -104,6 +105,7 @@ export type InstructionCommitResult =
 export interface ProviderTurnRequest {
   system: InstructionLayer[];
   messages: ChatMessage[];
+  protocolHistory?: ProviderProtocolExchange[];
   permissionProfile: PermissionProfile;
   modelId: GigaChatModelId | null;
 }
@@ -126,6 +128,31 @@ export interface ModelRegistrySnapshot {
   errorCategory: ProviderErrorCategory | null;
 }
 
+export interface ProviderFunctionCall {
+  name: string;
+  arguments: Record<string, unknown>;
+  content: string | null;
+  functionsStateId: string | null;
+  terminalReason: 'function_call';
+}
+
+export interface ProviderProtocolExchange {
+  anchorMessageId: string;
+  name: string;
+  arguments: Record<string, unknown>;
+  content: string | null;
+  functionsStateId: string | null;
+  result: string;
+}
+
+export interface ChatToolReceipt extends Omit<ProviderProtocolExchange, 'result'> {
+  receiptId: string;
+  effectId?: string;
+  status: 'pending' | 'completed' | 'unknown';
+  result: string | null;
+  createdAt: string;
+}
+
 export interface AcceptedTurnInput {
   turnId: string;
   chatId: string;
@@ -145,7 +172,8 @@ export type ProviderToolName = 'list' | 'search' | 'read' | 'write' | 'open' | '
 export type ProviderEvent =
   | { type: 'activity'; activity: 'connecting' | 'receiving' | 'waiting-for-tool' | 'tool-started' | 'tool-finished'; tool?: ProviderToolName }
   | { type: 'text-delta'; text: string }
-  | { type: 'completed'; responseId?: string }
+  | { type: 'function-call'; functionCall: ProviderFunctionCall }
+  | { type: 'completed'; responseId?: string; functionsStateId?: string }
   | { type: 'error'; category: ProviderErrorCategory; retryable: boolean };
 
 export interface GigaChatProvider {
@@ -209,6 +237,7 @@ export interface ChatDetail extends ChatSummary {
   modelId: GigaChatModelId | null;
   nextTurnSkillId: string | null;
   messages: ChatMessage[];
+  toolReceipts: ChatToolReceipt[];
   artifacts: ChatArtifact[];
 }
 

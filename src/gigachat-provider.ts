@@ -3,7 +3,7 @@ import { randomUUID, X509Certificate } from 'node:crypto';
 import { type ClientRequest, type IncomingHttpHeaders, type IncomingMessage } from 'node:http';
 import { Agent, request as httpsRequest } from 'node:https';
 import * as tls from 'node:tls';
-import type { GigaChatProvider, ModelRegistrySnapshot, ProviderConnectionSnapshot, ProviderErrorCategory, ProviderEvent, ProviderTurnRequest } from './contracts';
+import type { GigaChatProvider, ModelRegistrySnapshot, ProviderConnectionSnapshot, ProviderErrorCategory, ProviderEvent, ProviderProtocolExchange, ProviderTurnRequest } from './contracts';
 import { discoveredModelRegistry, failedModelRegistry, isModelAvailable, requireModelId, unavailableModelRegistry } from './models';
 
 export const GIGACHAT_API_BASE_URL = 'https://api.giga.chat/v1';
@@ -15,6 +15,16 @@ const MAX_TOKEN_LIFETIME_MS = 24 * 60 * 60 * 1000;
 const MAX_TOKEN_CHARS = 16 * 1024;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const MAX_FUNCTION_ARGUMENT_BYTES = 1_900_000;
+
+const GIGACHAT_FUNCTIONS: readonly Record<string, unknown>[] = [
+  { name: 'list', description: 'Список файлов и папок внутри текущей рабочей папки проекта.', parameters: { type: 'object', properties: { path: { type: 'string', maxLength: 2048 } }, additionalProperties: false } },
+  { name: 'search', description: 'Поиск текста внутри файлов текущей рабочей папки проекта.', parameters: { type: 'object', properties: { query: { type: 'string', minLength: 1, maxLength: 256 }, path: { type: 'string', maxLength: 2048 } }, required: ['query'], additionalProperties: false } },
+  { name: 'read', description: 'Чтение небольшого текстового файла внутри текущей рабочей папки проекта.', parameters: { type: 'object', properties: { path: { type: 'string', minLength: 1, maxLength: 2048 } }, required: ['path'], additionalProperties: false } },
+  { name: 'write', description: 'Запись текста в файл проекта с применением текущего профиля разрешений. UTF-8 содержимое ограничено 1 МиБ.', parameters: { type: 'object', properties: { path: { type: 'string', minLength: 1, maxLength: 2048 }, contents: { type: 'string', maxLength: 1048576 } }, required: ['path', 'contents'], additionalProperties: false } },
+  { name: 'open', description: 'Открытие или показ безопасного файла проекта.', parameters: { type: 'object', properties: { path: { type: 'string', maxLength: 2048 } }, additionalProperties: false } },
+  { name: 'powershell', description: 'Выполнение PowerShell через существующий локальный helper и текущий профиль разрешений.', parameters: { type: 'object', properties: { script: { type: 'string', minLength: 1, maxLength: 16384 }, external_access: { type: 'boolean' } }, required: ['script'], additionalProperties: false } },
+];
 
 export interface ProviderTransportRequest {
   url: string;
@@ -447,15 +457,42 @@ export function createGigaChatProvider(options: {
         if (!layer || typeof layer.label !== 'string' || typeof layer.text !== 'string') throw new GigaChatProviderError('protocol');
         return `[${layer.label}]\n${layer.text}`;
       }).join('\n\n');
-      const messages = [
+      const protocolHistory = validateProtocolHistory(request.protocolHistory ?? []);
+      const exchanges = new Map<string, ProviderProtocolExchange[]>();
+      for (const exchange of protocolHistory) {
+        const rows = exchanges.get(exchange.anchorMessageId) ?? [];
+        rows.push(exchange);
+        exchanges.set(exchange.anchorMessageId, rows);
+      }
+      const messages: Array<Record<string, unknown>> = [
         ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
-        ...request.messages.map((message) => {
+      ];
+      for (const message of request.messages) {
           if (!message || (message.role !== 'user' && message.role !== 'assistant') || typeof message.text !== 'string') {
             throw new GigaChatProviderError('protocol');
           }
-          return { role: message.role, content: message.text };
-        }),
-      ];
+          if (message.functionsStateId !== undefined && (message.role !== 'assistant' || typeof message.functionsStateId !== 'string'
+            || !message.functionsStateId || message.functionsStateId.length > 4096
+            || /[\u0000-\u001f\u007f]/.test(message.functionsStateId))) throw new GigaChatProviderError('protocol');
+          messages.push({
+            role: message.role,
+            content: message.text,
+            ...(message.role === 'assistant' && message.functionsStateId ? { functions_state_id: message.functionsStateId } : {}),
+          });
+          if (message.role === 'user') {
+            for (const exchange of exchanges.get(message.id) ?? []) {
+              messages.push({
+                role: 'assistant', content: exchange.content ?? '',
+                ...(exchange.functionsStateId ? { functions_state_id: exchange.functionsStateId } : {}),
+                function_call: { name: exchange.name, arguments: exchange.arguments },
+              });
+              messages.push({ role: 'function', name: exchange.name, content: exchange.result });
+            }
+          }
+      }
+      if (protocolHistory.some((exchange) => !request.messages.some((message) => message.role === 'user' && message.id === exchange.anchorMessageId))) {
+        throw new GigaChatProviderError('protocol');
+      }
       let opened = false;
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const access = await getAccessToken(operation.controller.signal, operationGeneration);
@@ -469,7 +506,7 @@ export function createGigaChatProvider(options: {
               Accept: 'text/event-stream',
               'Content-Type': 'application/json',
             },
-            body: JSON.stringify({ model: modelId, messages, stream: true, function_call: 'none' }),
+            body: JSON.stringify({ model: modelId, messages, functions: GIGACHAT_FUNCTIONS, stream: true, function_call: 'auto' }),
             signal: operation.controller.signal,
             streaming: true,
           }), operation.controller.signal, (lateResponse) => lateResponse.cancel());
@@ -495,24 +532,36 @@ export function createGigaChatProvider(options: {
       if (!opened || !response) throw new GigaChatProviderError('auth');
 
       yield { type: 'activity', activity: 'receiving' };
-      let receivedStop = false;
+      let terminalReason: 'stop' | 'function_call' | null = null;
+      let terminalFunctionsStateId: string | null = null;
+      let terminalFunctionCall: NonNullable<ReturnType<typeof parseCompletionChunk>['functionCall']> | null = null;
       let receivedDone = false;
       for await (const data of readSseData(response.body, operation.controller.signal)) {
         assertCurrent(operationGeneration, operation.controller.signal);
         if (data === '[DONE]') {
-          if (!receivedStop || receivedDone) throw new GigaChatProviderError('protocol');
+          if (!terminalReason || receivedDone) throw new GigaChatProviderError('protocol');
           receivedDone = true;
           break;
         }
-        if (receivedStop || receivedDone) throw new GigaChatProviderError('protocol');
+        if (terminalReason || receivedDone) throw new GigaChatProviderError('protocol');
         const chunk = parseCompletionChunk(data);
-        if (chunk.content) yield { type: 'text-delta', text: chunk.content };
-        if (chunk.errorCategory) throw new GigaChatProviderError(chunk.errorCategory);
-        if (chunk.finishReasonStop) receivedStop = true;
+        if (chunk.finishReason === 'function_call') {
+          if (chunk.errorCategory) throw new GigaChatProviderError(chunk.errorCategory);
+          if (!chunk.functionCall) throw new GigaChatProviderError('protocol');
+          terminalReason = 'function_call';
+          terminalFunctionsStateId = chunk.functionCall.functionsStateId;
+          terminalFunctionCall = chunk.functionCall;
+        } else {
+          if (chunk.content) yield { type: 'text-delta', text: chunk.content };
+          if (chunk.errorCategory) throw new GigaChatProviderError(chunk.errorCategory);
+          if (chunk.functionsStateId) terminalFunctionsStateId = chunk.functionsStateId;
+          if (chunk.finishReason === 'stop') terminalReason = 'stop';
+        }
       }
       assertCurrent(operationGeneration, operation.controller.signal);
-      if (!receivedStop || !receivedDone) throw new GigaChatProviderError('protocol');
-      yield { type: 'completed' };
+      if (!terminalReason || !receivedDone) throw new GigaChatProviderError('protocol');
+      if (terminalReason === 'function_call' && terminalFunctionCall) yield { type: 'function-call', functionCall: terminalFunctionCall };
+      else if (terminalReason === 'stop') yield { type: 'completed', ...(terminalFunctionsStateId ? { functionsStateId: terminalFunctionsStateId } : {}) };
     } catch (error) {
       const normalized = error instanceof GigaChatProviderError
         ? error : transportError(error, operation.controller.signal);
@@ -661,7 +710,9 @@ async function* readSseData(body: AsyncIterable<Uint8Array>, signal: AbortSignal
 
 function parseCompletionChunk(value: string): {
   content: string | null;
-  finishReasonStop: boolean;
+  functionsStateId: string | null;
+  finishReason: 'stop' | 'function_call' | null;
+  functionCall?: { name: string; arguments: Record<string, unknown>; content: string | null; functionsStateId: string | null; terminalReason: 'function_call' };
   errorCategory?: ProviderErrorCategory;
 } {
   let parsed: unknown;
@@ -676,25 +727,85 @@ function parseCompletionChunk(value: string): {
     throw new GigaChatProviderError('protocol');
   }
   let errorCategory: ProviderErrorCategory | undefined;
-  if ('function_call' in choice.delta) errorCategory = 'tool';
   const finishReason = choice.finish_reason;
-  let finishReasonStop = false;
+  let terminal: 'stop' | 'function_call' | null = null;
   if (finishReason !== undefined && finishReason !== null) {
     if (finishReason === 'length') errorCategory = 'context';
-    else if (finishReason === 'function_call') errorCategory = 'tool';
+    else if (finishReason === 'function_call') terminal = 'function_call';
     else if (finishReason === 'blacklist') errorCategory = 'model';
-    else if (finishReason === 'stop') finishReasonStop = true;
+    else if (finishReason === 'stop') terminal = 'stop';
     else throw new GigaChatProviderError('protocol');
   }
   const content = choice.delta.content;
   if (content !== undefined && content !== null && typeof content !== 'string') {
     throw new GigaChatProviderError('protocol');
   }
+  const rawStateId = choice.delta.functions_state_id;
+  if (rawStateId !== undefined && (typeof rawStateId !== 'string' || rawStateId.length === 0 || rawStateId.length > 4096
+    || /[\u0000-\u001f\u007f]/.test(rawStateId))) throw new GigaChatProviderError('protocol');
+  const functionsStateId = typeof rawStateId === 'string' ? rawStateId : null;
+  let functionCall: ReturnType<typeof parseProviderFunctionCall> | undefined;
+  if ('function_call' in choice.delta) {
+    if (terminal !== 'function_call') throw new GigaChatProviderError('protocol');
+    functionCall = parseProviderFunctionCall(choice.delta.function_call, typeof content === 'string' ? content : null, functionsStateId);
+  } else if (terminal === 'function_call') throw new GigaChatProviderError('protocol');
   return {
     content: typeof content === 'string' ? content : null,
-    finishReasonStop,
+    functionsStateId,
+    finishReason: terminal,
+    ...(functionCall ? { functionCall } : {}),
     ...(errorCategory ? { errorCategory } : {}),
   };
+}
+
+function parseProviderFunctionCall(
+  value: unknown,
+  content: string | null,
+  functionsStateId: string | null,
+): { name: string; arguments: Record<string, unknown>; content: string | null; functionsStateId: string | null; terminalReason: 'function_call' } {
+  if (!isRecord(value) || typeof value.name !== 'string' || !value.name || value.name.length > 128
+    || /[\u0000-\u001f\u007f]/.test(value.name) || !isRecord(value.arguments)) {
+    throw new GigaChatProviderError('protocol');
+  }
+  let encoded: string;
+  try { encoded = JSON.stringify(value.arguments); }
+  catch { throw new GigaChatProviderError('protocol'); }
+  if (Buffer.byteLength(encoded, 'utf8') > MAX_FUNCTION_ARGUMENT_BYTES || (content?.length ?? 0) > 16_000) {
+    throw new GigaChatProviderError('protocol');
+  }
+  return { name: value.name, arguments: value.arguments, content, functionsStateId, terminalReason: 'function_call' };
+}
+
+function validateProtocolHistory(value: unknown): ProviderProtocolExchange[] {
+  if (!Array.isArray(value) || value.length > 256) throw new GigaChatProviderError('protocol');
+  return value.map((entry): ProviderProtocolExchange => {
+    if (!isRecord(entry) || typeof entry.anchorMessageId !== 'string' || !entry.anchorMessageId
+      || typeof entry.name !== 'string' || !entry.name || entry.name.length > 128 || /[\u0000-\u001f\u007f]/.test(entry.name)
+      || !isRecord(entry.arguments)
+      || (entry.content !== null && typeof entry.content !== 'string')
+      || (entry.functionsStateId !== null && typeof entry.functionsStateId !== 'string')
+      || typeof entry.result !== 'string' || Buffer.byteLength(entry.result, 'utf8') > MAX_FUNCTION_ARGUMENT_BYTES) {
+      throw new GigaChatProviderError('protocol');
+    }
+    let argumentsBytes: number;
+    try { argumentsBytes = Buffer.byteLength(JSON.stringify(entry.arguments), 'utf8'); }
+    catch { throw new GigaChatProviderError('protocol'); }
+    if (argumentsBytes > MAX_FUNCTION_ARGUMENT_BYTES || (entry.content !== null && entry.content.length > 16_000)) {
+      throw new GigaChatProviderError('protocol');
+    }
+    let parsedResult: unknown;
+    try { parsedResult = JSON.parse(entry.result) as unknown; }
+    catch { throw new GigaChatProviderError('protocol'); }
+    if (!isRecord(parsedResult)) throw new GigaChatProviderError('protocol');
+    return {
+      anchorMessageId: entry.anchorMessageId,
+      name: entry.name,
+      arguments: structuredClone(entry.arguments),
+      content: entry.content as string | null,
+      functionsStateId: entry.functionsStateId as string | null,
+      result: entry.result,
+    };
+  });
 }
 
 function linkAbortSignals(...signals: AbortSignal[]): { controller: AbortController; dispose(): void } {

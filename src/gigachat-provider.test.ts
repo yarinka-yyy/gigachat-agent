@@ -207,7 +207,7 @@ test('streams GigaChat v1 SSE across split UTF-8, CRLF and multiline data frames
       completionRequests.push(request);
       return eventStreamResponse([
         firstFrame.subarray(0, splitAt), firstFrame.subarray(splitAt),
-        Buffer.from('data: {"choices":[{"index":0,"delta":{"content":"мир"},"finish_reason":"stop"}]}\r\n\r\n'),
+        Buffer.from('data: {"choices":[{"index":0,"delta":{"content":"мир","functions_state_id":"state-final"},"finish_reason":"stop"}]}\r\n\r\n'),
         Buffer.from('data: [DONE]\r\n\r\n'),
       ]);
     }),
@@ -220,7 +220,15 @@ test('streams GigaChat v1 SSE across split UTF-8, CRLF and multiline data frames
       { source: 'runtime', label: 'Runtime', text: 'Runtime rules' },
       { source: 'global', label: 'Rules', text: 'Правила' },
     ],
-    messages: [{ id: 'message-1', role: 'user', text: 'Вопрос', createdAt: '2026-10-09T00:00:00.000Z' }],
+    messages: [
+      { id: 'message-1', role: 'user', text: 'Вопрос', createdAt: '2026-10-09T00:00:00.000Z' },
+      { id: 'message-2', role: 'assistant', text: 'Ответ', createdAt: '2026-10-09T00:00:01.000Z', functionsStateId: 'state-saved' },
+      { id: 'message-3', role: 'user', text: 'Продолжи', createdAt: '2026-10-09T00:00:02.000Z' },
+    ],
+    protocolHistory: [{
+      anchorMessageId: 'message-1', name: 'read', arguments: { path: 'README.md' }, content: null,
+      functionsStateId: 'state-1', result: '{"ok":true,"result":"текст"}',
+    }],
     permissionProfile: 'ask',
     modelId: 'future/model-v2',
   }, new AbortController().signal)) events.push(event);
@@ -229,19 +237,66 @@ test('streams GigaChat v1 SSE across split UTF-8, CRLF and multiline data frames
     { type: 'activity', activity: 'receiving' },
     { type: 'text-delta', text: 'Привет ' },
     { type: 'text-delta', text: 'мир' },
-    { type: 'completed' },
+    { type: 'completed', functionsStateId: 'state-final' },
   ]);
   assert.equal(completionRequests[0]?.method, 'POST');
   assert.equal(completionRequests[0]?.headers.Accept, 'text/event-stream');
   assert.equal(completionRequests[0]?.headers.Authorization, 'Bearer synthetic-token');
-  const requestBody = JSON.parse(completionRequests[0]?.body ?? '{}') as { messages: Array<{ role: string; content: string }> };
-  assert.deepEqual(requestBody, {
-    model: 'future/model-v2',
-    messages: [{ role: 'system', content: '[Runtime]\nRuntime rules\n\n[Rules]\nПравила' }, { role: 'user', content: 'Вопрос' }],
-    stream: true,
-    function_call: 'none',
-  });
+  const requestBody = JSON.parse(completionRequests[0]?.body ?? '{}') as {
+    model: string; messages: Array<Record<string, unknown>>; functions: Array<{ name: string }>; function_call: string; stream: boolean;
+  };
+  assert.equal(requestBody.model, 'future/model-v2');
+  assert.deepEqual(requestBody.messages, [
+    { role: 'system', content: '[Runtime]\nRuntime rules\n\n[Rules]\nПравила' },
+    { role: 'user', content: 'Вопрос' },
+    { role: 'assistant', content: '', functions_state_id: 'state-1', function_call: { name: 'read', arguments: { path: 'README.md' } } },
+    { role: 'function', name: 'read', content: '{"ok":true,"result":"текст"}' },
+    { role: 'assistant', content: 'Ответ', functions_state_id: 'state-saved' },
+    { role: 'user', content: 'Продолжи' },
+  ]);
+  assert.equal(requestBody.stream, true);
+  assert.equal(requestBody.function_call, 'auto');
+  assert.deepEqual(requestBody.functions.map((fn) => fn.name), ['list', 'search', 'read', 'write', 'open', 'powershell']);
   assert.equal(requestBody.messages.filter((message) => message.role === 'system').length, 1);
+});
+
+test('normalizes an unknown bounded function call with object arguments only after DONE', async () => {
+  let doneYielded = false;
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => {
+      if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'test-model' }] });
+      return {
+        statusCode: 200,
+        headers: { 'content-type': 'text/event-stream' },
+        body: (async function* () {
+          yield Buffer.from(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { function_call: { name: 'archive', arguments: { path: 'a' } }, functions_state_id: 'state-2', }, finish_reason: 'function_call' }] })}\n\n`);
+          await delay(1);
+          doneYielded = true;
+          yield Buffer.from('data: [DONE]\n\n');
+        }()),
+        cancel() {},
+      };
+    }),
+  });
+  assert.equal((await provider.connect()).state, 'connected');
+  const events: ProviderEvent[] = [];
+  for await (const event of provider.stream({
+    system: [], messages: [{ id: 'message-1', role: 'user', text: 'Задача', createdAt: '2026-10-09T00:00:00.000Z' }],
+    permissionProfile: 'ask', modelId: 'test-model',
+  }, new AbortController().signal)) {
+    if (event.type === 'function-call') assert.equal(doneYielded, true);
+    events.push(event);
+  }
+  assert.equal(doneYielded, true);
+  assert.deepEqual(events, [
+    { type: 'activity', activity: 'receiving' },
+    { type: 'function-call', functionCall: {
+      name: 'archive', arguments: { path: 'a' }, content: null, functionsStateId: 'state-2', terminalReason: 'function_call',
+    } },
+  ]);
 });
 
 test('rejects malformed, incomplete, oversized, and unsupported terminal SSE events safely', async (t) => {
@@ -265,7 +320,10 @@ test('rejects malformed, incomplete, oversized, and unsupported terminal SSE eve
       name: 'length finish reason', response: eventStreamResponse([Buffer.from('data: {"choices":[{"index":0,"delta":{"content":"часть"},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n')]), category: 'context',
     },
     {
-      name: 'unsupported function call', response: eventStreamResponse([Buffer.from('data: {"choices":[{"index":0,"delta":{"function_call":{"name":"read"}},"finish_reason":"function_call"}]}\n\ndata: [DONE]\n\n')]), category: 'tool',
+      name: 'function terminal missing arguments', response: eventStreamResponse([Buffer.from('data: {"choices":[{"index":0,"delta":{"function_call":{"name":"read"}},"finish_reason":"function_call"}]}\n\ndata: [DONE]\n\n')]), category: 'protocol',
+    },
+    {
+      name: 'function call missing DONE', response: eventStreamResponse([Buffer.from(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { function_call: { name: 'future', arguments: { x: 1 } }, functions_state_id: 'state-1' }, finish_reason: 'function_call' }] })}\n\n`)]), category: 'protocol',
     },
     {
       name: 'oversized stream', response: eventStreamResponse([Buffer.from(`data: ${'x'.repeat(2 * 1024 * 1024)}\n\n`)]), category: 'protocol',
@@ -290,6 +348,7 @@ test('rejects malformed, incomplete, oversized, and unsupported terminal SSE eve
       }, new AbortController().signal)) events.push(event);
       assert.deepEqual(events[events.length - 1], { type: 'error', category: item.category, retryable: false });
       assert.equal(events.some((event) => event.type === 'completed'), false);
+      if (item.name === 'function call missing DONE') assert.equal(events.some((event) => event.type === 'function-call'), false);
       if (item.category === 'context') assert.ok(events.some((event) => event.type === 'text-delta' && event.text === 'часть'));
     });
   }
