@@ -705,6 +705,62 @@ test('reserves one-shot profile and Skill independently and preserves a same-val
   assert.equal(current.nextTurnPermissionProfile, 'approve');
 });
 
+test('retry transfers only the original unconsumed one-shot reservation before the next message', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-retry-reservation-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { nextTurnPermissionProfile: 'full', nextTurnSkillId: 'global/review' });
+  const accepted = await store.acceptLocalMessage(chat.id, 'Оригинальный ход', 'turn-original');
+
+  store.releaseTurnReservation(accepted.turn.turnId);
+  const retry = { ...structuredClone(accepted.turn), turnId: 'turn-retry' };
+  assert.deepEqual(retry.messages, accepted.turn.messages, 'retry keeps the original accepted prompt/history snapshot');
+  await store.reserveRetryTurn(accepted.turn, retry);
+  await store.consumeTurnReservation(retry);
+
+  const afterRetry = await store.getChat(chat.id);
+  assert.equal(afterRetry.messages.length, 1, 'retry does not append a duplicate user message');
+  assert.equal(afterRetry.nextTurnPermissionProfile, null);
+  assert.equal(afterRetry.nextTurnSkillId, null);
+  const next = await store.acceptLocalMessage(chat.id, 'Следующее новое сообщение', 'turn-next');
+  assert.equal(next.turn.reservation.permissionProfileRevision, null);
+  assert.equal(next.turn.reservation.skillRevision, null);
+});
+
+test('retry does not consume changed one-shot overrides or steal a competing accepted reservation', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-retry-reservation-guard-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { nextTurnPermissionProfile: 'full', nextTurnSkillId: 'global/review' });
+  const original = await store.acceptLocalMessage(chat.id, 'Первый исходный ход', 'turn-original');
+  store.releaseTurnReservation(original.turn.turnId);
+  await store.updateChat(chat.id, { nextTurnPermissionProfile: 'approve', nextTurnSkillId: 'global/review-next' });
+  const retryAfterChange = { ...structuredClone(original.turn), turnId: 'turn-retry-after-change' };
+  await store.reserveRetryTurn(original.turn, retryAfterChange);
+  await store.consumeTurnReservation(retryAfterChange);
+  let current = await store.getChat(chat.id);
+  assert.equal(current.nextTurnPermissionProfile, 'approve');
+  assert.equal(current.nextTurnSkillId, 'global/review-next');
+
+  const competingChat = await store.createChat();
+  await store.updateChat(competingChat.id, { nextTurnPermissionProfile: 'full', nextTurnSkillId: 'global/review' });
+  const first = await store.acceptLocalMessage(competingChat.id, 'Исходный ход с reservation', 'turn-competing-original');
+  store.releaseTurnReservation(first.turn.turnId);
+  const competitor = await store.acceptLocalMessage(competingChat.id, 'Другой принятый ход', 'turn-reservation-owner');
+  const retry = { ...structuredClone(first.turn), turnId: 'turn-competing-retry' };
+  await store.reserveRetryTurn(first.turn, retry);
+  await store.consumeTurnReservation(retry);
+  current = await store.getChat(competingChat.id);
+  assert.equal(current.nextTurnPermissionProfile, 'full');
+  assert.equal(current.nextTurnSkillId, 'global/review');
+  await store.consumeTurnReservation(competitor.turn);
+  current = await store.getChat(competingChat.id);
+  assert.equal(current.nextTurnPermissionProfile, null);
+  assert.equal(current.nextTurnSkillId, null);
+});
+
 test('rejects reservation consumption when the accepted project folder or chat binding changes', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-accepted-binding-'));
   t.after(() => rm(directory, { recursive: true, force: true }));

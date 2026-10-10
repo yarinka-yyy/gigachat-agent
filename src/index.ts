@@ -753,6 +753,30 @@ async function createMainRuntime(
   const turnRuntime = createTurnRuntime({
     provider: providerConnection,
     tools,
+    validateRetry: async (turn, original) => {
+      await store.validateAcceptedTurn(turn);
+      await store.getMessagesThrough(turn.chatId, turn.messageId);
+      if (providerConnection.getConnectionStatus().state !== 'connected') {
+        throw new Error('Подключите GigaChat перед повтором этого хода.');
+      }
+      if (!turn.modelId || !isModelAvailable(providerConnection.getModelRegistry(), turn.modelId)) {
+        throw new Error('Выбранная для этого хода модель сейчас недоступна. Выбор исходного хода сохранён.');
+      }
+      if (turn.skillId && !await skills.getEnabled(turn.skillId)) {
+        throw new Error('Skill исходного хода больше не включён; его выбор не заменён автоматически.');
+      }
+      if (providerConnection.getConnectionStatus().state !== 'connected') {
+        throw new Error('Подключение GigaChat изменилось; повтор не поставлен в очередь.');
+      }
+      await store.reserveRetryTurn(original, turn);
+      if (providerConnection.getConnectionStatus().state !== 'connected'
+        || !turn.modelId || !isModelAvailable(providerConnection.getModelRegistry(), turn.modelId)) {
+        throw new Error('Подключение или доступность модели изменились; повтор не поставлен в очередь.');
+      }
+      if (turn.skillId && !await skills.getEnabled(turn.skillId)) {
+        throw new Error('Skill исходного хода больше не включён; повтор не поставлен в очередь.');
+      }
+    },
     prepareTurn: async (turn, signal) => {
       if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
       if (turn.operation === 'compaction' && !COMPACTION_QUALITY_VERIFIED) throw new Error(COMPACTION_UNAVAILABLE_REASON);
@@ -1149,6 +1173,12 @@ async function registerIpcHandlers(
     const chatId = requireId(chatIdInput);
     await store.getChat(chatId);
     return runtime.cancel(requireId(turnIdInput), chatId);
+  });
+  handle('runtime:retry', async (chatIdInput, turnIdInput) => {
+    const chatId = requireId(chatIdInput);
+    const turnId = requireId(turnIdInput);
+    await store.getChat(chatId);
+    return runtime.retry(turnId, chatId);
   });
   handle('runtime:status', () => ({
     ...availability,

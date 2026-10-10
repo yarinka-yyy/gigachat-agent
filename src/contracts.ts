@@ -273,6 +273,7 @@ export type RuntimeActivity =
 export interface RuntimeTurnSnapshot {
   id: string;
   chatId: string;
+  modelId?: GigaChatModelId | null;
   status: RuntimeTurnStatus;
   createdAt: string;
   startedAt?: string;
@@ -283,6 +284,7 @@ export interface RuntimeTurnSnapshot {
   draft?: string;
   error?: string;
   errorCategory?: ProviderErrorCategory;
+  retryEligible?: boolean;
 }
 
 export interface RuntimeAvailability {
@@ -526,6 +528,7 @@ export interface AppApi {
     getStatus(): Promise<RuntimeAvailability>;
     list(chatId: string): Promise<RuntimeTurnSnapshot[]>;
     cancel(chatId: string, turnId: string): Promise<boolean>;
+    retry(chatId: string, turnId: string): Promise<string | null>;
     onUpdate(listener: (turn: RuntimeTurnSnapshot) => void): () => void;
   };
   permissions: {

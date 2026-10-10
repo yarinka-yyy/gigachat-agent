@@ -11,6 +11,7 @@ import { validateProjectFolder, validateProjectInstructionsPath } from './projec
 import { createInstructionDocument, instructionFileHash } from './instruction-documents';
 import { MAX_USAGE_RECEIPTS, mergeUsageReceipt, summarizeUsage, validateUsageReceipt } from './usage';
 import { hashCompactionPrefix, validateCompactSummary } from './context';
+import { LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES } from './attachment-policy';
 
 type ProjectFile = { schemaVersion: 2; projects: Project[] };
 type LegacyChat = ChatSummary & { draft: string };
@@ -40,7 +41,6 @@ export interface StoreOpenOptions {
   instructionCommitter?: InstructionCommitter;
 }
 
-const MAX_IMPORTED_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_INSTRUCTION_BYTES = 64 * 1024;
 const MAX_USAGE_LEDGER_BYTES = 32 * 1024 * 1024;
 const MAX_TOOL_RECEIPTS_PER_CHAT = 256;
@@ -78,6 +78,7 @@ export interface LocalStore {
   acceptLocalMessage(id: unknown, text: unknown, turnId: unknown): Promise<{ detail: ChatDetail; turn: AcceptedTurnInput }>;
   acceptCompactionTurn(id: unknown, turnId: unknown): Promise<{ detail: ChatDetail; turn: AcceptedTurnInput }>;
   releaseTurnReservation(turnId: unknown): void;
+  reserveRetryTurn(original: AcceptedTurnInput, retry: AcceptedTurnInput): Promise<void>;
   consumeTurnReservation(turn: AcceptedTurnInput, signal?: AbortSignal): Promise<void>;
   validateAcceptedTurn(turn: AcceptedTurnInput): Promise<void>;
   appendAssistantMessageFromRuntime(id: unknown, messageId: unknown, text: unknown, signal?: AbortSignal, functionsStateId?: unknown): Promise<ChatDetail>;
@@ -1679,6 +1680,55 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     releaseTurnReservation: (turnIdInput) => {
       if (typeof turnIdInput === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(turnIdInput)) turnReservations.delete(turnIdInput);
     },
+    reserveRetryTurn: (originalInput, retryInput) => serialize(async () => {
+      const original = structuredClone(originalInput);
+      const retry = structuredClone(retryInput);
+      const sameSnapshot = original.chatId === retry.chatId && original.projectId === retry.projectId
+        && original.projectWorkingFolder === retry.projectWorkingFolder && original.messageId === retry.messageId
+        && original.historyBoundary === retry.historyBoundary && JSON.stringify(original.messages) === JSON.stringify(retry.messages)
+        && original.permissionProfile === retry.permissionProfile && original.modelId === retry.modelId
+        && original.skillId === retry.skillId
+        && original.reservation.permissionProfileRevision === retry.reservation.permissionProfileRevision
+        && original.reservation.skillRevision === retry.reservation.skillRevision;
+      if (original.operation || retry.operation || original.turnId === retry.turnId || !sameSnapshot) {
+        throw new Error('Повтор должен сохранять исходный снимок хода.');
+      }
+      const chat = validateAcceptedTurnBinding(original);
+      validateAcceptedTurnBinding(retry);
+      if (!chat.messages.some((message) => message.id === original.messageId && message.role === 'user')) {
+        throw new Error('Исходное сообщение для повтора отсутствует.');
+      }
+      if (turnReservations.has(retry.turnId)) throw new Error('Ход с таким идентификатором уже принят.');
+
+      const currentRevisions = selectionRevisions.get(chat.id) ?? { permissionProfile: 0, skill: 0 };
+      const previousReservation = turnReservations.get(original.turnId);
+      const isOwnedByAnotherTurn = (kind: 'permissionProfile' | 'skill', revision: number): boolean =>
+        [...turnReservations.entries()].some(([turnId, reservation]) => turnId !== original.turnId
+          && reservation.chatId === chat.id && reservation[kind]?.revision === revision);
+      const profileRevision = original.reservation.permissionProfileRevision;
+      const skillRevision = original.reservation.skillRevision;
+      const permissionProfile = profileRevision !== null
+        && currentRevisions.permissionProfile === profileRevision
+        && chat.nextTurnPermissionProfile === original.permissionProfile
+        && !isOwnedByAnotherTurn('permissionProfile', profileRevision)
+        ? { value: original.permissionProfile, revision: profileRevision }
+        : null;
+      const skill = skillRevision !== null
+        && currentRevisions.skill === skillRevision
+        && original.skillId !== null
+        && chat.nextTurnSkillId === original.skillId
+        && !isOwnedByAnotherTurn('skill', skillRevision)
+        ? { value: original.skillId!, revision: skillRevision }
+        : null;
+      if (permissionProfile || skill) {
+        turnReservations.set(retry.turnId, {
+          chatId: chat.id,
+          permissionProfile,
+          skill,
+        });
+      }
+      if (previousReservation) turnReservations.delete(original.turnId);
+    }),
     validateAcceptedTurn: (turn) => serialize(async () => {
       validateAcceptedTurnBinding(turn);
     }),
@@ -1766,7 +1816,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       const source = await stat(sourcePath);
       if (!source.isFile()) throw new Error('Выбранный путь не является файлом.');
       if (!Number.isSafeInteger(source.size)) throw new Error('Размер файла недоступен.');
-      if (source.size > MAX_IMPORTED_FILE_BYTES) throw new Error('Размер файла превышает лимит 25 МиБ.');
+      if (source.size > LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES) throw new Error('Размер файла превышает лимит 25 МиБ.');
       const existing = idInput === null ? null : findChat(idInput);
       const projectId = projectIdInput === null ? null : requireId(projectIdInput);
       if (!existing && projectId && !projects.some((project) => project.id === projectId && !project.archived)) {
@@ -1788,7 +1838,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         copied = true;
         await assertOwnedPath(storageRoot, target);
         const storedFile = await stat(target);
-        if (!storedFile.isFile() || storedFile.size > MAX_IMPORTED_FILE_BYTES) {
+        if (!storedFile.isFile() || storedFile.size > LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES) {
           throw new Error('Размер файла превышает лимит 25 МиБ.');
         }
         const now = new Date().toISOString();

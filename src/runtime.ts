@@ -38,6 +38,9 @@ const MAX_TOOL_RESULT_BYTES = 16 * 1024;
 const MAX_TOTAL_TOOL_RESULT_BYTES = 128 * 1024;
 const STOP_TIMEOUT = Symbol('stop-timeout');
 const PROVIDER_TOOL_NAMES: readonly ProviderToolName[] = ['list', 'search', 'read', 'write', 'open', 'powershell'];
+const RETRYABLE_ERROR_CATEGORIES = new Set<ProviderErrorCategory>([
+  'auth', 'tls', 'network', 'rate-limit', 'quota', 'protocol', 'tool', 'storage',
+]);
 
 export interface ToolReceiptInput extends Omit<ChatToolReceipt, 'anchorMessageId' | 'status' | 'result' | 'createdAt'> {}
 export interface ToolReceiptStart { shouldExecute: boolean; receipt: ChatToolReceipt }
@@ -68,6 +71,7 @@ export interface TurnRuntimeOptions {
   beginToolReceipt?(turn: AcceptedTurnInput, receipt: ToolReceiptInput): Promise<ToolReceiptStart>;
   completeToolReceipt?(turn: AcceptedTurnInput, receiptId: string, status: 'completed' | 'unknown', result: string): Promise<void>;
   runHooks?(turn: AcceptedTurnInput, input: HookDispatchInput, signal: AbortSignal): Promise<HookRunResult[]>;
+  validateRetry?(turn: AcceptedTurnInput, original: AcceptedTurnInput): Promise<void>;
   timeouts?: { prepareMs?: number; nextMs?: number; stopMs?: number; operationMs?: number; toolMs?: number; turnMs?: number };
   onUpdate?(turn: RuntimeTurnSnapshot): void;
 }
@@ -78,6 +82,7 @@ export interface TurnRuntime {
   enqueueCompaction(turn: unknown): string | null;
   list(chatId?: unknown): RuntimeTurnSnapshot[];
   cancel(turnId: unknown, chatId?: unknown): boolean;
+  retry(turnId: unknown, chatId?: unknown): Promise<string | null>;
   cancelAll(): Promise<void>;
   whenIdle(): Promise<void>;
   onUpdate(listener: (turn: RuntimeTurnSnapshot) => void): () => void;
@@ -97,7 +102,7 @@ interface StopState {
   pendingToolIds: Set<string>;
   waiters: Set<() => void>;
   pendingOperation: boolean;
-  pendingOutcome: { status: 'completed' | 'failed' | 'cancelled'; error?: string } | null;
+  pendingOutcome: { status: 'completed' | 'failed' | 'cancelled'; error?: string; errorCategory?: ProviderErrorCategory } | null;
 }
 
 interface IdleWaiter {
@@ -116,6 +121,7 @@ function copyTurn(turn: RuntimeTurn): RuntimeTurnSnapshot {
   return {
     id: turn.id,
     chatId: turn.chatId,
+    modelId: turn.input.modelId,
     status: turn.status,
     createdAt: turn.createdAt,
     ...(turn.startedAt ? { startedAt: turn.startedAt } : {}),
@@ -126,11 +132,44 @@ function copyTurn(turn: RuntimeTurn): RuntimeTurnSnapshot {
     ...(turn.draft === undefined ? {} : { draft: turn.draft }),
     ...(turn.error ? { error: turn.error } : {}),
     ...(turn.errorCategory ? { errorCategory: turn.errorCategory } : {}),
+    ...(turn.retryEligible ? { retryEligible: true } : {}),
   };
 }
 
 function isProviderErrorCategory(value: unknown): value is ProviderErrorCategory {
   return typeof value === 'string' && (PROVIDER_ERROR_CATEGORIES as readonly string[]).includes(value);
+}
+
+function runtimeErrorCategory(error: unknown, turnTimedOut = false): ProviderErrorCategory | undefined {
+  if (turnTimedOut) return undefined;
+  if (typeof error === 'object' && error !== null && 'category' in error && isProviderErrorCategory(error.category)) {
+    return error.category;
+  }
+  if (!(error instanceof Error)) return undefined;
+  switch (error.message) {
+    case 'MODEL_NOT_SELECTED': return 'model';
+    case 'TURN_PREPARE_TIMEOUT':
+    case 'COMPACTION_CONTEXT_UNAVAILABLE':
+    case 'UNEXPECTED_COMPACTION_FUNCTION':
+    case 'RESPONSE_LIMIT': return 'context';
+    case 'PROVIDER_STEP_TIMEOUT':
+    case 'PROVIDER_UNAVAILABLE': return 'network';
+    case 'PROVIDER_PROTOCOL':
+    case 'BAD_PROVIDER_EVENT':
+    case 'INCOMPLETE_PROVIDER_RESPONSE': return 'protocol';
+    case 'TURN_CONSUME_TIMEOUT':
+    case 'TOOL_INTENT_SAVE_TIMEOUT':
+    case 'USAGE_RECEIPT_SAVE_TIMEOUT':
+    case 'USAGE_RECEIPT_SAVE_FAILED':
+    case 'USAGE_RECEIPT_WRITE_FAILED':
+    case 'COMPACTION_SAVE_UNAVAILABLE': return 'storage';
+    case 'TOOL_STOP_STATE':
+    case 'TOOL_ROUND_LIMIT':
+    case 'TOOL_RESULT_LIMIT':
+    case 'LOCAL_TOOL_TIMEOUT':
+    case 'TOOL_RECEIPT_STORE_UNAVAILABLE': return 'tool';
+    default: return undefined;
+  }
 }
 
 function isProviderToolName(value: string): value is ProviderToolName {
@@ -328,6 +367,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
   const listeners = new Set<(turn: RuntimeTurnSnapshot) => void>();
   const stopStates = new Map<string, StopState>();
   const toolOwners = new Map<string, string>();
+  const latestTurnByAnchor = new Map<string, string>();
+  const retryingAnchors = new Set<string>();
   let activeTurn: RuntimeTurn | null = null;
   let draining = false;
   let blockedTurnId: string | null = null;
@@ -345,6 +386,28 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     for (const listener of listeners) {
       try { listener(snapshot); } catch { /* Runtime state must survive observer failures. */ }
     }
+  };
+
+  const anchorKey = (turn: AcceptedTurnInput): string => `${turn.chatId}\0${turn.messageId}`;
+  const canRetry = (turn: RuntimeTurn, ignoreRetryLock = false): boolean => {
+    const eligibleOutcome = turn.status === 'cancelled'
+      || turn.status === 'failed' && Boolean(turn.errorCategory && RETRYABLE_ERROR_CATEGORIES.has(turn.errorCategory));
+    const key = anchorKey(turn.input);
+    return eligibleOutcome && !turn.input.operation
+      && latestTurnByAnchor.get(key) === turn.id
+      && !stopStates.has(turn.id)
+      && blockedTurnId === null
+      && (ignoreRetryLock || !retryingAnchors.has(key));
+  };
+  const updateRetryEligibility = (turn: RuntimeTurn): void => {
+    const eligible = canRetry(turn);
+    if (Boolean(turn.retryEligible) === eligible) return;
+    if (eligible) turn.retryEligible = true;
+    else delete turn.retryEligible;
+    publish(turn);
+  };
+  const refreshRetryEligibility = (): void => {
+    for (const turn of turns.values()) updateRetryEligibility(turn);
   };
 
   const addActivity = (turn: RuntimeTurn, activity: RuntimeActivity): void => {
@@ -367,14 +430,19 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     if (turn && state.pendingOutcome) {
       turn.status = state.pendingOutcome.status;
       turn.endedAt = new Date().toISOString();
+      if (turn.startedAt) turn.activeDurationMs = Math.max(0, Date.now() - Date.parse(turn.startedAt));
       if (state.pendingOutcome.status === 'completed') delete turn.draft;
       if (state.pendingOutcome.error) turn.error = state.pendingOutcome.error;
       else delete turn.error;
+      if (state.pendingOutcome.errorCategory) turn.errorCategory = state.pendingOutcome.errorCategory;
+      else if (state.pendingOutcome.status === 'cancelled') turn.errorCategory = 'cancel';
+      else delete turn.errorCategory;
       turn.controller = undefined;
       publish(turn);
     }
     stopStates.delete(turnId);
     blockedTurnId = null;
+    refreshRetryEligibility();
     finishIdleWaiters();
     if (!draining && queue.some((turn) => turn.status === 'queued')) void drain();
   };
@@ -453,7 +521,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
   const holdForPendingOperation = (
     turn: RuntimeTurn,
     state: StopState,
-    outcome: Promise<{ status: 'completed' | 'failed' | 'cancelled'; error?: string }>,
+    outcome: Promise<{ status: 'completed' | 'failed' | 'cancelled'; error?: string; errorCategory?: ProviderErrorCategory }>,
     message: string,
   ): void => {
     state.pendingOperation = true;
@@ -461,6 +529,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     turn.status = 'running';
     turn.error = message;
     publish(turn);
+    refreshRetryEligibility();
     finishIdleWaiters();
     void outcome.then((result) => {
       state.pendingOperation = false;
@@ -472,9 +541,12 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
   const markStopUnconfirmed = (turn: RuntimeTurn): void => {
     blockedTurnId = turn.id;
     turn.status = 'failed';
+    delete turn.retryEligible;
+    delete turn.errorCategory;
     turn.error = 'Не удалось подтвердить остановку потока или локального инструмента; очередь приостановлена.';
     turn.endedAt = new Date().toISOString();
     publish(turn);
+    refreshRetryEligibility();
     finishIdleWaiters();
     const state = stopStates.get(turn.id);
     if (state) {
@@ -492,6 +564,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     stopStates.set(turn.id, stopState);
     turn.controller = controller;
     turn.status = 'running';
+    delete turn.retryEligible;
     turn.startedAt = new Date().toISOString();
     turn.queueDurationMs = Math.max(0, Date.now() - Date.parse(turn.createdAt));
     publish(turn);
@@ -537,11 +610,12 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         }
         const pendingOutcome = promise.then(
           () => turn.cancelRequested || !timedOut && controller.signal.aborted && !turnTimedOut
-            ? ({ status: 'cancelled' as const })
-            : ({ status: 'failed' as const, error: pendingMessage }),
+            ? ({ status: 'cancelled' as const, errorCategory: 'cancel' as const })
+            : ({ status: 'failed' as const, error: pendingMessage, errorCategory: runtimeErrorCategory(new Error(timeoutMessage)) }),
           (lateError: unknown) => turn.cancelRequested || !timedOut && controller.signal.aborted && !turnTimedOut
-            ? ({ status: 'cancelled' as const })
-            : ({ status: 'failed' as const, error: lateError instanceof Error ? lateError.message : pendingMessage }),
+            ? ({ status: 'cancelled' as const, errorCategory: 'cancel' as const })
+            : ({ status: 'failed' as const, error: lateError instanceof Error ? lateError.message : pendingMessage,
+              errorCategory: runtimeErrorCategory(lateError) ?? runtimeErrorCategory(new Error(timeoutMessage)) }),
         );
         holdForPendingOperation(turn, stopState, pendingOutcome, pendingMessage);
         throw timedOut ? new Error(timeoutMessage) : error;
@@ -712,9 +786,14 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
             const consuming = options.consumeTurn(turn.input, controller.signal);
             const consumeOutcome = consuming.then(
               () => ({ status: turn.cancelRequested ? 'cancelled' as const : 'failed' as const,
-                ...(turn.cancelRequested ? {} : { error: 'Не удалось вовремя подтвердить выбор параметров хода.' }) }),
+                ...(turn.cancelRequested ? { errorCategory: 'cancel' as const } : {
+                  error: 'Не удалось вовремя подтвердить выбор параметров хода.', errorCategory: 'storage' as const,
+                }) }),
               (error: unknown) => ({ status: turn.cancelRequested ? 'cancelled' as const : 'failed' as const,
-                ...(turn.cancelRequested ? {} : { error: error instanceof Error ? error.message : 'Не удалось подтвердить выбор параметров хода.' }) }),
+                ...(turn.cancelRequested ? { errorCategory: 'cancel' as const } : {
+                  error: error instanceof Error ? error.message : 'Не удалось подтвердить выбор параметров хода.',
+                  errorCategory: 'storage' as const,
+                }) }),
             );
             const consumed = await bounded(consuming.then(() => true), operationTimeoutMs);
             if (consumed === STOP_TIMEOUT) {
@@ -906,7 +985,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         stopHooksRan = true;
         await runHookEvent({ event: 'stop', projectId: turn.input.projectId }, new AbortController().signal).catch(() => undefined);
         flushDraft();
-        const appending = turn.input.operation === 'compaction'
+        const appendOperation = turn.input.operation === 'compaction'
           ? options.appendCompaction && compactionContext
             ? options.appendCompaction(turn.input, validateCompactSummary(answer), controller.signal, compactionContext)
               .then(async () => {
@@ -914,11 +993,15 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
               })
             : Promise.reject(new Error('COMPACTION_SAVE_UNAVAILABLE'))
           : options.appendAssistant(turn.input, answer, controller.signal, completedFunctionsStateId);
+        const appending = appendOperation.catch((error: unknown) => {
+          if (isAbortError(error)) throw error;
+          throw Object.assign(new Error('ASSISTANT_SAVE_FAILED'), { category: 'storage' as const });
+        });
         const appendOutcome = appending.then(
           () => ({ status: 'completed' as const }),
           (error: unknown) => turn.cancelRequested || isAbortError(error)
-            ? ({ status: 'cancelled' as const })
-            : ({ status: 'failed' as const, error: 'Ответ не удалось сохранить. Сообщение пользователя осталось в чате.' }),
+            ? ({ status: 'cancelled' as const, errorCategory: 'cancel' as const })
+            : ({ status: 'failed' as const, error: 'Ответ не удалось сохранить. Сообщение пользователя осталось в чате.', errorCategory: 'storage' as const }),
         );
         const appended = await bounded(appending.then(() => true), operationTimeoutMs);
         if (appended === STOP_TIMEOUT) {
@@ -927,6 +1010,9 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         }
         delete turn.draft;
         turn.status = 'completed';
+        delete turn.error;
+        delete turn.errorCategory;
+        delete turn.retryEligible;
         turn.endedAt = new Date().toISOString();
         turn.activeDurationMs = Math.max(0, Date.now() - started);
         publish(turn);
@@ -942,6 +1028,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       } else if (stopState.pendingOperation) {
         if (blockedTurnId !== turn.id) holdForPendingOperation(turn, stopState, Promise.resolve({
           status: 'failed', error: 'Ожидание локальной операции не завершено.',
+          ...(runtimeErrorCategory(error, turnTimedOut) ? { errorCategory: runtimeErrorCategory(error, turnTimedOut) } : {}),
         }), 'Ожидание локальной операции не завершено; очередь приостановлена.');
       } else if (stopState.pendingOutcome) {
         maybeUnblock(turn.id);
@@ -968,8 +1055,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         turn.status = turn.cancelRequested || isAbortError(error) && !turnTimedOut ? 'cancelled' : 'failed';
         turn.endedAt = new Date().toISOString();
         turn.activeDurationMs = Math.max(0, Date.now() - started);
-        const category = typeof error === 'object' && error !== null && 'category' in error
-          && isProviderErrorCategory(error.category) ? error.category : undefined;
+        const category = runtimeErrorCategory(error, turnTimedOut);
         if (turn.status === 'cancelled') turn.errorCategory = 'cancel';
         else if (category) turn.errorCategory = category;
         else delete turn.errorCategory;
@@ -1010,7 +1096,10 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       draftTimer = null;
       if (!reservationConsumed) options.releaseTurn(turn.input);
       if (!stopState.pendingOperation && blockedTurnId !== turn.id) turn.controller = undefined;
-      if (blockedTurnId !== turn.id && stopConfirmed(stopState)) stopStates.delete(turn.id);
+      if (blockedTurnId !== turn.id && stopConfirmed(stopState)) {
+        stopStates.delete(turn.id);
+        updateRetryEligibility(turn);
+      }
     }
   };
 
@@ -1045,6 +1134,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       input,
     };
     turns.set(turn.id, turn);
+    if (input.operation !== 'compaction') latestTurnByAnchor.set(anchorKey(input), turn.id);
     queue.push(turn);
     publish(turn);
     void drain();
@@ -1078,10 +1168,12 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       if (chatIdInput !== undefined && turn.chatId !== requireChatId(chatIdInput)) return false;
       if (turn.status === 'queued') {
         turn.status = 'cancelled';
+        turn.errorCategory = 'cancel';
         turn.endedAt = new Date().toISOString();
         turn.queueDurationMs = Math.max(0, Date.now() - Date.parse(turn.createdAt));
         options.releaseTurn(turn.input);
         publish(turn);
+        updateRetryEligibility(turn);
         finishIdleWaiters();
       } else {
         turn.cancelRequested = true;
@@ -1089,14 +1181,42 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       }
       return true;
     },
+    retry: async (turnIdInput, chatIdInput) => {
+      if (!options.provider || typeof turnIdInput !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(turnIdInput)) return null;
+      const turn = turns.get(turnIdInput);
+      if (!turn || chatIdInput !== undefined && turn.chatId !== requireChatId(chatIdInput)
+        || turn.retryEligible !== true || !canRetry(turn)) return null;
+      const key = anchorKey(turn.input);
+      retryingAnchors.add(key);
+      delete turn.retryEligible;
+      publish(turn);
+      let accepted = false;
+      let retryInput: AcceptedTurnInput | null = null;
+      try {
+        retryInput = requireAcceptedTurn({ ...turn.input, turnId: randomUUID() });
+        await options.validateRetry?.(structuredClone(retryInput), structuredClone(turn.input));
+        if (!canRetry(turn, true)) return null;
+        const retryId = enqueueAcceptedTurn(retryInput);
+        accepted = true;
+        return retryId;
+      } finally {
+        retryingAnchors.delete(key);
+        if (!accepted) {
+          if (retryInput) options.releaseTurn(retryInput);
+          updateRetryEligibility(turn);
+        }
+      }
+    },
     cancelAll: async () => {
       for (const turn of queue) {
         if (turn.status === 'queued') {
           turn.status = 'cancelled';
+          turn.errorCategory = 'cancel';
           turn.endedAt = new Date().toISOString();
           turn.queueDurationMs = Math.max(0, Date.now() - Date.parse(turn.createdAt));
           options.releaseTurn(turn.input);
           publish(turn);
+          updateRetryEligibility(turn);
         }
       }
       activeTurn?.controller?.abort();

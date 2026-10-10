@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createChatForDraftSession, createNewChatDraftSession, createRendererOperationTracker, shouldOpenCreatedDraftChat } from './renderer-operations';
+import { createChatForDraftSession, createNewChatDraftSession, createRendererOperationTracker, retryUnavailableReason, shouldOpenCreatedDraftChat } from './renderer-operations';
+
+test('retry availability requires the frozen original model in the ready registry', () => {
+  const turn = { retryEligible: true, modelId: 'original/model' };
+  assert.match(retryUnavailableReason(turn, { state: 'unavailable', modelIds: [], errorCategory: null }) ?? '', /Подключите API/);
+  assert.match(retryUnavailableReason(turn, { state: 'error', modelIds: [], errorCategory: 'network' }) ?? '', /обновить список/);
+  assert.match(retryUnavailableReason(turn, { state: 'ready', modelIds: ['changed/composer'], errorCategory: null }) ?? '', /Исходная модель/);
+  assert.equal(retryUnavailableReason(turn, { state: 'ready', modelIds: ['original/model', 'changed/composer'], errorCategory: null }), null);
+  assert.match(retryUnavailableReason({ retryEligible: true, modelId: null }, { state: 'ready', modelIds: ['changed/composer'], errorCategory: null }) ?? '', /не указана/);
+});
 
 function deferred<T>() {
   let resolve!: (value: T) => void;

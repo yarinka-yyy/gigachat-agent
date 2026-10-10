@@ -478,8 +478,17 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .runtime-timeline { display: grid; gap: 9px; width: 100%; padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); }
 .runtime-turn { display: grid; gap: 6px; min-width: 0; }
 .runtime-turn-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 13px; color: var(--text); font-size: 13px; }
-.runtime-turn-heading small { color: var(--muted); font-size: 12px; }
-.runtime-cancel { min-height: 30px; margin-left: auto; }
+.runtime-turn-details { flex: 1; min-width: 220px; }
+.runtime-turn-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 13px; min-height: 30px; cursor: pointer; list-style: none; }
+.runtime-turn-summary::-webkit-details-marker { display: none; }
+.runtime-turn-summary::before { content: '›'; color: var(--muted); font-size: 17px; line-height: 1; transform: rotate(0); transition: transform .14s ease; }
+.runtime-turn-details[open] > .runtime-turn-summary::before { transform: rotate(90deg); }
+.runtime-turn-summary small { color: var(--muted); font-size: 12px; }
+.runtime-turn-body { display: grid; gap: 8px; padding: 4px 0 2px 17px; }
+.runtime-turn-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+.runtime-retry-hint { flex-basis: 100%; color: var(--muted); font-size: 12px; text-align: right; }
+.runtime-cancel, .runtime-retry, .runtime-reconnect { min-height: 30px; }
+.runtime-turn-actions .quiet-button { padding: 0 9px; font-size: 12px; }
 .runtime-activity-list { display: flex; flex-wrap: wrap; gap: 4px 17px; margin: 0; padding-left: 18px; color: var(--muted); font-size: 12px; }
 .runtime-error { margin: 0; color: var(--danger); font-size: 13px; line-height: 1.4; }
 .runtime-turn-draft { display: grid; gap: 5px; padding: 11px 13px; border-left: 2px solid var(--accent); background: var(--surface); color: var(--text); }

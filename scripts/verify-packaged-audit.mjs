@@ -155,6 +155,19 @@ async function runElectronHost() {
   const details = new Map(chats.map((chat, index) => [chat.id, makeDetail(chat, index === 0 ? 'A baseline' : index === 1 ? 'B baseline' : 'History baseline')]));
   const state = {
     projects, chats, details,
+    runtimeTurns: new Map(), retryCalls: [],
+    modelRegistry: { state: 'unavailable', modelIds: [], errorCategory: null }, modelRegistryCalls: [],
+    connectionStatus: { state: 'not-configured', errorCategory: null }, connectionCalls: [],
+    keyStatus: { available: true, saved: false, usable: false },
+    hookRegistry: { hooks: [], issues: [] }, hookCalls: [],
+    usageLedger: {
+      key: 'all', requestCount: 0, completedRequestCount: 0, pendingRequestCount: 0, failedRequestCount: 0, cancelledRequestCount: 0,
+      promptTokens: { knownTokens: 0, unknownRequests: 0, conflictedRequests: 0 },
+      completionTokens: { knownTokens: 0, unknownRequests: 0, conflictedRequests: 0 },
+      totalTokens: { knownTokens: 0, unknownRequests: 0, conflictedRequests: 0 },
+      precachedPromptTokens: { knownTokens: 0, unknownRequests: 0, conflictedRequests: 0 },
+      byChat: [], byModel: [], byDay: [],
+    },
     deferChatGets: false, pendingGets: new Map(), rejectNextGet: null,
     deferCreate: false, rejectNextCreate: false, pendingCreates: [], createCalls: [],
     deferDraftUpdates: false, pendingDraftUpdates: [], deferProjectMoves: false, pendingProjectMoves: [], updateCalls: [],
@@ -386,9 +399,21 @@ async function runElectronHost() {
         state.pendingKeySaves.push({ resolve: request.resolve, reject: request.reject });
         return request.promise;
       }
-      return { available: true, saved: true, usable: true };
+      state.keyStatus = { available: true, saved: true, usable: true };
+      return clone(state.keyStatus);
     }
-    if (group === 'onboarding' && method === 'getKeyStatus') return { available: true, saved: false, usable: false };
+    if (group === 'onboarding' && method === 'getKeyStatus') return clone(state.keyStatus);
+    if (group === 'onboarding' && method === 'getConnectionStatus') return clone(state.connectionStatus);
+    if (group === 'onboarding' && method === 'connect') {
+      state.connectionCalls.push(method);
+      state.connectionStatus = { state: 'connected', errorCategory: null };
+      return clone(state.connectionStatus);
+    }
+    if (group === 'onboarding' && (method === 'cancelConnect' || method === 'disconnect')) {
+      state.connectionCalls.push(method);
+      state.connectionStatus = { state: 'not-configured', errorCategory: null };
+      return clone(state.connectionStatus);
+    }
     if (group === 'onboarding' && method === 'getBrowserStatus') {
       return { open: false, loading: false, canGoBack: false, atStudio: false, hostname: null, error: null };
     }
@@ -422,8 +447,24 @@ async function runElectronHost() {
       { id: 'global/audit', name: 'Audit', description: 'Synthetic audit skill', command: 'global/audit', scope: 'global', projectId: null, projectName: null, source: 'synthetic', enabled: true },
       { id: 'global/other', name: 'Other', description: 'Synthetic second skill', command: 'global/other', scope: 'global', projectId: null, projectName: null, source: 'synthetic', enabled: true },
     ], issues: [] };
-    if (group === 'hooks' && method === 'list') return { hooks: [], issues: [] };
-    if (group === 'runtime' && method === 'list') return [];
+    if (group === 'hooks' && method === 'list') return clone(state.hookRegistry);
+    if (group === 'hooks' && method === 'inspect') {
+      state.hookCalls.push({ method, id: args[0] });
+      throw new Error('Synthetic hook does not exist.');
+    }
+    if (group === 'hooks' && (method === 'trust' || method === 'setEnabled')) {
+      state.hookCalls.push({ method, id: args[0] });
+      return clone(state.hookRegistry);
+    }
+    if (group === 'models' && (method === 'getRegistry' || method === 'refresh')) {
+      state.modelRegistryCalls.push(method);
+      return clone(state.modelRegistry);
+    }
+    if (group === 'runtime' && method === 'list') return clone(state.runtimeTurns.get(args[0]) ?? []);
+    if (group === 'runtime' && method === 'retry') {
+      state.retryCalls.push({ chatId: args[0], turnId: args[1] });
+      return `synthetic-retry-${state.retryCalls.length}`;
+    }
     if (group === 'voice' && method === 'getStatus') return { available: state.voiceAvailable, reason: state.voiceAvailable ? null : 'Disabled in synthetic test host.' };
     if (group === 'voice' && method === 'requestAccess') {
       state.voiceAccessCalls += 1;
@@ -484,6 +525,7 @@ async function runElectronHost() {
       return true;
     }
     if (group === 'usage' && method === 'getLocalStats') return { chatCount: state.chats.length, projectCount: state.projects.length, activityDayCount: 0 };
+    if (group === 'usage' && method === 'getLedger') return clone(state.usageLedger);
     return null;
   });
   ipcMain.handle('audit:close-ready', (_event, discardBrowserMetadata) => {
@@ -1737,6 +1779,95 @@ async function runElectronHost() {
     assert.equal(await evaluate(`document.querySelector('.chat-history')?.textContent.includes('stale completed turn')`), false);
     state.deferChatGets = false;
     passed('Rendered chat load and completed-turn reads ignore late A→B→A responses');
+
+    state.details.get('chat-a').artifacts = [
+      { id: 'local-pdf', name: 'local.pdf', storedName: 'local.pdf', size: 1024, createdAt: timestamp, messageId: null },
+      { id: 'local-xlsx', name: 'local.xlsx', storedName: 'local.xlsx', size: 2048, createdAt: timestamp, messageId: null },
+      { id: 'local-md', name: 'local.md', storedName: 'local.md', size: 512, createdAt: timestamp, messageId: null },
+    ];
+    const importCountBeforeLocalAttachmentRender = state.importCalls.length;
+    const queuedTurn = {
+      id: 'turn-a-retryable', chatId: 'chat-a', status: 'queued', createdAt: timestamp, activity: [],
+      queueDurationMs: 850,
+    };
+    state.runtimeTurns.set('chat-a', [queuedTurn]);
+    window.webContents.send('audit:runtime', queuedTurn);
+    await waitDom('queued runtime action', `document.querySelector('.runtime-turn-summary')?.textContent.includes('Ожидает')
+      && document.querySelector('.runtime-cancel')?.textContent.includes('Убрать из очереди')`);
+    const runningTurn = { ...queuedTurn, status: 'running', draft: 'Текст поступает частями.', activeDurationMs: 900 };
+    state.runtimeTurns.set('chat-a', [runningTurn]);
+    window.webContents.send('audit:runtime', runningTurn);
+    await waitDom('running partial draft and stop action', `document.querySelector('.runtime-turn-summary')?.textContent.includes('Выполняется')
+      && document.querySelector('.runtime-turn-draft')?.textContent.includes('Текст поступает частями')
+      && document.querySelector('.runtime-cancel')?.textContent === 'Остановить'`);
+    const failedTurn = {
+      ...runningTurn, status: 'failed', error: 'Synthetic network failure', errorCategory: 'network', retryEligible: true,
+      modelId: 'original/model',
+      draft: 'Частичный ответ остаётся незавершённым.', activeDurationMs: 4200,
+    };
+    state.runtimeTurns.set('chat-a', [failedTurn]);
+    window.webContents.send('audit:runtime', failedTurn);
+    await waitDom('local attachment disclosure and collapsed failed timeline', `
+      document.querySelector('.chat-files')?.textContent.includes('Локальный файл; модели не отправлен')
+      && document.querySelector('.chat-files')?.textContent.includes('local.md')
+      && document.querySelector('.chat-files')?.textContent.includes('Формат указан в API')
+      && document.querySelector('.chat-files')?.textContent.includes('не подтверждён API')
+      && document.querySelector('.runtime-turn-details')?.open === false
+      && document.querySelector('.runtime-turn-summary')?.textContent.includes('Сеть')
+      && document.querySelector('.runtime-retry')?.disabled
+      && document.querySelector('.runtime-retry-hint')?.textContent.includes('Подключите API')`);
+    assert.equal(state.retryCalls.length, 0, 'known-unavailable model registry must block renderer retry IPC');
+    await clickText('.runtime-turn-summary', 'Ошибка');
+    await waitDom('expanded failed timeline draft', `document.querySelector('.runtime-turn-details')?.open === true
+      && document.querySelector('.runtime-turn-draft')?.textContent.includes('незавершённый ответ')`);
+    state.keyStatus = { available: true, saved: true, usable: true };
+    await clickText('.runtime-reconnect', 'Проверить подключение');
+    await waitDom('connection status before retry', `document.querySelector('.connection-setup')?.textContent.includes('GigaChat API не подключён')`);
+    await clickText('.connection-setup button', 'Проверить подключение');
+    await waitDom('synthetic API reconnect before retry', `document.querySelector('.connection-setup')?.textContent.includes('OAuth и список моделей проверены')`);
+    assert.deepEqual(state.connectionCalls, ['connect'], 'retry recovery uses the existing Connect flow');
+    await clickText('.settings-nav-item', 'Модели и лимиты');
+    state.modelRegistry = { state: 'ready', modelIds: ['original/model'], errorCategory: null };
+    await clickText('.connection-card button', 'Обновить список');
+    await waitDom('connected model registry enables retry', `document.querySelector('.connection-card .status-pill')?.textContent.includes('Список загружен')`);
+    assert.ok(state.modelRegistryCalls.includes('refresh'), 'renderer must refresh the actual model registry before retry');
+    await click('button[aria-label="Назад"]');
+    await waitDom('return to the original chat after registry refresh', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'`);
+    await waitDom('original failed turn retry after registry refresh', `document.querySelector('.runtime-retry') && !document.querySelector('.runtime-retry').disabled`);
+    const appendCountBeforeRetry = state.appendCalls.length;
+    await evaluate(`(() => { const button = document.querySelector('.runtime-retry'); button.click(); button.click(); })()`);
+    await waitUntil('one retry IPC after a double click', () => state.retryCalls.length === 1);
+    assert.deepEqual(state.retryCalls[0], { chatId: 'chat-a', turnId: failedTurn.id });
+    assert.equal(state.appendCalls.length, appendCountBeforeRetry, 'retry must not append a second user record');
+    assert.equal(state.details.get('chat-a').messages.length, 1, 'synthetic renderer retry does not mutate chat history');
+    assert.equal(state.importCalls.length, importCountBeforeLocalAttachmentRender, 'rendering stored files does not start a transfer or import');
+    const settledFailure = { ...failedTurn, retryEligible: false };
+    const completedRetry = {
+      id: 'turn-a-retry-completed', chatId: 'chat-a', status: 'completed', createdAt: timestamp,
+      activity: [], queueDurationMs: 100, activeDurationMs: 2800,
+    };
+    const cancelledTurn = {
+      id: 'turn-a-cancelled', chatId: 'chat-a', status: 'cancelled', createdAt: timestamp,
+      activity: [], errorCategory: 'cancel', draft: 'Остановленный черновик.', activeDurationMs: 700,
+    };
+    state.runtimeTurns.set('chat-a', [settledFailure, completedRetry, cancelledTurn]);
+    window.webContents.send('audit:runtime', settledFailure);
+    window.webContents.send('audit:runtime', completedRetry);
+    window.webContents.send('audit:runtime', cancelledTurn);
+    await waitDom('completed and cancelled turns hide the old retry action', `document.querySelectorAll('.runtime-retry').length === 0
+      && [...document.querySelectorAll('.runtime-turn-summary')].some((summary) => summary.textContent.includes('Завершено'))
+      && [...document.querySelectorAll('.runtime-turn-summary')].some((summary) => summary.textContent.includes('Отменено'))`);
+    await clickText('.runtime-reconnect', 'Проверить подключение');
+    await waitDom('network recovery opens connection settings', `document.querySelector('.connection-setup h1')?.textContent.includes('Подключение GigaChat API')`);
+    await click('button[aria-label="Назад"]');
+    await waitDom('return to the current chat before switching chats', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'`);
+    await clickChat('Chat B');
+    await waitDom('timeline hidden after switching chats', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'
+      && document.querySelector('.runtime-timeline') === null`);
+    await clickChat('Chat A');
+    await waitDom('timeline restored for original chat', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'
+      && document.querySelectorAll('.runtime-turn-summary').length === 3`);
+    passed('Rendered local attachments stay local; retry is explicit, collapsible, and adds no user message');
 
     state.rejectNextGet = 'chat-b';
     await clickChat('Chat B');
@@ -3140,15 +3271,16 @@ const { contextBridge, ipcRenderer } = require('electron');
 const methods = {
   projects: ['list','create','pickFolder','instructionsBackupPath','update','remove','chooseFolder','openFolder','readInstructions','saveInstructions','saveInstructionsCopy'],
   chats: ['list','get','create','update','appendLocalMessage','importFile','openArtifact','openFolder','remove'],
-  runtime: ['getStatus','list','cancel'],
+  runtime: ['getStatus','list','cancel','retry'],
   permissions: ['readConfig','saveConfig','respond'],
   skills: ['list','readSource','setEnabled','openFolder'],
-  hooks: ['list'],
-  onboarding: ['getKeyStatus','saveKey','getBrowserStatus','openStudio','closeBrowser','setBrowserBounds','back','reload'],
+  hooks: ['list','inspect','trust','setEnabled'],
+  models: ['getRegistry','refresh'],
+  onboarding: ['getKeyStatus','saveKey','getConnectionStatus','connect','cancelConnect','disconnect','getBrowserStatus','openStudio','closeBrowser','setBrowserBounds','back','reload'],
   browser: ['getStatus','newTab','closeTab','activateTab','navigate','back','forward','reload','setBounds'],
   voice: ['getStatus','requestAccess','transcribe','cancel'],
   settings: ['get','update','chooseProjectsFolder','openProjectsFolder','listOpeners','getAppInfo','getAutoStart','setAutoStart','readInstructions','saveInstructions','saveInstructionsCopy','deleteAppData'],
-  usage: ['getLocalStats'],
+  usage: ['getLocalStats','getLedger'],
 };
 const api = {};
 for (const [group, names] of Object.entries(methods)) {

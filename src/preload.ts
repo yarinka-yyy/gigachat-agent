@@ -90,6 +90,7 @@ const api: AppApi = {
     getStatus: () => ipcRenderer.invoke('runtime:status') as Promise<RuntimeAvailability>,
     list: (chatId) => ipcRenderer.invoke('runtime:list', chatId) as Promise<RuntimeTurnSnapshot[]>,
     cancel: (chatId, turnId) => ipcRenderer.invoke('runtime:cancel', chatId, turnId) as Promise<boolean>,
+    retry: (chatId, turnId) => ipcRenderer.invoke('runtime:retry', chatId, turnId) as Promise<string | null>,
     onUpdate: (listener) => {
       const handler = (_event: Electron.IpcRendererEvent, turn: RuntimeTurnSnapshot): void => listener(turn);
       ipcRenderer.on('runtime:update', handler);

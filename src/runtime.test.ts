@@ -53,6 +53,8 @@ function makeRuntime(provider: GigaChatProvider | null, options: {
   recordUsageReceipt?: TurnRuntimeOptions['recordUsageReceipt'];
   usageReceipts?: UsageReceipt[];
   timeouts?: TurnRuntimeOptions['timeouts'];
+  validateRetry?: TurnRuntimeOptions['validateRetry'];
+  releaseTurn?: TurnRuntimeOptions['releaseTurn'];
   onUpdate?: (turn: RuntimeTurnSnapshot) => void;
 } = {}) {
   const usageReceipts = options.usageReceipts ?? [];
@@ -61,7 +63,7 @@ function makeRuntime(provider: GigaChatProvider | null, options: {
     tools: options.tools ?? testTools,
     prepareTurn: async (turn) => requestFor(turn),
     consumeTurn: async () => undefined,
-    releaseTurn: () => undefined,
+    releaseTurn: options.releaseTurn ?? (() => undefined),
     appendAssistant: options.appendAssistant
       ? async (turn, text, signal, functionsStateId) => options.appendAssistant?.(turn.chatId, text, signal, functionsStateId)
       : async () => undefined,
@@ -73,6 +75,7 @@ function makeRuntime(provider: GigaChatProvider | null, options: {
     ...(options.beginToolReceipt ? { beginToolReceipt: options.beginToolReceipt } : {}),
     ...(options.completeToolReceipt ? { completeToolReceipt: options.completeToolReceipt } : {}),
     ...(options.runHooks ? { runHooks: options.runHooks } : {}),
+    ...(options.validateRetry ? { validateRetry: options.validateRetry } : {}),
     ...(options.timeouts ? { timeouts: options.timeouts } : {}),
     ...(options.onUpdate ? { onUpdate: options.onUpdate } : {}),
   });
@@ -1299,6 +1302,7 @@ test('provider session cancellation keeps the partial draft and waits for stream
   await runtime.whenIdle();
   assert.deepEqual(started, ['chat-one', 'chat-two']);
   assert.equal(runtime.list('chat-one')[0]?.status, 'cancelled');
+  assert.equal(runtime.list('chat-one')[0]?.retryEligible, true);
   assert.equal(runtime.list('chat-one')[0]?.draft, 'Частичный ответ');
   assert.equal(runtime.list('chat-two')[0]?.status, 'completed');
   assert.deepEqual(saved, ['Ответ второго хода']);
@@ -1481,7 +1485,7 @@ test('records a proven permission denial as completed and returns permission_den
   assert.equal(receipt?.status, 'completed');
 });
 
-test('does not replay a completed write when retry returns a new provider state ID', async () => {
+test('explicit retry preserves the accepted turn and does not replay a completed write under a new provider state ID', async () => {
   const receipts = makeReceiptStore();
   let writes = 0;
   let providerRound = 0;
@@ -1503,19 +1507,153 @@ test('does not replay a completed write when retry returns a new provider state 
     completeToolReceipt: receipts.complete,
   };
   const first = turnFor('chat-one', 'один запрос');
-  const retryTemplate = turnFor('chat-one', 'retry');
-  const retry = { ...retryTemplate, messageId: first.messageId, messages: structuredClone(first.messages) };
-  const firstRuntime = makeRuntime(provider, options);
-  firstRuntime.enqueue(first);
-  await firstRuntime.whenIdle();
-  assert.equal(firstRuntime.list('chat-one')[0]?.status, 'failed');
+  const accepted: AcceptedTurnInput = { ...first, projectId: 'project-one', projectWorkingFolder: 'C:\\Project', permissionProfile: 'full', skillId: 'global/audit' };
+  const retryInputs: AcceptedTurnInput[] = [];
+  const runtime = makeRuntime(provider, {
+    ...options,
+    validateRetry: async (input) => { retryInputs.push(structuredClone(input)); },
+  });
+  const firstId = runtime.enqueue(accepted);
+  assert.equal(firstId, accepted.turnId);
+  await runtime.whenIdle();
+  assert.equal(runtime.list('chat-one')[0]?.status, 'failed');
+  assert.equal(runtime.list('chat-one')[0]?.errorCategory, 'network');
+  assert.equal(runtime.list('chat-one')[0]?.retryEligible, true);
   assert.equal(writes, 1);
 
-  const retryRuntime = makeRuntime(provider, options);
-  retryRuntime.enqueue(retry);
-  await retryRuntime.whenIdle();
-  assert.equal(retryRuntime.list('chat-one')[0]?.status, 'completed');
+  accepted.messages[0]!.text = 'изменённый внешний объект';
+  accepted.permissionProfile = 'ask';
+  accepted.projectWorkingFolder = 'C:\\Other';
+  accepted.skillId = null;
+  const retryId = await runtime.retry(accepted.turnId, 'chat-one');
+  assert.ok(retryId);
+  await runtime.whenIdle();
+  assert.equal(runtime.list('chat-one').length, 2);
+  assert.equal(runtime.list('chat-one')[1]?.id, retryId);
+  assert.equal(runtime.list('chat-one')[1]?.status, 'completed');
+  assert.equal(runtime.list('chat-one')[0]?.retryEligible, undefined);
+  assert.equal(retryInputs.length, 1);
+  assert.notEqual(retryInputs[0]?.turnId, accepted.turnId);
+  assert.equal(retryInputs[0]?.messageId, first.messageId);
+  assert.equal(retryInputs[0]?.projectId, 'project-one');
+  assert.equal(retryInputs[0]?.projectWorkingFolder, 'C:\\Project');
+  assert.equal(retryInputs[0]?.permissionProfile, 'full');
+  assert.equal(retryInputs[0]?.skillId, 'global/audit');
+  assert.equal(retryInputs[0]?.messages[0]?.text, 'один запрос');
   assert.equal(writes, 1);
+  assert.equal(await runtime.retry(accepted.turnId, 'chat-one'), null, 'a stale failed row loses retry authority after success');
+  assert.equal(runtime.list('chat-one').length, 2);
+});
+
+test('double-click retry admits only one immutable attempt', async () => {
+  const validationStarted = deferred();
+  const validationGate = deferred();
+  let validations = 0;
+  let providerRounds = 0;
+  const provider = makeProvider(async function* () {
+    providerRounds += 1;
+    if (providerRounds === 1) yield { type: 'error', category: 'network', retryable: true };
+    else { yield { type: 'text-delta', text: 'Повтор завершён' }; yield { type: 'completed' }; }
+  });
+  const runtime = makeRuntime(provider, {
+    validateRetry: async () => {
+      validations += 1;
+      validationStarted.resolve();
+      await validationGate.promise;
+    },
+  });
+  const original = turnFor('retry-race');
+  const originalId = runtime.enqueue(original);
+  assert.ok(originalId);
+  await runtime.whenIdle();
+
+  const firstRetry = runtime.retry(originalId, 'retry-race');
+  await validationStarted.promise;
+  assert.equal(await runtime.retry(originalId, 'retry-race'), null);
+  validationGate.resolve();
+  assert.ok(await firstRetry);
+  await runtime.whenIdle();
+  assert.equal(validations, 1);
+  assert.equal(providerRounds, 2);
+  assert.equal(runtime.list('retry-race').length, 2);
+  assert.equal(runtime.list('retry-race')[0]?.retryEligible, undefined);
+
+  const failedRetryId = runtime.list('retry-race')[1]?.id;
+  assert.ok(failedRetryId);
+  assert.equal(await runtime.retry(failedRetryId, 'retry-race'), null, 'successful retry is no longer eligible');
+});
+
+test('retry validation failure keeps the source snapshot eligible and starts no provider round', async () => {
+  let providerRounds = 0;
+  const retryReservations = new Set<string>();
+  const reservedRetryIds: string[] = [];
+  const releasedReservations: string[] = [];
+  const provider = makeProvider(async function* () {
+    providerRounds += 1;
+    yield { type: 'error', category: 'network', retryable: true };
+  });
+  const runtime = makeRuntime(provider, {
+    validateRetry: async (turn) => {
+      retryReservations.add(turn.turnId);
+      reservedRetryIds.push(turn.turnId);
+      throw new Error('Подключите GigaChat перед повтором этого хода.');
+    },
+    releaseTurn: (turn) => {
+      releasedReservations.push(turn.turnId);
+      retryReservations.delete(turn.turnId);
+    },
+  });
+  const originalId = runtime.enqueue(turnFor('retry-validation'));
+  assert.ok(originalId);
+  await runtime.whenIdle();
+
+  await assert.rejects(runtime.retry(originalId, 'retry-validation'), /Подключите GigaChat/);
+  assert.equal(providerRounds, 1);
+  assert.equal(runtime.list('retry-validation').length, 1);
+  assert.equal(runtime.list('retry-validation')[0]?.modelId, 'GigaChat-2-Pro', 'the retry UI receives the frozen model ID from the accepted turn');
+  assert.equal(runtime.list('retry-validation')[0]?.retryEligible, true);
+  assert.equal(releasedReservations.length, 1);
+  assert.deepEqual(releasedReservations, reservedRetryIds);
+  assert.equal(releasedReservations[0] === originalId, false, 'the source turn reservation must not be released for a failed retry');
+  assert.equal(retryReservations.size, 0, 'a reservation made during validation is released when retry admission fails');
+});
+
+test('retry availability follows a global pending save and returns only after settlement', async () => {
+  const saveStarted = deferred();
+  const saveGate = deferred();
+  const provider = makeProvider(async function* (request) {
+    if (request.messages[0]?.text === 'retry-source') {
+      yield { type: 'error', category: 'network', retryable: true };
+      return;
+    }
+    yield { type: 'text-delta', text: 'Ответ после сохранения' };
+    yield { type: 'completed' };
+  });
+  const runtime = makeRuntime(provider, {
+    timeouts: { operationMs: 15 },
+    appendAssistant: async (chatId) => {
+      if (chatId === 'pending-save') {
+        saveStarted.resolve();
+        await saveGate.promise;
+      }
+    },
+  });
+  const retrySourceId = runtime.enqueue(turnFor('retry-source'));
+  assert.ok(retrySourceId);
+  await runtime.whenIdle();
+  assert.equal(runtime.list('retry-source')[0]?.retryEligible, true);
+
+  runtime.enqueue(turnFor('pending-save'));
+  await saveStarted.promise;
+  await waitUntil(() => runtime.list('pending-save')[0]?.error?.includes('очередь приостановлена') === true);
+  assert.equal(runtime.list('retry-source')[0]?.retryEligible, undefined);
+  assert.equal(await runtime.retry(retrySourceId, 'retry-source'), null);
+  await assert.rejects(runtime.whenIdle(), /очередь приостановлена/i);
+
+  saveGate.resolve();
+  await waitUntil(() => runtime.list('pending-save')[0]?.status === 'completed');
+  await runtime.whenIdle();
+  assert.equal(runtime.list('retry-source')[0]?.retryEligible, true);
 });
 
 test('resets stop confirmation for each provider round and holds FIFO until a cancelled follow-up confirms stop', async () => {

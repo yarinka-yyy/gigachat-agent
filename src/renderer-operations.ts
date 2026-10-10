@@ -1,8 +1,22 @@
+import type { ModelRegistrySnapshot, RuntimeTurnSnapshot } from './contracts';
+
 export interface NewChatDraftSession<TProfile extends string = string> {
   text: string;
   projectId: string | null;
   permissionProfile: TProfile | null;
   skillId: string | null;
+}
+
+export function retryUnavailableReason(
+  turn: Pick<RuntimeTurnSnapshot, 'retryEligible' | 'modelId'>,
+  registry: ModelRegistrySnapshot,
+): string | null {
+  if (turn.retryEligible !== true) return 'Повтор этого хода недоступен.';
+  if (registry.state === 'unavailable') return 'Подключите API и загрузите список моделей перед повтором.';
+  if (registry.state === 'error') return 'Не удалось обновить список моделей; проверьте подключение API.';
+  if (!turn.modelId) return 'Для исходного хода не указана модель; повтор недоступен.';
+  if (!registry.modelIds.includes(turn.modelId)) return 'Исходная модель сейчас недоступна; сохранённый выбор не заменён.';
+  return null;
 }
 
 export function createRendererOperationTracker() {

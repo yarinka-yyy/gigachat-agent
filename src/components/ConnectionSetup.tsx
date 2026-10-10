@@ -343,6 +343,7 @@ export default function ConnectionSetup({
               <p id="connection-key-status" className="connection-key-status" role="status">{keyStatusText(keyStatus)}</p>
             </form>
             <p className="connection-key-status" role="status">{connectionStatusText(connectionStatus)}</p>
+            <p className="connection-key-status">OAuth и список моделей не подтверждают поддержку вложений или понимание документов выбранной моделью.</p>
             {connectionStatus?.state === 'connecting' || connecting
               ? <button type="button" className="secondary-button" onClick={() => void cancelConnect()}>Отменить Connect</button>
               : connectionStatus?.state === 'connected'

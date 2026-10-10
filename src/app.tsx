@@ -68,6 +68,7 @@ import type {
   UsageCounterSummary,
   UsageLedgerSummary,
   ModelRegistrySnapshot,
+  ProviderErrorCategory,
   Project,
   ProjectPatch,
   RuntimeActivity,
@@ -87,13 +88,14 @@ import type { PermissionProfile } from './permissions';
 import { isModelAvailable, modelIdsForSelection, unavailableModelRegistry, type GigaChatModelId } from './models';
 import gigaChatLogo from './assets/gigachat-logo.png';
 import { createInstructionAutosave, type SaveStatus } from './instruction-autosave';
-import { createChatForDraftSession, createNewChatDraftSession, createRendererOperationTracker, persistDraftSession, shouldOpenCreatedDraftChat, type NewChatDraftSession } from './renderer-operations';
+import { createChatForDraftSession, createNewChatDraftSession, createRendererOperationTracker, persistDraftSession, retryUnavailableReason, shouldOpenCreatedDraftChat, type NewChatDraftSession } from './renderer-operations';
 import ConnectionSetup from './components/ConnectionSetup';
 import VoiceCaptureControl, { getCaptureError } from './components/VoiceCaptureControl';
 import ContextRing from './components/ContextRing';
 import BrowserPanel from './components/BrowserPanel';
 import { createPreviewExitTimer, maxSidebarWidth as computeMaxSidebarWidth } from './sidebar-behavior';
 import { sidebarSections } from './sidebar-sections';
+import { evaluateAttachmentPolicy } from './attachment-policy';
 
 type Page = 'home' | 'chat' | 'settings' | 'onboarding' | 'images' | 'video' | 'podcasts' | 'archive' | 'profile';
 type Route = { page: Page; id?: string };
@@ -656,6 +658,16 @@ function runtimeStatusLabel(status: RuntimeTurnSnapshot['status']): string {
   return 'Ошибка';
 }
 
+function runtimeErrorCategoryLabel(category: ProviderErrorCategory | undefined): string | null {
+  if (!category) return null;
+  const labels: Record<ProviderErrorCategory, string> = {
+    auth: 'Авторизация', tls: 'TLS', network: 'Сеть', 'rate-limit': 'Лимит запросов', quota: 'Квота',
+    model: 'Модель', context: 'Контекст', protocol: 'Протокол', tool: 'Локальный инструмент',
+    storage: 'Сохранение', cancel: 'Отмена',
+  };
+  return labels[category];
+}
+
 function runtimeActivityLabel(activity: RuntimeActivity): string {
   if (activity.kind === 'tool') {
     type ToolActivity = Extract<RuntimeActivity, { kind: 'tool' }>;
@@ -757,6 +769,8 @@ export default function App() {
   const [homeDraftError, setHomeDraftError] = useState('');
   const [detachedDraftSessions, setDetachedDraftSessions] = useState<HomeDraftSession[]>([]);
   const [runtimeTurns, setRuntimeTurns] = useState<RuntimeTurnSnapshot[]>([]);
+  const [retryingTurnIds, setRetryingTurnIds] = useState<Set<string>>(() => new Set());
+  const retryingTurnIdsRef = useRef(new Set<string>());
   const [pendingPermissionProfile, setPendingPermissionProfile] = useState<PermissionProfile | null>(null);
   const [sending, setSending] = useState(false);
   const [dialogRequest, setDialogRequest] = useState<{ kind: 'create-project' | 'project-settings' | 'rename-project' | 'delete-project' | 'rename-chat' | 'delete-chat'; project?: Project; chat?: ChatSummary; hasFiles?: boolean; assignChatId?: string; createdProjectId?: string } | null>(null);
@@ -945,6 +959,21 @@ export default function App() {
     setNoticeText(value);
     setNoticeKind('success');
     setNoticeSequence((sequence) => sequence + 1);
+  }
+
+  async function retryRuntimeTurn(turn: RuntimeTurnSnapshot): Promise<void> {
+    if (retryingTurnIdsRef.current.has(turn.id)) return;
+    retryingTurnIdsRef.current.add(turn.id);
+    setRetryingTurnIds(new Set(retryingTurnIdsRef.current));
+    try {
+      const retryId = await window.gigaChat.runtime.retry(turn.chatId, turn.id);
+      setNotice(retryId ? 'Повтор поставлен в очередь.' : 'Повтор больше недоступен. Обновите состояние хода.');
+    } catch (error) {
+      setNotice(getErrorMessage(error));
+    } finally {
+      retryingTurnIdsRef.current.delete(turn.id);
+      setRetryingTurnIds(new Set(retryingTurnIdsRef.current));
+    }
   }
   const [globalSaver] = useState(() => createInstructionAutosave(
     (_key, value, expectedRevision) => window.gigaChat.settings.saveInstructions(value, expectedRevision),
@@ -2877,7 +2906,7 @@ export default function App() {
       case 'permissions':
         return (
           <>
-            <div className="settings-section-heading"><h2>Разрешения</h2><p>Профиль хранится локально. Локальные действия проверяются перед выполнением; запросы к модели пока не отправляются.</p></div>
+            <div className="settings-section-heading"><h2>Разрешения</h2><p>Профиль хранится локально. Локальные действия проверяются перед выполнением; запрос модели отправляется после успешного Connect и проверки выбранной модели.</p></div>
             <div className="permission-profile-list">
               {AVAILABLE_PERMISSION_PROFILES.map((profile) => {
                 const selected = settings.defaultPermissionProfile === profile.id;
@@ -2914,7 +2943,7 @@ export default function App() {
           <>
             <div className="settings-section-heading"><h2>Персонализация</h2><p>Локальная инструкция хранится в данных приложения и не записывается в рабочую папку.</p></div>
             <section className="settings-card instruction-card">
-              <div className="setting-subheading"><div><h3>GIGACHAT.md</h3><p>Применение к ответам заработает после подключения harness и API.</p></div><span className="value-chip">Локальный файл</span></div>
+              <div className="setting-subheading"><div><h3>GIGACHAT.md</h3><p>Инструкция добавляется к запросам модели после успешного Connect; соблюдение её правил зависит от ответа модели.</p></div><span className="value-chip">Локальный файл</span></div>
               <SettingRow title="Путь к инструкции" description="Файл хранится в каталоге данных приложения.">
                 <span className="path-value" title={appInfo?.dataPath ? `${appInfo.dataPath}\\GIGACHAT.md` : undefined}>
                   {appInfo?.dataPath ? `${appInfo.dataPath}\\GIGACHAT.md` : 'Загрузка…'}
@@ -2959,7 +2988,7 @@ export default function App() {
         const skillProjects = projects.filter((project) => !project.archived);
         return (
           <>
-            <div className="settings-section-heading"><h2>Skills и интеграции</h2><p>Локальные Skills доступны только после ручного выбора через `$`. Их инструкции подключатся к ходу после API; scripts/assets не запускаются.</p></div>
+            <div className="settings-section-heading"><h2>Skills и интеграции</h2><p>Локальные Skills доступны после ручного выбора через `$`; выбранная инструкция включается в запрос модели. Scripts и assets автоматически не запускаются.</p></div>
             <div className="settings-tabs" role="tablist" aria-label="Интеграции">
               {([['skills', 'Skills'], ['plugins', 'Plugins / MCP'], ['tools', 'Tools']] as const).map(([id, label]) => (
                 <button key={id} type="button" role="tab" aria-selected={integrationTab === id} className={integrationTab === id ? 'active' : ''} onClick={() => setIntegrationTab(id)}>{label}</button>
@@ -3053,12 +3082,12 @@ export default function App() {
       case 'notifications':
         return (
           <>
-            <div className="settings-section-heading"><h2>Уведомления</h2><p>Windows показывает уведомления только для реальных событий, когда окно приложения не в фокусе. Запуск очереди и ответ модели появятся после подключения провайдера.</p></div>
+            <div className="settings-section-heading"><h2>Уведомления</h2><p>Windows показывает уведомления о реальных событиях очереди, ответах и ошибках, когда окно приложения не в фокусе.</p></div>
             <div className="settings-card settings-list">
-              <SettingRow title="Ответ готов" description="Появится после подключения API и завершения настоящего ответа.">
+              <SettingRow title="Ответ готов" description="Отправляется после успешного ответа API и сохранения его в истории.">
                 <label className="notification-toggle"><input type="checkbox" checked={settings.notifications.taskCompleted} onChange={(event) => updateNotificationSetting('taskCompleted', event.target.checked)} /><span>{settings.notifications.taskCompleted ? 'Включено' : 'Выключено'}</span></label>
               </SettingRow>
-              <SettingRow title="Начался следующий ход" description="Появится после подключения очереди провайдера.">
+              <SettingRow title="Начался следующий ход" description="Отправляется, когда очередь действительно запускает следующий ход.">
                 <label className="notification-toggle"><input type="checkbox" checked={settings.notifications.taskStarted} onChange={(event) => updateNotificationSetting('taskStarted', event.target.checked)} /><span>{settings.notifications.taskStarted ? 'Включено' : 'Выключено'}</span></label>
               </SettingRow>
               <SettingRow title="Ошибка локальной операции" description="Ошибка сохранения, импорта или локального инструмента; без текста данных и только когда окно не в фокусе.">
@@ -3097,11 +3126,11 @@ export default function App() {
       case 'terminal':
         return (
           <>
-            <div className="settings-section-heading"><h2>Терминал и код</h2><p>Настройки отображают будущую конфигурацию без обещания запуска команд.</p></div>
+            <div className="settings-section-heading"><h2>Терминал и код</h2><p>Локальные команды доступны через инструменты модели в пределах выбранного профиля и его подтверждений.</p></div>
             <div className="settings-card settings-list">
-              <SettingRow title="PowerShell" description="Кандидат оболочки Windows; запуск из приложения пока не реализован."><span className="status-label">Не подключён</span></SettingRow>
-              <SettingRow title="Рабочий каталог" description="Будет использовать выбранную папку проекта."><span className="status-label">Нет исполнения</span></SettingRow>
-              <SettingRow title="Команды кодирования" description="Требуют отдельной настройки и permission engine."><span className="status-label">Недоступно</span></SettingRow>
+              <SettingRow title="PowerShell" description="Запускается для принятого хода после проверки разрешений и остановки процесса по завершении."><span className="status-label">Локальный инструмент</span></SettingRow>
+              <SettingRow title="Рабочий каталог" description="Project-профили используют зафиксированную рабочую папку; Full доступен после явного выбора профиля."><span className="status-label">По профилю хода</span></SettingRow>
+              <SettingRow title="Команды кодирования" description="Чтение, запись и запуск команд проходят через существующие инструменты и разрешения."><span className="status-label">Проверяются перед запуском</span></SettingRow>
             </div>
           </>
         );
@@ -3159,33 +3188,58 @@ export default function App() {
               </article>)}
             </div> : null}
             {runtimeTurns.length ? <section className="runtime-timeline" aria-label="Состояние локального хода">
-              {runtimeTurns.map((turn) => <article className="runtime-turn" key={turn.id}>
+              {runtimeTurns.map((turn) => {
+                const retryReason = turn.retryEligible ? retryUnavailableReason(turn, modelRegistry) : null;
+                return <article className="runtime-turn" key={turn.id}>
                 <div className="runtime-turn-heading">
-                  <strong>{runtimeStatusLabel(turn.status)}</strong>
-                  {turn.queueDurationMs !== undefined && <small>Очередь · {elapsedLabel(turn.queueDurationMs)}</small>}
-                  {turn.activeDurationMs !== undefined && <small>Работа · {elapsedLabel(turn.activeDurationMs)}</small>}
-                  {(turn.status === 'queued' || turn.status === 'running') && <button type="button" className="quiet-button runtime-cancel" onClick={() => {
-                    void window.gigaChat.runtime.cancel(turn.chatId, turn.id).catch((error: unknown) => setNotice(getErrorMessage(error)));
-                  }}>Отменить</button>}
+                  <details className="runtime-turn-details" open={turn.status === 'queued' || turn.status === 'running'}>
+                    <summary className="runtime-turn-summary">
+                      <strong>{runtimeStatusLabel(turn.status)}</strong>
+                      {turn.queueDurationMs !== undefined && <small>Очередь · {elapsedLabel(turn.queueDurationMs)}</small>}
+                      {turn.activeDurationMs !== undefined && <small>Работа · {elapsedLabel(turn.activeDurationMs)}</small>}
+                      {runtimeErrorCategoryLabel(turn.errorCategory) && <small>Причина · {runtimeErrorCategoryLabel(turn.errorCategory)}</small>}
+                    </summary>
+                    <div className="runtime-turn-body">
+                      {turn.activity.length > 0 && <ul className="runtime-activity-list">
+                        {turn.activity.map((activity, index) => <li key={`${turn.id}-${index}`}>{runtimeActivityLabel(activity)}{activity.kind === 'tool' && activity.durationMs !== undefined ? ` · ${elapsedLabel(activity.durationMs)}` : ''}</li>)}
+                      </ul>}
+                      {turn.draft && <div className="runtime-turn-draft" aria-live="polite">
+                        <span className="message-author">{turn.status === 'running' ? 'Ответ от GigaChat' : 'GigaChat · незавершённый ответ'}</span>
+                        <p>{turn.draft}</p>
+                        {(turn.status === 'failed' || turn.status === 'cancelled') && <small>Ответ не добавлен в историю чата.</small>}
+                      </div>}
+                      {turn.error && <p className="runtime-error" role="alert">{turn.error}</p>}
+                    </div>
+                  </details>
+                  <div className="runtime-turn-actions">
+                    {(turn.status === 'queued' || turn.status === 'running') && <button type="button" className="quiet-button runtime-cancel" onClick={() => {
+                      void window.gigaChat.runtime.cancel(turn.chatId, turn.id).catch((error: unknown) => setNotice(getErrorMessage(error)));
+                    }}>{turn.status === 'queued' ? 'Убрать из очереди' : 'Остановить'}</button>}
+                    {turn.retryEligible && <>
+                      <button type="button" className="quiet-button runtime-retry" disabled={retryingTurnIds.has(turn.id) || retryReason !== null}
+                        title={retryReason ?? undefined}
+                        onClick={() => void retryRuntimeTurn(turn)}>{retryingTurnIds.has(turn.id) ? 'Постановка…' : 'Повторить ход'}</button>
+                      {retryReason && <small className="runtime-retry-hint">{retryReason}</small>}
+                    </>}
+                    {turn.errorCategory === 'auth' || turn.errorCategory === 'tls' || turn.errorCategory === 'network'
+                      ? <button type="button" className="quiet-button runtime-reconnect" onClick={() => openSettings('browser')}>Проверить подключение</button>
+                      : null}
+                  </div>
                 </div>
-                {turn.activity.length > 0 && <ul className="runtime-activity-list">
-                  {turn.activity.map((activity, index) => <li key={`${turn.id}-${index}`}>{runtimeActivityLabel(activity)}{activity.kind === 'tool' && activity.durationMs !== undefined ? ` · ${elapsedLabel(activity.durationMs)}` : ''}</li>)}
-                </ul>}
-                {turn.draft && <div className="runtime-turn-draft" aria-live="polite">
-                  <span className="message-author">{turn.status === 'running' ? 'Ответ от GigaChat' : 'GigaChat · незавершённый ответ'}</span>
-                  <p>{turn.draft}</p>
-                  {(turn.status === 'failed' || turn.status === 'cancelled') && <small>Ответ не добавлен в историю чата.</small>}
-                </div>}
-                {turn.error && <p className="runtime-error" role="alert">{turn.error}</p>}
-              </article>)}
+                </article>;
+              })}
             </section> : null}
             {chatDetail?.artifacts.length ? <section className="chat-files" aria-label="Файлы чата">
               <h2>Файлы чата</h2>
-              {chatDetail.artifacts.map((artifact) => <div className="chat-file" key={artifact.id}>
-                <Icon name="file" /><span><strong>{artifact.name}</strong><small>{Math.ceil(artifact.size / 1024)} КБ</small></span>
-                <button type="button" className="quiet-button" onClick={() => void window.gigaChat.chats.openArtifact(chatDetail.id, artifact.id).catch((error: unknown) => setNotice(getErrorMessage(error)))}>Открыть</button>
-                <button type="button" className="quiet-button" onClick={() => void window.gigaChat.chats.openFolder(chatDetail.id).catch((error: unknown) => setNotice(getErrorMessage(error)))}>Открыть папку чата</button>
-              </div>)}
+              {chatDetail.artifacts.map((artifact) => {
+                const policy = evaluateAttachmentPolicy(artifact.name, artifact.size);
+                return <div className="chat-file" key={artifact.id}>
+                  <Icon name="file" /><span><strong>{artifact.name}</strong><small>{Math.ceil(artifact.size / 1024)} КБ · Локальный файл; модели не отправлен.</small>
+                    <small>{policy.format === 'documented' ? 'Формат указан в API; поддержка аккаунта и модели не проверена.' : 'Формат не подтверждён API; файл остаётся локальным.'}</small></span>
+                  <button type="button" className="quiet-button" onClick={() => void window.gigaChat.chats.openArtifact(chatDetail.id, artifact.id).catch((error: unknown) => setNotice(getErrorMessage(error)))}>Открыть</button>
+                  <button type="button" className="quiet-button" onClick={() => void window.gigaChat.chats.openFolder(chatDetail.id).catch((error: unknown) => setNotice(getErrorMessage(error)))}>Открыть папку чата</button>
+                </div>;
+              })}
             </section> : null}
           </section>
         ) : <section className="content-page"><h1>Чат не найден</h1><button type="button" className="secondary-button" onClick={() => navigate({ page: 'home' })}>На главный экран</button></section>;
@@ -3207,7 +3261,7 @@ export default function App() {
           </section>
         );
       case 'images':
-        return <section className="content-page"><div className="page-heading"><span className="eyebrow">Локальная оболочка</span><h1>Изображения</h1></div><EmptyState title="Генерация пока недоступна" description="Новый чат изображений сохранится локально. Отправка и генерация начнутся после подключения API." icon="image" /><button type="button" className="primary-button" onClick={() => void createChat(null, 'image')}>Создать чат изображений</button></section>;
+        return <section className="content-page"><div className="page-heading"><span className="eyebrow">Локальная оболочка</span><h1>Изображения</h1></div><EmptyState title="Генерация пока недоступна" description="Чат изображений сохраняется локально; отправка и генерация пока не подтверждены." icon="image" /><button type="button" className="primary-button" onClick={() => void createChat(null, 'image')}>Создать чат изображений</button></section>;
       case 'video':
         return <section className="content-page"><div className="page-heading"><span className="eyebrow">Будущая функция</span><h1>Создание видео</h1></div><EmptyState title="Раздел подготовлен" description="Генерация видео появится после отдельной проверки возможностей API." icon="video" /><span className="future-badge">FUTURE</span></section>;
       case 'podcasts':
@@ -3381,7 +3435,7 @@ export default function App() {
 
           <div className="profile-area">
             <button type="button" className="profile-button" onClick={() => navigate({ page: 'profile' })}>
-              <span className="profile-avatar"><Icon name="user" /></span><span className="profile-copy"><strong>Локальный профиль</strong><small>API не подключён</small></span>
+              <span className="profile-avatar"><Icon name="user" /></span><span className="profile-copy"><strong>Локальный профиль</strong><small>Состояние API · настройки</small></span>
             </button>
             <button type="button" className="profile-settings-button" aria-label="Настройки" onClick={() => openSettings('general')}><Icon name="settings" /><span className="profile-tooltip" role="tooltip">Настройки</span></button>
           </div>
@@ -3486,7 +3540,7 @@ export default function App() {
                   rows={2}
                 />
                 {selectedComposerSkillId && <div className="composer-skill-selection" role="status">
-                  <span><strong>{selectedComposerSkill?.name ?? 'Выбранный Skill недоступен'}</strong><small>{selectedComposerSkill ? `${selectedComposerSkill.scope === 'global' ? 'Global' : selectedComposerSkill.projectName ?? 'Project'} · будет применён при подключении API` : 'Включите Skill в настройках или снимите выбор.'}</small></span>
+                  <span><strong>{selectedComposerSkill?.name ?? 'Выбранный Skill недоступен'}</strong><small>{selectedComposerSkill ? `${selectedComposerSkill.scope === 'global' ? 'Global' : selectedComposerSkill.projectName ?? 'Project'} · инструкция войдёт в запрос модели; scripts/assets не запускаются` : 'Включите Skill в настройках или снимите выбор.'}</small></span>
                   <button type="button" className="quiet-button" aria-label="Снять выбор Skill" title="Снять выбор Skill" onClick={() => void changeComposerSkill(null)}>Снять</button>
                 </div>}
                 <div className="composer-toolbar">
