@@ -5,7 +5,7 @@ import { createServer as createHttpsServer } from 'node:https';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createServer as createTcpServer, type AddressInfo, type Socket } from 'node:net';
 import { test } from 'node:test';
-import type { ProviderEvent } from './contracts';
+import type { ProviderEvent, ProviderTurnRequest } from './contracts';
 import {
   createGigaChatProvider,
   createHttpsTransport,
@@ -873,3 +873,65 @@ test('keeps SSE streams bounded by idle time while preserving a whole-response d
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
 });
+
+test('uses the documented token-count REST array and rejects SDK-wrapper responses', async () => {
+  const requests: ProviderTransportRequest[] = [];
+  let malformed = false;
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-authorization-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => {
+      requests.push(request);
+      if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-access-token'));
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-test-model' }] });
+      return jsonResponse(200, malformed
+        ? { tokens: [{ object: 'tokens', tokens: 3, characters: 4 }] }
+        : [{ object: 'tokens', tokens: 3, characters: 4 }, { object: 'tokens', tokens: 7, characters: 8 }]);
+    }),
+  });
+  assert.equal((await provider.connect()).state, 'connected');
+  const signal = new AbortController().signal;
+  assert.deepEqual(await provider.countTokens('GigaChat-test-model', ['text-one', 'text-two'], signal), [
+    { object: 'tokens', tokens: 3, characters: 4 }, { object: 'tokens', tokens: 7, characters: 8 },
+  ]);
+  const countRequest = requests[requests.length - 1]!;
+  assert.equal(countRequest.url, `${GIGACHAT_API_BASE_URL}/tokens/count`);
+  assert.deepEqual(JSON.parse(countRequest.body ?? '{}'), { model: 'GigaChat-test-model', input: ['text-one', 'text-two'] });
+  malformed = true;
+  await assert.rejects(provider.countTokens('GigaChat-test-model', ['text-one', 'text-two'], signal),
+    (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
+});
+
+test('rejects oversized serialized continuation before transport, including protocol results and function schemas', async () => {
+  let transportRequests = 0;
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-authorization-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => {
+      transportRequests += 1;
+      if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-access-token'));
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-test-model' }] });
+      return eventStreamResponse([Buffer.from('data: [DONE]\n\n')]);
+    }),
+  });
+  assert.equal((await provider.connect()).state, 'connected');
+  const exchange = (anchorMessageId: string): NonNullable<ProviderTurnRequest['protocolHistory']>[number] => ({
+    anchorMessageId, name: 'read', arguments: {}, content: null, functionsStateId: null,
+    result: JSON.stringify({ contents: 'x'.repeat(1_100_000) }),
+  });
+  const request: ProviderTurnRequest = {
+    system: [],
+    messages: [{ id: 'user-1', role: 'user', text: 'prompt', createdAt: atFixture }],
+    protocolHistory: [exchange('user-1'), exchange('user-1')],
+    permissionProfile: 'ask',
+    modelId: 'GigaChat-test-model',
+  };
+  const events: ProviderEvent[] = [];
+  for await (const event of provider.stream(request, new AbortController().signal)) events.push(event);
+  const terminalEvent = events[events.length - 1];
+  assert.equal(terminalEvent?.type, 'error');
+  if (terminalEvent?.type === 'error') assert.equal(terminalEvent.category, 'context');
+  assert.equal(transportRequests, 2, 'only OAuth and model discovery ran before the oversized continuation was rejected');
+});
+
+const atFixture = '2026-10-09T12:00:00.000Z';

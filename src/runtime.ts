@@ -14,6 +14,7 @@ import type {
   ProviderToolName,
   RuntimeActivity,
   RuntimeTurnSnapshot,
+  CompactSnapshot,
   UsageReceipt,
   UsageReceiptStatus,
 } from './contracts';
@@ -21,6 +22,7 @@ import { PROVIDER_ERROR_CATEGORIES } from './contracts';
 import { LocalToolError, type LocalToolEvent, type LocalTools } from './local-tools';
 import { HookDispatchAbortError } from './hooks';
 import { MAX_USAGE_COUNT, mergeUsageReceipt } from './usage';
+import { validateCompactSummary } from './context';
 
 const MAX_ACTIVITY_PER_TURN = 50;
 const MAX_ASSISTANT_CHARS = 100_000;
@@ -40,13 +42,28 @@ const PROVIDER_TOOL_NAMES: readonly ProviderToolName[] = ['list', 'search', 'rea
 export interface ToolReceiptInput extends Omit<ChatToolReceipt, 'anchorMessageId' | 'status' | 'result' | 'createdAt'> {}
 export interface ToolReceiptStart { shouldExecute: boolean; receipt: ChatToolReceipt }
 
+export interface PreparedCompactionContext {
+  boundaryMessageId: string;
+  coveredThroughMessageId: string;
+  coveredPrefixHash: string;
+  expectedSnapshotId: string | null;
+  provenance: CompactSnapshot['provenance'];
+}
+
+export interface PreparedTurn {
+  request: ProviderTurnRequest;
+  compaction?: PreparedCompactionContext;
+}
+
 export interface TurnRuntimeOptions {
   provider?: GigaChatProvider | null;
   tools: LocalTools;
-  prepareTurn(turn: AcceptedTurnInput, signal: AbortSignal): Promise<ProviderTurnRequest>;
+  prepareTurn(turn: AcceptedTurnInput, signal: AbortSignal): Promise<ProviderTurnRequest | PreparedTurn>;
   consumeTurn(turn: AcceptedTurnInput, signal: AbortSignal): Promise<void>;
   releaseTurn(turn: AcceptedTurnInput): void;
   appendAssistant(turn: AcceptedTurnInput, text: string, signal: AbortSignal, functionsStateId?: string): Promise<void>;
+  appendCompaction?(turn: AcceptedTurnInput, text: string, signal: AbortSignal, context: PreparedCompactionContext): Promise<void>;
+  compactionEnabled?: boolean;
   recordUsageReceipt(receipt: UsageReceipt): Promise<void>;
   beginToolReceipt?(turn: AcceptedTurnInput, receipt: ToolReceiptInput): Promise<ToolReceiptStart>;
   completeToolReceipt?(turn: AcceptedTurnInput, receiptId: string, status: 'completed' | 'unknown', result: string): Promise<void>;
@@ -58,6 +75,7 @@ export interface TurnRuntimeOptions {
 export interface TurnRuntime {
   readonly tools: LocalTools;
   enqueue(turn: unknown): string | null;
+  enqueueCompaction(turn: unknown): string | null;
   list(chatId?: unknown): RuntimeTurnSnapshot[];
   cancel(turnId: unknown, chatId?: unknown): boolean;
   cancelAll(): Promise<void>;
@@ -138,6 +156,11 @@ function requireAcceptedTurn(value: unknown): AcceptedTurnInput {
     || !turn.messages.some((message) => message.id === turn.messageId && message.role === 'user')
     || (turn.projectId !== null && typeof turn.projectId !== 'string')
     || (turn.projectWorkingFolder !== null && typeof turn.projectWorkingFolder !== 'string')
+    || (turn.operation !== undefined && turn.operation !== 'compaction')
+    || (turn.operation === 'compaction' && (typeof turn.compactBoundaryMessageId !== 'string'
+      || turn.compactBoundaryMessageId !== turn.messageId
+      || !(turn.compactExpectedSnapshotId === null || typeof turn.compactExpectedSnapshotId === 'string')))
+    || (turn.operation !== 'compaction' && (turn.compactBoundaryMessageId !== undefined || turn.compactExpectedSnapshotId !== undefined))
     || !turn.reservation || typeof turn.reservation !== 'object') {
     throw new Error('Некорректный снимок принятого хода.');
   }
@@ -617,10 +640,21 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       if (!options.provider) throw new Error('PROVIDER_UNAVAILABLE');
       if (!turn.input.modelId) throw new Error('MODEL_NOT_SELECTED');
       const preparation = Promise.resolve().then(() => options.prepareTurn(turn.input, controller.signal));
-      let request = await waitFor(preparation, controller.signal, prepareTimeoutMs, 'TURN_PREPARE_TIMEOUT');
+      const prepared = await waitFor(preparation, controller.signal, prepareTimeoutMs, 'TURN_PREPARE_TIMEOUT');
+      let request: ProviderTurnRequest;
+      let compactionContext: PreparedCompactionContext | null = null;
+      if (typeof prepared === 'object' && prepared !== null && 'request' in prepared) {
+        request = prepared.request;
+        compactionContext = prepared.compaction ?? null;
+      } else request = prepared;
       if (controller.signal.aborted) throw abortError();
       if (!request.modelId) throw new Error('MODEL_NOT_SELECTED');
-      await runHookEvent({ event: 'user-prompt-submitted', projectId: turn.input.projectId });
+      if (turn.input.operation === 'compaction') {
+        if (!compactionContext) throw new Error('COMPACTION_CONTEXT_UNAVAILABLE');
+        const beforeResults = await runHookEvent({ event: 'before-compaction', projectId: turn.input.projectId });
+        const rejected = beforeResults.find((result) => result.status !== 'completed' || result.decision === 'block');
+        if (rejected) throw new Error(rejected.reason ?? 'Проверка Hook остановила сжатие контекста.');
+      } else await runHookEvent({ event: 'user-prompt-submitted', projectId: turn.input.projectId });
 
       let toolRounds = 0;
       let totalToolResultBytes = 0;
@@ -634,7 +668,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         const usageReceipt: UsageReceipt = {
           localRequestId: randomUUID(),
           chatId: turn.input.chatId,
-          requestKind: toolRounds > 0 ? 'tool-continuation' : request.usageKind ?? 'chat',
+          requestKind: toolRounds > 0 ? 'tool-continuation'
+            : turn.input.operation === 'compaction' ? 'compaction' : request.usageKind ?? 'chat',
           modelId: request.modelId,
           providerRequestId: null,
           providerModel: null,
@@ -723,6 +758,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
 
         if (controller.signal.aborted) throw abortError();
         if (functionCall) {
+          if (turn.input.operation === 'compaction') throw Object.assign(new Error('UNEXPECTED_COMPACTION_FUNCTION'), { category: 'context' });
           if (completed) throw new Error('PROVIDER_PROTOCOL');
           if (toolRounds >= MAX_FUNCTION_ROUNDS || (request.protocolHistory?.length ?? 0) >= 256) {
             throw Object.assign(new Error('TOOL_ROUND_LIMIT'), { category: 'tool' });
@@ -870,7 +906,14 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         stopHooksRan = true;
         await runHookEvent({ event: 'stop', projectId: turn.input.projectId }, new AbortController().signal).catch(() => undefined);
         flushDraft();
-        const appending = options.appendAssistant(turn.input, answer, controller.signal, completedFunctionsStateId);
+        const appending = turn.input.operation === 'compaction'
+          ? options.appendCompaction && compactionContext
+            ? options.appendCompaction(turn.input, validateCompactSummary(answer), controller.signal, compactionContext)
+              .then(async () => {
+                await runHookEvent({ event: 'after-compaction', projectId: turn.input.projectId }, new AbortController().signal).catch(() => undefined);
+              })
+            : Promise.reject(new Error('COMPACTION_SAVE_UNAVAILABLE'))
+          : options.appendAssistant(turn.input, answer, controller.signal, completedFunctionsStateId);
         const appendOutcome = appending.then(
           () => ({ status: 'completed' as const }),
           (error: unknown) => turn.cancelRequested || isAbortError(error)
@@ -990,26 +1033,37 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     }
   };
 
+  const enqueueAcceptedTurn = (input: AcceptedTurnInput): string => {
+    if (turns.has(input.turnId)) throw new Error('Повторный ID принятого хода.');
+    const turn: RuntimeTurn = {
+      id: input.turnId,
+      chatId: input.chatId,
+      status: 'queued',
+      createdAt: new Date().toISOString(),
+      activity: [],
+      cancelRequested: false,
+      input,
+    };
+    turns.set(turn.id, turn);
+    queue.push(turn);
+    publish(turn);
+    void drain();
+    return turn.id;
+  };
+
   return {
     tools: options.tools,
     enqueue: (turnInput) => {
       if (!options.provider) return null;
       const input = requireAcceptedTurn(turnInput);
-      if (turns.has(input.turnId)) throw new Error('Повторный ID принятого хода.');
-      const turn: RuntimeTurn = {
-        id: input.turnId,
-        chatId: input.chatId,
-        status: 'queued',
-        createdAt: new Date().toISOString(),
-        activity: [],
-        cancelRequested: false,
-        input,
-      };
-      turns.set(turn.id, turn);
-      queue.push(turn);
-      publish(turn);
-      void drain();
-      return turn.id;
+      if (input.operation !== undefined) throw new Error('Сжатие контекста нельзя поставить как обычный ход.');
+      return enqueueAcceptedTurn(input);
+    },
+    enqueueCompaction: (turnInput) => {
+      if (!options.provider || options.compactionEnabled !== true || !options.appendCompaction) return null;
+      const input = requireAcceptedTurn(turnInput);
+      if (input.operation !== 'compaction') throw new Error('Ожидалась задача сжатия контекста.');
+      return enqueueAcceptedTurn(input);
     },
     list: (chatIdInput) => {
       const chatId = chatIdInput === undefined ? undefined : requireChatId(chatIdInput);

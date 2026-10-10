@@ -1,4 +1,4 @@
-import type { ChatMessage, InstructionLayer, ProviderProtocolExchange, ProviderTurnRequest } from './contracts';
+import type { ChatMessage, CompactSnapshot, InstructionLayer, ProviderProtocolExchange, ProviderTurnRequest, UsageRequestKind } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { requireModelId, type GigaChatModelId } from './models';
 
@@ -13,8 +13,12 @@ export interface InstructionInput {
   selectedSkill?: { name: string; scope: string; text: string } | null;
   messages: readonly ChatMessage[];
   protocolHistory?: readonly ProviderProtocolExchange[];
+  compactSnapshot?: Pick<CompactSnapshot, 'text'> | null;
+  taskInstruction?: string;
   permissionProfile: PermissionProfile;
   modelId?: GigaChatModelId | null;
+  usageKind?: UsageRequestKind;
+  functionCallMode?: 'auto' | 'none';
 }
 
 export const APP_RUNTIME_RULES = [
@@ -56,6 +60,13 @@ export function buildInstructionRequest(input: InstructionInput): ProviderTurnRe
     }
     addLayer(layers, 'skill', input.selectedSkill.name.trim(), input.selectedSkill.text, input.selectedSkill.scope.trim());
   }
+  if (input.compactSnapshot) {
+    addLayer(layers, 'summary', 'Сводка предыдущей истории', input.compactSnapshot.text);
+  }
+  if (input.taskInstruction !== undefined) {
+    if (typeof input.taskInstruction !== 'string') throw new Error('Некорректная задача контекста.');
+    addLayer(layers, 'runtime', 'Задача текущего запроса', input.taskInstruction);
+  }
 
   return {
     system: layers,
@@ -63,5 +74,7 @@ export function buildInstructionRequest(input: InstructionInput): ProviderTurnRe
     protocolHistory: (input.protocolHistory ?? []).map((exchange) => structuredClone(exchange)),
     permissionProfile,
     modelId,
+    ...(input.usageKind ? { usageKind: input.usageKind } : {}),
+    ...(input.functionCallMode ? { functionCallMode: input.functionCallMode } : {}),
   };
 }

@@ -62,7 +62,34 @@ export interface ChatMessage {
   functionsStateId?: string;
 }
 
-export type InstructionSource = 'runtime' | 'global' | 'project' | 'skill';
+export interface CompactSnapshot {
+  id: string;
+  version: 1;
+  boundaryMessageId: string;
+  coveredThroughMessageId: string;
+  coveredPrefixHash: string;
+  text: string;
+  modelId: GigaChatModelId;
+  provenance: 'fixture' | 'provider';
+  createdAt: string;
+}
+
+export interface CompactionPrefix {
+  messages: ChatMessage[];
+  protocolHistory: ProviderProtocolExchange[];
+  coveredThroughMessageId: string;
+  coveredPrefixHash: string;
+}
+
+export type ContextProvenance = 'unknown' | 'estimated' | 'verified';
+
+export interface ContextBlockSize {
+  source: 'runtime' | 'global' | 'project' | 'skill' | 'summary' | 'message' | 'protocol' | 'function-schema';
+  label: string;
+  utf8Bytes: number;
+}
+
+export type InstructionSource = 'runtime' | 'global' | 'project' | 'skill' | 'summary';
 
 export interface InstructionLayer {
   source: InstructionSource;
@@ -109,6 +136,7 @@ export interface ProviderTurnRequest {
   permissionProfile: PermissionProfile;
   modelId: GigaChatModelId | null;
   usageKind?: UsageRequestKind;
+  functionCallMode?: 'auto' | 'none';
 }
 
 export type UsageRequestKind = 'chat' | 'tool-continuation' | 'compaction';
@@ -216,6 +244,9 @@ export interface AcceptedTurnInput {
   modelId: GigaChatModelId | null;
   skillId: string | null;
   reservation: { permissionProfileRevision: number | null; skillRevision: number | null };
+  operation?: 'compaction';
+  compactBoundaryMessageId?: string;
+  compactExpectedSnapshotId?: string | null;
 }
 
 export type ProviderToolName = 'list' | 'search' | 'read' | 'write' | 'open' | 'powershell';
@@ -259,6 +290,8 @@ export interface RuntimeAvailability {
   helperRecovered: boolean;
   rendererToolApi: false;
   helperUnavailableReason: string | null;
+  compactionAvailable: false;
+  compactionUnavailableReason: string;
 }
 
 export interface PermissionApprovalRequest {
@@ -292,6 +325,7 @@ export interface ChatDetail extends ChatSummary {
   messages: ChatMessage[];
   toolReceipts: ChatToolReceipt[];
   artifacts: ChatArtifact[];
+  compactSnapshot: CompactSnapshot | null;
 }
 
 export type ProjectPatch = Partial<Pick<Project, 'name' | 'pinned' | 'archived' | 'workingFolder'>>;

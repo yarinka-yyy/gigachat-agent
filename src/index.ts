@@ -4,10 +4,10 @@ import { lstat, mkdir, mkdtemp, readFile, realpath, rm, rmdir, stat, writeFile }
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, Notification, safeStorage, screen, session, shell, systemPreferences, Tray, WebContentsView, type IpcMainInvokeEvent, type MediaAccessPermissionRequest } from 'electron';
 import { openStore, type LocalStore } from './store';
-import { buildInstructionRequest } from './instructions';
+import { COMPACTION_QUALITY_VERIFIED, COMPACTION_UNAVAILABLE_REASON, COMPACTION_TASK_INSTRUCTION, buildNextTurnContext, validateCompactSummary } from './context';
 import { createLocalTools, createPowerShellHelper, resolvePowerShellHelperPath, type LocalTools } from './local-tools';
-import { createTurnRuntime, type TurnRuntime } from './runtime';
-import type { AcceptedTurnInput, ChatPatch, FolderOpener, HookRunResult, ModelRegistrySnapshot, NotificationSettings, PreferredOpener, RuntimeAvailability, SettingsPatch, Theme, VoiceAvailability } from './contracts';
+import { createTurnRuntime, type PreparedCompactionContext, type TurnRuntime } from './runtime';
+import type { AcceptedTurnInput, ChatPatch, CompactSnapshot, FolderOpener, HookRunResult, ModelRegistrySnapshot, NotificationSettings, PreferredOpener, RuntimeAvailability, SettingsPatch, Theme, VoiceAvailability } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { isModelAvailable, requireModelId } from './models';
 import { openCustomPermissions, parseCustomConfig } from './custom-permissions';
@@ -755,6 +755,7 @@ async function createMainRuntime(
     tools,
     prepareTurn: async (turn, signal) => {
       if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
+      if (turn.operation === 'compaction' && !COMPACTION_QUALITY_VERIFIED) throw new Error(COMPACTION_UNAVAILABLE_REASON);
       await store.validateAcceptedTurn(turn);
       if (!turn.modelId || !isModelAvailable(providerConnection.getModelRegistry(), turn.modelId)) {
         throw new GigaChatProviderError('model');
@@ -776,10 +777,14 @@ async function createMainRuntime(
       const globalText = await store.readGlobalInstructions();
       if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
       await store.validateAcceptedTurn(turn);
-      const messages = await store.getMessagesThrough(turn.chatId, turn.messageId);
-      const protocolHistory = await store.getToolProtocolThrough(turn.chatId, turn.messageId);
+      const detail = await store.getChat(turn.chatId);
+      const compactionPrefix = turn.operation === 'compaction'
+        ? await store.getCompactionPrefix(turn.chatId, turn.compactBoundaryMessageId)
+        : null;
+      const messages = compactionPrefix?.messages ?? await store.getMessagesThrough(turn.chatId, turn.messageId);
+      const protocolHistory = compactionPrefix?.protocolHistory ?? await store.getToolProtocolThrough(turn.chatId, turn.messageId);
       if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
-      const request = buildInstructionRequest({
+      const context = buildNextTurnContext({
         globalText,
         projectInstructions: project ? [{ scope: project.name, text: projectInstructions }] : [],
         selectedSkill: selectedSkill ? {
@@ -789,10 +794,28 @@ async function createMainRuntime(
         } : null,
         messages,
         protocolHistory,
+        compactSnapshot: detail.compactSnapshot,
         permissionProfile: turn.permissionProfile,
         modelId: turn.modelId,
+        ...(turn.operation === 'compaction' ? {
+          taskInstruction: COMPACTION_TASK_INSTRUCTION,
+          usageKind: 'compaction' as const,
+          functionCallMode: 'none' as const,
+        } : {}),
       });
-      return request;
+      if (turn.operation === 'compaction' && compactionPrefix) {
+        return {
+          request: context.request,
+          compaction: {
+            boundaryMessageId: turn.compactBoundaryMessageId!,
+            coveredThroughMessageId: compactionPrefix.coveredThroughMessageId,
+            coveredPrefixHash: compactionPrefix.coveredPrefixHash,
+            expectedSnapshotId: turn.compactExpectedSnapshotId ?? null,
+            provenance: 'provider' as const,
+          },
+        };
+      }
+      return context.request;
     },
     consumeTurn: (turn: AcceptedTurnInput, signal) => store.consumeTurnReservation(turn, signal),
     releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
@@ -801,6 +824,21 @@ async function createMainRuntime(
     appendAssistant: async (turn, text, signal, functionsStateId) => {
       await store.appendAssistantMessageFromRuntime(turn.chatId, turn.messageId, text, signal, functionsStateId);
     },
+    appendCompaction: async (turn, text, signal, context: PreparedCompactionContext) => {
+      const snapshot: CompactSnapshot = {
+        id: randomUUID(),
+        version: 1,
+        boundaryMessageId: context.boundaryMessageId,
+        coveredThroughMessageId: context.coveredThroughMessageId,
+        coveredPrefixHash: context.coveredPrefixHash,
+        text: validateCompactSummary(text),
+        modelId: turn.modelId ?? (() => { throw new Error('Модель для сводки не выбрана.'); })(),
+        provenance: context.provenance,
+        createdAt: new Date().toISOString(),
+      };
+      await store.commitCompactSnapshot(turn.chatId, snapshot, context.expectedSnapshotId, signal);
+    },
+    compactionEnabled: COMPACTION_QUALITY_VERIFIED,
     recordUsageReceipt: (receipt) => store.recordUsageReceipt(receipt),
     runHooks: async (turn, input, signal) => {
       const context: HookExecutionContext = {
@@ -899,6 +937,8 @@ async function createMainRuntime(
       helperRecovered: Boolean(helper),
       rendererToolApi: false,
       helperUnavailableReason: unavailableReason,
+      compactionAvailable: COMPACTION_QUALITY_VERIFIED,
+      compactionUnavailableReason: COMPACTION_UNAVAILABLE_REASON,
     },
     voiceRuntime: voiceService.runtime,
     voiceAvailability: voiceService.availability,

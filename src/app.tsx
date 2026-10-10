@@ -1816,7 +1816,8 @@ export default function App() {
     const value = draftRef.current.trim();
     if (!value || sending) return;
     if (isUnavailableCompactCommand(value)) {
-      showSuccess('/compact станет доступна после подключения модели. История не изменена.');
+      const status = await window.gigaChat.runtime.getStatus().catch(() => null);
+      showSuccess(status?.compactionUnavailableReason ?? 'Команда /compact пока недоступна; история чата не изменена.');
       return;
     }
     const sourceRoute = routeRef.current;

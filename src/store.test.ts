@@ -4,9 +4,10 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { openStore as openStoreProduction, type StoreFaultStage, type StoreOpenOptions } from './store';
-import type { GigaChatProvider, InstructionCommitRequest, InstructionCommitResult, ProviderTurnRequest } from './contracts';
+import type { AcceptedTurnInput, CompactSnapshot, GigaChatProvider, HookDispatchInput, HookRunResult, InstructionCommitRequest, InstructionCommitResult, ProviderEvent, ProviderTurnRequest } from './contracts';
+import { COMPACTION_TASK_INSTRUCTION, buildNextTurnContext } from './context';
 import { instructionFileHash } from './instruction-documents';
-import { createTurnRuntime } from './runtime';
+import { createTurnRuntime, type PreparedTurn } from './runtime';
 
 const timestamp = '2026-09-24T10:00:00.000Z';
 
@@ -25,6 +26,12 @@ const syntheticInstructionCommitter = async (request: InstructionCommitRequest):
 
 function openStore(directory: string, options: StoreOpenOptions = {}) {
   return openStoreProduction(directory, { instructionCommitter: syntheticInstructionCommitter, ...options });
+}
+
+function deferred(): { promise: Promise<void>; resolve(): void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
 }
 
 test('persists projects, chats, relationships, drafts, image kind, and settings', async (t) => {
@@ -180,6 +187,273 @@ test('inserts a queued reply after its user anchor and assembles only history th
   for (const turn of [first.turn, second.turn, third.turn]) store.releaseTurnReservation(turn.turnId);
 });
 
+test('compaction captures the fixed queued prefix, keeps tool pairing, and persists without hiding messages', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-compaction-prefix-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { modelId: 'GigaChat-2-Pro' });
+  const first = await store.acceptLocalMessage(chat.id, 'user1', 'turn-compact-user1');
+  const receiptId = 'c'.repeat(64);
+  await store.beginToolReceipt(chat.id, first.turn.messageId, {
+    receiptId, name: 'read', arguments: { path: 'src/example.ts' }, content: null, functionsStateId: 'state-user1',
+  });
+  await store.completeToolReceipt(chat.id, first.turn.messageId, receiptId, 'completed', JSON.stringify({ ok: true, text: 'tool result' }));
+  await store.appendAssistantMessageFromRuntime(chat.id, first.turn.messageId, 'answer1');
+
+  const second = await store.acceptLocalMessage(chat.id, 'user2', 'turn-compact-user2');
+  const compact = await store.acceptCompactionTurn(chat.id, 'turn-compact');
+  assert.equal(compact.turn.messageId, second.turn.messageId);
+  await store.appendAssistantMessageFromRuntime(chat.id, second.turn.messageId, 'answer2');
+  await store.acceptLocalMessage(chat.id, 'user3', 'turn-compact-user3');
+
+  const prefix = await store.getCompactionPrefix(chat.id, compact.turn.messageId);
+  assert.deepEqual(prefix.messages.map((message) => message.text), ['user1', 'answer1', 'user2', 'answer2']);
+  assert.equal(prefix.coveredThroughMessageId, (await store.getChat(chat.id)).messages[3]?.id);
+  assert.deepEqual(prefix.protocolHistory.map((exchange) => ({
+    anchorMessageId: exchange.anchorMessageId,
+    name: exchange.name,
+    functionsStateId: exchange.functionsStateId,
+    result: JSON.parse(exchange.result),
+  })), [{
+    anchorMessageId: first.turn.messageId,
+    name: 'read',
+    functionsStateId: 'state-user1',
+    result: { ok: true, text: 'tool result' },
+  }]);
+
+  const snapshot: CompactSnapshot = {
+    id: 'snapshot-compact-1', version: 1, boundaryMessageId: compact.turn.messageId,
+    coveredThroughMessageId: prefix.coveredThroughMessageId, coveredPrefixHash: prefix.coveredPrefixHash,
+    text: 'Сохранены user1, tool result, answer1 и user2.', modelId: 'GigaChat-2-Pro',
+    provenance: 'fixture', createdAt: timestamp,
+  };
+  await store.commitCompactSnapshot(chat.id, snapshot, compact.turn.compactExpectedSnapshotId ?? null);
+  const beforeReload = await store.getChat(chat.id);
+  assert.deepEqual(beforeReload.messages.map((message) => message.text), ['user1', 'answer1', 'user2', 'answer2', 'user3']);
+  assert.deepEqual(beforeReload.compactSnapshot, snapshot);
+
+  const restored = await openStore(directory);
+  const afterReload = await restored.getChat(chat.id);
+  assert.deepEqual(afterReload.messages, beforeReload.messages);
+  assert.deepEqual(afterReload.compactSnapshot, snapshot);
+  store.releaseTurnReservation(first.turn.turnId);
+  store.releaseTurnReservation(second.turn.turnId);
+  store.releaseTurnReservation(compact.turn.turnId);
+});
+
+test('compact snapshot conflicts, save failures, and cancellation leave prior summary and history intact', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-compaction-rollback-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const enteredCommit = deferred();
+  const releaseCommit = deferred();
+  let holdCommit = false;
+  let failCommit = false;
+  const store = await openStore(directory, {
+    testFaults: {
+      beforeCompactSnapshotCommit: async () => {
+        if (failCommit) throw new Error('synthetic compact snapshot save failure');
+        if (!holdCommit) return;
+        enteredCommit.resolve();
+        await releaseCommit.promise;
+      },
+    },
+  });
+  const chat = await store.createChat();
+  const first = await store.acceptLocalMessage(chat.id, 'Первый запрос', 'turn-compact-first');
+  const firstPrefix = await store.getCompactionPrefix(chat.id, first.turn.messageId);
+  const firstSnapshot: CompactSnapshot = {
+    id: 'snapshot-first', version: 1, boundaryMessageId: first.turn.messageId,
+    coveredThroughMessageId: firstPrefix.coveredThroughMessageId, coveredPrefixHash: firstPrefix.coveredPrefixHash,
+    text: 'Первая сохранённая сводка.', modelId: 'GigaChat-2-Pro', provenance: 'fixture', createdAt: timestamp,
+  };
+  await store.commitCompactSnapshot(chat.id, firstSnapshot, null);
+
+  const conflicting = { ...firstSnapshot, id: 'snapshot-conflict', text: 'Конкурирующая сводка.' };
+  await assert.rejects(store.commitCompactSnapshot(chat.id, conflicting, null), /изменилась/);
+  const second = await store.acceptLocalMessage(chat.id, 'Второй запрос', 'turn-compact-second');
+  const secondPrefix = await store.getCompactionPrefix(chat.id, second.turn.messageId);
+  const cancelledSnapshot: CompactSnapshot = {
+    id: 'snapshot-cancelled', version: 1, boundaryMessageId: second.turn.messageId,
+    coveredThroughMessageId: secondPrefix.coveredThroughMessageId, coveredPrefixHash: secondPrefix.coveredPrefixHash,
+    text: 'Эта сводка должна быть отменена.', modelId: 'GigaChat-2-Pro', provenance: 'fixture', createdAt: timestamp,
+  };
+  const beforeSaveFailure = await store.getChat(chat.id);
+  const failedSnapshot = { ...cancelledSnapshot, id: 'snapshot-save-failure', text: 'Эта сводка не должна сохраниться.' };
+  failCommit = true;
+  await assert.rejects(store.commitCompactSnapshot(chat.id, failedSnapshot, firstSnapshot.id), /synthetic compact snapshot save failure/);
+  failCommit = false;
+
+  const afterSaveFailure = await store.getChat(chat.id);
+  assert.deepEqual(afterSaveFailure.messages, beforeSaveFailure.messages);
+  assert.deepEqual(afterSaveFailure.compactSnapshot, firstSnapshot);
+  const reloadedAfterSaveFailure = await openStore(directory);
+  const persistedAfterSaveFailure = await reloadedAfterSaveFailure.getChat(chat.id);
+  assert.deepEqual(persistedAfterSaveFailure.messages, beforeSaveFailure.messages);
+  assert.deepEqual(persistedAfterSaveFailure.compactSnapshot, firstSnapshot);
+
+  holdCommit = true;
+  const controller = new AbortController();
+  const pendingCommit = store.commitCompactSnapshot(chat.id, cancelledSnapshot, firstSnapshot.id, controller.signal);
+  await enteredCommit.promise;
+  controller.abort();
+  releaseCommit.resolve();
+  await assert.rejects(pendingCommit, (error: unknown) => error instanceof Error && error.name === 'AbortError');
+
+  assert.deepEqual((await store.getChat(chat.id)).compactSnapshot, firstSnapshot);
+  assert.deepEqual((await (await openStore(directory)).getChat(chat.id)).compactSnapshot, firstSnapshot);
+  store.releaseTurnReservation(first.turn.turnId);
+  store.releaseTurnReservation(second.turn.turnId);
+});
+
+test('runs queued turns through the real context builder and store compaction, then reloads summary with recent history', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-compaction-e2e-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { modelId: 'future/model-without-capability-metadata' });
+  const first = await store.acceptLocalMessage(chat.id, 'Первый запрос', 'turn-e2e-first');
+  const second = await store.acceptLocalMessage(chat.id, 'Второй запрос', 'turn-e2e-second');
+  const compact = await store.acceptCompactionTurn(chat.id, 'turn-e2e-compact');
+  const third = await store.acceptLocalMessage(chat.id, 'Третий запрос', 'turn-e2e-third');
+  const requests: ProviderTurnRequest[] = [];
+  const hookEvents: string[] = [];
+  let reads = 0;
+  const provider: GigaChatProvider = {
+    stream: async function* (request): AsyncGenerator<ProviderEvent> {
+      requests.push(structuredClone(request));
+      yield { type: 'usage', promptTokens: 8, completionTokens: 2, totalTokens: 10, precachedPromptTokens: 1 };
+      if (request.usageKind === 'compaction') {
+        yield { type: 'text-delta', text: 'Сводка: первый, второй и результат чтения.' };
+      } else {
+        const userPrompt = [...request.messages].reverse().find((message) => message.role === 'user')?.text ?? '';
+        if (userPrompt === 'Первый запрос' && !request.protocolHistory?.length) {
+          yield {
+            type: 'function-call',
+            functionCall: {
+              name: 'read', arguments: { path: 'src/example.ts' }, content: null,
+              functionsStateId: 'state-read-first', terminalReason: 'function_call',
+            },
+          };
+          return;
+        } else yield { type: 'text-delta', text: `Ответ:${userPrompt}` };
+      }
+      yield { type: 'completed' };
+    },
+  };
+  const runtime = createTurnRuntime({
+    provider,
+    tools: { read: async (_projectId: string | null, _profile: unknown, path: string) => { reads += 1; return `fixture:${path}`; } } as never,
+    prepareTurn: async (turn: AcceptedTurnInput, signal): Promise<ProviderTurnRequest | PreparedTurn> => {
+      if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
+      await store.validateAcceptedTurn(turn);
+      const detail = await store.getChat(turn.chatId);
+      const prefix = turn.operation === 'compaction'
+        ? await store.getCompactionPrefix(turn.chatId, turn.compactBoundaryMessageId)
+        : null;
+      const messages = prefix?.messages ?? await store.getMessagesThrough(turn.chatId, turn.messageId);
+      const protocolHistory = prefix?.protocolHistory ?? await store.getToolProtocolThrough(turn.chatId, turn.messageId);
+      const context = buildNextTurnContext({
+        globalText: 'Контекст приложения.',
+        selectedSkill: null,
+        projectInstructions: [],
+        messages,
+        protocolHistory,
+        compactSnapshot: detail.compactSnapshot,
+        permissionProfile: turn.permissionProfile,
+        modelId: turn.modelId,
+        ...(turn.operation === 'compaction' ? {
+          taskInstruction: COMPACTION_TASK_INSTRUCTION,
+          usageKind: 'compaction' as const,
+          functionCallMode: 'none' as const,
+        } : {}),
+      });
+      if (!prefix || turn.operation !== 'compaction') return context.request;
+      return {
+        request: context.request,
+        compaction: {
+          boundaryMessageId: turn.compactBoundaryMessageId!,
+          coveredThroughMessageId: prefix.coveredThroughMessageId,
+          coveredPrefixHash: prefix.coveredPrefixHash,
+          expectedSnapshotId: turn.compactExpectedSnapshotId ?? null,
+          provenance: 'fixture',
+        },
+      };
+    },
+    consumeTurn: (turn, signal) => store.consumeTurnReservation(turn, signal),
+    releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
+    appendAssistant: async (turn, text, signal) => {
+      await store.appendAssistantMessageFromRuntime(turn.chatId, turn.messageId, text, signal);
+    },
+    appendCompaction: async (turn, text, signal, context) => {
+      const snapshot: CompactSnapshot = {
+        id: `snapshot-${turn.turnId}`, version: 1, boundaryMessageId: context.boundaryMessageId,
+        coveredThroughMessageId: context.coveredThroughMessageId, coveredPrefixHash: context.coveredPrefixHash,
+        text, modelId: turn.modelId!, provenance: context.provenance, createdAt: new Date().toISOString(),
+      };
+      await store.commitCompactSnapshot(turn.chatId, snapshot, context.expectedSnapshotId, signal);
+    },
+    compactionEnabled: true,
+    beginToolReceipt: (turn, receipt) => store.beginToolReceipt(turn.chatId, turn.messageId, receipt),
+    completeToolReceipt: (turn, receiptId, status, result) => store.completeToolReceipt(turn.chatId, turn.messageId, receiptId, status, result),
+    recordUsageReceipt: (receipt) => store.recordUsageReceipt(receipt),
+    runHooks: async (_turn, input: HookDispatchInput): Promise<HookRunResult[]> => {
+      hookEvents.push(input.event);
+      return [{ hookId: `fixture-${input.event}`, hookName: 'Fixture', event: input.event, status: 'completed' }];
+    },
+  });
+
+  assert.ok(runtime.enqueue(first.turn));
+  assert.ok(runtime.enqueue(second.turn));
+  assert.ok(runtime.enqueueCompaction(compact.turn));
+  assert.ok(runtime.enqueue(third.turn));
+  await runtime.whenIdle();
+
+  assert.equal(reads, 1);
+  assert.equal(requests.length, 5);
+  assert.deepEqual(requests[2]?.messages.map((message) => message.text), [
+    'Первый запрос', 'Ответ:Первый запрос', 'Второй запрос',
+  ]);
+  assert.deepEqual(requests[3]?.messages.map((message) => message.text), [
+    'Первый запрос', 'Ответ:Первый запрос', 'Второй запрос', 'Ответ:Второй запрос',
+  ]);
+  assert.equal(requests[3]?.protocolHistory?.length, 1);
+  assert.equal(requests[3]?.protocolHistory?.[0]?.anchorMessageId, first.turn.messageId);
+  assert.equal(requests[3]?.protocolHistory?.[0]?.result, JSON.stringify({ ok: true, result: 'fixture:src/example.ts' }));
+  assert.equal(requests[3]?.functionCallMode, 'none');
+  assert.equal(requests[3]?.usageKind, 'compaction');
+  assert.deepEqual(requests[4]?.messages.map((message) => message.text), ['Третий запрос']);
+  assert.match(requests[4]?.system.find((layer) => layer.source === 'summary')?.text ?? '', /Сводка: первый, второй/);
+  assert.equal(requests[4]?.protocolHistory?.length, 0);
+  assert.equal(hookEvents.filter((event) => event === 'before-compaction').length, 1);
+  assert.equal(hookEvents.filter((event) => event === 'after-compaction').length, 1);
+
+  const usageFile = JSON.parse(await readFile(join(directory, 'usage.json'), 'utf8')) as {
+    receipts: Array<{ requestKind: string; status: string }>;
+  };
+  assert.deepEqual(usageFile.receipts.map((receipt) => receipt.requestKind), [
+    'chat', 'tool-continuation', 'chat', 'compaction', 'chat',
+  ]);
+  assert.ok(usageFile.receipts.every((receipt) => receipt.status === 'completed'));
+
+  const reloaded = await openStore(directory);
+  const savedChat = await reloaded.getChat(chat.id);
+  const afterRestart = await reloaded.acceptLocalMessage(chat.id, 'После перезапуска', 'turn-after-restart');
+  const futureMessages = await reloaded.getMessagesThrough(chat.id, afterRestart.turn.messageId);
+  const futureProtocols = await reloaded.getToolProtocolThrough(chat.id, afterRestart.turn.messageId);
+  const futureContext = buildNextTurnContext({
+    globalText: 'Контекст приложения.', selectedSkill: null, projectInstructions: [],
+    messages: futureMessages, protocolHistory: futureProtocols, compactSnapshot: savedChat.compactSnapshot,
+    permissionProfile: afterRestart.turn.permissionProfile, modelId: afterRestart.turn.modelId,
+  });
+  assert.deepEqual(futureContext.request.messages.map((message) => message.text), [
+    'Третий запрос', 'Ответ:Третий запрос', 'После перезапуска',
+  ]);
+  assert.match(futureContext.request.system.find((layer) => layer.source === 'summary')?.text ?? '', /Сводка: первый, второй/);
+  assert.equal(futureContext.request.protocolHistory?.length, 0);
+  reloaded.releaseTurnReservation(afterRestart.turn.turnId);
+});
+
 test('queued fake provider turns see prior replies but never later accepted prompts', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-queued-runtime-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -258,7 +532,7 @@ test('migrates v1 projects, chats, drafts, and theme without losing data', async
   const store = await openStore(directory);
   assert.deepEqual(await store.listProjects(), [{ ...project, workingFolder: null }]);
   assert.equal((await store.listChats())[0]?.id, chat.id);
-  assert.deepEqual(await store.getChat(chat.id), { ...chat, kind: 'text', nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [], toolReceipts: [] });
+  assert.deepEqual(await store.getChat(chat.id), { ...chat, kind: 'text', nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [], toolReceipts: [], compactSnapshot: null });
   assert.deepEqual(await store.getSettings(), {
     theme: 'emerald',
     sidebarTransparent: false,
@@ -279,7 +553,7 @@ test('migrates v1 projects, chats, drafts, and theme without losing data', async
   assert.equal(JSON.parse(await readFile(join(directory, 'projects.json'), 'utf8')).schemaVersion, 2);
   assert.equal(JSON.parse(await readFile(join(directory, 'chats.json'), 'utf8')).schemaVersion, 1);
   assert.equal(await readFile(join(directory, 'chats.json.bak'), 'utf8'), await readFile(join(directory, 'chats.json'), 'utf8'));
-  assert.equal(JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')).schemaVersion, 7);
+  assert.equal(JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')).schemaVersion, 8);
   assert.equal(JSON.parse(await readFile(join(directory, 'settings.json'), 'utf8')).schemaVersion, 10);
   await store.deleteChat(chat.id);
   assert.deepEqual(await (await openStore(directory)).listChats(), []);
@@ -292,7 +566,7 @@ test('migrates v2 chats with archive and draft without changing their UUIDs', as
     pinned: true, archived: true, createdAt: timestamp, updatedAt: timestamp, draft: 'Текст', kind: 'image' };
   await writeFile(join(directory, 'chats.json'), JSON.stringify({ schemaVersion: 2, chats: [chat] }));
   const store = await openStore(directory);
-  assert.deepEqual(await store.getChat(chat.id), { ...chat, nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [], toolReceipts: [] });
+  assert.deepEqual(await store.getChat(chat.id), { ...chat, nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [], toolReceipts: [], compactSnapshot: null });
   assert.equal((await store.listChats())[0]?.id, chat.id);
   assert.equal((await (await openStore(directory)).getChat(chat.id)).draft, 'Текст');
 });
@@ -327,11 +601,20 @@ test('unfinished legacy migration preserves existing invalid chat details', asyn
       if (contents !== null) await writeFile(detailPath, contents);
 
       const store = await openStore(directory);
-      if (contents !== null) assert.equal(await readFile(detailPath, 'utf8'), contents, 'existing bytes must survive migration');
+      const validUnmarkedLegacyDetail = kind === 'valid' && !migrated;
+      if (contents !== null && !validUnmarkedLegacyDetail) {
+        assert.equal(await readFile(detailPath, 'utf8'), contents, 'existing invalid bytes must survive migration');
+      }
       if (kind === 'valid' || kind === 'missing') {
         const restored = await store.getChat(legacy.id);
         assert.equal(restored.draft, kind === 'valid' ? 'newer draft' : 'legacy draft');
         assert.deepEqual(restored.messages, kind === 'valid' ? detail.messages : []);
+        if (validUnmarkedLegacyDetail) {
+          const migratedDetail = JSON.parse(await readFile(detailPath, 'utf8')) as Record<string, unknown>;
+          assert.equal(migratedDetail.schemaVersion, 8);
+          assert.equal(migratedDetail.compactSnapshot, null);
+          assert.equal(migratedDetail.draft, 'newer draft');
+        }
         assert.deepEqual(await store.getStorageIssues(), []);
       } else {
         assert.deepEqual(await store.listChats(), []);
@@ -550,7 +833,7 @@ test('migrates existing chat detail schema 3 and preserves its draft', async (t)
   assert.equal((await restored.getChat(chat.id)).draft, 'Сохранённый черновик');
   assert.equal((await restored.getChat(chat.id)).nextTurnPermissionProfile, null);
   const migrated = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  assert.equal(migrated.schemaVersion, 7);
+  assert.equal(migrated.schemaVersion, 8);
   assert.equal(migrated.nextTurnPermissionProfile, null);
   assert.equal(migrated.nextTurnSkillId, null);
 });
@@ -574,7 +857,7 @@ test('migrates chat detail schema 4 to 5 without changing history or artifacts',
   assert.equal(detail.nextTurnSkillId, null);
   assert.equal(detail.draft, 'Черновик');
   assert.equal(detail.messages[0]?.text, 'Сохранённая история');
-  assert.equal(JSON.parse(await readFile(path, 'utf8')).schemaVersion, 7);
+  assert.equal(JSON.parse(await readFile(path, 'utf8')).schemaVersion, 8);
 });
 
 test('migrates previous settings and chat schemas with an empty model choice', async (t) => {
@@ -596,7 +879,7 @@ test('migrates previous settings and chat schemas with an empty model choice', a
   assert.equal((await restored.getChat(chat.id)).modelId, null);
   assert.equal((await restored.getSettings()).defaultModelId, null);
   assert.equal((await restored.getSettings()).microphoneConsent, 'unasked');
-  assert.equal(JSON.parse(await readFile(chatPath, 'utf8')).schemaVersion, 7);
+  assert.equal(JSON.parse(await readFile(chatPath, 'utf8')).schemaVersion, 8);
   assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).schemaVersion, 10);
 });
 

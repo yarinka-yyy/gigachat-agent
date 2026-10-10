@@ -28,7 +28,7 @@ const commandOptions: readonly ComposerSuggestion[] = [
     id: 'compact',
     label: '/compact',
     insertText: '/compact',
-    description: 'Сжать контекст этого чата (после подключения API)',
+    description: 'Недоступна до проверки качества сводки; история останется без изменений.',
     available: false,
   },
 ];

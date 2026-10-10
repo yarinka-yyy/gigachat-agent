@@ -25,6 +25,16 @@ function turnFor(chatId: string, text = chatId): AcceptedTurnInput {
   };
 }
 
+function compactionTurnFor(chatId: string): AcceptedTurnInput {
+  const turn = turnFor(chatId, 'Сожми историю');
+  return {
+    ...turn,
+    operation: 'compaction',
+    compactBoundaryMessageId: turn.messageId,
+    compactExpectedSnapshotId: null,
+  };
+}
+
 function requestFor(turn: AcceptedTurnInput): ProviderTurnRequest {
   return {
     system: [],
@@ -175,6 +185,309 @@ test('runs turns from two chats FIFO with one active adapter and appends only a 
   ]);
   assert.equal(runtime.list('chat-one')[0]?.status, 'completed');
   assert.equal(runtime.list('chat-two')[0]?.status, 'completed');
+});
+
+test('holds FIFO through delayed compaction save and its single after hook', async () => {
+  const saveStarted = deferred();
+  const allowSave = deferred();
+  const afterHookStarted = deferred();
+  const allowAfterHook = deferred();
+  const started: string[] = [];
+  const hookEvents: string[] = [];
+  let summarySaved = false;
+  const provider = makeProvider(async function* (request) {
+    const prompt = request.messages[0]?.text ?? '';
+    started.push(prompt);
+    yield { type: 'text-delta', text: prompt === 'Сожми историю' ? 'Сводка истории' : 'Ответ после сжатия' };
+    yield { type: 'completed' };
+  });
+  const runtime = createTurnRuntime({
+    provider,
+    tools: testTools,
+    prepareTurn: async (turn): Promise<ProviderTurnRequest | { request: ProviderTurnRequest; compaction: {
+      boundaryMessageId: string; coveredThroughMessageId: string; coveredPrefixHash: string;
+      expectedSnapshotId: string | null; provenance: 'fixture';
+    } }> => turn.operation === 'compaction'
+      ? {
+        request: requestFor(turn),
+        compaction: {
+          boundaryMessageId: turn.messageId,
+          coveredThroughMessageId: turn.messageId,
+          coveredPrefixHash: 'a'.repeat(64),
+          expectedSnapshotId: null,
+          provenance: 'fixture',
+        },
+      }
+      : requestFor(turn),
+    consumeTurn: async () => undefined,
+    releaseTurn: () => undefined,
+    appendAssistant: async () => undefined,
+    appendCompaction: async () => {
+      saveStarted.resolve();
+      await allowSave.promise;
+      summarySaved = true;
+    },
+    compactionEnabled: true,
+    recordUsageReceipt: async () => undefined,
+    runHooks: async (_turn, input) => {
+      hookEvents.push(input.event);
+      if (input.event === 'after-compaction') {
+        afterHookStarted.resolve();
+        await allowAfterHook.promise;
+      }
+      return [];
+    },
+    timeouts: { operationMs: 20, stopMs: 1000 },
+  });
+  const compactId = runtime.enqueueCompaction(compactionTurnFor('chat-compact'));
+  assert.ok(compactId);
+  const nextId = runtime.enqueue(turnFor('chat-next'));
+  assert.ok(nextId);
+  await saveStarted.promise;
+  await waitUntil(() => runtime.list('chat-compact')[0]?.error?.includes('сохранения ответа ожидается') === true);
+
+  assert.deepEqual(started, ['Сожми историю']);
+  assert.equal(runtime.list('chat-next')[0]?.status, 'queued');
+  assert.equal(summarySaved, false);
+  assert.equal(hookEvents.filter((event) => event === 'after-compaction').length, 0);
+
+  allowSave.resolve();
+  await afterHookStarted.promise;
+  assert.equal(summarySaved, true);
+  assert.deepEqual(started, ['Сожми историю']);
+  assert.equal(runtime.list('chat-next')[0]?.status, 'queued');
+  assert.equal(hookEvents.filter((event) => event === 'after-compaction').length, 1);
+
+  allowAfterHook.resolve();
+  await waitUntil(() => runtime.list('chat-compact')[0]?.status === 'completed');
+  await runtime.whenIdle();
+  assert.deepEqual(started, ['Сожми историю', 'chat-next']);
+  assert.equal(runtime.list('chat-compact')[0]?.status, 'completed');
+  assert.equal(runtime.list('chat-next')[0]?.status, 'completed');
+  assert.equal(hookEvents.filter((event) => event === 'after-compaction').length, 1);
+});
+
+test('a rejected compaction append skips the after hook and releases FIFO only after settlement', async () => {
+  const saveStarted = deferred();
+  let rejectSave!: (error: Error) => void;
+  const pendingSave = new Promise<void>((_resolve, reject) => { rejectSave = reject; });
+  const started: string[] = [];
+  const hookEvents: string[] = [];
+  const provider = makeProvider(async function* (request) {
+    const prompt = request.messages[0]?.text ?? '';
+    started.push(prompt);
+    yield { type: 'text-delta', text: prompt === 'Сожми историю' ? 'Сводка истории' : 'Ответ следующего хода' };
+    yield { type: 'completed' };
+  });
+  const runtime = createTurnRuntime({
+    provider,
+    tools: testTools,
+    prepareTurn: async (turn): Promise<ProviderTurnRequest | { request: ProviderTurnRequest; compaction: {
+      boundaryMessageId: string; coveredThroughMessageId: string; coveredPrefixHash: string;
+      expectedSnapshotId: string | null; provenance: 'fixture';
+    } }> => turn.operation === 'compaction'
+      ? {
+        request: requestFor(turn),
+        compaction: {
+          boundaryMessageId: turn.compactBoundaryMessageId!,
+          coveredThroughMessageId: turn.messageId,
+          coveredPrefixHash: 'e'.repeat(64),
+          expectedSnapshotId: null,
+          provenance: 'fixture',
+        },
+      }
+      : requestFor(turn),
+    consumeTurn: async () => undefined,
+    releaseTurn: () => undefined,
+    appendAssistant: async () => undefined,
+    appendCompaction: async () => {
+      saveStarted.resolve();
+      await pendingSave;
+    },
+    compactionEnabled: true,
+    recordUsageReceipt: async () => undefined,
+    runHooks: async (_turn, input) => { hookEvents.push(input.event); return []; },
+  });
+
+  const compactId = runtime.enqueueCompaction(compactionTurnFor('chat-compact-rejected-save'));
+  assert.ok(compactId);
+  const nextId = runtime.enqueue(turnFor('chat-after-rejected-compact'));
+  assert.ok(nextId);
+  await saveStarted.promise;
+
+  assert.deepEqual(started, ['Сожми историю']);
+  assert.equal(runtime.list('chat-after-rejected-compact')[0]?.status, 'queued');
+  assert.equal(hookEvents.includes('after-compaction'), false);
+
+  rejectSave(new Error('synthetic compaction append failure'));
+  await waitUntil(() => runtime.list('chat-after-rejected-compact')[0]?.status === 'completed');
+  assert.equal(runtime.list('chat-compact-rejected-save')[0]?.status, 'failed');
+  assert.deepEqual(started, ['Сожми историю', 'chat-after-rejected-compact']);
+  assert.equal(hookEvents.includes('after-compaction'), false);
+});
+
+test('keeps production compaction disabled and refuses unexpected summarizer function calls', async () => {
+  const input = compactionTurnFor('chat-compact-disabled');
+  const provider = makeProvider(async function* () {
+    yield functionCall('write', { path: 'must-not-exist.txt', contents: 'no side effect' }, 'unexpected-state');
+  });
+  const disabled = createTurnRuntime({
+    provider,
+    tools: testTools,
+    prepareTurn: async (turn) => requestFor(turn),
+    consumeTurn: async () => undefined,
+    releaseTurn: () => undefined,
+    appendAssistant: async () => undefined,
+    appendCompaction: async () => undefined,
+    recordUsageReceipt: async () => undefined,
+  });
+  assert.equal(disabled.enqueueCompaction(input), null);
+  assert.deepEqual(disabled.list(), []);
+
+  let writes = 0;
+  let snapshots = 0;
+  const hookEvents: string[] = [];
+  const fixture = createTurnRuntime({
+    provider,
+    tools: { write: async () => { writes += 1; } } as unknown as LocalTools,
+    prepareTurn: async (turn): Promise<ProviderTurnRequest | { request: ProviderTurnRequest; compaction: {
+      boundaryMessageId: string; coveredThroughMessageId: string; coveredPrefixHash: string;
+      expectedSnapshotId: string | null; provenance: 'fixture';
+    } }> => ({
+      request: { ...requestFor(turn), functionCallMode: 'none' },
+      compaction: {
+        boundaryMessageId: turn.messageId,
+        coveredThroughMessageId: turn.messageId,
+        coveredPrefixHash: 'b'.repeat(64),
+        expectedSnapshotId: null,
+        provenance: 'fixture',
+      },
+    }),
+    consumeTurn: async () => undefined,
+    releaseTurn: () => undefined,
+    appendAssistant: async () => undefined,
+    appendCompaction: async () => { snapshots += 1; },
+    compactionEnabled: true,
+    recordUsageReceipt: async () => undefined,
+    runHooks: async (_turn, input) => { hookEvents.push(input.event); return []; },
+  });
+  assert.ok(fixture.enqueueCompaction(input));
+  await fixture.whenIdle();
+  assert.equal(fixture.list('chat-compact-disabled')[0]?.status, 'failed');
+  assert.equal(writes, 0);
+  assert.equal(snapshots, 0);
+  assert.equal(hookEvents.filter((event) => event === 'before-compaction').length, 1);
+  assert.equal(hookEvents.filter((event) => event === 'after-compaction').length, 0);
+});
+
+test('pre-compaction Hook blocks provider work and provider errors never commit a summary', async () => {
+  let providerCalls = 0;
+  let snapshots = 0;
+  const hookEvents: string[] = [];
+  const provider = makeProvider(async function* () {
+    providerCalls += 1;
+    yield { type: 'error', category: 'network', retryable: true };
+  });
+  const makeCompactionRuntime = (blocked: boolean) => createTurnRuntime({
+    provider,
+    tools: testTools,
+    prepareTurn: async (turn): Promise<ProviderTurnRequest | { request: ProviderTurnRequest; compaction: {
+      boundaryMessageId: string; coveredThroughMessageId: string; coveredPrefixHash: string;
+      expectedSnapshotId: string | null; provenance: 'fixture';
+    } }> => ({
+      request: requestFor(turn),
+      compaction: {
+        boundaryMessageId: turn.compactBoundaryMessageId!,
+        coveredThroughMessageId: turn.messageId,
+        coveredPrefixHash: 'c'.repeat(64),
+        expectedSnapshotId: null,
+        provenance: 'fixture',
+      },
+    }),
+    consumeTurn: async () => undefined,
+    releaseTurn: () => undefined,
+    appendAssistant: async () => undefined,
+    appendCompaction: async () => { snapshots += 1; },
+    compactionEnabled: true,
+    recordUsageReceipt: async () => undefined,
+    runHooks: async (_turn, input): Promise<HookRunResult[]> => {
+      hookEvents.push(`${input.event}${blocked ? ':blocked-case' : ':provider-error-case'}`);
+      return input.event === 'before-compaction' && blocked
+        ? [{ hookId: 'fixture-block', hookName: 'Fixture', event: input.event, status: 'blocked', decision: 'block', reason: 'fixture denial' }]
+        : [];
+    },
+  });
+
+  const blockedRuntime = makeCompactionRuntime(true);
+  const blockedId = blockedRuntime.enqueueCompaction(compactionTurnFor('chat-compact-hook-block'));
+  assert.ok(blockedId);
+  await blockedRuntime.whenIdle();
+  assert.equal(blockedRuntime.list()[0]?.status, 'failed');
+  assert.equal(providerCalls, 0);
+  assert.equal(snapshots, 0);
+  assert.equal(hookEvents.filter((event) => event === 'before-compaction:blocked-case').length, 1);
+  assert.equal(hookEvents.includes('after-compaction:blocked-case'), false);
+
+  const providerErrorRuntime = makeCompactionRuntime(false);
+  const errorId = providerErrorRuntime.enqueueCompaction(compactionTurnFor('chat-compact-provider-error'));
+  assert.ok(errorId);
+  await providerErrorRuntime.whenIdle();
+  assert.equal(providerErrorRuntime.list()[0]?.status, 'failed');
+  assert.equal(providerCalls, 1);
+  assert.equal(snapshots, 0);
+  assert.equal(hookEvents.filter((event) => event === 'before-compaction:provider-error-case').length, 1);
+  assert.equal(hookEvents.includes('after-compaction:provider-error-case'), false);
+});
+
+test('cancelling a running compaction never saves a snapshot or runs its after hook', async () => {
+  const streamStarted = deferred();
+  let snapshots = 0;
+  const hookEvents: string[] = [];
+  const provider: GigaChatProvider = {
+    stream: async function* (_request, signal): AsyncGenerator<ProviderEvent> {
+      yield { type: 'text-delta', text: 'Неполная сводка' };
+      streamStarted.resolve();
+      await new Promise<void>((_resolve, reject) => {
+        if (signal.aborted) {
+          reject(Object.assign(new Error('cancelled'), { name: 'AbortError' }));
+          return;
+        }
+        signal.addEventListener('abort', () => reject(Object.assign(new Error('cancelled'), { name: 'AbortError' })), { once: true });
+      });
+    },
+  };
+  const runtime = createTurnRuntime({
+    provider,
+    tools: testTools,
+    prepareTurn: async (turn) => ({
+      request: requestFor(turn),
+      compaction: {
+        boundaryMessageId: turn.compactBoundaryMessageId!,
+        coveredThroughMessageId: turn.messageId,
+        coveredPrefixHash: 'd'.repeat(64),
+        expectedSnapshotId: null,
+        provenance: 'fixture' as const,
+      },
+    }),
+    consumeTurn: async () => undefined,
+    releaseTurn: () => undefined,
+    appendAssistant: async () => undefined,
+    appendCompaction: async () => { snapshots += 1; },
+    compactionEnabled: true,
+    recordUsageReceipt: async () => undefined,
+    runHooks: async (_turn, input) => { hookEvents.push(input.event); return []; },
+  });
+
+  const id = runtime.enqueueCompaction(compactionTurnFor('chat-compact-cancel'));
+  assert.ok(id);
+  await streamStarted.promise;
+  assert.equal(runtime.cancel(id), true);
+  await runtime.whenIdle();
+
+  assert.equal(runtime.list()[0]?.status, 'cancelled');
+  assert.equal(snapshots, 0);
+  assert.equal(hookEvents.filter((event) => event === 'before-compaction').length, 1);
+  assert.equal(hookEvents.includes('after-compaction'), false);
 });
 
 test('records separate raw usage receipts for chat and tool-continuation requests', async () => {

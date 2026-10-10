@@ -39,6 +39,25 @@ test('keeps a provider model ID outside the former static list in the accepted r
   assert.equal(request.modelId, 'vendor/model.v4:preview');
 });
 
+test('appends a prior summary and bounded task after the existing instruction order', () => {
+  const request = buildInstructionRequest({
+    globalText: 'Global',
+    projectInstructions: [{ scope: 'project', text: 'Project' }],
+    selectedSkill: { name: 'Review', scope: 'Global', text: 'Skill' },
+    compactSnapshot: { text: 'Prior summary' },
+    taskInstruction: 'Summarize the covered prefix.',
+    usageKind: 'compaction',
+    functionCallMode: 'none',
+    messages: [userMessage],
+    permissionProfile: 'ask',
+    modelId: 'vendor/model.v4:preview',
+  });
+  assert.deepEqual(request.system.map((layer) => layer.source), ['runtime', 'global', 'project', 'skill', 'summary', 'runtime']);
+  assert.equal(request.usageKind, 'compaction');
+  assert.equal(request.functionCallMode, 'none');
+  assert.deepEqual(request.messages, [userMessage]);
+});
+
 test('rejects malformed project instruction sources', () => {
   assert.throws(() => buildInstructionRequest({
     globalText: '',

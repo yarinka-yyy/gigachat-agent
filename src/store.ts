@@ -3,13 +3,14 @@ import { Buffer } from 'node:buffer';
 import { constants } from 'node:fs';
 import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { DEFAULT_NOTIFICATION_SETTINGS, type AcceptedTurnInput, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderProtocolExchange, type Settings, type SettingsPatch, type Theme, type UsageLedgerSummary, type UsageReceipt } from './contracts';
+import { DEFAULT_NOTIFICATION_SETTINGS, type AcceptedTurnInput, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type CompactSnapshot, type CompactionPrefix, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderProtocolExchange, type Settings, type SettingsPatch, type Theme, type UsageLedgerSummary, type UsageReceipt } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { requireModelId } from './models';
 import { isSkillId } from './skills';
 import { validateProjectFolder, validateProjectInstructionsPath } from './project-paths';
 import { createInstructionDocument, instructionFileHash } from './instruction-documents';
 import { MAX_USAGE_RECEIPTS, mergeUsageReceipt, summarizeUsage, validateUsageReceipt } from './usage';
+import { hashCompactionPrefix, validateCompactSummary } from './context';
 
 type ProjectFile = { schemaVersion: 2; projects: Project[] };
 type LegacyChat = ChatSummary & { draft: string };
@@ -28,6 +29,7 @@ export type StoreFaultStage = 'journal' | 'chat' | 'projects' | 'instructions' |
 export interface StoreTestFaults {
   afterProjectDeleteStage?: (stage: StoreFaultStage, chatIndex?: number) => void | Promise<void>;
   beforeProjectInstructionCommit?: (targetPath: string) => void | Promise<void>;
+  beforeCompactSnapshotCommit?: () => void | Promise<void>;
 }
 
 export type InstructionCommitter = (request: InstructionCommitRequest) => Promise<InstructionCommitResult>;
@@ -67,16 +69,19 @@ export interface LocalStore {
   getChat(id: unknown): Promise<ChatDetail>;
   getMessagesThrough(chatId: unknown, messageId: unknown): Promise<ChatMessage[]>;
   getToolProtocolThrough(chatId: unknown, messageId: unknown): Promise<ProviderProtocolExchange[]>;
+  getCompactionPrefix(chatId: unknown, boundaryMessageId: unknown): Promise<CompactionPrefix>;
   beginToolReceipt(chatId: unknown, messageId: unknown, receipt: Omit<ChatToolReceipt, 'anchorMessageId' | 'status' | 'result' | 'createdAt'>): Promise<{ shouldExecute: boolean; receipt: ChatToolReceipt }>;
   completeToolReceipt(chatId: unknown, messageId: unknown, receiptId: unknown, status: 'completed' | 'unknown', result: unknown): Promise<void>;
   createChat(projectId?: unknown, kind?: unknown): Promise<ChatSummary>;
   updateChat(id: unknown, patch: unknown): Promise<ChatSummary>;
   appendLocalMessage(id: unknown, text: unknown): Promise<ChatDetail>;
   acceptLocalMessage(id: unknown, text: unknown, turnId: unknown): Promise<{ detail: ChatDetail; turn: AcceptedTurnInput }>;
+  acceptCompactionTurn(id: unknown, turnId: unknown): Promise<{ detail: ChatDetail; turn: AcceptedTurnInput }>;
   releaseTurnReservation(turnId: unknown): void;
   consumeTurnReservation(turn: AcceptedTurnInput, signal?: AbortSignal): Promise<void>;
   validateAcceptedTurn(turn: AcceptedTurnInput): Promise<void>;
   appendAssistantMessageFromRuntime(id: unknown, messageId: unknown, text: unknown, signal?: AbortSignal, functionsStateId?: unknown): Promise<ChatDetail>;
+  commitCompactSnapshot(id: unknown, snapshot: CompactSnapshot, expectedSnapshotId: string | null, signal?: AbortSignal): Promise<ChatDetail>;
   importFile(id: unknown, sourcePath: string, projectId?: unknown): Promise<ChatDetail>;
   getArtifactPath(id: unknown, artifactId: unknown): Promise<string>;
   getChatFolder(id: unknown): Promise<string>;
@@ -433,10 +438,37 @@ function parseChatFile(value: unknown): Loaded<ChatFile> {
   };
 }
 
+function validateCompactSnapshot(value: unknown, messages: readonly ChatMessage[]): CompactSnapshot | null {
+  if (value === null) return null;
+  if (!isRecord(value) || value.version !== 1 || typeof value.coveredPrefixHash !== 'string'
+    || !/^[a-f0-9]{64}$/.test(value.coveredPrefixHash)
+    || (value.provenance !== 'fixture' && value.provenance !== 'provider')) {
+    throw new Error('Invalid compact snapshot.');
+  }
+  const boundaryMessageId = requireId(value.boundaryMessageId);
+  if (!messages.some((message) => message.id === boundaryMessageId && message.role === 'user')) throw new Error('Invalid compact boundary.');
+  const coveredThroughMessageId = requireId(value.coveredThroughMessageId);
+  const boundaryIndex = messages.findIndex((message) => message.id === boundaryMessageId);
+  const coveredIndex = messages.findIndex((message) => message.id === coveredThroughMessageId);
+  if (coveredIndex < boundaryIndex) throw new Error('Invalid compact covered prefix.');
+  return {
+    id: requireId(value.id),
+    version: 1,
+    boundaryMessageId,
+    coveredThroughMessageId,
+    coveredPrefixHash: value.coveredPrefixHash,
+    text: validateCompactSummary(value.text),
+    modelId: requireModelId(value.modelId),
+    provenance: value.provenance,
+    createdAt: requireTimestamp(value.createdAt),
+  };
+}
+
 function validateChatDetail(value: unknown): Loaded<ChatDetail> {
-  if (!isRecord(value) || (value.schemaVersion !== 3 && value.schemaVersion !== 4 && value.schemaVersion !== 5 && value.schemaVersion !== 6 && value.schemaVersion !== 7)
+  if (!isRecord(value) || (value.schemaVersion !== 3 && value.schemaVersion !== 4 && value.schemaVersion !== 5 && value.schemaVersion !== 6 && value.schemaVersion !== 7 && value.schemaVersion !== 8)
     || !Array.isArray(value.messages) || !Array.isArray(value.artifacts)
-    || (value.schemaVersion === 7 && !Array.isArray(value.toolReceipts))) {
+    || (value.schemaVersion >= 7 && !Array.isArray(value.toolReceipts))
+    || (value.schemaVersion === 8 && !('compactSnapshot' in value))) {
     throw new Error('Invalid chat detail.');
   }
   const version = value.schemaVersion;
@@ -468,11 +500,11 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
       createdAt: requireTimestamp(entry.createdAt), messageId: entry.messageId === null ? null : requireId(entry.messageId),
     };
   });
-  const toolReceipts: ChatToolReceipt[] = (value.schemaVersion >= 7 && Array.isArray(value.toolReceipts) ? value.toolReceipts : []).map((entry: unknown) => {
+  const toolReceipts: ChatToolReceipt[] = (version >= 7 && Array.isArray(value.toolReceipts) ? value.toolReceipts : []).map((entry: unknown) => {
     if (!isRecord(entry) || typeof entry.receiptId !== 'string' || !/^[a-f0-9]{64}$/.test(entry.receiptId)
       || typeof entry.anchorMessageId !== 'string' || typeof entry.name !== 'string' || !entry.name || entry.name.length > 128
       || (entry.effectId !== undefined && (typeof entry.effectId !== 'string' || !/^[a-f0-9]{64}$/.test(entry.effectId)))
-      || (value.schemaVersion === 7 && SIDE_EFFECT_TOOLS.has(entry.name) && typeof entry.effectId !== 'string')
+      || (version >= 7 && SIDE_EFFECT_TOOLS.has(entry.name) && typeof entry.effectId !== 'string')
       || /[\u0000-\u001f\u007f]/.test(entry.name)
       || !isRecord(entry.arguments) || (entry.content !== null && typeof entry.content !== 'string')
       || (entry.functionsStateId !== null && typeof entry.functionsStateId !== 'string')
@@ -521,10 +553,20 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
     if (!isSkillId(value.nextTurnSkillId)) throw new Error('Invalid next-turn Skill.');
     nextTurnSkillId = value.nextTurnSkillId;
   }
+  const compactSnapshot = version >= 8 ? validateCompactSnapshot(value.compactSnapshot, messages) : null;
+  if (compactSnapshot) {
+    const storedChat = { ...chat, messages, artifacts, toolReceipts, nextTurnPermissionProfile, nextTurnSkillId,
+      modelId: version >= 6 && value.modelId !== null ? requireModelId(value.modelId) : null,
+      compactSnapshot };
+    const prefix = buildCompactionPrefix(storedChat, compactSnapshot.boundaryMessageId, compactSnapshot.coveredThroughMessageId);
+    if (prefix.coveredThroughMessageId !== compactSnapshot.coveredThroughMessageId
+      || prefix.coveredPrefixHash !== compactSnapshot.coveredPrefixHash) throw new Error('Invalid compact prefix hash.');
+  }
   return {
     value: { ...chat, messages, artifacts, toolReceipts, nextTurnPermissionProfile, nextTurnSkillId,
-      modelId: version >= 6 && value.modelId !== null ? requireModelId(value.modelId) : null },
-    needsWrite: version < 7,
+      modelId: version >= 6 && value.modelId !== null ? requireModelId(value.modelId) : null,
+      compactSnapshot },
+    needsWrite: version < 8,
   };
 }
 
@@ -536,7 +578,37 @@ function summary(chat: ChatDetail): ChatSummary {
 }
 
 function detailFile(chat: ChatDetail): Record<string, unknown> {
-  return { schemaVersion: 7, ...chat };
+  return { schemaVersion: 8, ...chat };
+}
+
+function buildCompactionPrefix(chat: ChatDetail, boundaryMessageId: string, coveredThroughMessageId?: string): CompactionPrefix {
+  const anchorIndex = chat.messages.findIndex((message) => message.id === boundaryMessageId && message.role === 'user');
+  if (anchorIndex < 0) throw new Error('Граница сжатия отсутствует в истории чата.');
+  const coveredIndex = coveredThroughMessageId === undefined
+    ? (chat.messages[anchorIndex + 1]?.role === 'assistant' ? anchorIndex + 1 : anchorIndex)
+    : chat.messages.findIndex((message) => message.id === coveredThroughMessageId);
+  if (coveredIndex < anchorIndex) throw new Error('Покрытая граница отсутствует в истории чата.');
+  const endIndex = coveredIndex + 1;
+  const messages = structuredClone(chat.messages.slice(0, endIndex));
+  const userAnchors = new Set(messages.filter((message) => message.role === 'user').map((message) => message.id));
+  const receipts = chat.toolReceipts.filter((receipt) => userAnchors.has(receipt.anchorMessageId));
+  const protocolHistory: ProviderProtocolExchange[] = receipts.map((receipt) => ({
+    anchorMessageId: receipt.anchorMessageId,
+    name: receipt.name,
+    arguments: structuredClone(receipt.arguments),
+    content: receipt.content,
+    functionsStateId: receipt.functionsStateId,
+    result: receipt.status === 'pending' ? UNKNOWN_TOOL_RESULT : receipt.result ?? UNKNOWN_TOOL_RESULT,
+  }));
+  const resolvedCoveredThroughMessageId = messages[messages.length - 1]?.id;
+  if (!resolvedCoveredThroughMessageId) throw new Error('Пустой префикс сжатия.');
+  const coveredPrefixHash = hashCompactionPrefix(messages, protocolHistory);
+  return {
+    messages,
+    protocolHistory,
+    coveredThroughMessageId: resolvedCoveredThroughMessageId,
+    coveredPrefixHash,
+  };
 }
 
 function isJsonObjectText(value: string): boolean {
@@ -1155,7 +1227,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     }
     for (const legacy of legacyChats) {
       if (existingChatDetails.has(legacy.id)) continue;
-      const detail: ChatDetail = { ...legacy, nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], toolReceipts: [], artifacts: [] };
+      const detail: ChatDetail = { ...legacy, nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], toolReceipts: [], artifacts: [], compactSnapshot: null };
       await writeOwnedAtomic(join(chatsDirectory, legacy.id, 'chat.json'), detailFile(detail));
       loadedChats.push(detail);
     }
@@ -1225,6 +1297,12 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
   };
   const validateAcceptedTurnBinding = (turn: AcceptedTurnInput): ChatDetail => {
     const chat = findChat(turn.chatId);
+    if (turn.operation === 'compaction'
+      && (turn.compactBoundaryMessageId !== turn.messageId
+        || (chat.compactSnapshot?.id ?? null) !== (turn.compactExpectedSnapshotId ?? null))) {
+      throw new Error('Сводка или её граница изменилась после постановки сжатия в очередь.');
+    }
+    if (turn.operation !== undefined && turn.operation !== 'compaction') throw new Error('Неизвестная операция хода.');
     if (chat.projectId !== turn.projectId) throw new Error('Чат перемещён после принятия хода; запрос остановлен.');
     const project = turn.projectId ? projects.find((item) => item.id === turn.projectId) : null;
     if (turn.projectId && (!project || project.workingFolder !== turn.projectWorkingFolder)) {
@@ -1239,10 +1317,55 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       id: randomUUID(), title: kind === 'image' ? 'Новое изображение' : 'Новый чат', projectId,
       pinned: false, archived: false, createdAt: now, updatedAt: now, draft: '', kind,
       nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: settings.defaultModelId, messages: [], toolReceipts: [], artifacts: [],
+      compactSnapshot: null,
     };
     await saveChat(chat);
     selectionRevisions.set(chat.id, { permissionProfile: 0, skill: 0 });
     return chat;
+  };
+  const createAcceptedTurn = (
+    detail: ChatDetail,
+    turnId: string,
+    messageId: string,
+    operation?: 'compaction',
+  ): AcceptedTurnInput => {
+    const project = detail.projectId ? projects.find((item) => item.id === detail.projectId) : null;
+    const revisions = selectionRevisions.get(detail.id) ?? { permissionProfile: 0, skill: 0 };
+    const profileAlreadyReserved = [...turnReservations.values()].some((item) => item.chatId === detail.id
+      && item.permissionProfile?.revision === revisions.permissionProfile);
+    const skillAlreadyReserved = [...turnReservations.values()].some((item) => item.chatId === detail.id
+      && item.skill?.revision === revisions.skill);
+    const profileReservation = detail.nextTurnPermissionProfile !== null && !profileAlreadyReserved
+      ? { value: detail.nextTurnPermissionProfile, revision: revisions.permissionProfile }
+      : null;
+    const skillReservation = detail.nextTurnSkillId !== null && !skillAlreadyReserved
+      ? { value: detail.nextTurnSkillId, revision: revisions.skill }
+      : null;
+    turnReservations.set(turnId, { chatId: detail.id, permissionProfile: profileReservation, skill: skillReservation });
+    const boundaryIndex = detail.messages.findIndex((message) => message.id === messageId && message.role === 'user');
+    if (boundaryIndex < 0) throw new Error('Принятое сообщение отсутствует в истории чата.');
+    const messages = operation === 'compaction' ? detail.messages.slice(0, boundaryIndex + 1) : detail.messages;
+    return {
+      turnId,
+      chatId: detail.id,
+      projectId: detail.projectId,
+      projectWorkingFolder: project?.workingFolder ?? null,
+      messageId,
+      historyBoundary: messages.length,
+      messages: structuredClone(messages),
+      permissionProfile: profileReservation?.value ?? settings.defaultPermissionProfile,
+      modelId: detail.modelId ?? settings.defaultModelId,
+      skillId: skillReservation?.value ?? null,
+      reservation: {
+        permissionProfileRevision: profileReservation?.revision ?? null,
+        skillRevision: skillReservation?.revision ?? null,
+      },
+      ...(operation ? {
+        operation,
+        compactBoundaryMessageId: messageId,
+        compactExpectedSnapshotId: detail.compactSnapshot?.id ?? null,
+      } : {}),
+    };
   };
   const appendLocalMessage = async (idInput: unknown, textInput: unknown): Promise<ChatDetail> => {
     const chat = findChat(idInput);
@@ -1374,6 +1497,10 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       const endIndex = detail.messages.findIndex((message) => message.id === anchor && message.role === 'user');
       if (endIndex < 0) throw new Error('Принятое сообщение не найдено в истории чата.');
       return structuredClone(detail.messages.slice(0, endIndex + 1));
+    }),
+    getCompactionPrefix: (chatIdInput, boundaryMessageIdInput) => serialize(async () => {
+      const chat = findChat(chatIdInput);
+      return buildCompactionPrefix(chat, requireId(boundaryMessageIdInput));
     }),
     getToolProtocolThrough: (chatId, messageId) => serialize(async () => {
       const detail = findChat(chatId);
@@ -1532,39 +1659,22 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         throw new Error('Проект чата больше недоступен.');
       }
       const detail = await appendLocalMessage(idInput, textInput);
-      const project = detail.projectId ? projects.find((item) => item.id === detail.projectId) : null;
-      if (detail.projectId && !project) throw new Error('Проект чата больше недоступен.');
-      const revisions = selectionRevisions.get(detail.id) ?? { permissionProfile: 0, skill: 0 };
-      const profileAlreadyReserved = [...turnReservations.values()].some((item) => item.chatId === detail.id
-        && item.permissionProfile?.revision === revisions.permissionProfile);
-      const skillAlreadyReserved = [...turnReservations.values()].some((item) => item.chatId === detail.id
-        && item.skill?.revision === revisions.skill);
-      const profileReservation = detail.nextTurnPermissionProfile !== null && !profileAlreadyReserved
-        ? { value: detail.nextTurnPermissionProfile, revision: revisions.permissionProfile }
-        : null;
-      const skillReservation = detail.nextTurnSkillId !== null && !skillAlreadyReserved
-        ? { value: detail.nextTurnSkillId, revision: revisions.skill }
-        : null;
-      turnReservations.set(turnId, { chatId: detail.id, permissionProfile: profileReservation, skill: skillReservation });
       const message = detail.messages[detail.messages.length - 1];
       if (!message || message.role !== 'user') throw new Error('Принятое сообщение отсутствует в истории чата.');
-      const turn: AcceptedTurnInput = {
-        turnId,
-        chatId: detail.id,
-        projectId: detail.projectId,
-        projectWorkingFolder: project?.workingFolder ?? null,
-        messageId: message.id,
-        historyBoundary: detail.messages.length,
-        messages: structuredClone(detail.messages),
-        permissionProfile: profileReservation?.value ?? settings.defaultPermissionProfile,
-        modelId: detail.modelId ?? settings.defaultModelId,
-        skillId: skillReservation?.value ?? null,
-        reservation: {
-          permissionProfileRevision: profileReservation?.revision ?? null,
-          skillRevision: skillReservation?.revision ?? null,
-        },
-      };
+      const turn = createAcceptedTurn(detail, turnId, message.id);
       return { detail, turn };
+    }),
+    acceptCompactionTurn: (idInput, turnIdInput) => serialize(async () => {
+      const turnId = requireId(turnIdInput);
+      if (turnReservations.has(turnId)) throw new Error('Ход с таким идентификатором уже принят.');
+      const detail = findChat(idInput);
+      const lastUserMessage = [...detail.messages].reverse().find((message) => message.role === 'user');
+      if (!lastUserMessage) throw new Error('Сначала добавьте сообщение перед сжатием контекста.');
+      if (detail.projectId && !projects.some((item) => item.id === detail.projectId)) {
+        throw new Error('Проект чата больше недоступен.');
+      }
+      const turn = createAcceptedTurn(detail, turnId, lastUserMessage.id, 'compaction');
+      return { detail: structuredClone(detail), turn };
     }),
     releaseTurnReservation: (turnIdInput) => {
       if (typeof turnIdInput === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(turnIdInput)) turnReservations.delete(turnIdInput);
@@ -1625,6 +1735,29 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       const messages = [...chat.messages];
       messages.splice(anchor + 1, 0, message);
       const updated = { ...chat, updatedAt: now, messages };
+      await saveChat(updated, signal);
+      return structuredClone(updated);
+    }),
+    commitCompactSnapshot: (idInput, snapshotInput, expectedSnapshotIdInput, signal) => serialize(async () => {
+      if (signal?.aborted) throw createAbortError();
+      const chat = findChat(idInput);
+      if (expectedSnapshotIdInput !== null && typeof expectedSnapshotIdInput !== 'string') {
+        throw new Error('Некорректная версия сводки.');
+      }
+      const currentSnapshotId = chat.compactSnapshot?.id ?? null;
+      if (currentSnapshotId !== expectedSnapshotIdInput) throw new Error('Сводка чата изменилась; новая сводка не сохранена.');
+      const snapshot = validateCompactSnapshot(snapshotInput, chat.messages);
+      if (!snapshot) throw new Error('Некорректная сводка чата.');
+      const prefix = buildCompactionPrefix(chat, snapshot.boundaryMessageId, snapshot.coveredThroughMessageId);
+      if (prefix.coveredPrefixHash !== snapshot.coveredPrefixHash) throw new Error('История изменилась во время сжатия; прежняя сводка сохранена.');
+      const previousBoundaryIndex = chat.compactSnapshot
+        ? chat.messages.findIndex((message) => message.id === chat.compactSnapshot?.boundaryMessageId)
+        : -1;
+      const nextBoundaryIndex = chat.messages.findIndex((message) => message.id === snapshot.boundaryMessageId);
+      if (nextBoundaryIndex < previousBoundaryIndex) throw new Error('Сводка не может откатывать уже покрытую историю.');
+      await testFaults?.beforeCompactSnapshotCommit?.();
+      if (signal?.aborted) throw createAbortError();
+      const updated = { ...chat, compactSnapshot: snapshot, updatedAt: new Date().toISOString() };
       await saveChat(updated, signal);
       return structuredClone(updated);
     }),

@@ -4,7 +4,7 @@ import { type ClientRequest, type IncomingHttpHeaders, type IncomingMessage } fr
 import { Agent, request as httpsRequest } from 'node:https';
 import * as tls from 'node:tls';
 import type { GigaChatProvider, ModelRegistrySnapshot, ProviderConnectionSnapshot, ProviderErrorCategory, ProviderEvent, ProviderProtocolExchange, ProviderTurnRequest, ProviderUsageValues } from './contracts';
-import { discoveredModelRegistry, failedModelRegistry, isModelAvailable, requireModelId, unavailableModelRegistry } from './models';
+import { discoveredModelRegistry, failedModelRegistry, isModelAvailable, requireModelId, unavailableModelRegistry, type GigaChatModelId } from './models';
 
 export const GIGACHAT_API_BASE_URL = 'https://api.giga.chat/v1';
 export const GIGACHAT_OAUTH_URL = 'https://ngw.devices.sberbank.ru:9443/api/v2/oauth';
@@ -16,6 +16,7 @@ const MAX_TOKEN_CHARS = 16 * 1024;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_FUNCTION_ARGUMENT_BYTES = 1_900_000;
+export const MAX_PROVIDER_REQUEST_BYTES = 2 * 1024 * 1024;
 
 const GIGACHAT_FUNCTIONS: readonly Record<string, unknown>[] = [
   { name: 'list', description: 'Список файлов и папок внутри текущей рабочей папки проекта.', parameters: { type: 'object', properties: { path: { type: 'string', maxLength: 2048 } }, additionalProperties: false } },
@@ -47,6 +48,81 @@ export interface ProviderTransport {
   close(): void;
 }
 
+export interface SerializedProviderTurnRequest {
+  body: string;
+  wireBytes: number;
+  textInputs: string[];
+  functionSchemaBytes: number;
+}
+
+export function serializeProviderTurnRequest(request: ProviderTurnRequest): SerializedProviderTurnRequest {
+  let modelId: string;
+  try { modelId = request.modelId === null ? '' : requireModelId(request.modelId); }
+  catch { throw new GigaChatProviderError('model'); }
+  if (!modelId || !Array.isArray(request.system) || !Array.isArray(request.messages)) {
+    throw new GigaChatProviderError('protocol');
+  }
+  const systemPrompt = request.system.map((layer) => {
+    if (!layer || typeof layer.label !== 'string' || typeof layer.text !== 'string') throw new GigaChatProviderError('protocol');
+    return `[${layer.label}]\n${layer.text}`;
+  }).join('\n\n');
+  const protocolHistory = validateProtocolHistory(request.protocolHistory ?? []);
+  const exchanges = new Map<string, ProviderProtocolExchange[]>();
+  for (const exchange of protocolHistory) {
+    const rows = exchanges.get(exchange.anchorMessageId) ?? [];
+    rows.push(exchange);
+    exchanges.set(exchange.anchorMessageId, rows);
+  }
+  const messages: Array<Record<string, unknown>> = [
+    ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+  ];
+  for (const message of request.messages) {
+    if (!message || (message.role !== 'user' && message.role !== 'assistant') || typeof message.text !== 'string') {
+      throw new GigaChatProviderError('protocol');
+    }
+    if (message.functionsStateId !== undefined && (message.role !== 'assistant' || typeof message.functionsStateId !== 'string'
+      || !message.functionsStateId || message.functionsStateId.length > 4096
+      || /[\u0000-\u001f\u007f]/.test(message.functionsStateId))) throw new GigaChatProviderError('protocol');
+    messages.push({
+      role: message.role,
+      content: message.text,
+      ...(message.role === 'assistant' && message.functionsStateId ? { functions_state_id: message.functionsStateId } : {}),
+    });
+    if (message.role === 'user') {
+      for (const exchange of exchanges.get(message.id) ?? []) {
+        messages.push({
+          role: 'assistant', content: exchange.content ?? '',
+          ...(exchange.functionsStateId ? { functions_state_id: exchange.functionsStateId } : {}),
+          function_call: { name: exchange.name, arguments: exchange.arguments },
+        });
+        messages.push({ role: 'function', name: exchange.name, content: exchange.result });
+      }
+    }
+  }
+  if (protocolHistory.some((exchange) => !request.messages.some((message) => message.role === 'user' && message.id === exchange.anchorMessageId))) {
+    throw new GigaChatProviderError('protocol');
+  }
+  const functionsEnabled = request.functionCallMode !== 'none';
+  let body: string;
+  try {
+    body = JSON.stringify({
+      model: modelId,
+      messages,
+      ...(functionsEnabled ? { functions: GIGACHAT_FUNCTIONS } : {}),
+      stream: true,
+      function_call: functionsEnabled ? 'auto' : 'none',
+    });
+  } catch { throw new GigaChatProviderError('protocol'); }
+  const wireBytes = Buffer.byteLength(body, 'utf8');
+  if (wireBytes > MAX_PROVIDER_REQUEST_BYTES) throw new GigaChatProviderError('context');
+  return {
+    body,
+    wireBytes,
+    textInputs: messages.flatMap((message) => typeof message.content === 'string' ? [message.content] : []),
+    functionSchemaBytes: functionsEnabled ? Buffer.byteLength(JSON.stringify(GIGACHAT_FUNCTIONS), 'utf8') : 0,
+  };
+}
+
 export interface GigaChatProviderConnection extends GigaChatProvider {
   getConnectionStatus(): ProviderConnectionSnapshot;
   getModelRegistry(): ModelRegistrySnapshot;
@@ -55,6 +131,13 @@ export interface GigaChatProviderConnection extends GigaChatProvider {
   disconnect(): ProviderConnectionSnapshot;
   invalidateSavedKey(): void;
   listModels(signal?: AbortSignal): Promise<string[]>;
+  countTokens(modelId: GigaChatModelId, input: readonly string[], signal: AbortSignal): Promise<ProviderTokenCount[]>;
+}
+
+export interface ProviderTokenCount {
+  object: 'tokens';
+  tokens: number;
+  characters: number;
 }
 
 export class GigaChatProviderError extends Error {
@@ -452,47 +535,7 @@ export function createGigaChatProvider(options: {
       if (connectionStatus.state !== 'connected' || !modelId || !isModelAvailable(modelRegistry, modelId)) {
         throw new GigaChatProviderError('model');
       }
-      if (!Array.isArray(request.system) || !Array.isArray(request.messages)) throw new GigaChatProviderError('protocol');
-      const systemPrompt = request.system.map((layer) => {
-        if (!layer || typeof layer.label !== 'string' || typeof layer.text !== 'string') throw new GigaChatProviderError('protocol');
-        return `[${layer.label}]\n${layer.text}`;
-      }).join('\n\n');
-      const protocolHistory = validateProtocolHistory(request.protocolHistory ?? []);
-      const exchanges = new Map<string, ProviderProtocolExchange[]>();
-      for (const exchange of protocolHistory) {
-        const rows = exchanges.get(exchange.anchorMessageId) ?? [];
-        rows.push(exchange);
-        exchanges.set(exchange.anchorMessageId, rows);
-      }
-      const messages: Array<Record<string, unknown>> = [
-        ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
-      ];
-      for (const message of request.messages) {
-          if (!message || (message.role !== 'user' && message.role !== 'assistant') || typeof message.text !== 'string') {
-            throw new GigaChatProviderError('protocol');
-          }
-          if (message.functionsStateId !== undefined && (message.role !== 'assistant' || typeof message.functionsStateId !== 'string'
-            || !message.functionsStateId || message.functionsStateId.length > 4096
-            || /[\u0000-\u001f\u007f]/.test(message.functionsStateId))) throw new GigaChatProviderError('protocol');
-          messages.push({
-            role: message.role,
-            content: message.text,
-            ...(message.role === 'assistant' && message.functionsStateId ? { functions_state_id: message.functionsStateId } : {}),
-          });
-          if (message.role === 'user') {
-            for (const exchange of exchanges.get(message.id) ?? []) {
-              messages.push({
-                role: 'assistant', content: exchange.content ?? '',
-                ...(exchange.functionsStateId ? { functions_state_id: exchange.functionsStateId } : {}),
-                function_call: { name: exchange.name, arguments: exchange.arguments },
-              });
-              messages.push({ role: 'function', name: exchange.name, content: exchange.result });
-            }
-          }
-      }
-      if (protocolHistory.some((exchange) => !request.messages.some((message) => message.role === 'user' && message.id === exchange.anchorMessageId))) {
-        throw new GigaChatProviderError('protocol');
-      }
+      const serializedRequest = serializeProviderTurnRequest(request);
       let opened = false;
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const access = await getAccessToken(operation.controller.signal, operationGeneration);
@@ -506,7 +549,7 @@ export function createGigaChatProvider(options: {
               Accept: 'text/event-stream',
               'Content-Type': 'application/json',
             },
-            body: JSON.stringify({ model: modelId, messages, functions: GIGACHAT_FUNCTIONS, stream: true, function_call: 'auto' }),
+            body: serializedRequest.body,
             signal: operation.controller.signal,
             streaming: true,
           }), operation.controller.signal, (lateResponse) => lateResponse.cancel());
@@ -603,6 +646,55 @@ export function createGigaChatProvider(options: {
       }
       finally { operation.dispose(); }
     },
+    countTokens: async (modelInput, input, signal) => {
+      const operationGeneration = generation;
+      const operation = linkAbortSignals(sessionController.signal, signal);
+      try {
+        let modelId: GigaChatModelId;
+        try { modelId = requireModelId(modelInput); }
+        catch { throw new GigaChatProviderError('model'); }
+        if (connectionStatus.state !== 'connected' || !isModelAvailable(modelRegistry, modelId)
+          || !Array.isArray(input) || input.some((item) => typeof item !== 'string')) {
+          throw new GigaChatProviderError('model');
+        }
+        const body = JSON.stringify({ model: modelId, input });
+        if (Buffer.byteLength(body, 'utf8') > MAX_PROVIDER_REQUEST_BYTES) throw new GigaChatProviderError('context');
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const access = await getAccessToken(operation.controller.signal, operationGeneration);
+          assertCurrent(operationGeneration, operation.controller.signal);
+          let response: ProviderTransportResponse;
+          try {
+            response = await awaitWithAbort(options.transport.request({
+              url: `${GIGACHAT_API_BASE_URL}/tokens/count`,
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${access.value}`,
+                Accept: 'application/json',
+                'Content-Type': 'application/json',
+              },
+              body,
+              signal: operation.controller.signal,
+            }), operation.controller.signal, (lateResponse) => lateResponse.cancel());
+          } catch (error) {
+            throw transportError(error, operation.controller.signal);
+          }
+          assertCurrent(operationGeneration, operation.controller.signal);
+          if (response.statusCode === 401 && attempt === 0) {
+            response.cancel();
+            if (accessToken?.value === access.value) accessToken = null;
+            continue;
+          }
+          if (response.statusCode !== 200) {
+            response.cancel();
+            throw statusError(response.statusCode);
+          }
+          const value = await readJsonResponse(response, operation.controller.signal);
+          assertCurrent(operationGeneration, operation.controller.signal);
+          return parseTokenCounts(value, input.length);
+        }
+        throw new GigaChatProviderError('auth');
+      } finally { operation.dispose(); }
+    },
   };
 }
 
@@ -637,6 +729,19 @@ async function readJsonResponse(response: ProviderTransportResponse, signal: Abo
   } finally {
     signal.removeEventListener('abort', cancelOnAbort);
   }
+}
+
+function parseTokenCounts(value: unknown, expectedLength: number): ProviderTokenCount[] {
+  if (!Array.isArray(value) || value.length !== expectedLength) throw new GigaChatProviderError('protocol');
+  return value.map((entry): ProviderTokenCount => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)
+      || !('object' in entry) || entry.object !== 'tokens'
+      || !('tokens' in entry) || typeof entry.tokens !== 'number' || !Number.isSafeInteger(entry.tokens) || entry.tokens < 0
+      || !('characters' in entry) || typeof entry.characters !== 'number' || !Number.isSafeInteger(entry.characters) || entry.characters < 0) {
+      throw new GigaChatProviderError('protocol');
+    }
+    return { object: 'tokens', tokens: entry.tokens, characters: entry.characters };
+  });
 }
 
 async function* readSseData(body: AsyncIterable<Uint8Array>, signal: AbortSignal): AsyncGenerator<string> {
