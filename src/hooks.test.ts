@@ -123,7 +123,7 @@ test('deleting a source revokes trust even when scanning reports the missing act
   let snapshot = await registry.list();
   assert.equal(snapshot.hooks.length, 0);
   assert.equal(snapshot.issues.length, 1);
-  let stored = JSON.parse(await readFile(join(userDataPath, 'hooks/state.json'), 'utf8')) as { entries: unknown[] };
+  const stored = JSON.parse(await readFile(join(userDataPath, 'hooks/state.json'), 'utf8')) as { entries: unknown[] };
   assert.equal(stored.entries.length, 0);
 
   await writeFile(actionPath, inspected.actionContents, 'utf8');

@@ -3,7 +3,9 @@ import type { ModelRegistrySnapshot, ProviderErrorCategory } from './contracts';
 export type GigaChatModelId = string;
 
 export function requireModelId(value: unknown): GigaChatModelId {
-  if (typeof value !== 'string' || !value.trim() || value.length > 200 || /[\u0000-\u001F\u007F-\u009F]/.test(value)) {
+  if (typeof value !== 'string' || !value.trim() || value.length > 200
+    // eslint-disable-next-line no-control-regex -- Reject C0/C1 controls in untrusted model IDs without imposing a namespace whitelist.
+    || /[\u0000-\u001F\u007F-\u009F]/.test(value)) {
     throw new Error('Некорректный идентификатор модели GigaChat.');
   }
   return value;

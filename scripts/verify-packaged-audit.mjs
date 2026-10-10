@@ -155,7 +155,7 @@ async function runElectronHost() {
   const details = new Map(chats.map((chat, index) => [chat.id, makeDetail(chat, index === 0 ? 'A baseline' : index === 1 ? 'B baseline' : 'History baseline')]));
   const state = {
     projects, chats, details,
-    runtimeTurns: new Map(), retryCalls: [],
+    runtimeTurns: new Map(), retryCalls: [], runtimeCancelCalls: [],
     modelRegistry: { state: 'unavailable', modelIds: [], errorCategory: null }, modelRegistryCalls: [],
     connectionStatus: { state: 'not-configured', errorCategory: null }, connectionCalls: [],
     keyStatus: { available: true, saved: false, usable: false },
@@ -450,10 +450,24 @@ async function runElectronHost() {
     if (group === 'hooks' && method === 'list') return clone(state.hookRegistry);
     if (group === 'hooks' && method === 'inspect') {
       state.hookCalls.push({ method, id: args[0] });
-      throw new Error('Synthetic hook does not exist.');
+      const hook = state.hookRegistry.hooks.find((item) => item.id === args[0]);
+      if (!hook) throw new Error('Synthetic hook does not exist.');
+      return {
+        id: hook.id, contentHash: hook.contentHash, name: hook.name, event: hook.event, source: hook.source,
+        manifestContents: '{"name":"review-check","event":"session-start"}',
+        actionContents: 'Write-Output "Synthetic renderer fixture"',
+      };
     }
-    if (group === 'hooks' && (method === 'trust' || method === 'setEnabled')) {
+    if (group === 'hooks' && method === 'trust') {
       state.hookCalls.push({ method, id: args[0] });
+      const hook = state.hookRegistry.hooks.find((item) => item.id === args[0]);
+      if (hook && hook.contentHash === args[1]) hook.trusted = true;
+      return clone(state.hookRegistry);
+    }
+    if (group === 'hooks' && method === 'setEnabled') {
+      state.hookCalls.push({ method, id: args[0], enabled: args[1] });
+      const hook = state.hookRegistry.hooks.find((item) => item.id === args[0]);
+      if (hook) hook.enabled = args[1];
       return clone(state.hookRegistry);
     }
     if (group === 'models' && (method === 'getRegistry' || method === 'refresh')) {
@@ -461,6 +475,15 @@ async function runElectronHost() {
       return clone(state.modelRegistry);
     }
     if (group === 'runtime' && method === 'list') return clone(state.runtimeTurns.get(args[0]) ?? []);
+    if (group === 'runtime' && method === 'getStatus') return {
+      providerConfigured: false, helperRecovered: false, rendererToolApi: false,
+      helperUnavailableReason: 'Synthetic renderer fixture.', compactionAvailable: false,
+      compactionUnavailableReason: 'Команда /compact выключена до проверки качества сводки. История чата не изменена.',
+    };
+    if (group === 'runtime' && method === 'cancel') {
+      state.runtimeCancelCalls.push({ chatId: args[0], turnId: args[1] });
+      return true;
+    }
     if (group === 'runtime' && method === 'retry') {
       state.retryCalls.push({ chatId: args[0], turnId: args[1] });
       return `synthetic-retry-${state.retryCalls.length}`;
@@ -1800,6 +1823,18 @@ async function runElectronHost() {
     await waitDom('running partial draft and stop action', `document.querySelector('.runtime-turn-summary')?.textContent.includes('Выполняется')
       && document.querySelector('.runtime-turn-draft')?.textContent.includes('Текст поступает частями')
       && document.querySelector('.runtime-cancel')?.textContent === 'Остановить'`);
+    const otherChatQueuedTurn = { ...queuedTurn, id: 'turn-b-queued', chatId: 'chat-b' };
+    state.runtimeTurns.set('chat-b', [otherChatQueuedTurn]);
+    await clickChat('Chat B');
+    await waitDom('second chat shows its queued turn while the first chat is active', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'
+      && document.querySelector('.runtime-turn-summary')?.textContent.includes('Ожидает')
+      && document.querySelector('.runtime-cancel')?.textContent.includes('Убрать из очереди')`);
+    await clickChat('Chat A');
+    await waitDom('active chat retains its running turn after switching back', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'
+      && document.querySelector('.runtime-turn-summary')?.textContent.includes('Выполняется')`);
+    await click('.runtime-cancel');
+    await waitUntil('Stop invokes runtime cancel for the active chat turn', () => state.runtimeCancelCalls.length === 1);
+    assert.deepEqual(state.runtimeCancelCalls[0], { chatId: 'chat-a', turnId: runningTurn.id });
     const failedTurn = {
       ...runningTurn, status: 'failed', error: 'Synthetic network failure', errorCategory: 'network', retryEligible: true,
       modelId: 'original/model',
@@ -1820,6 +1855,7 @@ async function runElectronHost() {
     await clickText('.runtime-turn-summary', 'Ошибка');
     await waitDom('expanded failed timeline draft', `document.querySelector('.runtime-turn-details')?.open === true
       && document.querySelector('.runtime-turn-draft')?.textContent.includes('незавершённый ответ')`);
+    await capture('plan010-runtime-timeline-attachments');
     state.keyStatus = { available: true, saved: true, usable: true };
     await clickText('.runtime-reconnect', 'Проверить подключение');
     await waitDom('connection status before retry', `document.querySelector('.connection-setup')?.textContent.includes('GigaChat API не подключён')`);
@@ -1831,6 +1867,7 @@ async function runElectronHost() {
     await clickText('.connection-card button', 'Обновить список');
     await waitDom('connected model registry enables retry', `document.querySelector('.connection-card .status-pill')?.textContent.includes('Список загружен')`);
     assert.ok(state.modelRegistryCalls.includes('refresh'), 'renderer must refresh the actual model registry before retry');
+    await capture('plan010-connected-model-registry');
     await click('button[aria-label="Назад"]');
     await waitDom('return to the original chat after registry refresh', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'`);
     await waitDom('original failed turn retry after registry refresh', `document.querySelector('.runtime-retry') && !document.querySelector('.runtime-retry').disabled`);
@@ -1857,6 +1894,63 @@ async function runElectronHost() {
     await waitDom('completed and cancelled turns hide the old retry action', `document.querySelectorAll('.runtime-retry').length === 0
       && [...document.querySelectorAll('.runtime-turn-summary')].some((summary) => summary.textContent.includes('Завершено'))
       && [...document.querySelectorAll('.runtime-turn-summary')].some((summary) => summary.textContent.includes('Отменено'))`);
+    assert.equal(await evaluate(`document.querySelector('.context-indicator')?.getAttribute('aria-label')`), 'Размер контекста неизвестен');
+    const historyBeforeCompact = state.details.get('chat-a').messages.length;
+    const appendsBeforeCompact = state.appendCalls.length;
+    await fillTextarea(draftSelector, '/compact');
+    await click('.send-button-wrap .send-button');
+    await waitDom('unverified compaction remains unavailable', `document.querySelector('.notice')?.textContent.includes('/compact выключена')`);
+    assert.equal(state.details.get('chat-a').messages.length, historyBeforeCompact, 'unavailable compaction must leave visible history unchanged');
+    assert.equal(state.appendCalls.length, appendsBeforeCompact, 'unavailable compaction must not save a new user turn');
+    const draftUpdatesBeforeClear = state.updateCalls.length;
+    await fillTextarea(draftSelector, '');
+    await waitUntil('compact command text is cleared from the local draft', () => state.updateCalls.slice(draftUpdatesBeforeClear).some((item) => item.id === 'chat-a' && item.patch.draft === ''));
+    await click('.profile-button');
+    await waitDom('usage and balance remain unknown without receipts', `document.querySelector('.profile-page .usage-unavailable strong')?.textContent === 'Неизвестен'
+      && document.querySelector('.profile-page').textContent.includes('Пока нет измерений API')`);
+    assert.equal(state.usageLedger.requestCount, 0, 'synthetic renderer fixture has no usage receipts');
+    await click('button[aria-label="Назад"]');
+    await waitDom('chat returns after usage unknown check', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'`);
+    passed('Rendered context, balance, and compaction remain unknown or unavailable without changing history');
+    const toolTurnBase = {
+      id: 'turn-a-approved-tool', chatId: 'chat-a', createdAt: timestamp, activity: [
+        { kind: 'provider', at: timestamp, activity: 'waiting-for-tool' },
+        { kind: 'tool', at: timestamp, tool: 'read', phase: 'completed', durationMs: 28 },
+      ],
+    };
+    const toolTurn = { ...toolTurnBase, status: 'running', draft: 'Файл проверен и обновлён.' };
+    const turnsBeforeTool = state.runtimeTurns.get('chat-a') ?? [];
+    state.runtimeTurns.set('chat-a', [...turnsBeforeTool, toolTurn]);
+    window.webContents.send('audit:runtime', toolTurn);
+    await waitDom('partial answer delta appears before completion or history append', `document.querySelector('.runtime-activity-list')?.textContent.includes('Чтение файла: завершён')
+      && [...document.querySelectorAll('.runtime-turn-draft')].some((draft) => draft.textContent.includes('Файл проверен и обновлён'))
+      && !document.querySelector('.chat-history')?.textContent.includes('Файл проверен и обновлён')`);
+    window.webContents.send('audit:permission', {
+      id: 'synthetic-write-approval', resource: 'project-files', action: 'write',
+      target: 'C:\\audit\\project-a\\report.txt', reason: 'Synthetic renderer fixture approval.',
+      expiresAt: new Date(Date.now() + 60000).toISOString(),
+    });
+    await waitDom('write approval is shown for the local action', `document.querySelector('.approval-dialog')?.open === true
+      && document.querySelector('.approval-target')?.textContent.includes('report.txt')`);
+    await clickText('.approval-dialog .primary-button', 'Разрешить');
+    await waitUntil('approval response reaches the existing IPC contract', () => state.permissionResponses.some((item) => item.id === 'synthetic-write-approval' && item.allowed));
+    const completedToolTurn = {
+      ...toolTurnBase, status: 'completed', activeDurationMs: 3400,
+      activity: [
+        { kind: 'tool', at: timestamp, tool: 'read', phase: 'completed', durationMs: 28 },
+        { kind: 'tool', at: timestamp, tool: 'write', phase: 'completed', durationMs: 47 },
+        { kind: 'provider', at: timestamp, activity: 'receiving' },
+      ],
+    };
+    state.details.get('chat-a').messages.push({ id: 'synthetic-tool-answer', role: 'assistant', source: 'runtime', text: 'Файл проверен и обновлён.', createdAt: timestamp });
+    state.runtimeTurns.set('chat-a', [...turnsBeforeTool, completedToolTurn]);
+    window.webContents.send('audit:runtime', completedToolTurn);
+    await waitDom('completed injected tool timeline and answer render', `document.querySelector('.runtime-activity-list')?.textContent.includes('Запись файла: завершён')
+      && [...document.querySelectorAll('.chat-message')].filter((message) => message.textContent.includes('Файл проверен и обновлён')).length === 1
+      && ![...document.querySelectorAll('.runtime-turn-draft')].some((draft) => draft.textContent.includes('Файл проверен и обновлён'))`);
+    assert.equal(state.details.get('chat-a').messages.filter((message) => message.text === 'Файл проверен и обновлён.').length, 1,
+      'completed synthetic response must be stored once after its partial draft');
+    passed('Renderer shows a partial delta before one final answer for synthetic tool activity; execution is covered by runtime/tool fixtures');
     await clickText('.runtime-reconnect', 'Проверить подключение');
     await waitDom('network recovery opens connection settings', `document.querySelector('.connection-setup h1')?.textContent.includes('Подключение GigaChat API')`);
     await click('button[aria-label="Назад"]');
@@ -1866,7 +1960,7 @@ async function runElectronHost() {
       && document.querySelector('.runtime-timeline') === null`);
     await clickChat('Chat A');
     await waitDom('timeline restored for original chat', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'
-      && document.querySelectorAll('.runtime-turn-summary').length === 3`);
+      && document.querySelectorAll('.runtime-turn-summary').length === 4`);
     passed('Rendered local attachments stay local; retry is explicit, collapsible, and adds no user message');
 
     state.rejectNextGet = 'chat-b';
@@ -2698,8 +2792,29 @@ async function runElectronHost() {
     window.webContents.sendInputEvent({ type: 'mouseDown', x: outsideX, y: outsideY, button: 'left', clickCount: 1 });
     window.webContents.sendInputEvent({ type: 'mouseUp', x: outsideX, y: outsideY, button: 'left', clickCount: 1 });
     await waitDom('outside click on visible Skills action dismisses popup', `!document.querySelector('.skill-locations .choice-menu .action-menu-content:popover-open') && document.querySelector('.settings-nav-item.active')?.textContent.includes('Skills и интеграции')`);
+    const syntheticHook = {
+      id: 'global/review-check', name: 'Review check', description: 'Synthetic renderer Hook record.',
+      event: 'session-start', origin: 'global', scope: 'Global', owner: 'user', ownerId: null,
+      source: 'synthetic', enabled: false, trusted: false, available: true,
+      contentHash: 'e'.repeat(64), actionFile: 'action.ps1', unavailableReason: '',
+    };
+    state.hookRegistry = { hooks: [syntheticHook], issues: [] };
     await clickText('.settings-nav-item', 'Hooks');
-    await waitDom('Hooks navigation follows outside dismissal', `document.querySelector('.settings-nav-item.active')?.textContent.includes('Hooks')`);
+    await waitDom('Hooks registry and trust action render', `document.querySelector('.settings-nav-item.active')?.textContent.includes('Hooks')
+      && document.querySelector('.settings-list')?.textContent.includes('Review check')`);
+    await clickText('.settings-list button', 'Просмотреть');
+    await waitDom('Hook content and matching hash are reviewed', `document.querySelector('.skill-source[open]')?.textContent.includes('${syntheticHook.contentHash}')
+      && document.querySelector('.settings-list')?.textContent.includes('Synthetic renderer fixture')`);
+    await clickText('.settings-list button', 'Доверять этой версии');
+    await waitUntil('reviewed Hook trust uses the inspected content hash', () => state.hookCalls.some((item) => item.method === 'trust' && item.id === syntheticHook.id)
+      && state.hookRegistry.hooks[0]?.trusted === true);
+    await waitDom('trusted Hook can be enabled separately', `document.querySelector('.settings-list')?.textContent.includes('Доверен, выключен')
+      && document.querySelector('input[aria-label="Включить Hook Review check"]')`);
+    await click('input[aria-label="Включить Hook Review check"]');
+    await waitUntil('Hook enablement uses its separate settings operation', () => state.hookCalls.some((item) => item.method === 'setEnabled' && item.id === syntheticHook.id && item.enabled === true)
+      && state.hookRegistry.hooks[0]?.enabled === true);
+    await waitDom('Hook status reflects enabled state', `document.querySelector('.settings-list')?.textContent.includes('Включён')`);
+    passed('Renderer presents synthetic Hook inspection, trust, and separate enablement; execution is covered by hook fixtures');
     await click('button.window-action[aria-label="Назад"]');
     await waitDom('Chat B restored after Settings choice test', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'`);
     window.webContents.setZoomFactor(originalChoiceZoom);

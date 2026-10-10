@@ -480,7 +480,9 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
     }
     if (entry.source !== undefined && entry.source !== 'runtime' && entry.source !== 'example') throw new Error('Invalid chat message source.');
     if (entry.functionsStateId !== undefined && (version < 7 || entry.role !== 'assistant' || typeof entry.functionsStateId !== 'string'
-      || !entry.functionsStateId || entry.functionsStateId.length > 4096 || /[\u0000-\u001f\u007f]/.test(entry.functionsStateId))) {
+      || !entry.functionsStateId || entry.functionsStateId.length > 4096
+      // eslint-disable-next-line no-control-regex -- Reject control characters in persisted provider state IDs.
+      || /[\u0000-\u001f\u007f]/.test(entry.functionsStateId))) {
       throw new Error('Invalid assistant function state.');
     }
     return {
@@ -506,6 +508,7 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
       || typeof entry.anchorMessageId !== 'string' || typeof entry.name !== 'string' || !entry.name || entry.name.length > 128
       || (entry.effectId !== undefined && (typeof entry.effectId !== 'string' || !/^[a-f0-9]{64}$/.test(entry.effectId)))
       || (version >= 7 && SIDE_EFFECT_TOOLS.has(entry.name) && typeof entry.effectId !== 'string')
+      // eslint-disable-next-line no-control-regex -- Reject control characters in persisted tool names.
       || /[\u0000-\u001f\u007f]/.test(entry.name)
       || !isRecord(entry.arguments) || (entry.content !== null && typeof entry.content !== 'string')
       || (entry.functionsStateId !== null && typeof entry.functionsStateId !== 'string')
@@ -521,6 +524,7 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
     catch { throw new Error('Invalid tool receipt arguments.'); }
     if (Buffer.byteLength(argumentsText, 'utf8') > MAX_TOOL_ARGUMENTS_BYTES || (entry.content !== null && Buffer.byteLength(entry.content, 'utf8') > 16_000)
       || (entry.functionsStateId !== null && (entry.functionsStateId.length === 0 || entry.functionsStateId.length > 4096
+        // eslint-disable-next-line no-control-regex -- Reject control characters in persisted provider state IDs.
         || /[\u0000-\u001f\u007f]/.test(entry.functionsStateId)))
       || (entry.result !== null && (Buffer.byteLength(entry.result, 'utf8') > MAX_TOOL_RESULT_BYTES || !isJsonObjectText(entry.result)))) {
       throw new Error('Tool receipt exceeds its limits.');
@@ -1529,6 +1533,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         || typeof receiptInput.name !== 'string' || !receiptInput.name || receiptInput.name.length > 128
         || (receiptInput.effectId !== undefined && (typeof receiptInput.effectId !== 'string' || !/^[a-f0-9]{64}$/.test(receiptInput.effectId)))
         || (SIDE_EFFECT_TOOLS.has(receiptInput.name) && typeof receiptInput.effectId !== 'string')
+        // eslint-disable-next-line no-control-regex -- Reject control characters in untrusted tool names before persisting receipts.
         || /[\u0000-\u001f\u007f]/.test(receiptInput.name) || !isRecord(receiptInput.arguments)
         || (receiptInput.content !== null && typeof receiptInput.content !== 'string')
         || (receiptInput.functionsStateId !== null && typeof receiptInput.functionsStateId !== 'string')) {
@@ -1539,7 +1544,9 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       catch { throw new Error('Некорректные аргументы инструмента.'); }
       if (Buffer.byteLength(argumentText, 'utf8') > MAX_TOOL_ARGUMENTS_BYTES || (receiptInput.content !== null && Buffer.byteLength(receiptInput.content, 'utf8') > 16_000)
         || (receiptInput.functionsStateId !== null && (receiptInput.functionsStateId.length === 0
-          || receiptInput.functionsStateId.length > 4096 || /[\u0000-\u001f\u007f]/.test(receiptInput.functionsStateId)))) {
+          || receiptInput.functionsStateId.length > 4096
+          // eslint-disable-next-line no-control-regex -- Reject control characters in provider state IDs before persisting receipts.
+          || /[\u0000-\u001f\u007f]/.test(receiptInput.functionsStateId)))) {
         throw new Error('Аргументы инструмента превышают допустимый размер.');
       }
       const existingRows = chat.toolReceipts.filter((receipt) => receipt.receiptId === receiptInput.receiptId);
@@ -1774,7 +1781,9 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         throw new Error('Ответ должен содержать от 1 до 100 000 символов.');
       }
       if (functionsStateIdInput !== undefined && (typeof functionsStateIdInput !== 'string' || !functionsStateIdInput
-        || functionsStateIdInput.length > 4096 || /[\u0000-\u001f\u007f]/.test(functionsStateIdInput))) {
+        || functionsStateIdInput.length > 4096
+        // eslint-disable-next-line no-control-regex -- Reject control characters in persisted provider state IDs.
+        || /[\u0000-\u001f\u007f]/.test(functionsStateIdInput))) {
         throw new Error('Некорректное состояние ответа GigaChat.');
       }
       const now = new Date().toISOString();

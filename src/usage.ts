@@ -23,7 +23,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function requireOptionalProviderValue(value: unknown, label: string): string | null {
   if (value === null) return null;
-  if (typeof value !== 'string' || value.length < 1 || value.length > 512 || /[\u0000-\u001f\u007f]/.test(value)) {
+  if (typeof value !== 'string' || value.length < 1 || value.length > 512
+    // eslint-disable-next-line no-control-regex -- Reject control characters in provider-supplied usage metadata.
+    || /[\u0000-\u001f\u007f]/.test(value)) {
     throw new Error(`Invalid ${label}.`);
   }
   return value;

@@ -42,7 +42,7 @@ const RETRYABLE_ERROR_CATEGORIES = new Set<ProviderErrorCategory>([
   'auth', 'tls', 'network', 'rate-limit', 'quota', 'protocol', 'tool', 'storage',
 ]);
 
-export interface ToolReceiptInput extends Omit<ChatToolReceipt, 'anchorMessageId' | 'status' | 'result' | 'createdAt'> {}
+export type ToolReceiptInput = Omit<ChatToolReceipt, 'anchorMessageId' | 'status' | 'result' | 'createdAt'>;
 export interface ToolReceiptStart { shouldExecute: boolean; receipt: ChatToolReceipt }
 
 export interface PreparedCompactionContext {
@@ -225,9 +225,13 @@ function assertProviderEvent(value: unknown): asserts value is ProviderEvent {
       return count === null || typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 && count <= MAX_USAGE_COUNT;
     })
     && (event.providerRequestId === undefined || typeof event.providerRequestId === 'string'
-      && event.providerRequestId.length > 0 && event.providerRequestId.length <= 512 && !/[\u0000-\u001f\u007f]/.test(event.providerRequestId))
+      && event.providerRequestId.length > 0 && event.providerRequestId.length <= 512
+      // eslint-disable-next-line no-control-regex -- Reject control characters in provider request IDs.
+      && !/[\u0000-\u001f\u007f]/.test(event.providerRequestId))
     && (event.providerModel === undefined || typeof event.providerModel === 'string'
-      && event.providerModel.length > 0 && event.providerModel.length <= 512 && !/[\u0000-\u001f\u007f]/.test(event.providerModel))) return;
+      && event.providerModel.length > 0 && event.providerModel.length <= 512
+      // eslint-disable-next-line no-control-regex -- Reject control characters in provider model metadata.
+      && !/[\u0000-\u001f\u007f]/.test(event.providerModel))) return;
   if (event.type === 'completed' && (event.functionsStateId === undefined
     || typeof event.functionsStateId === 'string' && event.functionsStateId.length > 0 && event.functionsStateId.length <= 4096)) return;
   if (event.type === 'function-call' && isFunctionCall(event.functionCall)) return;
@@ -238,7 +242,9 @@ function assertProviderEvent(value: unknown): asserts value is ProviderEvent {
 function isFunctionCall(value: unknown): value is ProviderFunctionCall {
   if (typeof value !== 'object' || value === null || !('name' in value) || !('arguments' in value)) return false;
   const call = value as Partial<ProviderFunctionCall>;
-  if (typeof call.name !== 'string' || !call.name || call.name.length > 128 || /[\u0000-\u001f\u007f]/.test(call.name)
+  if (typeof call.name !== 'string' || !call.name || call.name.length > 128
+    // eslint-disable-next-line no-control-regex -- Reject control characters in untrusted function names.
+    || /[\u0000-\u001f\u007f]/.test(call.name)
     || typeof call.arguments !== 'object' || call.arguments === null || Array.isArray(call.arguments)
     || (call.content !== null && typeof call.content !== 'string')
     || (call.functionsStateId !== null && typeof call.functionsStateId !== 'string')
@@ -1035,8 +1041,9 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       } else {
         const terminalSignal = new AbortController().signal;
         const cancelled = turn.cancelRequested || isAbortError(error) && !turnTimedOut;
+        let terminalError: unknown = error;
         try { await finishActiveUsage(cancelled ? 'cancelled' : 'failed', terminalSignal); }
-        catch (usageError) { error = usageError; }
+        catch (usageError) { terminalError = usageError; }
         if (stopState.pendingOperation || stopState.pendingOutcome || blockedTurnId === turn.id) {
           if (!stopState.pendingOperation) maybeUnblock(turn.id);
           return;
@@ -1052,39 +1059,39 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
             outcome: cancelled ? 'cancelled' : 'failed',
           }, terminalSignal).catch(() => undefined);
         }
-        turn.status = turn.cancelRequested || isAbortError(error) && !turnTimedOut ? 'cancelled' : 'failed';
+        turn.status = turn.cancelRequested || isAbortError(terminalError) && !turnTimedOut ? 'cancelled' : 'failed';
         turn.endedAt = new Date().toISOString();
         turn.activeDurationMs = Math.max(0, Date.now() - started);
-        const category = runtimeErrorCategory(error, turnTimedOut);
+        const category = runtimeErrorCategory(terminalError, turnTimedOut);
         if (turn.status === 'cancelled') turn.errorCategory = 'cancel';
         else if (category) turn.errorCategory = category;
         else delete turn.errorCategory;
         if (turn.status === 'failed') {
           turn.error = turnTimedOut
             ? 'Ход превысил общий лимит времени.'
-            : error instanceof Error && error.message === 'PROVIDER_UNAVAILABLE'
+            : terminalError instanceof Error && terminalError.message === 'PROVIDER_UNAVAILABLE'
               ? 'GigaChat API пока не подключён.'
-              : error instanceof Error && error.message === 'MODEL_NOT_SELECTED'
+              : terminalError instanceof Error && terminalError.message === 'MODEL_NOT_SELECTED'
                 ? 'Выберите модель GigaChat для следующего хода.'
-                : error instanceof Error && error.message === 'TURN_PREPARE_TIMEOUT'
+                : terminalError instanceof Error && terminalError.message === 'TURN_PREPARE_TIMEOUT'
                   ? 'Подготовка хода превысила ограниченное время ожидания.'
-                  : error instanceof Error && error.message === 'PROVIDER_STEP_TIMEOUT'
+                  : terminalError instanceof Error && terminalError.message === 'PROVIDER_STEP_TIMEOUT'
                     ? 'Поток не ответил в отведённое время.'
-                    : error instanceof Error && error.message === 'TURN_CONSUME_TIMEOUT'
+                    : terminalError instanceof Error && terminalError.message === 'TURN_CONSUME_TIMEOUT'
                       ? 'Не удалось зафиксировать параметры хода вовремя.'
-                      : error instanceof Error && error.message === 'TOOL_ROUND_LIMIT'
+                      : terminalError instanceof Error && terminalError.message === 'TOOL_ROUND_LIMIT'
                         ? 'Ход остановлен: достигнут лимит последовательных вызовов инструментов.'
-                        : error instanceof Error && error.message === 'TOOL_RESULT_LIMIT'
+                        : terminalError instanceof Error && terminalError.message === 'TOOL_RESULT_LIMIT'
                           ? 'Ход остановлен: суммарный результат инструментов превысил лимит.'
-                          : error instanceof Error && error.message === 'LOCAL_TOOL_TIMEOUT'
+                          : terminalError instanceof Error && terminalError.message === 'LOCAL_TOOL_TIMEOUT'
                             ? 'Локальный инструмент превысил лимит времени; очередь ожидает подтверждённой остановки.'
-                            : error instanceof Error && error.message === 'TOOL_INTENT_SAVE_TIMEOUT'
+                            : terminalError instanceof Error && terminalError.message === 'TOOL_INTENT_SAVE_TIMEOUT'
                               ? 'Не удалось вовремя зафиксировать намерение инструмента.'
-                              : error instanceof Error && error.message === 'USAGE_RECEIPT_SAVE_TIMEOUT'
+                              : terminalError instanceof Error && terminalError.message === 'USAGE_RECEIPT_SAVE_TIMEOUT'
                                 ? 'Не удалось вовремя сохранить usage; очередь ожидает завершения записи.'
-                                : error instanceof Error && error.message === 'USAGE_RECEIPT_SAVE_FAILED'
+                                : terminalError instanceof Error && terminalError.message === 'USAGE_RECEIPT_SAVE_FAILED'
                                   ? 'Не удалось сохранить usage; запрос не будет продолжен.'
-                                  : error instanceof Error && error.message === 'TOOL_RECEIPT_STORE_UNAVAILABLE'
+                                  : terminalError instanceof Error && terminalError.message === 'TOOL_RECEIPT_STORE_UNAVAILABLE'
                                     ? 'Сохранение истории инструментов недоступно; действие не выполнено.'
                                     : 'Ход завершился ошибкой. Сообщение пользователя сохранено локально.';
         }

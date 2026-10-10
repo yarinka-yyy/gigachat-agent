@@ -72,6 +72,7 @@ export function hashCompactionPrefix(
 
 export function validateCompactSummary(value: unknown): string {
   if (typeof value !== 'string' || !value.trim() || byteLength(value) > MAX_COMPACT_SUMMARY_BYTES
+    // eslint-disable-next-line no-control-regex -- Reject C0/C1 control characters in the untrusted summary.
     || /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(value)) {
     throw new Error('Сводка должна быть непустым текстом без управляющих символов размером до 32 КиБ.');
   }

@@ -865,9 +865,11 @@ test('keeps SSE streams bounded by idle time while preserving a whole-response d
       url: `https://127.0.0.1:${address.port}/json`, method: 'GET', headers: {},
       signal: new AbortController().signal,
     });
+    let jsonResponsePrefix = '';
     await assert.rejects(async () => {
-      for await (const _chunk of jsonResponseBody.body) { /* consume bounded JSON body */ }
+      for await (const chunk of jsonResponseBody.body) jsonResponsePrefix += Buffer.from(chunk).toString('utf8');
     }, (error: unknown) => error instanceof GigaChatProviderError && error.category === 'network');
+    assert.equal(jsonResponsePrefix, '{"data":[', 'the timed JSON request must have received only its initial prefix');
   } finally {
     transport.close();
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));

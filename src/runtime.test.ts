@@ -1489,7 +1489,7 @@ test('explicit retry preserves the accepted turn and does not replay a completed
   const receipts = makeReceiptStore();
   let writes = 0;
   let providerRound = 0;
-  const provider = makeProvider(async function* (request) {
+  const provider = makeProvider(async function* () {
     providerRound += 1;
     if (providerRound === 1) {
       yield functionCall('write', { path: 'once.txt', contents: 'once' }, 'state-write-once');

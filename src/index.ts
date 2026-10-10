@@ -5,7 +5,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, Notification, safeStorage, screen, session, shell, systemPreferences, Tray, WebContentsView, type IpcMainInvokeEvent, type MediaAccessPermissionRequest } from 'electron';
 import { openStore, type LocalStore } from './store';
 import { COMPACTION_QUALITY_VERIFIED, COMPACTION_UNAVAILABLE_REASON, COMPACTION_TASK_INSTRUCTION, buildNextTurnContext, validateCompactSummary } from './context';
-import { createLocalTools, createPowerShellHelper, resolvePowerShellHelperPath, type LocalTools } from './local-tools';
+import { createLocalTools, createPowerShellHelper, resolvePowerShellHelperPath } from './local-tools';
 import { createTurnRuntime, type PreparedCompactionContext, type TurnRuntime } from './runtime';
 import type { AcceptedTurnInput, ChatPatch, CompactSnapshot, FolderOpener, HookRunResult, ModelRegistrySnapshot, NotificationSettings, PreferredOpener, RuntimeAvailability, SettingsPatch, Theme, VoiceAvailability } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
@@ -250,11 +250,6 @@ async function withLocalFailureNotification<T>(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function isAbortError(value: unknown): boolean {
-  return value instanceof Error && value.name === 'AbortError'
-    || isRecord(value) && value.code === 'ABORT_ERR';
 }
 
 function requireText(value: unknown, label: string, maxLength = 128): string {
@@ -694,12 +689,6 @@ async function createMainRuntime(
   let closingHooks = false;
   let sessionStartAttempted = false;
   let sessionEndAttempted = false;
-  let tools!: LocalTools;
-  let dispatchHookHandlers!: ReturnType<typeof createHookDispatcher>;
-  let hookApprovalGate: {
-    request(details: Parameters<typeof approvals.request>[0], signal?: AbortSignal, context?: HookApprovalRequestContext): Promise<boolean>;
-  };
-
   const requestLocalApproval = async (
     details: Parameters<typeof approvals.request>[0],
     signal?: AbortSignal,
@@ -713,7 +702,7 @@ async function createMainRuntime(
   };
 
   let runtime: TurnRuntime | null = null;
-  tools = createLocalTools({
+  const tools = createLocalTools({
     resolveProject: async (id) => (await store.listProjects()).find((project) => project.id === id) ?? null,
     protectedDirectory: app.getPath('userData'),
     getCustomPolicy: customPermissions.policy,
@@ -736,13 +725,13 @@ async function createMainRuntime(
       }
     },
   });
-  dispatchHookHandlers = createHookDispatcher({
+  const dispatchHookHandlers = createHookDispatcher({
     registry: hooks,
     tools,
     isAvailable: () => Boolean(helper),
     onResult: (result) => hooks.recordResult(result),
   });
-  hookApprovalGate = createHookApprovalGate({
+  const hookApprovalGate = createHookApprovalGate({
     dispatch: dispatchHookHandlers,
     isSuppressed: () => closingHooks || hookApprovalSuppressionDepth > 0,
     requestApproval: approvals.request,

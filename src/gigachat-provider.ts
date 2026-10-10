@@ -19,11 +19,11 @@ const MAX_FUNCTION_ARGUMENT_BYTES = 1_900_000;
 export const MAX_PROVIDER_REQUEST_BYTES = 2 * 1024 * 1024;
 
 const GIGACHAT_FUNCTIONS: readonly Record<string, unknown>[] = [
-  { name: 'list', description: 'Список файлов и папок внутри текущей рабочей папки проекта.', parameters: { type: 'object', properties: { path: { type: 'string', maxLength: 2048 } }, additionalProperties: false } },
-  { name: 'search', description: 'Поиск текста внутри файлов текущей рабочей папки проекта.', parameters: { type: 'object', properties: { query: { type: 'string', minLength: 1, maxLength: 256 }, path: { type: 'string', maxLength: 2048 } }, required: ['query'], additionalProperties: false } },
-  { name: 'read', description: 'Чтение небольшого текстового файла внутри текущей рабочей папки проекта.', parameters: { type: 'object', properties: { path: { type: 'string', minLength: 1, maxLength: 2048 } }, required: ['path'], additionalProperties: false } },
-  { name: 'write', description: 'Запись текста в файл проекта с применением текущего профиля разрешений. UTF-8 содержимое ограничено 1 МиБ.', parameters: { type: 'object', properties: { path: { type: 'string', minLength: 1, maxLength: 2048 }, contents: { type: 'string', maxLength: 1048576 } }, required: ['path', 'contents'], additionalProperties: false } },
-  { name: 'open', description: 'Открытие или показ безопасного файла проекта.', parameters: { type: 'object', properties: { path: { type: 'string', maxLength: 2048 } }, additionalProperties: false } },
+  { name: 'list', description: 'Список файлов и папок по текущему профилю разрешений. Относительные пути считаются от рабочей папки; абсолютные пути вне неё доступны только при разрешении.', parameters: { type: 'object', properties: { path: { type: 'string', maxLength: 2048 } }, additionalProperties: false } },
+  { name: 'search', description: 'Поиск текста в файлах по текущему профилю разрешений. Относительные пути считаются от рабочей папки; абсолютные пути вне неё доступны только при разрешении.', parameters: { type: 'object', properties: { query: { type: 'string', minLength: 1, maxLength: 256 }, path: { type: 'string', maxLength: 2048 } }, required: ['query'], additionalProperties: false } },
+  { name: 'read', description: 'Чтение небольшого текстового файла по текущему профилю разрешений. Относительные пути считаются от рабочей папки; абсолютные пути вне неё доступны только при разрешении.', parameters: { type: 'object', properties: { path: { type: 'string', minLength: 1, maxLength: 2048 } }, required: ['path'], additionalProperties: false } },
+  { name: 'write', description: 'Запись текста в файл по текущему профилю разрешений. Относительные пути считаются от рабочей папки; абсолютные пути вне неё доступны только при разрешении. UTF-8 содержимое ограничено 1 МиБ.', parameters: { type: 'object', properties: { path: { type: 'string', minLength: 1, maxLength: 2048 }, contents: { type: 'string', maxLength: 1048576 } }, required: ['path', 'contents'], additionalProperties: false } },
+  { name: 'open', description: 'Открытие или показ безопасного файла по текущему профилю разрешений. Относительные пути считаются от рабочей папки; абсолютные пути вне неё доступны только при разрешении.', parameters: { type: 'object', properties: { path: { type: 'string', maxLength: 2048 } }, additionalProperties: false } },
   { name: 'powershell', description: 'Выполнение PowerShell через существующий локальный helper и текущий профиль разрешений.', parameters: { type: 'object', properties: { script: { type: 'string', minLength: 1, maxLength: 16384 }, external_access: { type: 'boolean' } }, required: ['script'], additionalProperties: false } },
 ];
 
@@ -82,6 +82,7 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
     }
     if (message.functionsStateId !== undefined && (message.role !== 'assistant' || typeof message.functionsStateId !== 'string'
       || !message.functionsStateId || message.functionsStateId.length > 4096
+      // eslint-disable-next-line no-control-regex -- Reject control characters in provider protocol state IDs.
       || /[\u0000-\u001f\u007f]/.test(message.functionsStateId))) throw new GigaChatProviderError('protocol');
     messages.push({
       role: message.role,
@@ -839,7 +840,9 @@ function parseProviderUsage(value: unknown): ProviderUsageValues | null {
   const readIdentity = (key: string): string | undefined => {
     const metadata = value[key];
     if (metadata === undefined || metadata === null) return undefined;
-    if (typeof metadata !== 'string' || metadata.length < 1 || metadata.length > 512 || /[\u0000-\u001f\u007f]/.test(metadata)) {
+    if (typeof metadata !== 'string' || metadata.length < 1 || metadata.length > 512
+      // eslint-disable-next-line no-control-regex -- Reject control characters in provider usage identity fields.
+      || /[\u0000-\u001f\u007f]/.test(metadata)) {
       throw new GigaChatProviderError('protocol');
     }
     return metadata;
@@ -887,6 +890,7 @@ function parseCompletionChunk(parsed: unknown): {
   }
   const rawStateId = choice.delta.functions_state_id;
   if (rawStateId !== undefined && (typeof rawStateId !== 'string' || rawStateId.length === 0 || rawStateId.length > 4096
+    // eslint-disable-next-line no-control-regex -- Reject control characters in provider protocol state IDs.
     || /[\u0000-\u001f\u007f]/.test(rawStateId))) throw new GigaChatProviderError('protocol');
   const functionsStateId = typeof rawStateId === 'string' ? rawStateId : null;
   let functionCall: ReturnType<typeof parseProviderFunctionCall> | undefined;
@@ -909,6 +913,7 @@ function parseProviderFunctionCall(
   functionsStateId: string | null,
 ): { name: string; arguments: Record<string, unknown>; content: string | null; functionsStateId: string | null; terminalReason: 'function_call' } {
   if (!isRecord(value) || typeof value.name !== 'string' || !value.name || value.name.length > 128
+    // eslint-disable-next-line no-control-regex -- Reject control characters in provider-supplied function names.
     || /[\u0000-\u001f\u007f]/.test(value.name) || !isRecord(value.arguments)) {
     throw new GigaChatProviderError('protocol');
   }
@@ -925,7 +930,9 @@ function validateProtocolHistory(value: unknown): ProviderProtocolExchange[] {
   if (!Array.isArray(value) || value.length > 256) throw new GigaChatProviderError('protocol');
   return value.map((entry): ProviderProtocolExchange => {
     if (!isRecord(entry) || typeof entry.anchorMessageId !== 'string' || !entry.anchorMessageId
-      || typeof entry.name !== 'string' || !entry.name || entry.name.length > 128 || /[\u0000-\u001f\u007f]/.test(entry.name)
+      || typeof entry.name !== 'string' || !entry.name || entry.name.length > 128
+      // eslint-disable-next-line no-control-regex -- Reject control characters in persisted provider function names.
+      || /[\u0000-\u001f\u007f]/.test(entry.name)
       || !isRecord(entry.arguments)
       || (entry.content !== null && typeof entry.content !== 'string')
       || (entry.functionsStateId !== null && typeof entry.functionsStateId !== 'string')
