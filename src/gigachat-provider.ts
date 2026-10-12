@@ -144,12 +144,14 @@ export interface ProviderTokenCount {
 export class GigaChatProviderError extends Error {
   readonly category: ProviderErrorCategory;
   readonly retryable: boolean;
+  readonly httpStatus?: number;
 
-  constructor(category: ProviderErrorCategory, retryable = false) {
+  constructor(category: ProviderErrorCategory, retryable = false, httpStatus?: number) {
     super(category);
     this.name = 'GigaChatProviderError';
     this.category = category;
     this.retryable = retryable;
+    if (httpStatus !== undefined && Number.isInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599) this.httpStatus = httpStatus;
   }
 }
 
@@ -355,17 +357,29 @@ export function createGigaChatProvider(options: {
 
   const fetchAccessToken = async (authorizationKey: string, signal: AbortSignal): Promise<AccessToken> => {
     const body = new URLSearchParams({ scope: 'GIGACHAT_API_PERS' }).toString();
-    const value = await fetchJson({
+    // Preserve the credentials' bytes while fixing Base64 padding and unused pad bits.
+    const decoded = /^[A-Za-z0-9+/]+={0,2}$/.test(authorizationKey) ? Buffer.from(authorizationKey, 'base64') : null;
+    const separator = decoded?.indexOf(0x3a) ?? -1;
+    const encodedKey = decoded && separator > 0 && separator < decoded.length - 1
+      ? decoded.toString('base64') : authorizationKey;
+    let value: unknown;
+    try { value = await fetchJson({
       url: GIGACHAT_OAUTH_URL,
       method: 'POST',
       headers: {
-        Authorization: `Basic ${authorizationKey}`,
+        Authorization: `Basic ${encodedKey}`,
         'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json',
         RqUID: randomUUID(),
       },
       body,
       signal,
-    });
+    }); } catch (error) {
+      if (error instanceof GigaChatProviderError && error.httpStatus === 400) {
+        throw new GigaChatProviderError('auth', false, 400);
+      }
+      throw error;
+    }
     if (!isRecord(value) || typeof value.access_token !== 'string'
       || !value.access_token.trim() || value.access_token.length > MAX_TOKEN_CHARS
       || /[\r\n]/.test(value.access_token)
@@ -489,6 +503,7 @@ export function createGigaChatProvider(options: {
     const controller = operation.controller;
     connectController = controller;
     setStatus({ state: 'connecting', errorCategory: null });
+    let failedStep: 'oauth' | 'models' = 'oauth';
     try {
       const authorizationKey = await loadKey();
       assertCurrent(operationGeneration, controller.signal);
@@ -497,6 +512,7 @@ export function createGigaChatProvider(options: {
         return getStatus();
       }
       await getAccessToken(controller.signal, operationGeneration, authorizationKey);
+      failedStep = 'models';
       const models = await listModelsWithAuthRetry(controller.signal, operationGeneration);
       assertCurrent(operationGeneration, controller.signal);
       if (models.length === 0) throw new GigaChatProviderError('model');
@@ -509,7 +525,9 @@ export function createGigaChatProvider(options: {
         setStatus({ state: 'not-configured', errorCategory: null });
       } else {
         modelRegistry = failedModelRegistry(category);
-        setStatus({ state: 'error', errorCategory: category });
+        setStatus({ state: 'error', errorCategory: category, failedStep,
+          ...(error instanceof GigaChatProviderError && error.httpStatus !== undefined ? { httpStatus: error.httpStatus } : {}),
+        });
       }
     } finally {
       if (connectController === controller) connectController = null;
@@ -1018,13 +1036,13 @@ function parseModelIds(value: unknown): string[] {
 }
 
 function statusError(statusCode: number): GigaChatProviderError {
-  if (statusCode === 401 || statusCode === 403) return new GigaChatProviderError('auth');
-  if (statusCode === 402) return new GigaChatProviderError('quota');
-  if (statusCode === 413) return new GigaChatProviderError('context');
-  if (statusCode === 429) return new GigaChatProviderError('rate-limit', true);
-  if (statusCode === 404) return new GigaChatProviderError('model');
-  if (statusCode >= 500 || statusCode === 408) return new GigaChatProviderError('network', true);
-  return new GigaChatProviderError('protocol');
+  if (statusCode === 401 || statusCode === 403) return new GigaChatProviderError('auth', false, statusCode);
+  if (statusCode === 402) return new GigaChatProviderError('quota', false, statusCode);
+  if (statusCode === 413) return new GigaChatProviderError('context', false, statusCode);
+  if (statusCode === 429) return new GigaChatProviderError('rate-limit', true, statusCode);
+  if (statusCode === 404) return new GigaChatProviderError('model', false, statusCode);
+  if (statusCode >= 500 || statusCode === 408) return new GigaChatProviderError('network', true, statusCode);
+  return new GigaChatProviderError('protocol', false, statusCode);
 }
 
 function errorCategory(error: unknown): ProviderErrorCategory {

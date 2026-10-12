@@ -736,6 +736,13 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .connection-key-control input::placeholder { color: var(--faint); }
 .connection-key-control .secondary-button { min-height: 39px; padding-inline: 10px; }
 .connection-key-status { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.4; }
+.connection-result { display: grid; gap: 6px; padding: 12px; border: 1px solid var(--line-strong); border-radius: 10px; }
+.connection-result strong { font-size: 14px; line-height: 1.4; }
+.connection-result p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.connection-result[data-state="connected"] { border-color: var(--accent); }
+.connection-result[data-state="connected"] strong { color: var(--accent); }
+.connection-result[data-state="error"] { border-color: var(--danger); }
+.connection-result[data-state="error"] strong { color: var(--danger); }
 .connection-finish .primary-button { justify-self: start; min-height: 42px; }
 .connection-error, .connection-browser-error { margin: 0; color: var(--danger); font-size: 14px; line-height: 1.45; }
 .connection-browser-card { display: flex; flex-direction: column; gap: 10px; min-height: 440px; padding: 11px; }

@@ -157,7 +157,7 @@ async function runElectronHost() {
     projects, chats, details,
     runtimeTurns: new Map(), retryCalls: [], runtimeCancelCalls: [],
     modelRegistry: { state: 'unavailable', modelIds: [], errorCategory: null }, modelRegistryCalls: [],
-    connectionStatus: { state: 'not-configured', errorCategory: null }, connectionCalls: [],
+    connectionStatus: { state: 'not-configured', errorCategory: null }, connectionCalls: [], nextConnectionFailure: null,
     keyStatus: { available: true, saved: false, usable: false },
     hookRegistry: { hooks: [], issues: [] }, hookCalls: [],
     usageLedger: {
@@ -406,7 +406,8 @@ async function runElectronHost() {
     if (group === 'onboarding' && method === 'getConnectionStatus') return clone(state.connectionStatus);
     if (group === 'onboarding' && method === 'connect') {
       state.connectionCalls.push(method);
-      state.connectionStatus = { state: 'connected', errorCategory: null };
+      state.connectionStatus = state.nextConnectionFailure ?? { state: 'connected', errorCategory: null };
+      state.nextConnectionFailure = null;
       return clone(state.connectionStatus);
     }
     if (group === 'onboarding' && (method === 'cancelConnect' || method === 'disconnect')) {
@@ -1858,10 +1859,19 @@ async function runElectronHost() {
     await capture('plan010-runtime-timeline-attachments');
     state.keyStatus = { available: true, saved: true, usable: true };
     await clickText('.runtime-reconnect', 'Проверить подключение');
-    await waitDom('connection status before retry', `document.querySelector('.connection-setup')?.textContent.includes('GigaChat API не подключён')`);
+    await waitDom('connection status before retry', `document.querySelector('.connection-result')?.textContent.includes('Не подключено — запросы к модели недоступны')`);
+    state.nextConnectionFailure = { state: 'error', errorCategory: 'auth', failedStep: 'oauth', httpStatus: 400 };
     await clickText('.connection-setup button', 'Проверить подключение');
-    await waitDom('synthetic API reconnect before retry', `document.querySelector('.connection-setup')?.textContent.includes('OAuth и список моделей проверены')`);
-    assert.deepEqual(state.connectionCalls, ['connect'], 'retry recovery uses the existing Connect flow');
+    await waitDom('OAuth rejection clearly says that chat is unavailable', `document.querySelector('.connection-result[data-state="error"]')?.textContent.includes('Не подключено — запросы к модели недоступны')
+      && document.querySelector('.connection-result')?.textContent.includes('Авторизация (HTTP 400)')
+      && !document.querySelector('.connection-result')?.textContent.includes('неподдерживаемом формате')`);
+    await capture('connect-error-oauth-400');
+    await clickText('.connection-setup button', 'Проверить подключение');
+    await waitDom('synthetic API reconnect before retry', `document.querySelector('.connection-result[data-state="connected"]')?.textContent.includes('Подключено — можно перейти в чат')
+      && !document.querySelector('.connection-result')?.textContent.includes('HTTP 400')`);
+    await capture('connect-ready');
+    assert.deepEqual(state.connectionCalls, ['connect', 'connect'], 'retry recovery uses the existing Connect flow');
+    passed('Connection status separates saved key, rejected OAuth, and ready chat without stale HTTP errors');
     await clickText('.settings-nav-item', 'Модели и лимиты');
     state.modelRegistry = { state: 'ready', modelIds: ['original/model'], errorCategory: null };
     await clickText('.connection-card button', 'Обновить список');

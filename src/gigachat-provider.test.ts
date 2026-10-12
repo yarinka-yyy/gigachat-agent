@@ -150,6 +150,62 @@ test('discovers future model IDs without inventing model capabilities', async ()
   assert.deepEqual(Object.keys(provider.getModelRegistry()).sort(), ['errorCategory', 'modelIds', 'state']);
 });
 
+test('OAuth canonicalizes Base64 without changing the credential bytes', async (t) => {
+  const credentials = '00000000-0000-4000-8000-000000000001:00000000-0000-4000-8000-000000000002';
+  const canonical = Buffer.from(credentials, 'utf8').toString('base64');
+  const unpadded = canonical.replace(/=+$/, '');
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  const nonzeroPadBits = unpadded.slice(0, -1) + alphabet[alphabet.indexOf(unpadded[unpadded.length - 1]) | 1];
+  for (const storedKey of [canonical, unpadded, nonzeroPadBits + '==']) {
+    await t.test(storedKey === canonical ? 'canonical' : storedKey === unpadded ? 'missing padding' : 'nonzero pad bits', async () => {
+      assert.equal(Buffer.from(storedKey, 'base64').toString('utf8'), credentials);
+      const provider = createGigaChatProvider({
+        loadAuthorizationKey: async () => storedKey,
+        now: () => FIXED_NOW,
+        transport: fakeTransport((request) => {
+          if (request.url === GIGACHAT_OAUTH_URL) {
+            assert.equal(request.headers.Authorization, `Basic ${canonical}`);
+            assert.equal(request.headers.Accept, 'application/json');
+            return jsonResponse(200, token('synthetic-token'));
+          }
+          return jsonResponse(200, { data: [{ id: 'test-model' }] });
+        }),
+      });
+      assert.deepEqual(await provider.connect(), { state: 'connected', errorCategory: null });
+      assert.equal(JSON.stringify(provider.getConnectionStatus()).includes(canonical), false);
+    });
+  }
+});
+
+test('OAuth HTTP 400 reports failed authorization without exposing the server body', async () => {
+  let modelRequests = 0;
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    transport: fakeTransport((request) => {
+      if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(400, { message: 'private credential sentinel', access_token: 'private token sentinel' });
+      modelRequests += 1;
+      return jsonResponse(200, { data: [] });
+    }),
+  });
+  const status = await provider.connect();
+  assert.deepEqual(status, { state: 'error', errorCategory: 'auth', failedStep: 'oauth', httpStatus: 400 });
+  assert.equal(modelRequests, 0);
+  assert.doesNotMatch(JSON.stringify(status), /private|sentinel|synthetic-key/);
+});
+
+test('model discovery errors identify their stage and disappear after a successful reconnect', async () => {
+  let modelRequests = 0;
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => request.url === GIGACHAT_OAUTH_URL
+      ? jsonResponse(200, token('synthetic-token'))
+      : ++modelRequests === 1 ? jsonResponse(500, { private: 'not exposed' }) : jsonResponse(200, { data: [{ id: 'test-model' }] })),
+  });
+  assert.deepEqual(await provider.connect(), { state: 'error', errorCategory: 'network', failedStep: 'models', httpStatus: 500 });
+  assert.deepEqual(await provider.connect(), { state: 'connected', errorCategory: null });
+});
+
 test('latest model refresh owns one provider registry even when replies finish in reverse order', async () => {
   const firstRefresh = deferred<ProviderTransportResponse>();
   const secondRefresh = deferred<ProviderTransportResponse>();
@@ -190,7 +246,7 @@ test('empty model discovery is an explicit error snapshot', async () => {
       : jsonResponse(200, { data: [] })),
   });
 
-  assert.deepEqual(await provider.connect(), { state: 'error', errorCategory: 'model' });
+  assert.deepEqual(await provider.connect(), { state: 'error', errorCategory: 'model', failedStep: 'models' });
   assert.deepEqual(provider.getModelRegistry(), { state: 'error', modelIds: [], errorCategory: 'model' });
 });
 
@@ -524,7 +580,7 @@ test('invalid authorization key returns only the safe auth category', async () =
 
   const status = await provider.connect();
 
-  assert.deepEqual(status, { state: 'error', errorCategory: 'auth' });
+  assert.deepEqual(status, { state: 'error', errorCategory: 'auth', failedStep: 'oauth', httpStatus: 401 });
   assert.doesNotMatch(JSON.stringify(status), /synthetic-invalid-key|private body sentinel|private token sentinel/);
 });
 
@@ -553,7 +609,7 @@ test('rejects seconds, expired, and out-of-range expiry values before model requ
 
       const status = await provider.connect();
 
-      assert.deepEqual(status, { state: 'error', errorCategory: 'protocol' });
+      assert.deepEqual(status, { state: 'error', errorCategory: 'protocol', failedStep: 'oauth' });
       assert.equal(oauthRequests, 1);
       assert.equal(modelRequests, 0);
     });
@@ -664,7 +720,7 @@ test('retries one models 401 after refresh and stops after a repeated 401', asyn
 
   const status = await provider.connect();
 
-  assert.deepEqual(status, { state: 'error', errorCategory: 'auth' });
+  assert.deepEqual(status, { state: 'error', errorCategory: 'auth', failedStep: 'models', httpStatus: 401 });
   assert.equal(oauthRequests, 2);
   assert.equal(modelRequests, 2);
   assert.doesNotMatch(JSON.stringify(status), /synthetic-key|synthetic-token|private provider detail/);

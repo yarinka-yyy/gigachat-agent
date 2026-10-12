@@ -42,10 +42,21 @@ function connectionErrorText(category: ProviderErrorCategory | null): string {
 
 function connectionStatusText(status: ProviderConnectionSnapshot | null): string {
   if (!status) return 'Проверяем состояние подключения…';
-  if (status.state === 'connecting') return 'Проверяем ключ и список моделей…';
-  if (status.state === 'connected') return 'OAuth и список моделей проверены.';
-  if (status.state === 'error') return connectionErrorText(status.errorCategory);
-  return 'GigaChat API не подключён.';
+  if (status.state === 'connecting') return 'Проверяем подключение к GigaChat…';
+  if (status.state === 'connected') return 'Подключено — можно перейти в чат.';
+  return 'Не подключено — запросы к модели недоступны.';
+}
+
+function connectionDetailText(status: ProviderConnectionSnapshot | null): string {
+  if (status?.state === 'connected') return 'Авторизация пройдена, список моделей загружен. Выберите доступную модель в чате и отправьте сообщение.';
+  if (status?.state === 'connecting') return 'Получаем токен доступа и загружаем доступные модели.';
+  if (status?.state === 'error') {
+    const step = status.failedStep === 'oauth' ? 'Авторизация' : status.failedStep === 'models' ? 'Загрузка моделей' : 'Подключение';
+    const http = status.httpStatus ? ` (HTTP ${status.httpStatus})` : '';
+    if (status.failedStep === 'oauth' && status.httpStatus === 400) return `${step}${http}: GigaChat отклонил запрос. Проверьте Authorization Key из Studio; нужен именно ключ авторизации, а не Client ID или токен доступа.`;
+    return `${step}${http}: ${connectionErrorText(status.errorCategory)}`;
+  }
+  return 'Сохранение ключа не проверяет подключение. После сохранения нажмите «Проверить подключение».';
 }
 
 const EMPTY_BROWSER_STATUS: OnboardingBrowserStatus = {
@@ -342,8 +353,10 @@ export default function ConnectionSetup({
               </div>
               <p id="connection-key-status" className="connection-key-status" role="status">{keyStatusText(keyStatus)}</p>
             </form>
-            <p className="connection-key-status" role="status">{connectionStatusText(connectionStatus)}</p>
-            <p className="connection-key-status">OAuth и список моделей не подтверждают поддержку вложений или понимание документов выбранной моделью.</p>
+            <div className="connection-result" data-state={connectionStatus?.state ?? 'loading'} role="status">
+              <strong>{connectionStatusText(connectionStatus)}</strong>
+              <p>{connectionDetailText(connectionStatus)}</p>
+            </div>
             {connectionStatus?.state === 'connecting' || connecting
               ? <button type="button" className="secondary-button" onClick={() => void cancelConnect()}>Отменить Connect</button>
               : connectionStatus?.state === 'connected'
@@ -358,7 +371,8 @@ export default function ConnectionSetup({
 
           <section className="setup-card connection-finish">
             <div className="setup-card-title"><span className="connection-step-number">3</span><h2>Выберите, как продолжить</h2></div>
-            <p>Локальные чаты и проекты доступны без API. После проверки подключения можно продолжить локально.</p>
+            <p>{connectionStatus?.state === 'connected' ? 'Подключение готово. Вернитесь в чат, выберите модель и начните общение.' : 'Чаты и проекты доступны локально. Для ответов модели нужно успешное подключение API.'}</p>
+            <p className="connection-key-status">Работа с вложениями и понимание документов проверяются отдельно от подключения.</p>
             {firstRun && <button type="button" className="primary-button" onClick={() => void finishLocally()} disabled={continuing}>
               {continuing ? 'Сохраняем…' : 'Продолжить локально'}
             </button>}

@@ -199,6 +199,8 @@ export type ProviderConnectionState = 'not-configured' | 'connecting' | 'connect
 export interface ProviderConnectionSnapshot {
   state: ProviderConnectionState;
   errorCategory: ProviderErrorCategory | null;
+  failedStep?: 'oauth' | 'models';
+  httpStatus?: number;
 }
 
 export interface ModelRegistrySnapshot {
