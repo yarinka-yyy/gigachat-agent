@@ -52,6 +52,12 @@ async function collectSourceFiles(sourceVendor) {
     if (!info.isFile() || info.isSymbolicLink()) throw new Error('electron-winstaller vendor entries must be regular files.');
     if (name !== 'nuget.exe') files.set(name, await hashFile(path));
   }
+  for (const extension of ['exe', 'dll']) {
+    const selectedName = `7z-${process.arch}.${extension}`;
+    const selected = files.get(selectedName);
+    if (!selected) throw new Error(`Missing host architecture 7-Zip: ${selectedName}`);
+    files.set(`7z.${extension}`, selected);
+  }
   files.set('nuget.exe', { sizeBytes: pinnedNuget.sizeBytes, sha256: pinnedNuget.sha256 });
   return files;
 }
@@ -59,7 +65,7 @@ async function collectSourceFiles(sourceVendor) {
 function expectedMarker(files, windInstallerVersion) {
   return {
     formatVersion: 1,
-    source: `electron-winstaller ${windInstallerVersion} vendor, with only nuget.exe replaced`,
+    source: `electron-winstaller ${windInstallerVersion} vendor, with pinned NuGet and host architecture 7-Zip aliases`,
     nuget: pinnedNuget,
     files: Object.fromEntries([...files.entries()].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)),
   };
@@ -74,7 +80,12 @@ async function validateVendorDirectory(path, expected, expectedParent) {
   if (JSON.stringify(actualMarker) !== JSON.stringify(expected)) throw new Error('Generated Squirrel vendor does not match the pinned toolchain.');
 
   const expectedNames = [...Object.keys(expected.files), markerName].sort();
-  const actualNames = (await readdir(path)).sort();
+  const directoryNames = await readdir(path);
+  if (directoryNames.includes('Squirrel-Releasify.log')) {
+    const logInfo = await lstat(join(path, 'Squirrel-Releasify.log'));
+    if (!logInfo.isFile() || logInfo.isSymbolicLink()) throw new Error('Squirrel build log must be a regular file.');
+  }
+  const actualNames = directoryNames.filter((name) => name !== 'Squirrel-Releasify.log').sort();
   if (JSON.stringify(actualNames) !== JSON.stringify(expectedNames)) throw new Error('Generated Squirrel vendor contains unexpected entries.');
   for (const [name, pinned] of Object.entries(expected.files)) {
     const filePath = join(path, name);
@@ -171,6 +182,9 @@ if (outputIsVerified) {
       } else {
         await copyFile(sourcePath, targetPath);
       }
+    }
+    for (const extension of ['exe', 'dll']) {
+      await copyFile(join(sourceVendor, `7z-${process.arch}.${extension}`), join(stageDirectory, `7z.${extension}`));
     }
     await writeFile(join(stageDirectory, markerName), `${JSON.stringify(marker, null, 2)}\n`, { flag: 'wx' });
     await validateVendorDirectory(stageDirectory, marker, canonicalResourcesDirectory);
