@@ -63,6 +63,8 @@ import type {
   HookInspection,
   HookRegistrySnapshot,
   HookRunResult,
+  HomeDraftInput,
+  HomeDraftRecord,
   InstructionSaveResult,
   LocalUsageStats,
   UsageCounterSummary,
@@ -89,7 +91,8 @@ import { unavailableModelRegistry } from './models';
 import { chatModelOptions, isChatModelAvailable, legacyModelUpgrade, modelFamilyForId, type ChatModelId, type ChatModelOption } from './model-catalog';
 import gigaChatLogo from './assets/gigachat-logo.png';
 import { createInstructionAutosave, type SaveStatus } from './instruction-autosave';
-import { createChatForDraftSession, createNewChatDraftSession, createRendererOperationTracker, persistDraftSession, retryUnavailableReason, shouldOpenCreatedDraftChat, type NewChatDraftSession } from './renderer-operations';
+import { createRendererOperationTracker, retryUnavailableReason } from './renderer-operations';
+import { createHomeDraftSaveQueue, mergeHomeDraftPersistence } from './composer-draft';
 import ConnectionSetup from './components/ConnectionSetup';
 import VoiceCaptureControl, { getCaptureError } from './components/VoiceCaptureControl';
 import ContextRing from './components/ContextRing';
@@ -100,12 +103,6 @@ import { evaluateAttachmentPolicy } from './attachment-policy';
 
 type Page = 'home' | 'chat' | 'settings' | 'onboarding' | 'images' | 'video' | 'podcasts' | 'archive' | 'profile';
 type Route = { page: Page; id?: string };
-type HomeDraftSession = NewChatDraftSession<PermissionProfile> & {
-  creation: Promise<ChatSummary> | null;
-  chatId: string | null;
-  chat: ChatSummary | null;
-  error: string;
-};
 type ChatLoadState = { chatId: string; status: 'loading' | 'ready' | 'error'; error?: string };
 type Navigation = { history: Route[]; index: number };
 type SettingsSection =
@@ -781,6 +778,13 @@ export default function App() {
   const [selectedProjectId, setSelectedProjectId] = useState('');
   const [projectSearch, setProjectSearch] = useState('');
   const [draft, setDraft] = useState('');
+  const [homeDraftRecord, setHomeDraftRecord] = useState<HomeDraftRecord | null>(null);
+  const [homeDraftImporting, setHomeDraftImporting] = useState(false);
+  const [homeDraftSaver] = useState(() => createHomeDraftSaveQueue<HomeDraftRecord>((snapshot) => {
+    const { revision, text, projectId, permissionProfile, skillId, modelId } = snapshot;
+    const input: HomeDraftInput = { revision, text, projectId, permissionProfile, skillId, modelId };
+    return window.gigaChat.homeDraft.save(input);
+  }));
   const [composerCaret, setComposerCaret] = useState(0);
   const [completionDismissed, setCompletionDismissed] = useState(false);
   const [completionIndex, setCompletionIndex] = useState(0);
@@ -789,7 +793,6 @@ export default function App() {
   const [chatLoadRetry, setChatLoadRetry] = useState(0);
   const [chatDraftSaveError, setChatDraftSaveError] = useState<{ chatId: string; message: string } | null>(null);
   const [homeDraftError, setHomeDraftError] = useState('');
-  const [detachedDraftSessions, setDetachedDraftSessions] = useState<HomeDraftSession[]>([]);
   const [runtimeTurns, setRuntimeTurns] = useState<RuntimeTurnSnapshot[]>([]);
   const [retryingTurnIds, setRetryingTurnIds] = useState<Set<string>>(() => new Set());
   const retryingTurnIdsRef = useRef(new Set<string>());
@@ -830,8 +833,8 @@ export default function App() {
   const [configLoading, setConfigLoading] = useState(false);
   const [configReady, setConfigReady] = useState(false);
   const configEditRevision = useRef(0);
-  const closeUiState = useRef({ configDraft, configSaved, configBusy, chatDraftSaveError });
-  closeUiState.current = { configDraft, configSaved, configBusy: configBusy || configLoading, chatDraftSaveError };
+  const closeUiState = useRef({ configDraft, configSaved, configBusy, chatDraftSaveError, homeDraftError });
+  closeUiState.current = { configDraft, configSaved, configBusy: configBusy || configLoading, chatDraftSaveError, homeDraftError };
   const [approvalRequest, setApprovalRequest] = useState<PermissionApprovalRequest | null>(null);
   const [closeFailure, setCloseFailure] = useState<CloseFailure | null>(null);
   const [closePending, setClosePending] = useState(false);
@@ -861,10 +864,10 @@ export default function App() {
   const dialogGeneration = useRef(0);
   const projectFolderChangeRevision = useRef(new Map<string, number>());
   const activeProjectInstructionId = useRef<string | null>(null);
-  const pendingChat = useRef<Promise<ChatSummary> | null>(null);
-  const homeDraftSession = useRef<HomeDraftSession | null>(null);
-  const detachedDraftSessionSet = useRef(new Set<HomeDraftSession>());
-  const homeChatId = useRef<string | null>(null);
+  const homeDraftRef = useRef<HomeDraftRecord | null>(null);
+  const homeDraftSaveGeneration = useRef(0);
+  const homeDraftImportInFlight = useRef(false);
+  const sendInProgress = useRef(false);
   const retainedChatDrafts = useRef(new Map<string, { text: string; message: string }>());
   const chatDraftMutationRevision = useRef(new Map<string, number>());
   const pendingPermissionProfileRef = useRef<PermissionProfile | null>(null);
@@ -875,6 +878,7 @@ export default function App() {
   const pendingSkillChatIdRef = useRef<string | null>(null);
   const skillSelectionRevision = useRef(0);
   const skillSelectionSave = useRef<Promise<unknown>>(Promise.resolve());
+  const sendingRoute = useRef<Route | null>(null);
   const draftRef = useRef('');
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const mainPanelRef = useRef<HTMLElement>(null);
@@ -896,6 +900,11 @@ export default function App() {
 
   function trackRendererOperation<T>(operation: () => T | Promise<T>): Promise<T> {
     return rendererOperations.current.track(operation);
+  }
+
+  function updateHomeDraftError(message: string): void {
+    closeUiState.current.homeDraftError = message;
+    setHomeDraftError(message);
   }
 
   function resizeComposer(): void {
@@ -1021,6 +1030,7 @@ export default function App() {
     },
   ));
   const route = navigation.history[navigation.index] ?? { page: 'home' as const };
+  const sendingOnCurrentRoute = sending && sendingRoute.current !== null && sameRoute(sendingRoute.current, route);
   useLayoutEffect(resizeComposer, [draft, route.page, route.id, compactLayout]);
   useEffect(() => {
     const panel = mainPanelRef.current;
@@ -1058,11 +1068,25 @@ export default function App() {
       window.gigaChat.projects.list(),
       window.gigaChat.chats.list(),
       window.gigaChat.settings.get(),
-    ]).then(([loadedProjects, loadedChats, loadedSettings]) => {
+      window.gigaChat.homeDraft.get(),
+    ]).then(async ([loadedProjects, loadedChats, loadedSettings, loadedHomeDraft]) => {
       if (cancelled) return;
+      await homeDraftSaver.synchronize(loadedHomeDraft.revision);
+      if (cancelled) return;
+      homeDraftRef.current = loadedHomeDraft;
       setProjects(loadedProjects);
       setChats(loadedChats);
       setSettings(loadedSettings);
+      setHomeDraftRecord(loadedHomeDraft);
+      setDraft(loadedHomeDraft.text);
+      draftRef.current = loadedHomeDraft.text;
+      setSelectedProjectId(loadedHomeDraft.projectId ?? '');
+      pendingPermissionProfileRef.current = loadedHomeDraft.permissionProfile;
+      pendingPermissionChatIdRef.current = null;
+      setPendingPermissionProfile(loadedHomeDraft.permissionProfile);
+      pendingSkillIdRef.current = loadedHomeDraft.skillId;
+      pendingSkillChatIdRef.current = null;
+      setPendingSkillId(loadedHomeDraft.skillId);
       if (!loadedSettings.onboardingCompleted) {
         const onboardingRoute: Route = { page: 'onboarding' };
         routeGeneration.current += 1;
@@ -1076,7 +1100,7 @@ export default function App() {
       setLoading(false);
     });
     return () => { cancelled = true; };
-  }, []);
+  }, [homeDraftSaver]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1181,7 +1205,7 @@ export default function App() {
     catch (error) { operationFailure = error; operationFailed = true; }
     const results = await Promise.allSettled([
       globalSaver.flushAll(), projectSaver.flushAll(), draftSave.current,
-      permissionProfileSave.current, skillSelectionSave.current,
+      permissionProfileSave.current, skillSelectionSave.current, homeDraftSaver.flush(),
     ]);
     if (operationFailed) throw operationFailure;
     const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
@@ -1189,9 +1213,7 @@ export default function App() {
     if (connectionKeySaveFailed.current) {
       throw new Error('Не удалось сохранить значение локально. Вернитесь к подключению API и повторите сохранение либо очистите поле перед закрытием.');
     }
-    const draftSessionFailed = homeDraftSession.current?.error
-      || [...detachedDraftSessionSet.current].some((session) => session.error);
-    if (closeUiState.current.chatDraftSaveError || retainedChatDrafts.current.size > 0 || draftSessionFailed) {
+    if (closeUiState.current.chatDraftSaveError || retainedChatDrafts.current.size > 0 || closeUiState.current.homeDraftError) {
       throw new Error('Есть несохранённый текст. Вернитесь к работе, чтобы повторить сохранение; окно останется открытым.');
     }
     if (closeUiState.current.configBusy || closeUiState.current.configDraft !== closeUiState.current.configSaved) {
@@ -1200,7 +1222,7 @@ export default function App() {
   }, (failure) => {
     setClosePending(false);
     setCloseFailure(failure);
-  }), [globalSaver, projectSaver]);
+  }), [globalSaver, projectSaver, homeDraftSaver]);
 
   function runCloseAction(action: () => Promise<CloseAttemptResult>): void {
     if (closeActionInFlight.current) return;
@@ -1332,13 +1354,9 @@ export default function App() {
       if (!id) return;
       const routeRevision = routeGeneration.current;
       const generation = ++chatDetailLoadGeneration.current;
-      const fromHome = homeChatId.current === id;
-      if (fromHome) homeChatId.current = null;
-      if (!fromHome) {
-        setDraft('');
-        draftRef.current = '';
-        draftSave.current = Promise.resolve();
-      }
+      setDraft('');
+      draftRef.current = '';
+      draftSave.current = Promise.resolve();
       setChatDraftSaveError(null);
       setChatLoadState({ chatId: id, status: 'loading' });
       let cancelled = false;
@@ -1348,13 +1366,11 @@ export default function App() {
           || routeRevision !== routeGeneration.current
           || routeRef.current.page !== 'chat' || routeRef.current.id !== id) return;
         setChatDetail(detail);
-        if (!fromHome) {
-          const retained = retainedChatDrafts.current.get(id);
-          const loadedDraft = retained?.text ?? detail.draft;
-          setDraft(loadedDraft);
-          draftRef.current = loadedDraft;
-          if (retained?.message) setChatDraftSaveError({ chatId: id, message: retained.message });
-        }
+        const retained = retainedChatDrafts.current.get(id);
+        const loadedDraft = retained?.text ?? detail.draft;
+        setDraft(loadedDraft);
+        draftRef.current = loadedDraft;
+        if (retained?.message) setChatDraftSaveError({ chatId: id, message: retained.message });
         setChatLoadState({ chatId: id, status: 'ready' });
       }).catch((error: unknown) => {
         if (cancelled || generation !== chatDetailLoadGeneration.current
@@ -1368,10 +1384,20 @@ export default function App() {
       setDraft('');
       draftRef.current = '';
       draftSave.current = Promise.resolve();
-      homeChatId.current = null;
       setChatDetail(null);
       setChatLoadState({ chatId: '', status: 'ready' });
       setChatDraftSaveError(null);
+      const homeDraft = homeDraftRef.current;
+      const homeText = homeDraft?.text ?? '';
+      setDraft(homeText);
+      draftRef.current = homeText;
+      setSelectedProjectId(homeDraft?.projectId ?? '');
+      pendingPermissionProfileRef.current = homeDraft?.permissionProfile ?? null;
+      pendingPermissionChatIdRef.current = null;
+      setPendingPermissionProfile(homeDraft?.permissionProfile ?? null);
+      pendingSkillIdRef.current = homeDraft?.skillId ?? null;
+      pendingSkillChatIdRef.current = null;
+      setPendingSkillId(homeDraft?.skillId ?? null);
     }
   }, [route.page, route.id, chatLoadRetry]);
 
@@ -1510,22 +1536,25 @@ export default function App() {
   const archivedProjects = projects.filter((project) => project.archived);
   const archivedChats = chats.filter((chat) => chat.archived);
   const selectedChat = chats.find((chat) => chat.id === route.id);
-  const chatComposerReady = route.page !== 'chat' || (chatLoadState.chatId === route.id
-    && chatLoadState.status === 'ready' && chatDetail?.id === route.id);
+  const chatComposerReady = route.page === 'home' ? homeDraftRecord !== null
+    : route.page !== 'chat' || (chatLoadState.chatId === route.id
+      && chatLoadState.status === 'ready' && chatDetail?.id === route.id);
   const resolvedTheme = settings.theme === 'system' ? (systemDark ? 'dark' : 'light') : settings.theme;
   const transparentSidebar = settings.sidebarTransparent;
   const canGoBack = navigation.index > 0;
   const canGoForward = navigation.index < navigation.history.length - 1;
   const settingTitle = SETTINGS_SECTIONS.find((item) => item.id === settingsSection)?.label ?? 'Настройки';
-  const activeHomeDraftSession = route.page === 'home' ? homeDraftSession.current : null;
+  const activeHomeDraftRecord = route.page === 'home' ? homeDraftRecord : null;
+  const homeDraftBusy = route.page === 'home' && homeDraftImporting;
   const composerPermissionProfile = selectedChat && chatDetail?.id === selectedChat.id
     ? chatDetail.nextTurnPermissionProfile ?? (pendingPermissionChatIdRef.current === selectedChat.id ? pendingPermissionProfile : null) ?? settings.defaultPermissionProfile
-    : activeHomeDraftSession ? activeHomeDraftSession.permissionProfile ?? settings.defaultPermissionProfile
+    : activeHomeDraftRecord ? activeHomeDraftRecord.permissionProfile ?? settings.defaultPermissionProfile
       : pendingPermissionProfile ?? settings.defaultPermissionProfile;
   const canChangeComposerPermissionProfile = (route.page === 'home' && !selectedChat)
     || Boolean(selectedChat && chatDetail?.id === selectedChat.id);
   const composerModelId = selectedChat && chatDetail?.id === selectedChat.id
-    ? chatDetail.modelId ?? settings.defaultModelId : settings.defaultModelId;
+    ? chatDetail.modelId ?? settings.defaultModelId
+    : activeHomeDraftRecord?.modelId ?? settings.defaultModelId;
   const availableChatModelOptions = chatModelOptions(modelRegistry);
   const composerModelAvailable = isChatModelAvailable(modelRegistry, composerModelId);
   const composerModelFamily = modelFamilyForId(composerModelId);
@@ -1540,7 +1569,7 @@ export default function App() {
     ? availableChatModelOptions.find((option) => option.currentId === settingsLegacyUpgrade.currentId) ?? null
     : null;
   const composerProjectId = route.page === 'chat' ? selectedChat?.projectId ?? null
-    : route.page === 'home' ? selectedProjectId || null : null;
+    : route.page === 'home' ? (activeHomeDraftRecord ? activeHomeDraftRecord.projectId : selectedProjectId || null) : null;
   const composerSkills = skillRegistry.skills
     .filter((skill) => skill.scope === 'global' || skill.projectId === composerProjectId)
     .map((skill) => ({
@@ -1550,7 +1579,7 @@ export default function App() {
     }));
   const selectedComposerSkillId = selectedChat && chatDetail?.id === selectedChat.id
     ? (pendingSkillChatIdRef.current === selectedChat.id ? pendingSkillId : null) ?? chatDetail.nextTurnSkillId
-    : activeHomeDraftSession ? activeHomeDraftSession.skillId
+    : activeHomeDraftRecord ? activeHomeDraftRecord.skillId
       : route.page === 'home' && pendingSkillChatIdRef.current === null ? pendingSkillId : null;
   const selectedComposerSkill = skillRegistry.skills.find((skill) => skill.id === selectedComposerSkillId && skill.enabled) ?? null;
   const composerCompletion = completionDismissed ? null : getComposerCompletion(draft, composerCaret, composerSkills, composerProjectId);
@@ -1594,10 +1623,8 @@ export default function App() {
   }
 
   function navigate(next: Route): void {
-    detachHomeDraftForNavigation(next);
     if (!sameRoute(routeRef.current, next)) routeGeneration.current += 1;
     routeRef.current = next;
-    if (next.page !== 'chat') homeChatId.current = null;
     closePreview();
     setNavigation((current) => {
       const entries = current.history.slice(0, current.index + 1);
@@ -1607,70 +1634,14 @@ export default function App() {
     });
   }
 
-  function preserveHomeDraftSession(session: HomeDraftSession): void {
-    if (!session.text && !session.creation && !session.error) return;
-    if (detachedDraftSessionSet.current.has(session)) return;
-    detachedDraftSessionSet.current.add(session);
-    setDetachedDraftSessions((current) => [...current, session]);
-  }
-
-  function detachHomeDraftForNavigation(next: Route): void {
-    const current = routeRef.current;
-    const session = homeDraftSession.current;
-    if (current.page === 'home' && next.page !== 'home'
-      && !(next.page === 'chat' && next.id && next.id === session?.chatId)) {
-      if (session) preserveHomeDraftSession(session);
-      homeDraftSession.current = null;
-    }
-    if (next.page === 'home' && current.page !== 'home') {
-      if (session) preserveHomeDraftSession(session);
-      homeDraftSession.current = null;
-    }
-  }
-
-  function resumeDetachedDraftSession(session: HomeDraftSession): void {
-    const current = homeDraftSession.current;
-    if (current && current !== session) preserveHomeDraftSession(current);
-    homeDraftSession.current = null;
-    detachedDraftSessionSet.current.delete(session);
-    setDetachedDraftSessions((current) => current.filter((item) => item !== session));
-    navigate({ page: 'home' });
-    homeDraftSession.current = session;
-    setSelectedProjectId(session.projectId ?? '');
-    setDraft(session.text);
-    draftRef.current = session.text;
-    setHomeDraftError(session.error);
-    void startHomeDraftSession(session).catch((error: unknown) => setHomeDraftError(getErrorMessage(error)));
-  }
-
   function startNewHomeChat(): void {
-    routeGeneration.current += 1;
     setHomeVoiceGeneration((current) => current + 1);
-    draftRevision.current += 1;
-    const previous = homeDraftSession.current;
-    if (previous) preserveHomeDraftSession(previous);
-    homeDraftSession.current = null;
-    if (previous && pendingChat.current === previous.creation) pendingChat.current = null;
-    homeChatId.current = null;
-    permissionProfileRevision.current += 1;
-    pendingPermissionProfileRef.current = null;
-    pendingPermissionChatIdRef.current = null;
-    setPendingPermissionProfile(null);
-    skillSelectionRevision.current += 1;
-    pendingSkillIdRef.current = null;
-    pendingSkillChatIdRef.current = null;
-    setPendingSkillId(null);
-    setDraft('');
-    draftRef.current = '';
-    setComposerCaret(0);
     setCompletionDismissed(false);
-    setHomeDraftError('');
-    setSelectedProjectId('');
     navigate({ page: 'home' });
+    window.requestAnimationFrame(() => composerInputRef.current?.focus());
   }
 
   function openSettings(section: SettingsSection = 'general'): void {
-    detachHomeDraftForNavigation({ page: 'settings' });
     closePreview();
     setSettingsSection(section);
     const next = { page: 'settings' as const };
@@ -1690,10 +1661,8 @@ export default function App() {
       const index = Math.max(0, Math.min(current.history.length - 1, current.index + delta));
       const next = current.history[index];
       if (!next) return current;
-      detachHomeDraftForNavigation(next);
       if (index !== current.index && !sameRoute(routeRef.current, next)) routeGeneration.current += 1;
       routeRef.current = next;
-      if (next.page !== 'chat') homeChatId.current = null;
       return { ...current, index };
     });
   }
@@ -1705,12 +1674,6 @@ export default function App() {
   async function createChatOperation(projectId: string | null, kind: ChatKind): Promise<void> {
     const origin = routeRef.current;
     const originGeneration = routeGeneration.current;
-    const oldSession = homeDraftSession.current;
-    if (origin.page === 'home') {
-      if (oldSession) preserveHomeDraftSession(oldSession);
-      homeDraftSession.current = null;
-      if (oldSession && pendingChat.current === oldSession.creation) pendingChat.current = null;
-    }
     try {
       const chat = await window.gigaChat.chats.create(projectId, kind);
       setChats((current) => [chat, ...current]);
@@ -1766,9 +1729,75 @@ export default function App() {
     });
   }
 
+  function persistHomeDraftPatch(patch: Partial<HomeDraftInput>): Promise<HomeDraftRecord> {
+    const current = homeDraftRef.current;
+    if (!current) return Promise.reject(new Error('Домашний черновик ещё загружается.'));
+    const next: HomeDraftRecord = { ...current, ...patch, revision: current.revision + 1 };
+    const generation = ++homeDraftSaveGeneration.current;
+    homeDraftRef.current = next;
+    setHomeDraftRecord(next);
+    const save = homeDraftSaver.enqueue(next);
+    draftSave.current = save;
+    void save.then((persisted) => {
+      const latest = homeDraftRef.current;
+      if (!latest) return;
+      const merged = mergeHomeDraftPersistence(latest, persisted);
+      homeDraftRef.current = merged;
+      setHomeDraftRecord(merged);
+      if (generation === homeDraftSaveGeneration.current) updateHomeDraftError('');
+    }).catch((error: unknown) => {
+      if (homeDraftRef.current?.revision === next.revision) updateHomeDraftError(getErrorMessage(error));
+    });
+    return save;
+  }
+
+  async function saveRebasedHomeDraft(mainSnapshot: HomeDraftRecord, localSnapshot: HomeDraftRecord): Promise<HomeDraftRecord> {
+    const rebased: HomeDraftRecord = {
+      ...mainSnapshot,
+      text: localSnapshot.text,
+      projectId: localSnapshot.projectId,
+      permissionProfile: localSnapshot.permissionProfile,
+      skillId: localSnapshot.skillId,
+      modelId: localSnapshot.modelId,
+      revision: mainSnapshot.revision + 1,
+    };
+    homeDraftRef.current = rebased;
+    setHomeDraftRecord(rebased);
+
+    const saving = homeDraftSaver.enqueue(rebased);
+    draftSave.current = saving;
+    const saved = await saving;
+    const latest = homeDraftRef.current;
+    const merged = latest && latest.revision > saved.revision
+      ? mergeHomeDraftPersistence(latest, saved)
+      : saved;
+    homeDraftRef.current = merged;
+    setHomeDraftRecord(merged);
+    updateHomeDraftError('');
+    return merged;
+  }
+
+  async function retryHomeDraftSave(): Promise<void> {
+    try {
+      await homeDraftSaver.flush().catch(() => undefined);
+      const persisted = await window.gigaChat.homeDraft.get();
+      if (!homeDraftRef.current) return;
+      await homeDraftSaver.synchronize(persisted.revision);
+      const latestLocal = homeDraftRef.current;
+      if (!latestLocal) return;
+      await saveRebasedHomeDraft(persisted, latestLocal);
+      updateHomeDraftError('');
+    } catch (error) {
+      updateHomeDraftError(getErrorMessage(error));
+    }
+  }
+
   function selectHomeProject(projectId: string): void {
     const nextProjectId = projectId || null;
-    const scopedSkill = pendingSkillIdRef.current ? /^project\/([^/]+)\//.exec(pendingSkillIdRef.current) : null;
+    const current = homeDraftRef.current;
+    const selectedSkillId = current?.skillId ?? pendingSkillIdRef.current;
+    const scopedSkill = selectedSkillId ? /^project\/([^/]+)\//.exec(selectedSkillId) : null;
+    const nextSkillId = scopedSkill && scopedSkill[1] !== nextProjectId ? null : selectedSkillId;
     if (scopedSkill && scopedSkill[1] !== nextProjectId) {
       pendingSkillIdRef.current = null;
       pendingSkillChatIdRef.current = null;
@@ -1776,29 +1805,9 @@ export default function App() {
       setPendingSkillId(null);
     }
     setSelectedProjectId(projectId);
-    const session = homeDraftSession.current;
-    if (!session) return;
-    session.projectId = nextProjectId;
-    const sessionSkillScope = session.skillId ? /^project\/([^/]+)\//.exec(session.skillId) : null;
-    if (sessionSkillScope && sessionSkillScope[1] !== nextProjectId) session.skillId = null;
-    if (session.chatId && !session.creation) {
-      void startHomeDraftSession(session).catch((error: unknown) => setHomeDraftError(getErrorMessage(error)));
+    if (current && (current.projectId !== nextProjectId || current.skillId !== nextSkillId)) {
+      void persistHomeDraftPatch({ projectId: nextProjectId, skillId: nextSkillId }).catch(() => undefined);
     }
-  }
-
-  async function moveDraftChat(chatId: string, projectId: string | null): Promise<ChatSummary> {
-    return window.gigaChat.chats.update(chatId, { projectId });
-  }
-
-  async function saveDraftSession(chatId: string, text: string): Promise<unknown> {
-    return window.gigaChat.chats.update(chatId, { draft: text });
-  }
-
-  async function saveDraftSessionSelection(chatId: string, snapshot: Readonly<NewChatDraftSession<PermissionProfile>>): Promise<unknown> {
-    return window.gigaChat.chats.update(chatId, {
-      nextTurnPermissionProfile: snapshot.permissionProfile,
-      nextTurnSkillId: snapshot.skillId,
-    });
   }
 
   function savePermissionProfileForChat(chatId: string, profile: PermissionProfile): Promise<ChatSummary> {
@@ -1810,118 +1819,101 @@ export default function App() {
     return save;
   }
 
-  function startHomeDraftSession(session: HomeDraftSession): Promise<ChatSummary> {
-    if (session.creation) return session.creation;
-    session.error = '';
-    setHomeDraftError('');
-    const operation = trackRendererOperation(() => session.chat
-      ? persistDraftSession(session, session.chat, moveDraftChat, saveDraftSession, saveDraftSessionSelection)
-      : createChatForDraftSession(
-        session,
-        (projectId) => window.gigaChat.chats.create(projectId),
-        moveDraftChat,
-        saveDraftSession,
-        saveDraftSessionSelection,
-        (chat) => {
-          session.chat = chat;
-          session.chatId = chat.id;
-          setChats((current) => current.some((item) => item.id === chat.id)
-            ? current.map((item) => item.id === chat.id ? chat : item)
-            : [chat, ...current]);
-        },
-      ));
-    session.creation = operation;
-    pendingChat.current = operation;
-    void operation.then((chat) => {
-      session.chat = chat;
-      session.chatId = chat.id;
-      session.error = '';
-      setChats((current) => current.some((item) => item.id === chat.id)
-        ? current.map((item) => item.id === chat.id ? chat : item)
-        : [chat, ...current]);
-      if (!shouldOpenCreatedDraftChat(session, homeDraftSession.current, routeRef.current.page === 'home')) {
-        detachedDraftSessionSet.current.delete(session);
-        setDetachedDraftSessions((current) => current.filter((item) => item !== session));
-        return;
-      }
-      homeChatId.current = chat.id;
-      if (pendingPermissionChatIdRef.current === null
-        && pendingPermissionProfileRef.current === session.permissionProfile) {
-        pendingPermissionProfileRef.current = null;
-        setPendingPermissionProfile(null);
-      }
-      if (pendingSkillChatIdRef.current === null && pendingSkillIdRef.current === session.skillId) {
-        pendingSkillIdRef.current = null;
-        setPendingSkillId(null);
-      }
-      navigate({ page: 'chat', id: chat.id });
-      homeDraftSession.current = null;
-      setHomeDraftError('');
-    }).catch((error: unknown) => {
-      session.error = getErrorMessage(error);
-      if (session.chatId) retainedChatDrafts.current.set(session.chatId, { text: session.text, message: session.error });
-      if (homeDraftSession.current === session) setHomeDraftError(session.error);
-      if (detachedDraftSessionSet.current.has(session)) setDetachedDraftSessions((current) => [...current]);
-    }).finally(() => {
-      if (session.creation === operation) session.creation = null;
-      if (pendingChat.current === operation) pendingChat.current = null;
-    }).catch(() => undefined);
-    return operation;
-  }
-
   function submitMessage(): Promise<void> {
     return trackRendererOperation(() => submitMessageOperation());
   }
 
   async function submitMessageOperation(): Promise<void> {
     const value = draftRef.current.trim();
-    if (!value || sending) return;
+    if (!value || sending || sendInProgress.current || homeDraftImportInFlight.current) return;
+    const sourceRoute = routeRef.current;
+    const sourceRouteGeneration = routeGeneration.current;
+    let sourceHomeDraft = sourceRoute.page === 'home' && homeDraftRef.current
+      ? structuredClone(homeDraftRef.current) : null;
+    let sourceHomeDraftGeneration = homeDraftSaveGeneration.current;
+    const sourceDefaultModelId = settingsRef.current.defaultModelId;
+    const sourceDefaultPermissionProfile = settingsRef.current.defaultPermissionProfile;
     if (isUnavailableCompactCommand(value)) {
       const status = await window.gigaChat.runtime.getStatus().catch(() => null);
       showSuccess(status?.compactionUnavailableReason ?? 'Команда /compact пока недоступна; история чата не изменена.');
       return;
     }
-    const sourceRoute = routeRef.current;
-    const sourceRouteGeneration = routeGeneration.current;
     const sourceDraftRevision = draftRevision.current;
-    const sourceSession = sourceRoute.page === 'home' ? homeDraftSession.current : null;
     const acceptedDraftSave = draftSave.current;
     const acceptedPermissionSave = permissionProfileSave.current;
     const acceptedSkillSave = skillSelectionSave.current;
-    const acceptedPermissionProfile = pendingPermissionProfileRef.current;
-    const acceptedPermissionChatId = pendingPermissionChatIdRef.current;
     const acceptedPermissionRevision = permissionProfileRevision.current;
-    const acceptedSkillId = pendingSkillIdRef.current;
-    const acceptedSkillChatId = pendingSkillChatIdRef.current;
     const acceptedSkillRevision = skillSelectionRevision.current;
+    sendInProgress.current = true;
+    sendingRoute.current = sourceRoute;
     setSending(true);
     try {
-      let acceptedRouteGeneration = sourceRouteGeneration;
-      let chatId: string | undefined;
-      if (sourceRoute.page === 'chat') chatId = sourceRoute.id;
-      else if (sourceSession) {
-        chatId = (await startHomeDraftSession(sourceSession)).id;
-        if (routeRef.current.page === 'chat' && routeRef.current.id === chatId && homeChatId.current === chatId) {
-          acceptedRouteGeneration = routeGeneration.current;
+      if (sourceRoute.page === 'home') {
+        if (!sourceHomeDraft || sourceHomeDraft.text.trim() !== value) {
+          throw new Error('Домашний черновик изменился перед отправкой. Отправьте актуальную версию.');
         }
-      } else chatId = homeChatId.current ?? (await pendingChat.current)?.id;
-      if (!chatId) throw new Error('Не удалось создать чат. Попробуйте снова.');
+        const effectiveModelId = sourceHomeDraft.modelId ?? sourceDefaultModelId;
+        const effectivePermissionProfile = sourceHomeDraft.permissionProfile ?? sourceDefaultPermissionProfile;
+        if (sourceHomeDraft.modelId !== effectiveModelId || sourceHomeDraft.permissionProfile !== effectivePermissionProfile) {
+          const materialized = persistHomeDraftPatch({
+            modelId: effectiveModelId,
+            permissionProfile: effectivePermissionProfile,
+          });
+          sourceHomeDraftGeneration = homeDraftSaveGeneration.current;
+          await materialized;
+          if (sourceHomeDraftGeneration !== homeDraftSaveGeneration.current) {
+            throw new Error('Домашний черновик изменился перед отправкой. Проверьте текст и отправьте ещё раз.');
+          }
+          sourceHomeDraft = homeDraftRef.current;
+          if (!sourceHomeDraft || sourceHomeDraft.text.trim() !== value) {
+            throw new Error('Домашний черновик изменился перед отправкой. Отправьте актуальную версию.');
+          }
+        }
+        await homeDraftSaver.flush();
+        if (sourceHomeDraftGeneration !== homeDraftSaveGeneration.current) {
+          throw new Error('Домашний черновик изменился перед отправкой. Проверьте текст и отправьте ещё раз.');
+        }
+        sourceHomeDraft = homeDraftRef.current ?? sourceHomeDraft;
+        if (sourceHomeDraft.modelId === null && sourceDefaultModelId === null
+          && settingsRef.current.defaultModelId !== sourceDefaultModelId) {
+          throw new Error('Модель по умолчанию изменилась во время подготовки. Проверьте выбор и отправьте ещё раз.');
+        }
+        const accepted = await window.gigaChat.homeDraft.send(sourceHomeDraft.revision);
+        await homeDraftSaver.synchronize(accepted.homeDraft.revision);
+        let nextHomeDraft = accepted.homeDraft;
+        const localHomeDraft = homeDraftRef.current;
+        if (localHomeDraft && (homeDraftSaveGeneration.current !== sourceHomeDraftGeneration
+          || localHomeDraft.revision > accepted.homeDraft.revision)) {
+          const persisted = await window.gigaChat.homeDraft.get();
+          await homeDraftSaver.synchronize(persisted.revision);
+          const latestHomeDraft = homeDraftRef.current;
+          if (latestHomeDraft) nextHomeDraft = await saveRebasedHomeDraft(persisted, latestHomeDraft);
+        }
+        homeDraftRef.current = nextHomeDraft;
+        setHomeDraftRecord(nextHomeDraft);
+        if (sourceRouteGeneration === routeGeneration.current && routeRef.current.page === 'home') {
+          setDraft(nextHomeDraft.text);
+          draftRef.current = nextHomeDraft.text;
+        }
+        updateHomeDraftError('');
+        setChats(await window.gigaChat.chats.list());
+        if (sourceRouteGeneration === routeGeneration.current && routeRef.current.page === 'home') {
+          navigate({ page: 'chat', id: accepted.detail.id });
+        }
+        showSuccess(accepted.queued
+          ? 'Сообщение сохранено и поставлено в очередь GigaChat.'
+          : 'Сообщение сохранено локально; подключите API и выберите доступную модель для отправки.');
+        return;
+      }
+      const chatId = sourceRoute.page === 'chat' ? sourceRoute.id : undefined;
+      if (!chatId) return;
       await acceptedDraftSave;
       await acceptedPermissionSave;
       await acceptedSkillSave;
-      const pendingProfile = !sourceSession && sourceRoute.page === 'home'
-        && acceptedPermissionChatId === null ? acceptedPermissionProfile : null;
-      if (pendingProfile) await window.gigaChat.chats.update(chatId, { nextTurnPermissionProfile: pendingProfile });
-      const unboundHomeSkill = !sourceSession && sourceRoute.page === 'home'
-        && acceptedSkillChatId === null ? acceptedSkillId : null;
-      if (unboundHomeSkill) {
-        await window.gigaChat.chats.update(chatId, { nextTurnSkillId: unboundHomeSkill });
-      }
       const detail = await window.gigaChat.chats.appendLocalMessage(chatId, value);
-      const stillCurrent = acceptedRouteGeneration === routeGeneration.current
+      const stillCurrent = sourceRouteGeneration === routeGeneration.current
         && sourceDraftRevision === draftRevision.current
-        && ((routeRef.current.page === 'chat' && routeRef.current.id === chatId)
-          || (sourceSession !== null && homeDraftSession.current === sourceSession && routeRef.current.page === 'home'));
+        && routeRef.current.page === 'chat' && routeRef.current.id === chatId;
       if (stillCurrent && routeRef.current.page === 'chat') {
         draftRevision.current += 1;
         setChatDetail((current) => current?.id === chatId ? {
@@ -1938,17 +1930,6 @@ export default function App() {
         retainedChatDrafts.current.delete(chatId);
         setChatDraftSaveError(null);
       }
-      if (pendingProfile && acceptedPermissionRevision === permissionProfileRevision.current
-        && acceptedPermissionChatId === pendingPermissionChatIdRef.current
-        && acceptedPermissionProfile === pendingPermissionProfileRef.current) {
-        pendingPermissionProfileRef.current = null;
-        pendingPermissionChatIdRef.current = null;
-        setPendingPermissionProfile(null);
-      }
-      if (unboundHomeSkill && acceptedSkillRevision === skillSelectionRevision.current
-        && acceptedSkillChatId === pendingSkillChatIdRef.current && acceptedSkillId === pendingSkillIdRef.current) {
-        pendingSkillChatIdRef.current = chatId;
-      }
       setChats(await window.gigaChat.chats.list());
       const connectionStatus = await window.gigaChat.onboarding.getConnectionStatus().catch(() => null);
       if (stillCurrent) showSuccess(connectionStatus?.state === 'connected'
@@ -1958,6 +1939,8 @@ export default function App() {
       rendererOperations.current.reportFailure(error);
       setNotice(getErrorMessage(error));
     } finally {
+      sendingRoute.current = null;
+      sendInProgress.current = false;
       setSending(false);
     }
   }
@@ -1969,28 +1952,83 @@ export default function App() {
   async function attachFileOperation(): Promise<void> {
     const sourceRoute = routeRef.current;
     const sourceRouteGeneration = routeGeneration.current;
-    const sourceSession = sourceRoute.page === 'home' ? homeDraftSession.current : null;
     const sourceProjectId = selectedProjectId || null;
+    if (sourceRoute.page === 'home') {
+      if (homeDraftImportInFlight.current) return;
+      const sourceHomeDraftGeneration = homeDraftSaveGeneration.current;
+      homeDraftImportInFlight.current = true;
+      setHomeDraftImporting(true);
+      try {
+        await homeDraftSaver.flush();
+        const imported = await window.gigaChat.homeDraft.importFile();
+        if (!imported) return;
+        await homeDraftSaver.synchronize(imported.revision);
+        let nextHomeDraft = imported;
+        const localHomeDraft = homeDraftRef.current;
+        if (localHomeDraft && homeDraftSaveGeneration.current !== sourceHomeDraftGeneration) {
+          nextHomeDraft = await saveRebasedHomeDraft(imported, localHomeDraft);
+        }
+        homeDraftRef.current = nextHomeDraft;
+        setHomeDraftRecord(nextHomeDraft);
+        if (sourceRouteGeneration === routeGeneration.current && sameRoute(routeRef.current, sourceRoute)) {
+          setDraft(nextHomeDraft.text);
+          draftRef.current = nextHomeDraft.text;
+        }
+        updateHomeDraftError('');
+        showSuccess('Файл подготовлен в черновике. Он попадёт в чат только после отправки сообщения.');
+      } catch (error) {
+        rendererOperations.current.reportFailure(error);
+        setNotice(getErrorMessage(error));
+      } finally {
+        homeDraftImportInFlight.current = false;
+        setHomeDraftImporting(false);
+      }
+      return;
+    }
+    if (sourceRoute.page !== 'chat' || !sourceRoute.id) return;
     try {
-      const chatId = sourceRoute.page === 'chat' ? sourceRoute.id
-        : sourceSession ? (await startHomeDraftSession(sourceSession)).id
-          : homeChatId.current ?? (await pendingChat.current)?.id ?? null;
-      const detail = await window.gigaChat.chats.importFile(chatId ?? null, sourceProjectId);
+      const detail = await window.gigaChat.chats.importFile(sourceRoute.id, sourceProjectId);
       if (!detail) return;
       setChats(await window.gigaChat.chats.list());
       const currentRoute = routeRef.current;
-      const sameView = sourceRouteGeneration === routeGeneration.current;
-      const stillTargetChat = sameView && currentRoute.page === 'chat' && currentRoute.id === detail.id;
-      const stillSourceHome = sameView && sourceSession !== null && homeDraftSession.current === sourceSession && currentRoute.page === 'home';
-      const unchangedRoute = sameView && sameRoute(currentRoute, sourceRoute);
-      if (stillTargetChat || stillSourceHome || unchangedRoute) {
+      if (currentRoute.page === 'chat' && currentRoute.id === detail.id) {
         setChatDetail(detail);
-        if (currentRoute.page === 'home') navigate({ page: 'chat', id: detail.id });
         showSuccess('Файл скопирован в чат.');
       }
     } catch (error) {
       rendererOperations.current.reportFailure(error);
       setNotice(getErrorMessage(error));
+    }
+  }
+
+  async function removeHomeDraftFile(id: string): Promise<void> {
+    if (homeDraftImportInFlight.current || sending) return;
+    const sourceRoute = routeRef.current;
+    const sourceRouteGeneration = routeGeneration.current;
+    const sourceHomeDraftGeneration = homeDraftSaveGeneration.current;
+    homeDraftImportInFlight.current = true;
+    setHomeDraftImporting(true);
+    try {
+      await homeDraftSaver.flush();
+      const updated = await window.gigaChat.homeDraft.removeFile(id);
+      await homeDraftSaver.synchronize(updated.revision);
+      let nextHomeDraft = updated;
+      const localHomeDraft = homeDraftRef.current;
+      if (localHomeDraft && homeDraftSaveGeneration.current !== sourceHomeDraftGeneration) {
+        nextHomeDraft = await saveRebasedHomeDraft(updated, localHomeDraft);
+      }
+      homeDraftRef.current = nextHomeDraft;
+      setHomeDraftRecord(nextHomeDraft);
+      if (sourceRouteGeneration === routeGeneration.current && sameRoute(routeRef.current, sourceRoute)) {
+        setDraft(nextHomeDraft.text);
+        draftRef.current = nextHomeDraft.text;
+      }
+      updateHomeDraftError('');
+    } catch (error) {
+      setNotice(getErrorMessage(error));
+    } finally {
+      homeDraftImportInFlight.current = false;
+      setHomeDraftImporting(false);
     }
   }
 
@@ -2007,34 +2045,7 @@ export default function App() {
       return;
     }
     if (currentRoute.page !== 'home') return;
-    let session = homeDraftSession.current;
-    if (!session) {
-      const projectId = selectedProjectId || null;
-      const selectedSkillId = pendingSkillIdRef.current;
-      const selectedSkillScope = selectedSkillId ? /^project\/([^/]+)\//.exec(selectedSkillId) : null;
-      const validSkillId = selectedSkillScope && selectedSkillScope[1] !== projectId ? null : selectedSkillId;
-      if (selectedSkillId && !validSkillId) {
-        pendingSkillIdRef.current = null;
-        pendingSkillChatIdRef.current = null;
-        skillSelectionRevision.current += 1;
-        setPendingSkillId(null);
-      }
-      session = {
-        ...createNewChatDraftSession({
-          text: value,
-          projectId,
-          permissionProfile: pendingPermissionProfileRef.current,
-          skillId: validSkillId,
-        }),
-        creation: null,
-        chatId: null,
-        chat: null,
-        error: '',
-      };
-      homeDraftSession.current = session;
-    }
-    session.text = value;
-    if (session.chatId || value) void startHomeDraftSession(session).catch(() => undefined);
+    void persistHomeDraftPatch({ text: value }).catch(() => undefined);
   }
 
   function insertVoiceTranscript(text: string): void {
@@ -2419,7 +2430,10 @@ export default function App() {
 
   async function changeComposerModel(modelId: ChatModelId): Promise<void> {
     if (route.page === 'chat' && selectedChat) await updateChat(selectedChat, { modelId });
-    else await updateLocalSettings({ defaultModelId: modelId });
+    else if (route.page === 'home') {
+      try { await persistHomeDraftPatch({ modelId }); }
+      catch (error) { setNotice(getErrorMessage(error)); }
+    }
   }
 
   async function refreshModelRegistry(): Promise<void> {
@@ -2603,16 +2617,9 @@ export default function App() {
     setPendingSkillId(skillId);
     if (route.page === 'home' && !selectedChat) {
       pendingSkillChatIdRef.current = null;
-      const session = homeDraftSession.current;
-      if (session) {
-        session.skillId = skillId;
-        if (session.chatId && !session.creation) void startHomeDraftSession(session).catch(() => undefined);
-        return;
-      }
-      const chatId = homeChatId.current ?? (await pendingChat.current)?.id ?? null;
-      if (chatId) {
-        pendingSkillChatIdRef.current = chatId;
-        await saveSkillSelectionForChat(chatId, skillId, revision);
+      if (homeDraftRef.current) {
+        try { await persistHomeDraftPatch({ skillId }); }
+        catch (error) { setNotice(getErrorMessage(error)); }
       }
       return;
     }
@@ -2704,10 +2711,9 @@ export default function App() {
         pendingPermissionProfileRef.current = profile;
         pendingPermissionChatIdRef.current = null;
         setPendingPermissionProfile(profile);
-        const session = homeDraftSession.current;
-        if (session) {
-          session.permissionProfile = profile;
-          if (session.chatId && !session.creation) void startHomeDraftSession(session).catch(() => undefined);
+        if (homeDraftRef.current) {
+          try { await persistHomeDraftPatch({ permissionProfile: profile }); }
+          catch (error) { setNotice(getErrorMessage(error)); }
         }
       }
       return;
@@ -3533,7 +3539,7 @@ export default function App() {
                 {composerCompletion.emptyMessage && <p className="composer-suggestions-empty" role="status">{composerCompletion.emptyMessage}</p>}
               </div>}
               {route.page === 'home' && <div className="project-picker">
-                <ActionMenu className="composer-project-menu" placement="below-start" label="Выбрать проект" onVisibilityChange={trackNativeOverlay}
+                <ActionMenu className="composer-project-menu" placement="below-start" label="Выбрать проект" disabled={sendingOnCurrentRoute || homeDraftImporting || !homeDraftRecord} onVisibilityChange={trackNativeOverlay}
                   initialFocus=".project-search-input" onOpen={() => setProjectSearch('')}
                   trigger={<><Icon name="folder" /><span>{activeProjects.find((project) => project.id === composerProjectId)?.name ?? 'Выбрать проект'}</span><Icon name="chevron" /></>}>
                   <div className="project-picker-popup" onKeyDown={(event) => {
@@ -3555,28 +3561,28 @@ export default function App() {
                       <input className="project-search-input" type="search" aria-label="Поиск проектов" placeholder="Поиск проектов" value={projectSearch} onChange={(event) => setProjectSearch(event.target.value)} />
                     </div>
                     <div className="project-picker-options">
-                      <button type="button" className="project-picker-option" aria-current={!composerProjectId} onClick={() => selectHomeProject('')}><Icon name="folder" />Без проекта{!composerProjectId && <Icon name="check" />}</button>
+                      <button type="button" className="project-picker-option" disabled={sendingOnCurrentRoute || homeDraftImporting} aria-current={!composerProjectId} onClick={() => selectHomeProject('')}><Icon name="folder" />Без проекта{!composerProjectId && <Icon name="check" />}</button>
                       {activeProjects.filter((project) => project.name.toLocaleLowerCase().includes(projectSearch.trim().toLocaleLowerCase())).map((project) =>
-                        <button type="button" className="project-picker-option" key={project.id} aria-current={project.id === composerProjectId} onClick={() => selectHomeProject(project.id)}><Icon name="folder" /><span>{project.name}</span>{project.id === composerProjectId && <Icon name="check" />}</button>)}
+                        <button type="button" className="project-picker-option" key={project.id} disabled={sendingOnCurrentRoute || homeDraftImporting} aria-current={project.id === composerProjectId} onClick={() => selectHomeProject(project.id)}><Icon name="folder" /><span>{project.name}</span>{project.id === composerProjectId && <Icon name="check" />}</button>)}
                       {activeProjects.length === 0 && <p className="picker-empty">Пока нет проектов</p>}
                       {activeProjects.length > 0 && !activeProjects.some((project) => project.name.toLocaleLowerCase().includes(projectSearch.trim().toLocaleLowerCase())) && <p className="picker-empty">Ничего не найдено</p>}
                     </div>
-                    <button type="button" className="project-picker-option project-create-option" onClick={() => createProject()}><Icon name="plus" />Новый проект</button>
+                    <button type="button" className="project-picker-option project-create-option" disabled={sendingOnCurrentRoute || homeDraftImporting} onClick={() => createProject()}><Icon name="plus" />Новый проект</button>
                   </div>
                 </ActionMenu>
               </div>}
-              {route.page === 'home' && detachedDraftSessions.map((session, index) => <div className="project-folder-choice" role="status" key={`detached-draft-${index}`}>
-                <strong>Есть отложенный черновик</strong><p>{session.text ? `${session.text.slice(0, 120)}${session.text.length > 120 ? '…' : ''}` : 'Текст появится после восстановления сессии.'}</p>
-                {session.error && <p role="alert">{session.error}</p>}
-                <button type="button" className="secondary-button" onClick={() => resumeDetachedDraftSession(session)}>Восстановить черновик</button>
-              </div>)}
               {route.page === 'home' && homeDraftError && <div className="project-folder-choice" role="alert">
-                <strong>Черновик пока не сохранён</strong><p>{homeDraftError} Текст сохранён в этой сессии.</p>
-                <button type="button" className="secondary-button" disabled={Boolean(homeDraftSession.current?.creation)} onClick={() => {
-                  const session = homeDraftSession.current;
-                  if (session) void startHomeDraftSession(session).catch((error: unknown) => setHomeDraftError(getErrorMessage(error)));
-                }}>Повторить сохранение</button>
+                <strong>Черновик пока не сохранён</strong><p>{homeDraftError} Введённый текст остаётся на экране.</p>
+                <button type="button" className="secondary-button" disabled={sendingOnCurrentRoute || homeDraftImporting} onClick={() => void retryHomeDraftSave()}>Повторить сохранение</button>
               </div>}
+              {route.page === 'home' && activeHomeDraftRecord?.attachments.length ? <section className="chat-files" aria-label="Подготовленные файлы">
+                <h2>Подготовленные файлы</h2>
+                {activeHomeDraftRecord.attachments.map((attachment) => <div className="chat-file" key={attachment.id}>
+                  <Icon name="file" /><span><strong>{attachment.name}</strong><small>{Math.ceil(attachment.size / 1024)} КБ · останется локально и не передаётся модели</small></span>
+                  <button type="button" className="quiet-button" aria-label={`Убрать ${attachment.name} из черновика`} title="Убрать из черновика"
+                    disabled={sendingOnCurrentRoute || homeDraftImporting} onClick={() => void removeHomeDraftFile(attachment.id)}>Убрать</button>
+                </div>)}
+              </section> : null}
               <div className="composer">
                 <label className="sr-only" htmlFor="chat-draft">Черновик сообщения</label>
                 <textarea
@@ -3590,7 +3596,7 @@ export default function App() {
                   onSelect={(event) => setComposerCaret(event.currentTarget.selectionStart)}
                   onClick={(event) => setComposerCaret(event.currentTarget.selectionStart)}
                   onKeyDown={handleComposerKeyDown}
-                  disabled={sending || !chatComposerReady}
+                  disabled={sendingOnCurrentRoute || !chatComposerReady || (route.page === 'home' && !homeDraftRecord)}
                   placeholder={selectedChat?.kind === 'image' ? 'Опишите изображение' : 'Поручите что угодно'}
                   rows={2}
                 />
@@ -3600,14 +3606,14 @@ export default function App() {
                 </div>}
                 <div className="composer-toolbar">
                   <div className="toolbar-leading">
-                  <button type="button" className="attach-button" disabled={sending || !chatComposerReady} aria-label="Прикрепить файл" title="Прикрепить файл" onClick={() => void attachFile()}><Icon name="plus" /></button>
+                  <button type="button" className="attach-button" disabled={sendingOnCurrentRoute || homeDraftBusy || !chatComposerReady || (route.page === 'home' && !homeDraftRecord)} aria-label="Прикрепить файл" title="Подготовить файл" onClick={() => void attachFile()}><Icon name="plus" /></button>
                   <ActionMenu className="composer-permission-menu" placement="below-start" onVisibilityChange={trackNativeOverlay}
                     label={`Разрешения: ${AVAILABLE_PERMISSION_PROFILES.find((profile) => profile.id === composerPermissionProfile)?.name ?? 'Спросить'}`}
-                    disabled={!canChangeComposerPermissionProfile}
+                    disabled={!canChangeComposerPermissionProfile || (sendingOnCurrentRoute && route.page === 'home') || homeDraftBusy || (route.page === 'home' && !homeDraftRecord)}
                     trigger={<><Icon name="shield" /><span>{AVAILABLE_PERMISSION_PROFILES.find((profile) => profile.id === composerPermissionProfile)?.name ?? 'Спросить'}</span><Icon name="chevron" /></>}>
                     <div className="permission-picker-popup"><p className="picker-heading">Как подтверждать действия GigaChat?</p>
                       {AVAILABLE_PERMISSION_PROFILES.map((profile) => <button type="button" className="permission-picker-option" key={profile.id}
-                        aria-current={profile.id === composerPermissionProfile} onClick={() => void changeComposerPermissionProfile(profile.id)}>
+                        disabled={(sendingOnCurrentRoute && route.page === 'home') || homeDraftBusy} aria-current={profile.id === composerPermissionProfile} onClick={() => void changeComposerPermissionProfile(profile.id)}>
                         <Icon name={profile.id === 'custom' ? 'settings' : 'shield'} />
                         <span><strong>{profile.name}</strong><small>{profile.description}</small></span>
                         {profile.id === composerPermissionProfile && <Icon name="check" />}
@@ -3622,7 +3628,7 @@ export default function App() {
                     if (visible && modelRegistry.state !== 'ready' && !modelRegistryLoading) void refreshModelRegistry();
                     else if (visible) void loadCurrentModelRegistry();
                   }}
-                    disabled={!canChangeComposerPermissionProfile}
+                    disabled={!canChangeComposerPermissionProfile || (sendingOnCurrentRoute && route.page === 'home') || homeDraftBusy || (route.page === 'home' && !homeDraftRecord)}
                     trigger={<><span title={composerModelId ?? undefined}>{composerModelId
                       ? `${composerModelAvailable ? '' : 'Недоступна · '}${composerModelFamily?.displayName ?? 'Сохранённая модель'}`
                       : 'Выбрать модель'}</span><Icon name="chevron" /> </>}>
@@ -3655,7 +3661,7 @@ export default function App() {
                   <span className="context-indicator" role="img" tabIndex={0} aria-label="Размер контекста неизвестен" title="Точный размер следующего контекста пока неизвестен."><ContextRing /></span>
                   <VoiceCaptureControl
                     key={route.page === 'chat' ? route.id ?? 'chat' : `home-${homeVoiceGeneration}`}
-                    available={voiceAvailability.available && chatComposerReady && !sending}
+                    available={voiceAvailability.available && chatComposerReady && !sending && !homeDraftBusy}
                     reason={!chatComposerReady ? (chatLoadState.error ?? 'Загрузка чата…') : voiceAvailability.reason}
                     canContinue={() => !rendererOperations.current.frozen}
                     suspended={closePending || Boolean(closeFailure)}
@@ -3663,7 +3669,7 @@ export default function App() {
                     onError={setNotice}
                     onSuccess={showSuccess}
                   />
-                  <span className="send-button-wrap" title={draft.trim() ? 'Сохранить локально без отправки в API' : 'Голосовой чат пока недоступен'}><button type="button" className="send-button" disabled={!draft.trim() || sending || !chatComposerReady} aria-label={draft.trim() ? 'Сохранить сообщение локально' : 'Голосовой чат пока недоступен'} onClick={() => void submitMessage()}><Icon name={draft.trim() ? 'send' : 'audio'} /></button></span>
+                  <span className="send-button-wrap" title={draft.trim() ? 'Сохранить сообщение и отправить его, если GigaChat подключён' : 'Введите сообщение'}><button type="button" className="send-button" disabled={!draft.trim() || sending || homeDraftBusy || !chatComposerReady || (route.page === 'home' && !homeDraftRecord)} aria-label="Отправить сообщение" onClick={() => void submitMessage()}><Icon name="send" /></button></span>
                   </div>
                 </div>
               </div>

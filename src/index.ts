@@ -991,7 +991,7 @@ async function registerIpcHandlers(
   ]);
   const readOnlyChannels = new Set([
     'projects:list', 'projects:read-instructions', 'projects:instructions-backup-path',
-    'chats:list', 'chats:get', 'runtime:list', 'runtime:status', 'permissions:read-config',
+    'chats:list', 'chats:get', 'home-draft:get', 'runtime:list', 'runtime:status', 'permissions:read-config',
     'voice:status', 'skills:list', 'skills:read-source', 'hooks:list', 'hooks:inspect', 'onboarding:key-status', 'onboarding:connection-status', 'models:get-registry',
     'onboarding:browser-status', 'browser:status', 'settings:get', 'usage:local-stats', 'usage:get-ledger',
     'settings:list-openers', 'settings:app-info', 'settings:get-auto-start', 'settings:read-instructions',
@@ -1022,6 +1022,7 @@ async function registerIpcHandlers(
     }
     return providerConnection.getModelRegistry();
   };
+  const queuedHomeTurns = new Set<string>();
 
   ipcMain.handle('app:close-handler-ready', (event) => {
     assertTrustedSender(event);
@@ -1108,6 +1109,44 @@ async function registerIpcHandlers(
 
   handle('chats:list', () => store.listChats());
   handle('chats:get', (id) => store.getChat(id));
+  handle('home-draft:get', () => store.getHomeDraft());
+  handle('home-draft:save', (input) => withLocalFailureNotification(store, () => store.saveHomeDraft(input)));
+  handle('home-draft:import-file', async () => {
+    const options = { properties: ['openFile'] as Array<'openFile'> };
+    const selected = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);
+    if (selected.canceled || !selected.filePaths[0]) return null;
+    return withLocalFailureNotification(store, () => store.stageHomeDraftFile(selected.filePaths[0]!));
+  });
+  handle('home-draft:remove-file', (id) => withLocalFailureNotification(store, () => store.removeHomeDraftFile(id)));
+  handle('home-draft:send', async (revision) => {
+    const before = await store.getHomeDraft();
+    const acceptedDuplicate = before.lastAcceptance?.sourceRevision === revision;
+    if (before.revision !== revision && !acceptedDuplicate) throw new Error('Черновик изменился перед отправкой; проверьте последний текст.');
+    if (!acceptedDuplicate && before.skillId) {
+      const selectedSkill = await skills.getEnabled(before.skillId);
+      if (!selectedSkill || (selectedSkill.scope === 'project' && selectedSkill.projectId !== before.projectId)) {
+        throw new Error('Выбранный Skill недоступен в этом проекте. Черновик сохранён.');
+      }
+    }
+    const accepted = await withLocalFailureNotification(store, () => store.acceptHomeDraft(revision, randomUUID()));
+    let queued = queuedHomeTurns.has(accepted.turn.turnId);
+    if (accepted.newlyAccepted && !queued) {
+      const connection = providerConnection.getConnectionStatus();
+      const registry = providerConnection.getModelRegistry();
+      const modelError = chatModelUnavailableReason(registry, accepted.turn.modelId);
+      if (connection.state === 'connected' && !modelError) {
+        try {
+          queued = runtime.enqueue(accepted.turn) !== null;
+          if (queued) queuedHomeTurns.add(accepted.turn.turnId);
+          else store.releaseTurnReservation(accepted.turn.turnId);
+        } catch (error) {
+          store.releaseTurnReservation(accepted.turn.turnId);
+          console.error('Accepted home turn was saved but could not be queued.', error);
+        }
+      } else store.releaseTurnReservation(accepted.turn.turnId);
+    }
+    return { ...accepted, homeDraft: await store.getHomeDraft(), queued };
+  });
   handle('chats:create', (projectId, kind) => withLocalFailureNotification(store, () => store.createChat(projectId, kind)));
   handle('chats:update', async (idInput, patchInput) => {
     const id = requireId(idInput);

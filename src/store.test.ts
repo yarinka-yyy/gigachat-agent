@@ -101,6 +101,186 @@ test('persists projects, chats, relationships, drafts, image kind, and settings'
   await assert.rejects(store.updateChat(chat.id, { modelId: '\0invalid' } as never));
 });
 
+test('home draft and selected files survive reload without creating a chat', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-home-draft-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = join(directory, 'source.txt');
+  await writeFile(source, 'local bytes stay unchanged', 'utf8');
+
+  const store = await openStore(directory);
+  const initial = await store.getHomeDraft();
+  assert.deepEqual(await store.listChats(), []);
+  const saved = await store.saveHomeDraft({
+    revision: initial.revision + 1,
+    text: 'first line',
+    projectId: null,
+    permissionProfile: 'approve',
+    skillId: 'global/review',
+    modelId: 'GigaChat-3-Pro',
+  });
+  const withFile = await store.stageHomeDraftFile(source);
+
+  assert.equal(withFile.revision, saved.revision + 1);
+  assert.equal(withFile.text, 'first line');
+  assert.equal(withFile.attachments.length, 1);
+  assert.equal(withFile.attachments[0]?.name, 'source.txt');
+  assert.deepEqual(await store.listChats(), [], 'typing, selections, and file choice stay out of Recents');
+  assert.equal(await readFile(source, 'utf8'), 'local bytes stay unchanged');
+
+  const restored = await openStore(directory);
+  assert.deepEqual(await restored.getHomeDraft(), withFile);
+  assert.deepEqual(await restored.listChats(), []);
+  const withoutFile = await restored.removeHomeDraftFile(withFile.attachments[0]!.id);
+  assert.equal(withoutFile.attachments.length, 0);
+  assert.equal(await readFile(source, 'utf8'), 'local bytes stay unchanged');
+});
+
+test('explicit home send creates one linked chat and returns the same frozen snapshot for a duplicate', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-home-send-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = join(directory, 'fixture.txt');
+  await writeFile(source, 'fixture bytes', 'utf8');
+
+  const store = await openStore(directory);
+  const draft = await store.saveHomeDraft({
+    revision: 1, text: 'Проверь файл', projectId: null,
+    permissionProfile: 'approve', skillId: 'global/review', modelId: 'GigaChat-3-Pro',
+  });
+  const withFile = await store.stageHomeDraftFile(source);
+  const accepted = await store.acceptHomeDraft(withFile.revision, 'home-turn-one');
+  const duplicate = await store.acceptHomeDraft(withFile.revision, 'home-turn-two');
+
+  assert.equal(accepted.detail.messages.length, 1);
+  assert.equal(accepted.detail.messages[0]?.text, 'Проверь файл');
+  assert.equal(accepted.detail.projectId, null);
+  assert.equal(accepted.detail.modelId, 'GigaChat-3-Pro');
+  assert.equal(accepted.detail.nextTurnPermissionProfile, 'approve');
+  assert.equal(accepted.detail.nextTurnSkillId, 'global/review');
+  assert.equal(accepted.detail.artifacts.length, 1);
+  assert.equal(accepted.detail.artifacts[0]?.messageId, accepted.detail.messages[0]?.id);
+  assert.equal(accepted.turn.messageId, accepted.detail.messages[0]?.id);
+  assert.equal(accepted.turn.modelId, 'GigaChat-3-Pro');
+  assert.equal(accepted.turn.permissionProfile, 'approve');
+  assert.equal(accepted.turn.skillId, 'global/review');
+  assert.equal(duplicate.detail.id, accepted.detail.id);
+  assert.equal(duplicate.turn.turnId, accepted.turn.turnId);
+  assert.equal((await store.listChats()).length, 1);
+  const nextDraft = await store.getHomeDraft();
+  assert.equal(nextDraft.text, '');
+  assert.equal(nextDraft.attachments.length, 0);
+  assert.equal(nextDraft.lastAcceptance?.sourceRevision, withFile.revision);
+  assert.equal(await readFile(source, 'utf8'), 'fixture bytes');
+  assert.notEqual(draft.revision, withFile.revision);
+});
+
+test('a failed home-send journal write leaves the unsent draft and files available', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-home-send-failure-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = join(directory, 'keep.txt');
+  await writeFile(source, 'keep me', 'utf8');
+  const store = await openStore(directory, {
+    testFaults: { beforeHomeSendJournal: () => { throw new Error('synthetic journal failure'); } },
+  });
+  const draft = await store.saveHomeDraft({
+    revision: 1, text: 'keep this input', projectId: null,
+    permissionProfile: 'ask', skillId: null, modelId: null,
+  });
+  const withFile = await store.stageHomeDraftFile(source);
+
+  await assert.rejects(store.acceptHomeDraft(withFile.revision, 'home-turn-failed'), /synthetic journal failure/);
+  assert.deepEqual(await store.getHomeDraft(), withFile);
+  assert.deepEqual(await store.listChats(), []);
+  assert.equal(await readFile(source, 'utf8'), 'keep me');
+  assert.ok(draft.revision < withFile.revision);
+});
+
+test('an interrupted home send journal replays the complete chat without queueing work', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-home-send-recovery-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = join(directory, 'recover.txt');
+  await writeFile(source, 'recovery fixture', 'utf8');
+  const store = await openStore(directory, {
+    testFaults: {
+      afterHomeSendStage: (stage) => {
+        if (stage === 'chat') throw new Error('simulated process interruption');
+      },
+    },
+  });
+  await store.saveHomeDraft({
+    revision: 1, text: 'restore this send', projectId: null,
+    permissionProfile: 'ask', skillId: null, modelId: 'GigaChat-3-Pro',
+  });
+  const staged = await store.stageHomeDraftFile(source);
+
+  await assert.rejects(store.acceptHomeDraft(staged.revision, 'home-turn-recovery'), /simulated process interruption/);
+  await assert.rejects(store.listChats(), /simulated process interruption/, 'a repeated read waits for journal recovery instead of exposing a partial chat');
+  assert.equal(await readFile(source, 'utf8'), 'recovery fixture');
+
+  const recovered = await openStore(directory);
+  const chats = await recovered.listChats();
+  assert.equal(chats.length, 1);
+  const detail = await recovered.getChat(chats[0]!.id);
+  assert.equal(detail.messages.length, 1);
+  assert.equal(detail.messages[0]?.text, 'restore this send');
+  assert.equal(detail.artifacts[0]?.messageId, detail.messages[0]?.id);
+  assert.equal(await readFile(await recovered.getArtifactPath(detail.id, detail.artifacts[0]!.id), 'utf8'), 'recovery fixture');
+  assert.equal((await recovered.getHomeDraft()).text, '');
+  assert.equal((await recovered.getHomeDraft()).lastAcceptance?.turn.turnId, 'home-turn-recovery');
+  assert.equal(await readFile(source, 'utf8'), 'recovery fixture');
+});
+
+test('home-send recovery preserves a different chat already stored under the journal ID', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-home-send-collision-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  let conflictTemplate: Record<string, unknown> | null = null;
+  const store = await openStore(directory, {
+    testFaults: {
+      afterHomeSendStage: async (stage) => {
+        if (stage !== 'journal' || !conflictTemplate) return;
+        const journal = JSON.parse(await readFile(join(directory, 'home-send.journal.json'), 'utf8')) as { chat: { id: string } };
+        const conflict = { schemaVersion: 8, ...conflictTemplate, id: journal.chat.id, title: 'Existing unrelated chat' };
+        const chatFolder = join(directory, 'chats', journal.chat.id);
+        await mkdir(chatFolder, { recursive: true });
+        await writeFile(join(chatFolder, 'chat.json'), JSON.stringify(conflict), 'utf8');
+      },
+    },
+  });
+  const existing = await store.createChat();
+  conflictTemplate = await store.getChat(existing.id) as unknown as Record<string, unknown>;
+  const originalMessages = conflictTemplate.messages;
+  const originalChatPath = join(directory, 'chats', existing.id, 'chat.json');
+  const originalChatBytes = await readFile(originalChatPath, 'utf8');
+  const draft = await store.saveHomeDraft({
+    revision: 1, text: 'Do not overwrite another chat', projectId: null,
+    permissionProfile: 'ask', skillId: null, modelId: 'GigaChat-3-Pro',
+  });
+
+  await assert.rejects(store.acceptHomeDraft(draft.revision, 'home-turn-collision'), /чат с тем же ID/);
+  const journal = JSON.parse(await readFile(join(directory, 'home-send.journal.json'), 'utf8')) as { chat: { id: string } };
+  const preserved = JSON.parse(await readFile(join(directory, 'chats', journal.chat.id, 'chat.json'), 'utf8')) as Record<string, unknown>;
+  assert.equal(preserved.title, 'Existing unrelated chat');
+  assert.deepEqual(preserved.messages, originalMessages);
+  assert.equal(await readFile(originalChatPath, 'utf8'), originalChatBytes, 'the original chat remains untouched');
+});
+
+test('deleting an accepted home chat removes its duplicate message snapshot and does not recreate it on a late Send', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-home-send-delete-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const draft = await store.saveHomeDraft({
+    revision: 1, text: 'Удалить вместе с сохранённой копией', projectId: null,
+    permissionProfile: null, skillId: null, modelId: 'GigaChat-3-Pro',
+  });
+  const accepted = await store.acceptHomeDraft(draft.revision, 'home-delete-turn');
+  await store.deleteChat(accepted.detail.id);
+
+  const reopened = await openStore(directory);
+  assert.deepEqual(await reopened.listChats(), []);
+  assert.equal((await reopened.getHomeDraft()).lastAcceptance, null);
+  await assert.rejects(reopened.acceptHomeDraft(draft.revision, 'late-home-send'), /изменился|устарела/i);
+  assert.deepEqual(await reopened.listChats(), [], 'a late IPC retry must not recreate the deleted chat');
+});
+
 test('changing the next model preserves accepted turns, messages, and historical usage IDs', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-model-family-migration-'));
   t.after(() => rm(directory, { recursive: true, force: true }));

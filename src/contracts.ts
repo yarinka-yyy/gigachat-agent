@@ -324,6 +324,43 @@ export interface ChatArtifact {
   messageId: string | null;
 }
 
+export interface HomeDraftAttachment {
+  id: string;
+  name: string;
+  storedName: string;
+  size: number;
+  sha256: string;
+  createdAt: string;
+}
+
+export interface HomeDraftInput {
+  revision: number;
+  text: string;
+  projectId: string | null;
+  permissionProfile: PermissionProfile | null;
+  skillId: string | null;
+  modelId: GigaChatModelId | null;
+}
+
+export interface HomeDraftAcceptance {
+  sourceRevision: number;
+  chatId: string;
+  turn: AcceptedTurnInput;
+}
+
+export interface HomeDraftRecord extends HomeDraftInput {
+  attachments: HomeDraftAttachment[];
+  lastAcceptance: HomeDraftAcceptance | null;
+}
+
+export interface HomeDraftSendResult {
+  detail: ChatDetail;
+  turn: AcceptedTurnInput;
+  homeDraft: HomeDraftRecord;
+  queued: boolean;
+  newlyAccepted: boolean;
+}
+
 export interface ChatDetail extends ChatSummary {
   draft: string;
   nextTurnPermissionProfile: PermissionProfile | null;
@@ -505,6 +542,13 @@ export interface OnboardingBrowserStatus {
 }
 
 export interface AppApi {
+  homeDraft: {
+    get(): Promise<HomeDraftRecord>;
+    save(input: HomeDraftInput): Promise<HomeDraftRecord>;
+    importFile(): Promise<HomeDraftRecord | null>;
+    removeFile(id: string): Promise<HomeDraftRecord>;
+    send(expectedRevision: number): Promise<HomeDraftSendResult>;
+  };
   projects: {
     list(): Promise<Project[]>;
     create(name: string, workingFolder?: string | null): Promise<Project>;

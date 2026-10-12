@@ -11,6 +11,9 @@ import type {
   ChatDetail,
   ChatSummary,
   ChatKind,
+  HomeDraftRecord,
+  HomeDraftInput,
+  HomeDraftSendResult,
   FolderOpener,
   HookInspection,
   HookEvent,
@@ -61,6 +64,13 @@ const runCloseAttempt = (discardBrowserMetadata = false): Promise<CloseAttemptRe
 };
 
 const api: AppApi = {
+  homeDraft: {
+    get: () => ipcRenderer.invoke('home-draft:get') as Promise<HomeDraftRecord>,
+    save: (input: HomeDraftInput) => ipcRenderer.invoke('home-draft:save', input) as Promise<HomeDraftRecord>,
+    importFile: () => ipcRenderer.invoke('home-draft:import-file') as Promise<HomeDraftRecord | null>,
+    removeFile: (id) => ipcRenderer.invoke('home-draft:remove-file', id) as Promise<HomeDraftRecord>,
+    send: (expectedRevision) => ipcRenderer.invoke('home-draft:send', expectedRevision) as Promise<HomeDraftSendResult>,
+  },
   projects: {
     list: () => ipcRenderer.invoke('projects:list') as Promise<Project[]>,
     create: (name, workingFolder = null) => ipcRenderer.invoke('projects:create', name, workingFolder) as Promise<Project>,

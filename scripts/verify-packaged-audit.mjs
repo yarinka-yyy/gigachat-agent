@@ -202,6 +202,12 @@ async function runElectronHost() {
   const details = new Map(chats.map((chat, index) => [chat.id, makeDetail(chat, index === 0 ? 'A baseline' : index === 1 ? 'B baseline' : 'History baseline')]));
   const state = {
     projects, chats, details,
+    homeDraft: { revision: 1, text: '', projectId: null, permissionProfile: null, skillId: null, modelId: null, attachments: [], lastAcceptance: null },
+    deferHomeDraftGet: true, pendingHomeDraftGets: [],
+    deferHomeDraftSaves: false, pendingHomeDraftSaves: [], homeDraftSaveCalls: [], rejectNextHomeDraftSave: false,
+    deferHomeDraftImports: false, pendingHomeDraftImports: [], homeDraftImportCalls: 0,
+    deferHomeDraftSendResponse: false, pendingHomeDraftSends: [], homeDraftSendCalls: [], rejectNextHomeDraftSend: false,
+    homeDraftAttachmentSequence: 0, homeDraftAcceptanceSequence: 0,
     runtimeTurns: new Map(), retryCalls: [], runtimeCancelCalls: [],
     modelRegistry: { state: 'unavailable', modelIds: [], errorCategory: null }, modelRegistryCalls: [],
     connectionStatus: { state: 'not-configured', errorCategory: null }, connectionCalls: [], nextConnectionFailure: null,
@@ -216,7 +222,7 @@ async function runElectronHost() {
       byChat: [], byModel: [], byDay: [],
     },
     deferChatGets: false, pendingGets: new Map(), rejectNextGet: null,
-    deferCreate: false, rejectNextCreate: false, pendingCreates: [], createCalls: [],
+    createCalls: [],
     deferDraftUpdates: false, pendingDraftUpdates: [], deferProjectMoves: false, pendingProjectMoves: [], updateCalls: [],
     deferSkillUpdates: false, pendingSkillUpdates: [], deferPermissionUpdates: false, pendingPermissionUpdates: [], appendCalls: [],
     deferImports: false, pendingImports: [], importCalls: [],
@@ -251,6 +257,74 @@ async function runElectronHost() {
     return { promise, resolve, reject };
   };
   const clone = (value) => value == null ? value : JSON.parse(JSON.stringify(value));
+  const applyHomeDraftSave = (input) => {
+    if (input.revision === state.homeDraft.revision
+      && input.text === state.homeDraft.text && input.projectId === state.homeDraft.projectId
+      && input.permissionProfile === state.homeDraft.permissionProfile && input.skillId === state.homeDraft.skillId
+      && input.modelId === state.homeDraft.modelId) return clone(state.homeDraft);
+    if (input.revision !== state.homeDraft.revision + 1) throw new Error('Synthetic home draft revision conflict');
+    state.homeDraft = {
+      ...clone(input), attachments: clone(state.homeDraft.attachments), lastAcceptance: clone(state.homeDraft.lastAcceptance),
+    };
+    return clone(state.homeDraft);
+  };
+  const resolveHomeDraftSave = (record) => {
+    try { record.resolve(applyHomeDraftSave(record.input)); }
+    catch (error) { record.reject(error); }
+  };
+  const stageHomeDraftAttachment = () => {
+    const index = ++state.homeDraftAttachmentSequence;
+    const attachment = {
+      id: `home-file-${index}`, name: `prepared-${index}.txt`, storedName: `home-file-${index}.txt`,
+      size: 24, sha256: 'a'.repeat(64), createdAt: timestamp,
+    };
+    state.homeDraft = {
+      ...state.homeDraft, revision: state.homeDraft.revision + 1,
+      attachments: [...state.homeDraft.attachments, attachment],
+    };
+    return clone(state.homeDraft);
+  };
+  const acceptHomeDraft = (revision) => {
+    state.homeDraftSendCalls.push(revision);
+    if (state.homeDraft.lastAcceptance?.sourceRevision === revision) {
+      const accepted = state.homeDraft.lastAcceptance;
+      return {
+        detail: clone(state.details.get(accepted.chatId)), turn: clone(accepted.turn),
+        newlyAccepted: false, homeDraft: clone(state.homeDraft), queued: false,
+      };
+    }
+    if (revision !== state.homeDraft.revision) throw new Error('Synthetic home draft changed before Send');
+    const text = state.homeDraft.text.trim();
+    if (!text) throw new Error('Synthetic empty home draft');
+    const index = ++state.homeDraftAcceptanceSequence;
+    const id = `home-chat-${index}`;
+    const message = { id: `home-message-${index}`, role: 'user', text, createdAt: timestamp };
+    const summary = makeChat(id, text.split(/\r?\n/, 1)[0].slice(0, 60), state.homeDraft.projectId);
+    const permissionProfile = state.homeDraft.permissionProfile ?? state.appSettings.defaultPermissionProfile;
+    const detail = {
+      ...summary, draft: '', nextTurnPermissionProfile: permissionProfile === state.appSettings.defaultPermissionProfile ? null : permissionProfile,
+      modelId: state.homeDraft.modelId ?? state.appSettings.defaultModelId, nextTurnSkillId: state.homeDraft.skillId,
+      messages: [message], toolReceipts: [], artifacts: state.homeDraft.attachments.map((attachment) => ({
+        id: attachment.id, name: attachment.name, storedName: attachment.storedName, size: attachment.size,
+        createdAt: attachment.createdAt, messageId: message.id,
+      })), compactSnapshot: null,
+    };
+    const turn = {
+      turnId: `home-turn-${index}`, chatId: id, projectId: state.homeDraft.projectId,
+      projectWorkingFolder: state.projects.find((project) => project.id === state.homeDraft.projectId)?.workingFolder ?? null,
+      messageId: message.id, historyBoundary: 0, messages: [message], permissionProfile, modelId: detail.modelId,
+      skillId: state.homeDraft.skillId, reservation: { permissionProfileRevision: null, skillRevision: null },
+    };
+    state.chats.unshift(summary);
+    state.details.set(id, detail);
+    state.homeDraft = {
+      ...state.homeDraft, revision: state.homeDraft.revision + 1, text: '', attachments: [],
+      lastAcceptance: { sourceRevision: revision, chatId: id, turn: clone(turn) },
+    };
+    return { detail: clone(detail), turn, newlyAccepted: true, homeDraft: clone(state.homeDraft), queued: false };
+  };
+  const resolveHomeDraftImport = (record) => record.resolve(stageHomeDraftAttachment());
+  const resolveHomeDraftSend = (record) => record.resolve(clone(record.accepted));
   const updateSummary = (id, patch) => {
     const summary = state.chats.find((item) => item.id === id);
     const detail = state.details.get(id);
@@ -259,12 +333,6 @@ async function runElectronHost() {
     Object.assign(detail, patch, { updatedAt: timestamp });
     state.updateCalls.push({ id, patch: clone(patch) });
     return clone(summary);
-  };
-  const resolveCreate = (record) => {
-    const summary = makeChat(`chat-new-${record.index}`, `New chat ${record.index}`, record.projectId);
-    state.chats.unshift(summary);
-    state.details.set(summary.id, makeDetail(summary, '', ''));
-    record.resolve(clone(summary));
   };
   const resolveSkillUpdate = (record) => record.resolve(updateSummary(record.id, record.patch));
   const resolvePermissionUpdate = (record) => record.resolve(updateSummary(record.id, record.patch));
@@ -320,6 +388,54 @@ async function runElectronHost() {
         return true;
       }
     }
+    if (group === 'homeDraft' && method === 'get') {
+      if (!state.deferHomeDraftGet) return clone(state.homeDraft);
+      const request = deferred();
+      state.pendingHomeDraftGets.push(request);
+      return request.promise;
+    }
+    if (group === 'homeDraft' && method === 'save') {
+      const input = clone(args[0]);
+      state.homeDraftSaveCalls.push(input);
+      if (state.rejectNextHomeDraftSave) {
+        state.rejectNextHomeDraftSave = false;
+        throw new Error('Synthetic home draft save failure');
+      }
+      if (state.deferHomeDraftSaves) {
+        const request = deferred();
+        state.pendingHomeDraftSaves.push({ input, resolve: request.resolve, reject: request.reject });
+        return request.promise;
+      }
+      return applyHomeDraftSave(input);
+    }
+    if (group === 'homeDraft' && method === 'importFile') {
+      state.homeDraftImportCalls += 1;
+      if (!state.deferHomeDraftImports) return stageHomeDraftAttachment();
+      const request = deferred();
+      state.pendingHomeDraftImports.push(request);
+      return request.promise;
+    }
+    if (group === 'homeDraft' && method === 'removeFile') {
+      const id = args[0];
+      if (!state.homeDraft.attachments.some((attachment) => attachment.id === id)) throw new Error('Synthetic home file not found');
+      state.homeDraft = {
+        ...state.homeDraft, revision: state.homeDraft.revision + 1,
+        attachments: state.homeDraft.attachments.filter((attachment) => attachment.id !== id),
+      };
+      return clone(state.homeDraft);
+    }
+    if (group === 'homeDraft' && method === 'send') {
+      if (state.rejectNextHomeDraftSend) {
+        state.rejectNextHomeDraftSend = false;
+        state.homeDraftSendCalls.push(args[0]);
+        throw new Error('Synthetic home draft Send failure');
+      }
+      const accepted = acceptHomeDraft(args[0]);
+      if (!state.deferHomeDraftSendResponse) return accepted;
+      const request = deferred();
+      state.pendingHomeDraftSends.push({ accepted, resolve: request.resolve, reject: request.reject });
+      return request.promise;
+    }
     if (group === 'projects' && method === 'list') return clone(state.projects);
     if (group === 'projects' && method === 'readInstructions') return readProjectInstructions(args[0]);
     if (group === 'projects' && method === 'instructionsBackupPath') return null;
@@ -373,15 +489,6 @@ async function runElectronHost() {
       const [projectId] = args;
       const record = { projectId, index: state.createCalls.length + 1 };
       state.createCalls.push(clone(record));
-      if (state.rejectNextCreate) {
-        state.rejectNextCreate = false;
-        throw new Error('Synthetic create failure');
-      }
-      if (state.deferCreate) {
-        const request = deferred();
-        state.pendingCreates.push({ ...record, resolve: request.resolve, reject: request.reject });
-        return request.promise;
-      }
       const summary = makeChat(`chat-new-${record.index}`, `New chat ${record.index}`, projectId);
       state.chats.unshift(summary);
       state.details.set(summary.id, makeDetail(summary, '', ''));
@@ -455,6 +562,9 @@ async function runElectronHost() {
       state.connectionCalls.push(method);
       state.connectionStatus = state.nextConnectionFailure ?? { state: 'connected', errorCategory: null };
       state.nextConnectionFailure = null;
+      if (state.connectionStatus.state === 'connected') {
+        state.modelRegistry = { ...state.modelRegistry, exhaustedModelIds: [] };
+      }
       return clone(state.connectionStatus);
     }
     if (group === 'onboarding' && (method === 'cancelConnect' || method === 'disconnect')) {
@@ -1434,6 +1544,11 @@ async function runElectronHost() {
     }
     await window.loadFile(join(bundleDirectory, 'index.html'));
     console.log('Renderer document loaded');
+    await waitUntil('initial home draft read is deferred', () => state.pendingHomeDraftGets.length === 1);
+    assert.equal(await evaluate(`document.querySelector('.composer textarea')?.disabled`), true,
+      'home composer stays disabled until its persistent draft is loaded');
+    state.pendingHomeDraftGets[0].resolve(clone(state.homeDraft));
+    state.deferHomeDraftGet = false;
     try {
       await waitDom('initial synthetic app load', `!document.querySelector('.loading-state') && document.querySelector('.composer textarea')`);
     } catch (error) {
@@ -1775,15 +1890,15 @@ async function runElectronHost() {
     console.log(`Layout measurement report retained: ${layoutReport}`);
 
     const draftSelector = '.composer textarea';
-    const closeCreateStart = state.pendingCreates.length;
     await clickText('.sidebar-actions button', 'Новый чат');
-    state.deferCreate = true;
+    const closeHomeSaveStart = state.pendingHomeDraftSaves.length;
+    state.deferHomeDraftSaves = true;
     await fillTextarea(draftSelector, 'close waits for accepted home draft');
-    await waitUntil('home draft creation before close', () => state.pendingCreates.length === closeCreateStart + 1);
-    const closePendingCreate = state.pendingCreates[closeCreateStart];
+    await waitUntil('home draft save before close', () => state.pendingHomeDraftSaves.length === closeHomeSaveStart + 1);
+    const closePendingDraftSave = state.pendingHomeDraftSaves[closeHomeSaveStart];
     const closeAttempt = evaluate('window.gigaChat.auditRequestClose()');
     await waitDom('pending close dialog', `document.querySelector('.close-pending-dialog')?.open === true`);
-    await capture('close-pending-home-create');
+    await capture('close-pending-home-draft-save');
     window.webContents.send('audit:permission', {
       id: 'approval-during-close', resource: 'project-files', action: 'read', target: 'synthetic file',
       reason: 'Synthetic close-barrier approval request.', expiresAt: new Date(Date.now() + 60000).toISOString(),
@@ -1792,24 +1907,24 @@ async function runElectronHost() {
     assert.equal(await evaluate(`document.querySelector('.close-pending-dialog')?.open === true`), true,
       'a late permission approval must not cover the close-pending modal');
     assert.equal(await evaluate(`document.querySelector('.approval-dialog')?.open === true`), false);
-    assert.equal(state.closeReadyCalls, 0, 'renderer must finish an accepted home create and its final draft before main close-ready');
+    assert.equal(state.closeReadyCalls, 0, 'renderer must finish the home draft save before main close-ready');
     const createsBeforeBlockedInput = state.createCalls.length;
     await clickText('.sidebar-actions button', 'Новый чат');
     assert.equal(state.createCalls.length, createsBeforeBlockedInput, 'frozen close must block new background actions');
-    resolveCreate(closePendingCreate);
+    resolveHomeDraftSave(closePendingDraftSave);
     await waitUntil('close-ready after accepted home draft settles', () => state.closeReadyCalls === 1);
     assert.equal((await closeAttempt).status, 'failed');
-    assert.equal(state.details.get(`chat-new-${closePendingCreate.index}`)?.draft, 'close waits for accepted home draft');
-    await waitDom('close failure dialog after accepted home create', `document.querySelector('.close-error-dialog')?.open === true`);
-    await capture('close-error-home-create');
+    assert.equal(state.homeDraft.text, 'close waits for accepted home draft');
+    await waitDom('close failure dialog after home draft save', `document.querySelector('.close-error-dialog')?.open === true`);
+    await capture('close-error-home-draft-save');
     await clickText('.close-error-dialog button', 'Вернуться к работе');
     await waitUntil('renderer resumes after close failure', async () => state.closeReturnCalls === 1
       && !(await evaluate(`document.querySelector('.close-error-dialog')?.open`)));
     await waitDom('deferred approval becomes available after return', `document.querySelector('.approval-dialog')?.open === true`);
     await clickText('.approval-dialog button', 'Отклонить');
     await waitUntil('synthetic deferred approval is rejected', () => state.permissionResponses.some((response) => response.id === 'approval-during-close' && response.allowed === false));
-    state.deferCreate = false;
-    passed('Rendered close waits for an accepted home create and persists its final draft');
+    state.deferHomeDraftSaves = false;
+    passed('Rendered close waits for the persistent home draft save without creating a chat');
 
     state.deferChatGets = true;
     const updatesBeforeLoading = state.updateCalls.length;
@@ -2138,6 +2253,10 @@ async function runElectronHost() {
     await waitDom('A submit waits for its captured Skill save', `document.querySelector('.composer textarea')?.disabled`);
     await clickChat('Chat B');
     await waitDom('B is active while A submit awaits its Skill save', `document.querySelector('.chat-header-title')?.textContent === 'Chat B' && document.querySelector('.composer-skill-selection strong')?.textContent === 'Other'`);
+    assert.equal(await evaluate(`document.querySelector('.composer textarea')?.disabled`), false,
+      'Chat B composer must remain editable while a send from Chat A is waiting');
+    await fillTextarea(draftSelector, 'draft edited in chat B while A waits');
+    await waitUntil('B draft saves while A waits', () => state.details.get('chat-b').draft === 'draft edited in chat B while A waits');
     await click('button[aria-label="Снять выбор Skill"]');
     const acceptedASkillSave = state.pendingSkillUpdates[0];
     resolveSkillUpdate(acceptedASkillSave);
@@ -2153,6 +2272,60 @@ async function runElectronHost() {
     state.deferSkillUpdates = false;
     await waitDom('B remains active after A submit completes', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'`);
     passed('Rendered submit keeps A accepted Skill when B changes its own Skill during the wait');
+
+    await clickText('.sidebar-actions button', 'Новый чат');
+    await waitDom('home draft for inherited-choice freeze', `document.querySelector('.home-view') && !document.querySelector('.composer textarea')?.disabled`);
+    await click('.profile-settings-button');
+    await clickText('.settings-nav-item', 'Подключение API');
+    await waitDom('API connection is ready before explicit quota reset', `[...document.querySelectorAll('.connection-setup button')].some((button) => button.textContent.includes('Отключить'))`);
+    await clickText('.connection-setup button', 'Отключить');
+    await waitUntil('explicit disconnect clears the connected session', () => state.connectionStatus.state === 'not-configured');
+    await clickText('.connection-setup button', 'Проверить подключение');
+    await waitUntil('explicit reconnect starts a fresh model allowance session', () => state.connectionStatus.state === 'connected'
+      && !state.modelRegistry.exhaustedModelIds?.includes('GigaChat-3-Ultra'));
+    await clickText('.settings-nav-item', 'Модели и лимиты');
+    await waitDom('refreshed registry makes Ultra selectable after reconnect', `[...document.querySelectorAll('.model-settings-list .permission-profile-selectable')].some((button) => button.textContent.includes('GigaChat Ultra') && !button.disabled)`);
+    await clickText('.model-settings-list .permission-profile-selectable', 'GigaChat Ultra');
+    await waitUntil('Ultra is the inherited default before Send', () => state.appSettings.defaultModelId === 'GigaChat-3-Ultra');
+    await clickText('.settings-nav-item', 'Разрешения');
+    await clickText('.permission-profile-list .permission-profile-selectable', 'Спросить');
+    await waitUntil('Ask is the inherited profile before Send', () => state.appSettings.defaultPermissionProfile === 'ask');
+    await click('button[aria-label="Назад"]');
+    await waitDom('home draft ready before inherited-choice Send', `document.querySelector('.home-view') && !document.querySelector('.composer textarea')?.disabled`);
+    await fillTextarea(draftSelector, 'Inherited choices stay frozen');
+    await waitUntil('inherited-choice message is saved', () => state.homeDraft.text === 'Inherited choices stay frozen');
+    state.deferHomeDraftSaves = true;
+    const frozenSendCount = state.homeDraftSendCalls.length;
+    const frozenSaveStart = state.pendingHomeDraftSaves.length;
+    await click('.send-button-wrap .send-button');
+    await waitUntil('Send materializes the inherited Ultra and Ask choices', () => state.pendingHomeDraftSaves.length === frozenSaveStart + 1
+      && state.pendingHomeDraftSaves[frozenSaveStart].input.modelId === 'GigaChat-3-Ultra'
+      && state.pendingHomeDraftSaves[frozenSaveStart].input.permissionProfile === 'ask');
+    const frozenChoiceSave = state.pendingHomeDraftSaves[frozenSaveStart];
+    await click('.profile-settings-button');
+    await clickText('.settings-nav-item', 'Модели и лимиты');
+    await clickText('.model-settings-list .permission-profile-selectable', 'GigaChat Pro');
+    await waitUntil('default model changes while home Send waits', () => state.appSettings.defaultModelId === 'GigaChat-3-Pro');
+    await clickText('.settings-nav-item', 'Разрешения');
+    await clickText('.permission-profile-list .permission-profile-selectable', 'Полный доступ');
+    await waitUntil('default profile changes while home Send waits', () => state.appSettings.defaultPermissionProfile === 'full');
+    resolveHomeDraftSave(frozenChoiceSave);
+    await waitUntil('home Send accepts the captured inherited choices', () => state.homeDraftSendCalls.length === frozenSendCount + 1
+      && state.homeDraft.lastAcceptance?.turn.permissionProfile === 'ask');
+    const frozenAcceptedChat = state.details.get(state.homeDraft.lastAcceptance.chatId);
+    assert.equal(frozenAcceptedChat.modelId, 'GigaChat-3-Ultra', 'the accepted message keeps the model inherited at Send');
+    assert.equal(frozenAcceptedChat.nextTurnPermissionProfile, 'ask', 'a later Full default cannot widen the accepted Ask choice');
+    assert.equal(state.homeDraft.lastAcceptance.turn.permissionProfile, 'ask');
+    state.deferHomeDraftSaves = false;
+    await clickText('.settings-nav-item', 'Модели и лимиты');
+    await clickText('.model-settings-list .permission-profile-selectable', 'GigaChat Ultra');
+    await waitUntil('model default restored after inherited-choice test', () => state.appSettings.defaultModelId === 'GigaChat-3-Ultra');
+    await clickText('.settings-nav-item', 'Разрешения');
+    await clickText('.permission-profile-list .permission-profile-selectable', 'Спросить');
+    await waitUntil('permission default restored after inherited-choice test', () => state.appSettings.defaultPermissionProfile === 'ask');
+    await click('button[aria-label="Назад"]');
+    await waitDom('return home after restoring inherited defaults', `document.querySelector('.home-view')`);
+    passed('Home Send freezes inherited model and permission defaults before async storage waits');
 
     await clickText('.sidebar-actions button', 'Новый чат');
     await click('.composer-permission-menu > button');
@@ -2271,95 +2444,124 @@ async function runElectronHost() {
     passed('Rendered project nesting, square-free child list, and project-aware chat title');
     passed('Rendered late project move updates its own chat without replacing another active chat');
 
-    const pendingNavigationCreateStart = state.pendingCreates.length;
+    const homeChatCount = state.chats.length;
+    const homeCreateCalls = state.createCalls.length;
+    const homeSendCalls = state.homeDraftSendCalls.length;
     await clickText('.sidebar-actions button', 'Новый чат');
-    state.deferCreate = true;
+    await waitDom('home draft editor ready', `document.querySelector('.home-view') && document.querySelector('.empty-state h1')?.textContent === 'Что будем создавать?' && !document.querySelector('.composer textarea')?.disabled`);
+    await evaluate(`document.querySelector(${JSON.stringify(draftSelector)})?.focus()`);
+    await fillTextarea(draftSelector, 'x');
+    await evaluate(`(() => { const element = document.querySelector(${JSON.stringify(draftSelector)}); const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set; setter.call(element, 'x' + 'a'.repeat(100)); element.setSelectionRange(101, 101); element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: 'a'.repeat(100) })); })()`);
+    await waitUntil('home text autosaved without a chat', () => state.homeDraft.text === `x${'a'.repeat(100)}`);
+    assert.equal(await evaluate(`document.activeElement === document.querySelector(${JSON.stringify(draftSelector)})`), true,
+      'typing beyond the first character keeps focus in the same home composer');
+    assert.equal(await evaluate(`document.querySelector('.empty-state h1')?.textContent`), 'Что будем создавать?',
+      'typing does not replace the welcome screen');
+    assert.equal(state.chats.length, homeChatCount, 'typing does not create a recent chat');
+    assert.equal(state.createCalls.length, homeCreateCalls, 'typing does not call chats.create');
+    assert.equal(state.homeDraftSendCalls.length, homeSendCalls, 'typing does not call homeDraft.send');
+    await capture('stage2-home-draft-before-send');
+
     await click('.composer-project-menu > button');
     await clickText('.action-menu-content:popover-open .project-picker-option', 'Project A');
-    await fillTextarea(draftSelector, 'draft 1');
-    await waitUntil('pending home create', () => state.pendingCreates.length === pendingNavigationCreateStart + 1);
-    await fillTextarea(draftSelector, 'draft 2');
-    await fillTextarea(draftSelector, 'draft 3');
-    await click('.composer-project-menu > button');
-    await clickText('.action-menu-content:popover-open .project-picker-option', 'Project B');
-    await clickChat('Chat B');
-    await waitDom('navigation away from pending create', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'`);
-    const pendingCreate = state.pendingCreates[pendingNavigationCreateStart];
-    resolveCreate(pendingCreate);
-    await waitUntil('home draft persisted after navigation', () => {
-      const chat = state.chats.find((item) => item.id === `chat-new-${pendingCreate.index}`);
-      return chat && state.details.get(chat.id)?.draft === 'draft 3' && chat.projectId === 'project-b'
-        && state.updateCalls.some((item) => item.id === chat.id && item.patch.projectId === 'project-b');
-    });
-    assert.equal(await evaluate(`document.querySelector('.chat-header-title')?.textContent`), 'Chat B');
-    state.deferCreate = false;
-    passed('Rendered pending home draft keeps text/project and does not take over a newer route');
-
-    await clickText('.sidebar-actions button', 'Новый чат');
-    state.rejectNextCreate = true;
-    await fillTextarea(draftSelector, 'keep this draft');
-    await waitDom('failed home draft with retry', `document.querySelector('.home-view') && document.querySelector('.composer-stack [role="alert"] button')?.textContent.includes('Повторить сохранение')`);
-    assert.equal(await evaluate(`document.querySelector(${JSON.stringify(draftSelector)})?.value`), 'keep this draft');
-    await capture('home-draft-create-error');
-    await clickText('.composer-stack [role="alert"] button', 'Повторить сохранение');
-    await waitDom('home draft retry opens created chat', `document.querySelector('.chat-header-title')?.textContent.startsWith('New chat')`);
-    passed('Rendered failed home create preserves the draft and retry succeeds');
-
-    await clickText('.sidebar-actions button', 'Новый чат');
-    state.deferCreate = true;
     await click('.composer-permission-menu > button');
     await clickText('.action-menu-content:popover-open .permission-picker-option', 'Подтверждать за меня');
-    await waitDom('home permission choice applied', `document.querySelector('.composer-permission-menu > button')?.textContent.includes('Подтверждать за меня')`);
-    const pendingCreateStart = state.pendingCreates.length;
+    await waitUntil('home project and permission profile remain draft state', () =>
+      state.homeDraft.projectId === 'project-a' && state.homeDraft.permissionProfile === 'approve');
+    await click('button[aria-label="Выбрать модель GigaChat"]');
+    await waitDom('home model options are refreshed before selection', `document.querySelector('.model-picker-popup .model-picker-option strong')?.textContent`);
+    const proOptionDisabled = await evaluate(`([...document.querySelectorAll('.model-picker-option')].find((button) => button.querySelector('strong')?.textContent.trim() === 'GigaChat Pro'))?.disabled`);
+    assert.equal(proOptionDisabled, false, 'the verified current Pro model remains selectable for a home draft');
+    await clickText('.model-picker-popup .model-picker-option', 'GigaChat Pro');
+    await waitUntil('home model choice is stored without a chat', () => state.homeDraft.modelId === 'GigaChat-3-Pro');
     await fillTextarea(draftSelector, '$audit');
-    await waitUntil('home session with a Skill pending', () => state.pendingCreates.length === pendingCreateStart + 1);
     await clickText('.composer-suggestions .composer-suggestion', 'Audit');
-    await fillTextarea(draftSelector, 'old session owns this draft');
-    await waitDom('home session owns selected Skill', `document.querySelector('.composer-skill-selection')?.textContent.includes('Audit')`);
-    await clickText('.sidebar-actions button', 'Новый чат');
-    await waitDom('new home uses default profile', `document.querySelector('.home-view') && document.querySelector('.composer-permission-menu > button')?.textContent.includes('Спросить')`);
-    assert.equal(await evaluate(`document.querySelector('.composer-skill-selection')`), null, 'new home must not inherit the prior session Skill');
-    const oldSessionCreate = state.pendingCreates[pendingCreateStart];
-    const oldSessionChatId = `chat-new-${oldSessionCreate.index}`;
-    resolveCreate(oldSessionCreate);
-    await waitUntil('detached session retains its own profile and Skill', () => {
-      const detail = state.details.get(oldSessionChatId);
-      return detail?.draft === 'old session owns this draft'
-        && detail.nextTurnPermissionProfile === 'approve'
-        && detail.nextTurnSkillId === 'global/audit';
-    });
-    await fillTextarea(draftSelector, 'fresh default session');
-    await waitUntil('new default home session pending', () => state.pendingCreates.length === pendingCreateStart + 2);
-    const newSessionCreate = state.pendingCreates[pendingCreateStart + 1];
-    resolveCreate(newSessionCreate);
-    const newSessionChatId = `chat-new-${newSessionCreate.index}`;
-    await waitUntil('new session saved without stale choices', () => {
-      const detail = state.details.get(newSessionChatId);
-      return detail?.draft === 'fresh default session'
-        && detail.nextTurnPermissionProfile === null
-        && detail.nextTurnSkillId === null;
-    });
-    state.deferCreate = false;
-    passed('Rendered new home session starts with defaults while a detached draft keeps its own choices');
+    await waitUntil('home Skill is stored without a chat', () => state.homeDraft.skillId === 'global/audit');
+    assert.equal(state.chats.length, homeChatCount, 'project, profile, and Skill selections stay out of Recents');
+
+    state.deferHomeDraftImports = true;
+    const importStart = state.pendingHomeDraftImports.length;
+    await click('button[aria-label="Прикрепить файл"]');
+    await waitUntil('home file import pending', () => state.pendingHomeDraftImports.length === importStart + 1);
+    await fillTextarea(draftSelector, 'Home message with staged attachment');
+    const draftGenerationBeforeImportResult = state.homeDraftSaveCalls.length;
+    resolveHomeDraftImport(state.pendingHomeDraftImports[importStart]);
+    await waitUntil('staged file and latest home text are preserved', () => state.homeDraft.attachments.length === 1
+      && state.homeDraft.text === 'Home message with staged attachment'
+      && state.homeDraftSaveCalls.length > draftGenerationBeforeImportResult);
+    state.deferHomeDraftImports = false;
+    assert.equal(state.chats.length, homeChatCount, 'choosing a file remains a local draft operation');
+
+    state.rejectNextHomeDraftSend = true;
+    const sendsBeforeFailure = state.homeDraftSendCalls.length;
+    await click('.send-button-wrap .send-button');
+    await waitDom('failed explicit home Send is reported', `document.querySelector('.notice')?.textContent.includes('Synthetic home draft Send failure')`);
+    assert.equal(state.homeDraftSendCalls.length, sendsBeforeFailure + 1);
+    assert.equal(state.chats.length, homeChatCount, 'failed atomic Send creates no visible chat');
+    assert.equal(state.homeDraft.text, 'Home message with staged attachment', 'failed Send retains typed text');
+    assert.equal(state.homeDraft.attachments.length, 1, 'failed Send retains staged files');
+
+    state.deferHomeDraftSendResponse = true;
+    const homeSendsBeforeAccept = state.homeDraftSendCalls.length;
+    const appendsBeforeAccept = state.appendCalls.length;
+    const acceptedClicks = await evaluate(`(() => { const button = document.querySelector('.send-button-wrap .send-button'); if (!button || button.disabled) return false; button.click(); button.click(); return true; })()`);
+    assert.equal(acceptedClicks, true);
+    await waitUntil('one atomic home Send after a double click', () => state.pendingHomeDraftSends.length === 1);
+    const pendingHomeSend = state.pendingHomeDraftSends[0];
+    assert.equal(state.homeDraftSendCalls.length, homeSendsBeforeAccept + 1, 'double click produces one Send IPC');
+    assert.equal(await evaluate(`document.querySelector('.home-view') !== null`), true,
+      'renderer remains on the welcome route until durable Send returns');
+    assert.equal(state.details.get(pendingHomeSend.accepted.detail.id)?.messages[0]?.text, 'Home message with staged attachment');
+    assert.equal(state.details.get(pendingHomeSend.accepted.detail.id)?.nextTurnPermissionProfile, 'approve');
+    assert.equal(state.details.get(pendingHomeSend.accepted.detail.id)?.nextTurnSkillId, 'global/audit');
+    assert.equal(state.details.get(pendingHomeSend.accepted.detail.id)?.modelId, 'GigaChat-3-Pro');
+    const acceptedMessageId = pendingHomeSend.accepted.detail.messages[0].id;
+    assert.equal(state.details.get(pendingHomeSend.accepted.detail.id)?.artifacts[0]?.messageId, acceptedMessageId,
+      'pending file is attached to the explicit first user message');
+    resolveHomeDraftSend(pendingHomeSend);
+    await waitDom('accepted home draft opens its new chat', `document.querySelector('.chat-header-title')?.textContent === 'Home message with staged attachment'`);
+    assert.equal(state.chats.length, homeChatCount + 1, 'only explicit Send creates one chat');
+    assert.equal(state.createCalls.length, homeCreateCalls, 'home Send uses the atomic homeDraft contract, not chats.create');
+    assert.equal(state.homeDraftSendCalls.length, homeSendsBeforeAccept + 1);
+    assert.equal(state.appendCalls.length, appendsBeforeAccept, 'accepted first message is not appended twice');
+    assert.equal(state.details.get(pendingHomeSend.accepted.detail.id)?.messages.filter((message) => message.role === 'user').length, 1);
+    assert.equal(state.homeDraft.text, '', 'accepted text clears from the persistent home draft');
+    assert.equal(state.homeDraft.attachments.length, 0, 'accepted attachments leave the pending home tray');
+    assert.equal(await evaluate(`document.querySelector('.notice')?.textContent.includes('сохранено локально')`), true,
+      'offline acceptance is shown as local, not queued or sent');
+    state.deferHomeDraftSendResponse = false;
+    passed('Home input and selections stay local until one explicit, durable Send; failure retains the draft and files');
 
     await clickText('.sidebar-actions button', 'Новый чат');
-    state.deferCreate = true;
-    const failedDetachedCreateStart = state.pendingCreates.length;
-    await fillTextarea(draftSelector, 'retry after navigating away');
-    await waitUntil('detached create pending before navigation', () => state.pendingCreates.length === failedDetachedCreateStart + 1);
-    await clickChat('Chat B');
-    await waitDom('different chat active before detached create fails', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'`);
-    state.pendingCreates[failedDetachedCreateStart].reject(new Error('Synthetic create failed after navigation'));
-    await sleep(100);
-    assert.equal(await evaluate(`document.querySelector('.chat-header-title')?.textContent`), 'Chat B');
-    state.deferCreate = false;
+    await waitDom('home route after accepted Send', `document.querySelector('.home-view')`);
+    assert.equal(await evaluate(`document.querySelector('.composer textarea')?.value`), '',
+      'a new home draft shows its own saved text, not the previous chat composer');
+    await fillTextarea(draftSelector, 'Accepted A before a late home edit');
+    await waitUntil('source A persisted before Send', () => state.homeDraft.text === 'Accepted A before a late home edit');
+    state.deferHomeDraftSendResponse = true;
+    const racePendingStart = state.pendingHomeDraftSends.length;
+    const raceSendStart = state.homeDraftSendCalls.length;
+    await click('.send-button-wrap .send-button');
+    await waitUntil('source A accepted while the renderer waits for the response', () => state.pendingHomeDraftSends.length === racePendingStart + 1);
+    const acceptedA = state.pendingHomeDraftSends.at(-1);
+    const clearedAcceptanceRevision = acceptedA.accepted.homeDraft.revision;
+    const typedAfterSend = await evaluate(`(() => { const element = document.querySelector(${JSON.stringify(draftSelector)}); const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set; setter.call(element, 'Typed B after Send'); element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: 'Typed B after Send' })); return true; })()`);
+    assert.equal(typedAfterSend, true);
+    await waitUntil('late B edit is represented by the same revision as accepted clear', () =>
+      state.homeDraftSaveCalls.some((input) => input.text === 'Typed B after Send' && input.revision === clearedAcceptanceRevision));
+    resolveHomeDraftSend(acceptedA);
+    await waitDom('accepted A route after latest B draft is rebased', `document.querySelector('.chat-header-title')?.textContent === 'Accepted A before a late home edit'`);
+    assert.equal(state.homeDraftSendCalls.length, raceSendStart + 1, 'only captured A reaches Send');
+    assert.equal(state.details.get(acceptedA.accepted.detail.id)?.messages[0]?.text, 'Accepted A before a late home edit');
+    assert.equal(state.homeDraft.text, 'Typed B after Send', 'late B edit survives when its optimistic revision equals the accepted clear revision');
+    assert.equal(await evaluate(`document.querySelector('.chat-history')?.textContent.includes('Typed B after Send')`), false,
+      'newer B draft is not inserted into A accepted history');
     await clickText('.sidebar-actions button', 'Новый чат');
-    await waitDom('failed detached draft remains recoverable', `[...document.querySelectorAll('.project-folder-choice button')].some((button) => button.textContent.includes('Восстановить черновик'))`);
-    assert.equal(await evaluate(`document.querySelector('.project-folder-choice')?.textContent.includes('retry after navigating away')`), true);
-    await clickText('.project-folder-choice button', 'Восстановить черновик');
-    await waitDom('recovered detached draft opens its chat', `document.querySelector('.chat-header-title')?.textContent.startsWith('New chat')`);
-    await waitUntil('recovered detached text persisted', () => [...state.details.values()].some((detail) => detail.draft === 'retry after navigating away'));
-    passed('Rendered failed create after navigation remains reachable and retryable');
+    await waitDom('late B draft reappears on home', `document.querySelector('.home-view') && document.querySelector('.composer textarea')?.value === 'Typed B after Send'`);
+    state.deferHomeDraftSendResponse = false;
+    await fillTextarea(draftSelector, '');
+    await waitUntil('late B draft cleanup saved', () => state.homeDraft.text === '');
+    passed('Equal-revision home edits remain separate from the immutable accepted message');
 
     state.rejectProjectRead = 'project-a';
     await click('button[aria-label="Действия проекта Project A"]');
@@ -2471,36 +2673,116 @@ async function runElectronHost() {
     passed('Rendered late folder result remains bound to the original project');
 
     await clickText('.sidebar-actions button', 'Новый чат');
-    state.deferImports = true;
-    const staleHomeImportIndex = state.pendingImports.length;
+    await fillTextarea(draftSelector, 'Home A before file import');
+    await waitUntil('home A persisted before a deferred import', () => state.homeDraft.text === 'Home A before file import');
+    state.deferHomeDraftImports = true;
+    const staleHomeImportIndex = state.pendingHomeDraftImports.length;
     await click('button[aria-label="Прикрепить файл"]');
-    await waitUntil('home file import before creating another draft', () => state.pendingImports.length === staleHomeImportIndex + 1);
-    const staleHomeImport = state.pendingImports[staleHomeImportIndex];
-    assert.equal(staleHomeImport.id, null, 'a fresh home import belongs to the not-yet-created home chat');
-    await clickText('.sidebar-actions button', 'Новый чат');
-    const pendingNewHomeStart = state.pendingCreates.length;
-    state.deferCreate = true;
-    await fillTextarea(draftSelector, 'new home draft survives old import');
-    await waitUntil('new home draft create starts', () => state.pendingCreates.length === pendingNewHomeStart + 1);
-    const newHomeCreate = state.pendingCreates[pendingNewHomeStart];
-    const staleImportedSummary = makeChat('chat-import-old-home', 'Imported old home');
-    const staleImportedDetail = makeDetail(staleImportedSummary, 'Old home file import');
-    state.chats.unshift(staleImportedSummary);
-    state.details.set(staleImportedSummary.id, staleImportedDetail);
-    staleHomeImport.request.resolve(clone(staleImportedDetail));
-    await waitDom('new home remains on its own draft after late import', `document.querySelector('.home-view') && document.querySelector('.composer textarea')?.value === 'new home draft survives old import'`);
-    resolveCreate(newHomeCreate);
-    await waitDom('new home creation completes independently of the late import', `document.querySelector('.chat-header-title')?.textContent === 'New chat ${newHomeCreate.index}'`);
-    assert.equal(await evaluate(`document.querySelector('.chat-header-title')?.textContent.includes('Imported old home')`), false);
-    state.deferCreate = false;
-    state.deferImports = false;
-    passed('Rendered late import from an old home cannot replace a newer home draft');
+    await waitUntil('home file import is pending', () => state.pendingHomeDraftImports.length === staleHomeImportIndex + 1);
+    assert.equal(await evaluate(`document.querySelector('.composer textarea')?.disabled`), false,
+      'typing remains available while a home file picker/import is pending');
+    await fillTextarea(draftSelector, 'Home B typed while import waits');
+    await waitUntil('home B persisted while import waits', () => state.homeDraft.text === 'Home B typed while import waits');
+    await clickChat('Chat B');
+    await waitDom('Chat B is editable while the old home import waits', `document.querySelector('.chat-header-title')?.textContent === 'Chat B' && !document.querySelector('.composer textarea')?.disabled`);
+    await fillTextarea(draftSelector, 'Chat B draft remains visible');
+    await waitUntil('Chat B draft saved independently of the home draft', () => state.details.get('chat-b')?.draft === 'Chat B draft remains visible');
+    resolveHomeDraftImport(state.pendingHomeDraftImports[staleHomeImportIndex]);
+    await waitUntil('late import saves its file and preserves home B text', () => state.homeDraft.attachments.length === 1
+      && state.homeDraft.text === 'Home B typed while import waits');
+    assert.equal(await evaluate(`document.querySelector('.chat-header-title')?.textContent`), 'Chat B',
+      'late home import does not navigate away from Chat B');
+    assert.equal(await evaluate(`document.querySelector(${JSON.stringify(draftSelector)})?.value`), 'Chat B draft remains visible',
+      'late home import does not replace Chat B’s draft');
+    assert.equal(state.createCalls.length, homeCreateCalls, 'a late home import still creates no chat');
+    state.deferHomeDraftImports = false;
+    passed('Deferred home import preserves later home edits and cannot replace another chat draft');
 
-    state.deferImports = true;
-    const closeImportIndex = state.pendingImports.length;
+    await clickText('.sidebar-actions button', 'Новый чат');
+    await waitDom('home draft before delayed import rebase', `document.querySelector('.home-view') && !document.querySelector('.composer textarea')?.disabled`);
+    await fillTextarea(draftSelector, 'Home A before delayed rebase');
+    await waitUntil('Home A persisted before delayed import rebase', () => state.homeDraft.text === 'Home A before delayed rebase');
+    state.deferHomeDraftImports = true;
+    const delayedRebaseImportIndex = state.pendingHomeDraftImports.length;
     await click('button[aria-label="Прикрепить файл"]');
-    await waitUntil('accepted import before close', () => state.pendingImports.length === closeImportIndex + 1);
-    const acceptedImport = state.pendingImports[closeImportIndex];
+    await waitUntil('delayed rebase import pending', () => state.pendingHomeDraftImports.length === delayedRebaseImportIndex + 1);
+    await fillTextarea(draftSelector, 'Home B before delayed rebase');
+    await waitUntil('Home B persisted before delayed rebase', () => state.homeDraft.text === 'Home B before delayed rebase');
+    state.deferHomeDraftSaves = true;
+    const delayedRebaseSaveIndex = state.pendingHomeDraftSaves.length;
+    resolveHomeDraftImport(state.pendingHomeDraftImports[delayedRebaseImportIndex]);
+    await waitUntil('main import result is rebased into a deferred home save', () => state.pendingHomeDraftSaves.length === delayedRebaseSaveIndex + 1
+      && state.pendingHomeDraftSaves[delayedRebaseSaveIndex].input.text === 'Home B before delayed rebase'
+      && state.pendingHomeDraftSaves[delayedRebaseSaveIndex].input.revision === state.homeDraft.revision + 1);
+    const delayedRebaseSave = state.pendingHomeDraftSaves[delayedRebaseSaveIndex];
+    const importedMetadata = clone(state.homeDraft);
+    assert.equal(await evaluate(`document.querySelector('.composer textarea')?.disabled`), false,
+      'the home composer stays editable while the final import rebase save is pending');
+    await fillTextarea(draftSelector, 'Home C while rebase save waits');
+    assert.equal(await evaluate(`document.querySelector('.composer textarea')?.value`), 'Home C while rebase save waits');
+    resolveHomeDraftSave(delayedRebaseSave);
+    await waitUntil('Home C save queues after the delayed rebase acknowledgement', () => state.pendingHomeDraftSaves.length === delayedRebaseSaveIndex + 2
+      && state.pendingHomeDraftSaves[delayedRebaseSaveIndex + 1].input.text === 'Home C while rebase save waits');
+    const delayedHomeCSave = state.pendingHomeDraftSaves[delayedRebaseSaveIndex + 1];
+    resolveHomeDraftSave(delayedHomeCSave);
+    await waitUntil('Home C and imported main metadata persist together', () => state.homeDraft.text === 'Home C while rebase save waits'
+      && state.homeDraft.attachments.length === importedMetadata.attachments.length);
+    assert.deepEqual(state.homeDraft.attachments, importedMetadata.attachments, 'the rebase keeps main-owned file metadata');
+    assert.deepEqual(state.homeDraft.lastAcceptance, importedMetadata.lastAcceptance, 'the rebase keeps the main-owned acceptance snapshot');
+    assert.equal(await evaluate(`document.querySelector('.composer textarea')?.value`), 'Home C while rebase save waits',
+      'the rebase acknowledgement cannot replace the newer home edit');
+    state.deferHomeDraftImports = false;
+    state.deferHomeDraftSaves = false;
+    passed('Deferred home rebase publishes its revision before saving and preserves newer input and main metadata');
+
+    await clickText('.sidebar-actions button', 'Новый чат');
+    await waitDom('home draft before retrying a failed save', `document.querySelector('.home-view') && !document.querySelector('.composer textarea')?.disabled`);
+    state.rejectNextHomeDraftSave = true;
+    await fillTextarea(draftSelector, 'Home B restored after a failed save');
+    await waitDom('failed home draft save offers a retry', `document.querySelector('.project-folder-choice[role="alert"] button')?.textContent.includes('Повторить сохранение')`);
+    const retryLocalRevision = state.homeDraft.revision + 1;
+    const retryMainMetadata = stageHomeDraftAttachment();
+    assert.equal(retryMainMetadata.revision, retryLocalRevision,
+      'the main import advances to the same revision as the local text whose save failed');
+    const retryMainSnapshot = clone(state.homeDraft);
+    state.deferHomeDraftSaves = true;
+    const retrySaveIndex = state.pendingHomeDraftSaves.length;
+    const closeCallsBeforeRetrySave = state.closeReadyCalls;
+    await clickText('.project-folder-choice[role="alert"] button', 'Повторить сохранение');
+    await waitUntil('home draft retry reaches its deferred durable save', () => state.pendingHomeDraftSaves.length === retrySaveIndex + 1);
+    const deferredRetrySave = state.pendingHomeDraftSaves[retrySaveIndex];
+    const retryCloseReturnBefore = state.closeReturnCalls;
+    const closeDuringRetry = evaluate('window.gigaChat.auditRequestClose()');
+    await waitDom('close waits for the active home draft retry', `document.querySelector('.close-pending-dialog')?.open === true`);
+    assert.equal(state.closeReadyCalls, closeCallsBeforeRetrySave,
+      'close must not reach main before the latest retry save is acknowledged');
+    resolveHomeDraftSave(deferredRetrySave);
+    await waitUntil('close reaches main after the home retry acknowledgement', () => state.closeReadyCalls === closeCallsBeforeRetrySave + 1);
+    assert.equal((await closeDuringRetry).status, 'failed', 'the synthetic main close result keeps the renderer host open');
+    await waitDom('successful retry is not blocked by its obsolete save error', `document.querySelector('.close-error-dialog')?.open === true
+      && document.querySelector('.close-error-dialog')?.textContent.includes('Synthetic close keeps the renderer host open.')
+      && !document.querySelector('.close-error-dialog')?.textContent.includes('Есть несохранённый текст')`);
+    await clickText('.close-error-dialog button', 'Вернуться к работе');
+    await waitUntil('return after close during successful home retry', async () => state.closeReturnCalls === retryCloseReturnBefore + 1
+      && !(await evaluate(`document.querySelector('.close-error-dialog')?.open`)));
+    state.deferHomeDraftSaves = false;
+    await waitUntil('retry rebases local text over equal-revision main metadata', () => state.homeDraft.text === 'Home B restored after a failed save'
+      && state.homeDraft.attachments.length === retryMainSnapshot.attachments.length);
+    await waitDom('successful home draft retry clears its save error', `!document.querySelector('.project-folder-choice[role="alert"]')`);
+    assert.deepEqual(state.homeDraft.attachments, retryMainSnapshot.attachments,
+      'retry preserves the file committed by the main process');
+    assert.deepEqual(state.homeDraft.lastAcceptance, retryMainSnapshot.lastAcceptance,
+      'retry preserves the main-owned accepted-turn snapshot');
+    assert.equal(await evaluate(`document.querySelector('.composer textarea')?.value`), 'Home B restored after a failed save',
+      'retry restores the unsaved editable text without changing its visible value');
+    passed('Home draft retry keeps local text and main-owned file/acceptance metadata at an equal revision');
+
+    await clickText('.sidebar-actions button', 'Новый чат');
+    state.deferHomeDraftImports = true;
+    const closeImportIndex = state.pendingHomeDraftImports.length;
+    await click('button[aria-label="Прикрепить файл"]');
+    await waitUntil('home import accepted before close', () => state.pendingHomeDraftImports.length === closeImportIndex + 1);
+    const acceptedImport = state.pendingHomeDraftImports[closeImportIndex];
     state.deferSettingUpdates = true;
     await click('.profile-settings-button');
     await clickText('.settings-nav-item', 'Оформление');
@@ -2513,6 +2795,7 @@ async function runElectronHost() {
     await click('.config-actions .primary-button');
     await waitUntil('accepted config save before close', () => state.pendingConfigSaves.length === 1);
     const closeCallsBeforeMixedDrain = state.closeReadyCalls;
+    const closeReturnsBeforeMixedDrain = state.closeReturnCalls;
     console.log(`MIXED_CLOSE before request ${JSON.stringify({ visible: window.isVisible(), state: await evaluate(`JSON.stringify({ visibility: document.visibilityState, pending: document.querySelector('.close-pending-dialog')?.open ?? false })`) })}`);
     const mixedClose = evaluate('window.gigaChat.auditRequestClose()');
     console.log(`MIXED_CLOSE after request ${JSON.stringify({ visible: window.isVisible(), state: await evaluate(`JSON.stringify({ visibility: document.visibilityState, pending: document.querySelector('.close-pending-dialog')?.open ?? false })`) })}`);
@@ -2530,24 +2813,28 @@ async function runElectronHost() {
     resolveConfigSave(state.pendingConfigSaves[0]);
     await sleep(100);
     assert.equal(state.closeReadyCalls, closeCallsBeforeMixedDrain, 'the remaining import must still hold the close barrier');
-    const importedForClose = clone(state.details.get(acceptedImport.id));
-    acceptedImport.request.resolve(importedForClose);
-    await waitUntil('main close-ready after imported settings and config settle', () => state.closeReadyCalls === closeCallsBeforeMixedDrain + 1);
+    resolveHomeDraftImport(acceptedImport);
+    await waitUntil('main close result after home import, settings, and config settle', async () => state.closeReadyCalls === closeCallsBeforeMixedDrain + 1
+      || await evaluate(`document.querySelector('.close-error-dialog')?.open === true`));
+    assert.equal(state.closeReadyCalls, closeCallsBeforeMixedDrain + 1,
+      `close should reach main after all accepted operations settle; visible error: ${await evaluate(`document.querySelector('.close-error-dialog')?.textContent ?? ''`)}`);
     assert.equal((await mixedClose).status, 'failed');
     assert.equal(state.appSettings.theme, 'warm');
     assert.equal(state.configContents, 'allow = []\n');
     await waitDom('mixed operations close error', `document.querySelector('.close-error-dialog')?.open === true`);
     await capture('close-error-import-settings-config');
     await clickText('.close-error-dialog button', 'Вернуться к работе');
-    await waitUntil('resume after mixed operations close error', async () => state.closeReturnCalls === 2
+    await waitUntil('resume after mixed operations close error', async () => state.closeReturnCalls === closeReturnsBeforeMixedDrain + 1
       && !(await evaluate(`document.querySelector('.close-error-dialog')?.open`)));
-    state.deferImports = false;
+    state.deferHomeDraftImports = false;
     state.deferSettingUpdates = false;
     state.deferConfigSaves = false;
-    passed('Rendered close waits for accepted import, settings, and config writes');
+    passed('Rendered close waits for a staged home file, settings, and config writes');
 
     await click('button.window-action[aria-label="Назад"]');
-    await waitDom('chat route before connection settings', `document.querySelector('.chat-header-title')`);
+    await waitDom('home route after connection settings', `document.querySelector('.home-view')`);
+    await clickChat('Chat B');
+    await waitDom('chat route before connection settings', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'`);
     await click('.profile-settings-button');
     await clickText('.settings-nav-item', 'Подключение API');
     await waitDom('connection setup key input', `document.querySelector('#connection-key')`);
@@ -2556,6 +2843,7 @@ async function runElectronHost() {
     await click('.connection-key-form button[type="submit"]');
     await waitUntil('accepted synthetic key save', () => state.pendingKeySaves.length === 1);
     const closeCallsBeforeKeyFailure = state.closeReadyCalls;
+    const closeReturnsBeforeKeyFailure = state.closeReturnCalls;
     const keySaveClose = evaluate('window.gigaChat.auditRequestClose()');
     await waitDom('key save close pending', `document.querySelector('.close-pending-dialog')?.open === true`);
     await capture('close-pending-key-save');
@@ -2568,28 +2856,30 @@ async function runElectronHost() {
     assert.equal(state.closeReadyCalls, closeCallsBeforeKeyFailure);
     await capture('close-error-key-save');
     await clickText('.close-error-dialog button', 'Вернуться к работе');
-    await waitUntil('resume after key save failure', async () => state.closeReturnCalls === 3
+    await waitUntil('resume after key save failure', async () => state.closeReturnCalls === closeReturnsBeforeKeyFailure + 1
       && !(await evaluate(`document.querySelector('.close-error-dialog')?.open`)));
 
+    const closeReturnsBeforeBlockedKeyRetry = state.closeReturnCalls;
     const blockedKeyRetry = evaluate('window.gigaChat.auditRequestClose()');
     await waitDom('unresolved key failure blocks another close', `document.querySelector('.close-error-dialog')?.open === true`);
     assert.equal((await blockedKeyRetry).status, 'failed');
     assert.equal(state.closeReadyCalls, closeCallsBeforeKeyFailure, 'retry must not discard the retained failed key input');
     assert.equal(await evaluate(`document.querySelector('#connection-key')?.value`), 'synthetic-audit-key');
     await clickText('.close-error-dialog button', 'Вернуться к работе');
-    await waitUntil('resume after unresolved key retry', async () => state.closeReturnCalls === 4
+    await waitUntil('resume after unresolved key retry', async () => state.closeReturnCalls === closeReturnsBeforeBlockedKeyRetry + 1
       && !(await evaluate(`document.querySelector('.close-error-dialog')?.open`)));
 
     await clickText('.settings-nav-item', 'Общие');
     await waitDom('key editor unmounted after leaving its settings section', `!document.querySelector('#connection-key')`);
     await clickText('.settings-nav-item', 'Подключение API');
     await waitDom('key editor remounted without stale failed draft', `document.querySelector('#connection-key')?.value === ''`);
+    const closeReturnsBeforeKeyRemount = state.closeReturnCalls;
     const closeAfterKeyRemount = evaluate('window.gigaChat.auditRequestClose()');
     await waitUntil('close after key editor remount reaches main', () => state.closeReadyCalls === closeCallsBeforeKeyFailure + 1);
     assert.equal((await closeAfterKeyRemount).status, 'failed');
     await waitDom('main close failure after key editor remount', `document.querySelector('.close-error-dialog')?.open === true`);
     await clickText('.close-error-dialog button', 'Вернуться к работе');
-    await waitUntil('resume after key editor remount close', async () => state.closeReturnCalls === 5
+    await waitUntil('resume after key editor remount close', async () => state.closeReturnCalls === closeReturnsBeforeKeyRemount + 1
       && !(await evaluate(`document.querySelector('.close-error-dialog')?.open`)));
 
     state.deferKeySaves = false;
@@ -2597,12 +2887,13 @@ async function runElectronHost() {
     await click('.connection-key-form button[type="submit"]');
     await waitDom('successful explicit key save clears input', `document.querySelector('#connection-key')?.value === ''`);
     assert.equal(state.keySaveCalls, 2, 'only explicit synthetic save attempts should reach the fake secure store');
+    const closeReturnsBeforeKeySave = state.closeReturnCalls;
     const closeAfterKeySave = evaluate('window.gigaChat.auditRequestClose()');
     await waitUntil('close reaches main after successful key save', () => state.closeReadyCalls === closeCallsBeforeKeyFailure + 2);
     assert.equal((await closeAfterKeySave).status, 'failed');
     await waitDom('synthetic main close failure after successful key save', `document.querySelector('.close-error-dialog')?.open === true`);
     await clickText('.close-error-dialog button', 'Вернуться к работе');
-    await waitUntil('resume after successful key save close attempt', async () => state.closeReturnCalls === 6
+    await waitUntil('resume after successful key save close attempt', async () => state.closeReturnCalls === closeReturnsBeforeKeySave + 1
       && !(await evaluate(`document.querySelector('.close-error-dialog')?.open`)));
     passed('Rendered key-save failure keeps its input and blocks close until explicit recovery');
 
@@ -2711,6 +3002,24 @@ async function runElectronHost() {
     assert.equal(await evaluate(`document.querySelector('.composer textarea')?.value.includes('Cancelled synthetic transcript must stay absent.')`), false);
     state.deferVoiceTranscribe = false;
     passed('Rendered voice cleanup failure remains retryable without an automatic retry or late transcript');
+
+    const homeVoiceChatsBefore = state.chats.length;
+    const homeVoiceSendsBefore = state.homeDraftSendCalls.length;
+    const homeVoiceRecordersBefore = await evaluate('window.__auditVoiceMedia.recorders.length');
+    const homeVoiceTranscribesBefore = state.voiceTranscribeCalls.length;
+    await clickText('.sidebar-actions button', 'Новый чат');
+    await waitDom('home draft before synthetic voice insertion', `document.querySelector('.home-view') && !document.querySelector('.composer textarea')?.disabled`);
+    await click('.mic-button');
+    await waitUntil('synthetic home recording starts', async () => await evaluate('window.__auditVoiceMedia.recorders.length') === homeVoiceRecordersBefore + 1
+      && await evaluate(`document.querySelector('.voice-capture')?.classList.contains('is-recording')`));
+    await click('.mic-button');
+    await waitUntil('home transcript reaches the local draft', () => state.voiceTranscribeCalls.length === homeVoiceTranscribesBefore + 1);
+    await waitDom('synthetic home transcript is inserted without Send', `document.querySelector('.home-view')
+      && document.querySelector('.composer textarea')?.value.includes('Synthetic dictation ready.')`);
+    await waitUntil('synthetic voice transcript autosaves to home draft', () => state.homeDraft.text.includes('Synthetic dictation ready.'));
+    assert.equal(state.chats.length, homeVoiceChatsBefore, 'voice transcription does not create a chat');
+    assert.equal(state.homeDraftSendCalls.length, homeVoiceSendsBefore, 'voice transcription does not call Send');
+    passed('Rendered voice transcript stays in the persistent home draft until explicit Send');
 
     const closeCallsBeforeBrowserFailure = state.closeReadyCalls;
     state.closeReadyResults.push({
@@ -3494,6 +3803,7 @@ async function runElectronHost() {
 const fakePreloadSource = String.raw`
 const { contextBridge, ipcRenderer } = require('electron');
 const methods = {
+  homeDraft: ['get','save','importFile','removeFile','send'],
   projects: ['list','create','pickFolder','instructionsBackupPath','update','remove','chooseFolder','openFolder','readInstructions','saveInstructions','saveInstructionsCopy'],
   chats: ['list','get','create','update','appendLocalMessage','importFile','openArtifact','openFolder','remove'],
   runtime: ['getStatus','list','cancel','retry'],

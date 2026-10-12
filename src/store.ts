@@ -1,9 +1,9 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import { constants } from 'node:fs';
 import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { DEFAULT_NOTIFICATION_SETTINGS, type AcceptedTurnInput, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type CompactSnapshot, type CompactionPrefix, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderProtocolExchange, type Settings, type SettingsPatch, type Theme, type UsageLedgerSummary, type UsageReceipt } from './contracts';
+import { DEFAULT_NOTIFICATION_SETTINGS, type AcceptedTurnInput, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type CompactSnapshot, type CompactionPrefix, type HomeDraftAttachment, type HomeDraftInput, type HomeDraftRecord, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderProtocolExchange, type Settings, type SettingsPatch, type Theme, type UsageLedgerSummary, type UsageReceipt } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { requireModelId } from './models';
 import { isSkillId } from './skills';
@@ -26,11 +26,23 @@ type ProjectDeleteJournal = {
   before: ProjectDeleteState;
   after: ProjectDeleteState;
 };
+type HomeSendJournal = {
+  schemaVersion: 1;
+  operationId: string;
+  sourceRevision: number;
+  chat: ChatDetail;
+  turn: AcceptedTurnInput;
+  attachments: HomeDraftAttachment[];
+  nextDraft: HomeDraftRecord;
+};
 export type StoreFaultStage = 'journal' | 'chat' | 'projects' | 'instructions' | 'journal-cleared';
+export type HomeSendFaultStage = 'journal' | 'chat' | 'draft' | 'journal-cleared';
 export interface StoreTestFaults {
   afterProjectDeleteStage?: (stage: StoreFaultStage, chatIndex?: number) => void | Promise<void>;
   beforeProjectInstructionCommit?: (targetPath: string) => void | Promise<void>;
   beforeCompactSnapshotCommit?: () => void | Promise<void>;
+  beforeHomeSendJournal?: () => void | Promise<void>;
+  afterHomeSendStage?: (stage: HomeSendFaultStage) => void | Promise<void>;
 }
 
 export type InstructionCommitter = (request: InstructionCommitRequest) => Promise<InstructionCommitResult>;
@@ -46,6 +58,10 @@ const MAX_USAGE_LEDGER_BYTES = 32 * 1024 * 1024;
 const MAX_TOOL_RECEIPTS_PER_CHAT = 256;
 const MAX_TOOL_ARGUMENTS_BYTES = 1_900_000;
 const MAX_TOOL_RESULT_BYTES = 32 * 1024;
+const MAX_HOME_DRAFT_BYTES = 1_000_000;
+const MAX_HOME_DRAFT_FILES = 32;
+const MAX_HOME_DRAFT_FILE_BYTES = 25 * 1024 * 1024;
+const MAX_HOME_DRAFT_TOTAL_BYTES = 100 * 1024 * 1024;
 const SIDE_EFFECT_TOOLS = new Set(['write', 'powershell', 'open']);
 const UNKNOWN_TOOL_RESULT = JSON.stringify({
   ok: false,
@@ -66,6 +82,11 @@ export interface LocalStore {
   projectInstructionsBackupPath(id: unknown): Promise<string | null>;
   deleteProject(id: unknown): Promise<void>;
   listChats(): Promise<ChatSummary[]>;
+  getHomeDraft(): Promise<HomeDraftRecord>;
+  saveHomeDraft(input: unknown): Promise<HomeDraftRecord>;
+  stageHomeDraftFile(sourcePath: string): Promise<HomeDraftRecord>;
+  removeHomeDraftFile(id: unknown): Promise<HomeDraftRecord>;
+  acceptHomeDraft(expectedRevision: unknown, turnId: unknown): Promise<{ detail: ChatDetail; turn: AcceptedTurnInput; newlyAccepted: boolean }>;
   getChat(id: unknown): Promise<ChatDetail>;
   getMessagesThrough(chatId: unknown, messageId: unknown): Promise<ChatMessage[]>;
   getToolProtocolThrough(chatId: unknown, messageId: unknown): Promise<ProviderProtocolExchange[]>;
@@ -586,6 +607,156 @@ function detailFile(chat: ChatDetail): Record<string, unknown> {
   return { schemaVersion: 8, ...chat };
 }
 
+function validateHomeDraftAttachment(value: unknown): HomeDraftAttachment {
+  if (!isRecord(value) || typeof value.name !== 'string' || !value.name.trim() || value.name.length > 255
+    // eslint-disable-next-line no-control-regex -- Reject control characters in persisted attachment names.
+    || /[\u0000-\u001f\u007f]/.test(value.name)
+    || typeof value.storedName !== 'string' || !/^[A-Za-z0-9_-]{1,128}(\.[A-Za-z0-9]{1,12})?$/.test(value.storedName)
+    || !Number.isSafeInteger(value.size) || (value.size as number) < 0 || (value.size as number) > MAX_HOME_DRAFT_FILE_BYTES
+    || typeof value.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(value.sha256)) {
+    throw new Error('Некорректный файл домашнего черновика.');
+  }
+  return {
+    id: requireId(value.id), name: value.name, storedName: value.storedName, size: value.size as number,
+    sha256: value.sha256, createdAt: requireTimestamp(value.createdAt),
+  };
+}
+
+function validateAcceptedTurnRecord(value: unknown): AcceptedTurnInput {
+  if (!isRecord(value) || !Array.isArray(value.messages) || !Number.isSafeInteger(value.historyBoundary)
+    || (value.historyBoundary as number) < 1 || value.historyBoundary !== value.messages.length || !isRecord(value.reservation)) {
+    throw new Error('Некорректный принятый ход домашнего черновика.');
+  }
+  const messages = value.messages.map((entry: unknown): ChatMessage => {
+    if (!isRecord(entry) || (entry.role !== 'user' && entry.role !== 'assistant')
+      || typeof entry.text !== 'string' || entry.text.length > 100_000
+      || (entry.source !== undefined && entry.source !== 'runtime' && entry.source !== 'example')
+      || (entry.functionsStateId !== undefined && (entry.role !== 'assistant' || typeof entry.functionsStateId !== 'string' || !entry.functionsStateId || entry.functionsStateId.length > 4096))) {
+      throw new Error('Некорректное сообщение принятого хода.');
+    }
+    return {
+      id: requireId(entry.id), role: entry.role, text: entry.text, createdAt: requireTimestamp(entry.createdAt),
+      ...(entry.source === undefined ? {} : { source: entry.source }),
+      ...(entry.functionsStateId === undefined ? {} : { functionsStateId: entry.functionsStateId }),
+    };
+  });
+  const ids = messages.map((message) => message.id);
+  if (new Set(ids).size !== ids.length) throw new Error('Повтор сообщения в принятом ходе.');
+  const projectWorkingFolder = value.projectWorkingFolder === null ? null : requireFolderPath(value.projectWorkingFolder, 'Рабочая папка принятого хода');
+  const revision = (input: unknown): number | null => {
+    if (input === null) return null;
+    if (!Number.isSafeInteger(input) || (input as number) < 0) throw new Error('Некорректная ревизия принятого хода.');
+    return input as number;
+  };
+  const turn: AcceptedTurnInput = {
+    turnId: requireId(value.turnId), chatId: requireId(value.chatId),
+    projectId: value.projectId === null ? null : requireId(value.projectId), projectWorkingFolder,
+    messageId: requireId(value.messageId), historyBoundary: value.historyBoundary as number, messages,
+    permissionProfile: requirePermissionProfile(value.permissionProfile),
+    modelId: value.modelId === null ? null : requireModelId(value.modelId),
+    skillId: value.skillId === null ? null : (isSkillId(value.skillId) ? value.skillId : (() => { throw new Error('Некорректный Skill принятого хода.'); })()),
+    reservation: {
+      permissionProfileRevision: revision(value.reservation.permissionProfileRevision),
+      skillRevision: revision(value.reservation.skillRevision),
+    },
+  };
+  if (value.operation !== undefined) throw new Error('Домашний черновик не может принимать служебный ход.');
+  if (!messages.some((message) => message.id === turn.messageId && message.role === 'user')) throw new Error('В принятом ходе отсутствует исходный запрос.');
+  return turn;
+}
+
+function validateHomeDraftRecord(value: unknown): HomeDraftRecord {
+  if (!isRecord(value) || value.schemaVersion !== 1 || !Number.isSafeInteger(value.revision)
+    || (value.revision as number) < 0 || typeof value.text !== 'string' || value.text.length > 100_000
+    || !Array.isArray(value.attachments) || value.attachments.length > MAX_HOME_DRAFT_FILES
+    || (value.lastAcceptance !== null && !isRecord(value.lastAcceptance))) {
+    throw new Error('Некорректный файл домашнего черновика.');
+  }
+  const attachments = value.attachments.map(validateHomeDraftAttachment);
+  if (new Set(attachments.map((attachment) => attachment.id)).size !== attachments.length
+    || new Set(attachments.map((attachment) => attachment.storedName)).size !== attachments.length
+    || attachments.reduce((total, attachment) => total + attachment.size, 0) > MAX_HOME_DRAFT_TOTAL_BYTES) {
+    throw new Error('Повтор или превышение лимита файлов домашнего черновика.');
+  }
+  let lastAcceptance: HomeDraftRecord['lastAcceptance'] = null;
+  if (value.lastAcceptance !== null) {
+    const accepted = value.lastAcceptance as Record<string, unknown>;
+    if (!Number.isSafeInteger(accepted.sourceRevision) || (accepted.sourceRevision as number) < 1
+      || (accepted.sourceRevision as number) > (value.revision as number)) throw new Error('Некорректная ревизия отправки черновика.');
+    lastAcceptance = {
+      sourceRevision: accepted.sourceRevision as number,
+      chatId: requireId(accepted.chatId),
+      turn: validateAcceptedTurnRecord(accepted.turn),
+    };
+    if (lastAcceptance.turn.chatId !== lastAcceptance.chatId) throw new Error('Привязка принятого хода повреждена.');
+  }
+  return {
+    revision: value.revision as number, text: value.text,
+    projectId: value.projectId === null ? null : requireId(value.projectId),
+    permissionProfile: value.permissionProfile === null ? null : requirePermissionProfile(value.permissionProfile),
+    skillId: value.skillId === null ? null : (isSkillId(value.skillId) ? value.skillId : (() => { throw new Error('Некорректный Skill домашнего черновика.'); })()),
+    modelId: value.modelId === null ? null : requireModelId(value.modelId),
+    attachments, lastAcceptance,
+  };
+}
+
+function parseHomeDraftFile(value: unknown): Loaded<HomeDraftRecord> {
+  return { value: validateHomeDraftRecord(value), needsWrite: false };
+}
+
+async function loadHomeDraftFile(filePath: string): Promise<Loaded<HomeDraftRecord>> {
+  let info;
+  try { info = await lstat(filePath); }
+  catch (error) {
+    if (isMissingFile(error)) {
+      return { value: { revision: 0, text: '', projectId: null, permissionProfile: null, skillId: null, modelId: null, attachments: [], lastAcceptance: null }, needsWrite: true };
+    }
+    throw error;
+  }
+  if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_HOME_DRAFT_BYTES) throw storageError(filePath);
+  const bytes = await readFile(filePath);
+  if (bytes.byteLength > MAX_HOME_DRAFT_BYTES) throw storageError(filePath);
+  try { return parseHomeDraftFile(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as unknown); }
+  catch { throw storageError(filePath); }
+}
+
+function validateHomeSendJournal(value: unknown): HomeSendJournal {
+  if (!isRecord(value) || value.schemaVersion !== 1 || !Number.isSafeInteger(value.sourceRevision)
+    || (value.sourceRevision as number) < 1 || !Array.isArray(value.attachments) || !isRecord(value.nextDraft)) {
+    throw new Error('Некорректный журнал отправки домашнего черновика.');
+  }
+  const chat = validateChatDetail(value.chat).value;
+  const turn = validateAcceptedTurnRecord(value.turn);
+  const attachments = value.attachments.map(validateHomeDraftAttachment);
+  const nextDraft = validateHomeDraftRecord(value.nextDraft);
+  const acceptance = nextDraft.lastAcceptance;
+  const userMessage = chat.messages[0];
+  if (new Set(attachments.map((attachment) => attachment.id)).size !== attachments.length
+    || new Set(attachments.map((attachment) => attachment.storedName)).size !== attachments.length
+    || attachments.reduce((total, attachment) => total + attachment.size, 0) > MAX_HOME_DRAFT_TOTAL_BYTES) {
+    throw new Error('Повтор или превышение лимита файлов в журнале отправки.');
+  }
+  if (!userMessage || userMessage.role !== 'user' || chat.messages.length !== 1
+    || turn.chatId !== chat.id || turn.messageId !== userMessage.id || turn.projectId !== chat.projectId
+    || turn.modelId !== chat.modelId || turn.historyBoundary !== chat.messages.length
+    || JSON.stringify(turn.messages) !== JSON.stringify(chat.messages)
+    || attachments.length !== chat.artifacts.length
+    || attachments.some((attachment) => !chat.artifacts.some((artifact) => artifact.id === attachment.id
+      && artifact.storedName === attachment.storedName && artifact.name === attachment.name
+      && artifact.size === attachment.size && artifact.messageId === userMessage.id))
+    || (chat.nextTurnPermissionProfile !== null && chat.nextTurnPermissionProfile !== turn.permissionProfile)
+    || chat.nextTurnSkillId !== turn.skillId
+    || nextDraft.revision !== (value.sourceRevision as number) + 1 || nextDraft.text !== '' || nextDraft.attachments.length !== 0
+    || !acceptance || acceptance.sourceRevision !== value.sourceRevision || acceptance.chatId !== chat.id
+    || JSON.stringify(acceptance.turn) !== JSON.stringify(turn)) {
+    throw new Error('Связи журнала отправки домашнего черновика повреждены.');
+  }
+  return {
+    schemaVersion: 1, operationId: requireId(value.operationId), sourceRevision: value.sourceRevision as number,
+    chat, turn, attachments, nextDraft,
+  };
+}
+
 function buildCompactionPrefix(chat: ChatDetail, boundaryMessageId: string, coveredThroughMessageId?: string): CompactionPrefix {
   const anchorIndex = chat.messages.findIndex((message) => message.id === boundaryMessageId && message.role === 'user');
   if (anchorIndex < 0) throw new Error('Граница сжатия отсутствует в истории чата.');
@@ -817,6 +988,9 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
   const migrationMarker = join(storageRoot, 'chats.migrated');
   const settingsPath = join(storageRoot, 'settings.json');
   const usagePath = join(storageRoot, 'usage.json');
+  const homeDraftPath = join(storageRoot, 'home-draft.json');
+  const homeDraftFilesDirectory = join(storageRoot, 'home-draft', 'files');
+  const homeSendJournalPath = join(storageRoot, 'home-send.journal.json');
   const writeOwnedAtomic = async (filePath: string, value: unknown, signal?: AbortSignal): Promise<void> => {
     await assertOwnedPath(storageRoot, filePath);
     await mkdir(dirname(filePath), { recursive: true });
@@ -828,6 +1002,93 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     await mkdir(dirname(filePath), { recursive: true });
     await assertOwnedPath(storageRoot, filePath);
     await writeTextAtomic(filePath, value);
+  };
+  const hashFile = async (filePath: string): Promise<{ size: number; sha256: string }> => {
+    const info = await lstat(filePath);
+    if (!info.isFile() || info.isSymbolicLink()) throw new Error('Файл черновика недоступен.');
+    const bytes = await readFile(filePath);
+    return { size: bytes.byteLength, sha256: createHash('sha256').update(bytes).digest('hex') };
+  };
+  const readHomeSendJournal = async (): Promise<HomeSendJournal | null> => {
+    await assertOwnedPath(storageRoot, homeSendJournalPath);
+    let info;
+    try { info = await lstat(homeSendJournalPath); }
+    catch (error) { if (isMissingFile(error)) return null; throw error; }
+    if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_HOME_DRAFT_BYTES + 2_000_000) {
+      throw storageError(homeSendJournalPath);
+    }
+    const bytes = await readFile(homeSendJournalPath);
+    if (bytes.byteLength > MAX_HOME_DRAFT_BYTES + 2_000_000) throw storageError(homeSendJournalPath);
+    try { return validateHomeSendJournal(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as unknown); }
+    catch { throw storageError(homeSendJournalPath); }
+  };
+  const homeSendJournalFile = (journal: HomeSendJournal): Record<string, unknown> => ({
+    schemaVersion: 1,
+    operationId: journal.operationId,
+    sourceRevision: journal.sourceRevision,
+    chat: detailFile(journal.chat),
+    turn: journal.turn,
+    attachments: journal.attachments,
+    nextDraft: { schemaVersion: 1, ...journal.nextDraft },
+  });
+  const applyHomeSendJournal = async (journal: HomeSendJournal): Promise<void> => {
+    const chatFolderPath = join(chatsDirectory, journal.chat.id);
+    const chatFilePath = join(chatFolderPath, 'chat.json');
+    await assertOwnedPath(storageRoot, chatFilePath);
+    const existingChatContents = await readFile(chatFilePath, 'utf8').catch((error: unknown) => {
+      if (isMissingFile(error)) return null;
+      throw error;
+    });
+    if (existingChatContents !== null) {
+      let existingChat: ChatDetail;
+      try { existingChat = validateChatDetail(JSON.parse(existingChatContents) as unknown).value; }
+      catch { throw storageError(chatFilePath); }
+      if (!sameJson(existingChat, journal.chat)) {
+        throw new Error('Отправка приостановлена: чат с тем же ID уже содержит другие данные. Существующий чат сохранён.');
+      }
+    }
+    const targetFilesDirectory = join(chatFolderPath, 'files');
+    if (journal.attachments.length > 0) {
+      await assertOwnedPath(storageRoot, targetFilesDirectory);
+      await mkdir(targetFilesDirectory, { recursive: true });
+    }
+    for (const attachment of journal.attachments) {
+      const source = join(homeDraftFilesDirectory, attachment.storedName);
+      const target = join(targetFilesDirectory, attachment.storedName);
+      await assertOwnedPath(storageRoot, source);
+      await assertOwnedPath(storageRoot, target);
+      const sourceHash = await hashFile(source);
+      if (sourceHash.size !== attachment.size || sourceHash.sha256 !== attachment.sha256) {
+        throw new Error('Копия подготовленного файла изменилась; исходный файл и черновик сохранены.');
+      }
+      await copyFile(source, target, constants.COPYFILE_EXCL).catch(async (error: unknown) => {
+        if (!isRecord(error) || error.code !== 'EEXIST') throw error;
+        const existing = await hashFile(target);
+        if (existing.size !== attachment.size || existing.sha256 !== attachment.sha256) {
+          throw new Error('Копия файла чата не совпадает с принятым черновиком.');
+        }
+      });
+      const copied = await hashFile(target);
+      if (copied.size !== attachment.size || copied.sha256 !== attachment.sha256) {
+        throw new Error('Копирование файла чата не прошло проверку целостности.');
+      }
+    }
+    if (existingChatContents === null) await writeOwnedAtomic(chatFilePath, detailFile(journal.chat));
+    await testFaults?.afterHomeSendStage?.('chat');
+    await writeOwnedAtomic(homeDraftPath, { schemaVersion: 1, ...journal.nextDraft });
+    await testFaults?.afterHomeSendStage?.('draft');
+    await assertOwnedPath(storageRoot, homeSendJournalPath);
+    await unlink(homeSendJournalPath).catch((error: unknown) => {
+      if (!isMissingFile(error)) throw error;
+    });
+    await testFaults?.afterHomeSendStage?.('journal-cleared');
+    for (const attachment of journal.attachments) {
+      try {
+        const source = join(homeDraftFilesDirectory, attachment.storedName);
+        await assertOwnedPath(storageRoot, source);
+        await unlink(source);
+      } catch { /* The accepted chat is durable; an orphaned staged copy is safe to leave behind. */ }
+    }
   };
   const readOwnedInstructions = async (filePath: string): Promise<string> => {
     await assertOwnedPath(storageRoot, filePath);
@@ -1111,7 +1372,13 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     assertOwnedPath(storageRoot, migrationMarker),
     assertOwnedPath(storageRoot, settingsPath),
     assertOwnedPath(storageRoot, usagePath),
+    assertOwnedPath(storageRoot, homeDraftPath),
+    assertOwnedPath(storageRoot, homeDraftFilesDirectory),
+    assertOwnedPath(storageRoot, homeSendJournalPath),
   ]);
+
+  const pendingHomeSend = await readHomeSendJournal();
+  if (pendingHomeSend) await applyHomeSendJournal(pendingHomeSend);
 
   const journalContents = await readFile(projectDeleteJournalPath, 'utf8').catch((error: unknown) => {
     if (isMissingFile(error)) return null;
@@ -1125,7 +1392,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
   }
 
   // Parse every existing file before creating or migrating any of them.
-  const [projectFile, settingsFile, usageFile] = await Promise.all([
+  const [projectFile, settingsFile, usageFile, homeDraftFile] = await Promise.all([
     loadVersioned<ProjectFile>(projectPath, { schemaVersion: 2, projects: [] }, parseProjectFile),
     loadVersioned<SettingsFile>(settingsPath, {
       schemaVersion: 10,
@@ -1148,6 +1415,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       },
     }, parseSettingsFile),
     loadUsageLedger(usagePath),
+    loadHomeDraftFile(homeDraftPath),
   ]);
 
   await assertOwnedPath(storageRoot, migrationMarker);
@@ -1246,11 +1514,16 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
   if (projectFile.needsWrite) await writeOwnedAtomic(projectPath, projectFile.value);
   if (settingsFile.needsWrite) await writeOwnedAtomic(settingsPath, settingsFile.value);
   if (usageFile.needsWrite) await writeOwnedAtomic(usagePath, usageFile.value);
+  const initialHomeDraft = homeDraftFile.needsWrite
+    ? { ...homeDraftFile.value, modelId: settingsFile.value.settings.defaultModelId }
+    : homeDraftFile.value;
+  if (homeDraftFile.needsWrite) await writeOwnedAtomic(homeDraftPath, { schemaVersion: 1, ...initialHomeDraft });
 
   let projects = projectFile.value.projects;
   let chats = loadedChats;
   let settings = settingsFile.value.settings;
   let usageReceipts = usageFile.value.receipts;
+  let homeDraft = initialHomeDraft;
   const selectionRevisions = new Map(chats.map((chat) => [chat.id, { permissionProfile: 0, skill: 0 }]));
   const turnReservations = new Map<string, {
     chatId: string;
@@ -1259,9 +1532,19 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
   }>();
   let writeQueue: Promise<void> = Promise.resolve();
   let pendingProjectDelete: ProjectDeleteJournal | null = null;
+  let pendingHomeSendJournal: HomeSendJournal | null = null;
 
   const serialize = <T>(operation: () => Promise<T>): Promise<T> => {
     const result = writeQueue.then(async () => {
+      if (pendingHomeSendJournal) {
+        const journal = pendingHomeSendJournal;
+        await applyHomeSendJournal(journal);
+        pendingHomeSendJournal = null;
+        homeDraft = journal.nextDraft;
+        chats = chats.some((chat) => chat.id === journal.chat.id)
+          ? chats.map((chat) => chat.id === journal.chat.id ? journal.chat : chat)
+          : [...chats, journal.chat];
+      }
       if (pendingProjectDelete) {
         const journal = pendingProjectDelete;
         await applyProjectDeleteJournal(journal);
@@ -1383,6 +1666,27 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     await saveChat(updated);
     return structuredClone(updated);
   };
+  const saveHomeDraftRecord = async (next: HomeDraftRecord): Promise<void> => {
+    const serialized = JSON.stringify({ schemaVersion: 1, ...next });
+    if (Buffer.byteLength(serialized, 'utf8') > MAX_HOME_DRAFT_BYTES) {
+      throw new Error('Домашний черновик превысил безопасный размер; предыдущая версия сохранена.');
+    }
+    await writeOwnedAtomic(homeDraftPath, { schemaVersion: 1, ...next });
+    homeDraft = next;
+  };
+  const homeDraftInput = (input: unknown): HomeDraftInput => {
+    if (!isRecord(input) || !Number.isSafeInteger(input.revision) || (input.revision as number) < 0
+      || typeof input.text !== 'string' || input.text.length > 100_000) {
+      throw new Error('Некорректный домашний черновик.');
+    }
+    return {
+      revision: input.revision as number, text: input.text,
+      projectId: input.projectId === null ? null : requireId(input.projectId),
+      permissionProfile: input.permissionProfile === null ? null : requirePermissionProfile(input.permissionProfile),
+      skillId: input.skillId === null ? null : (isSkillId(input.skillId) ? input.skillId : (() => { throw new Error('Некорректный Skill домашнего черновика.'); })()),
+      modelId: input.modelId === null ? null : requireModelId(input.modelId),
+    };
+  };
   const saveSettings = async (next: Settings): Promise<void> => {
     await writeOwnedAtomic(settingsPath, { schemaVersion: 10, settings: next });
     settings = next;
@@ -1395,6 +1699,143 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
 
   return {
     listProjects: () => serialize(async () => projects.map((project) => ({ ...project }))),
+    getHomeDraft: () => serialize(async () => structuredClone(homeDraft)),
+    saveHomeDraft: (input) => serialize(async () => {
+      const nextInput = homeDraftInput(input);
+      if (nextInput.revision === homeDraft.revision) {
+        if (nextInput.text === homeDraft.text && nextInput.projectId === homeDraft.projectId
+          && nextInput.permissionProfile === homeDraft.permissionProfile && nextInput.skillId === homeDraft.skillId
+          && nextInput.modelId === homeDraft.modelId) return structuredClone(homeDraft);
+        throw new Error('Домашний черновик изменился; сохраните последнюю версию.');
+      }
+      if (nextInput.revision !== homeDraft.revision + 1) throw new Error('Ревизия домашнего черновика устарела.');
+      if (nextInput.projectId && !projects.some((project) => project.id === nextInput.projectId && !project.archived)) {
+        throw new Error('Выбранный проект недоступен.');
+      }
+      const next: HomeDraftRecord = { ...nextInput, attachments: homeDraft.attachments, lastAcceptance: homeDraft.lastAcceptance };
+      const validated = validateHomeDraftRecord({ schemaVersion: 1, ...next });
+      await saveHomeDraftRecord(validated);
+      return structuredClone(homeDraft);
+    }),
+    stageHomeDraftFile: (sourcePath) => serialize(async () => {
+      if (typeof sourcePath !== 'string' || !sourcePath || sourcePath.includes('\0') || !isAbsolute(sourcePath)) {
+        throw new Error('Выберите доступный локальный файл.');
+      }
+      if (homeDraft.attachments.length >= MAX_HOME_DRAFT_FILES) throw new Error('В домашний черновик можно добавить не более 32 файлов.');
+      const sourceInfo = await lstat(sourcePath);
+      if (!sourceInfo.isFile() || sourceInfo.isSymbolicLink() || sourceInfo.size > MAX_HOME_DRAFT_FILE_BYTES) {
+        throw new Error('Выбранный файл недоступен или превышает лимит 25 МиБ.');
+      }
+      const sourceRealPath = await realpath(sourcePath);
+      if (!samePath(sourceRealPath, sourcePath)) throw new Error('Символические ссылки на файлы не поддерживаются.');
+      if (homeDraft.attachments.reduce((total, attachment) => total + attachment.size, 0) + sourceInfo.size > MAX_HOME_DRAFT_TOTAL_BYTES) {
+        throw new Error('Подготовленные файлы превышают локальный лимит 100 МиБ.');
+      }
+      const id = randomUUID();
+      const extension = extname(sourcePath).match(/^\.[A-Za-z0-9]{1,12}$/)?.[0].toLowerCase() ?? '';
+      const storedName = `${id}${extension}`;
+      const target = join(homeDraftFilesDirectory, storedName);
+      await assertOwnedPath(storageRoot, target);
+      await mkdir(homeDraftFilesDirectory, { recursive: true });
+      await assertOwnedPath(storageRoot, target);
+      try {
+        await copyFile(sourcePath, target, constants.COPYFILE_EXCL);
+        const sourceAfter = await lstat(sourcePath);
+        if (!sourceAfter.isFile() || sourceAfter.isSymbolicLink() || sourceAfter.size !== sourceInfo.size
+          || sourceAfter.mtimeMs !== sourceInfo.mtimeMs || !samePath(await realpath(sourcePath), sourceRealPath)) {
+          throw new Error('Исходный файл изменился во время подготовки; он не изменён.');
+        }
+        const copied = await hashFile(target);
+        const attachment: HomeDraftAttachment = {
+          id, name: requireName(basename(sourcePath), 'Имя файла', 255), storedName,
+          size: copied.size, sha256: copied.sha256, createdAt: new Date().toISOString(),
+        };
+        const next = validateHomeDraftRecord({ schemaVersion: 1, ...homeDraft,
+          revision: homeDraft.revision + 1, attachments: [...homeDraft.attachments, attachment] });
+        await saveHomeDraftRecord(next);
+        return structuredClone(homeDraft);
+      } catch (error) {
+        await unlink(target).catch(() => undefined);
+        throw error;
+      }
+    }),
+    removeHomeDraftFile: (idInput) => serialize(async () => {
+      const id = requireId(idInput);
+      const attachment = homeDraft.attachments.find((item) => item.id === id);
+      if (!attachment) throw new Error('Подготовленный файл не найден.');
+      const next = validateHomeDraftRecord({ schemaVersion: 1, ...homeDraft,
+        revision: homeDraft.revision + 1, attachments: homeDraft.attachments.filter((item) => item.id !== id) });
+      await saveHomeDraftRecord(next);
+      const path = join(homeDraftFilesDirectory, attachment.storedName);
+      await assertOwnedPath(storageRoot, path);
+      await unlink(path).catch((error: unknown) => { if (!isMissingFile(error)) throw error; });
+      return structuredClone(homeDraft);
+    }),
+    acceptHomeDraft: (expectedRevisionInput, turnIdInput) => serialize(async () => {
+      if (!Number.isSafeInteger(expectedRevisionInput) || (expectedRevisionInput as number) < 1) {
+        throw new Error('Ревизия домашнего черновика некорректна.');
+      }
+      const expectedRevision = expectedRevisionInput as number;
+      if (homeDraft.lastAcceptance?.sourceRevision === expectedRevision) {
+        return { detail: structuredClone(findChat(homeDraft.lastAcceptance.chatId)), turn: structuredClone(homeDraft.lastAcceptance.turn), newlyAccepted: false };
+      }
+      if (expectedRevision !== homeDraft.revision) throw new Error('Черновик изменился перед отправкой; отправьте актуальную версию.');
+      const text = homeDraft.text.trim();
+      if (!text || text.length > 100_000) throw new Error('Введите сообщение перед отправкой.');
+      const project = homeDraft.projectId ? projects.find((item) => item.id === homeDraft.projectId && !item.archived) : null;
+      if (homeDraft.projectId && !project) throw new Error('Выбранный проект недоступен.');
+      if (homeDraft.skillId && skillForProject(homeDraft.skillId, homeDraft.projectId) !== homeDraft.skillId) {
+        throw new Error('Выбранный Skill не относится к этому проекту.');
+      }
+      const turnId = requireId(turnIdInput);
+      const now = new Date().toISOString();
+      const message: ChatMessage = { id: randomUUID(), role: 'user', text, createdAt: now };
+      const chatId = randomUUID();
+      const chat: ChatDetail = {
+        id: chatId,
+        title: requireName(text.split(/\r?\n/, 1)[0]?.slice(0, 60) ?? '', 'Название чата', 160),
+        projectId: homeDraft.projectId, pinned: false, archived: false, createdAt: now, updatedAt: now,
+        draft: '', kind: 'text',
+        nextTurnPermissionProfile: homeDraft.permissionProfile === settings.defaultPermissionProfile ? null : homeDraft.permissionProfile,
+        nextTurnSkillId: homeDraft.skillId,
+        modelId: homeDraft.modelId ?? settings.defaultModelId,
+        messages: [message], toolReceipts: [],
+        artifacts: homeDraft.attachments.map((attachment) => ({
+          id: attachment.id, name: attachment.name, storedName: attachment.storedName,
+          size: attachment.size, createdAt: attachment.createdAt, messageId: message.id,
+        })),
+        compactSnapshot: null,
+      };
+      const turn = createAcceptedTurn(chat, turnId, message.id);
+      const nextDraft: HomeDraftRecord = {
+        ...homeDraft, revision: homeDraft.revision + 1, text: '', attachments: [],
+        lastAcceptance: { sourceRevision: expectedRevision, chatId, turn: structuredClone(turn) },
+      };
+      let journal: HomeSendJournal;
+      try {
+        journal = validateHomeSendJournal({
+          schemaVersion: 1, operationId: randomUUID(), sourceRevision: expectedRevision,
+          chat: detailFile(chat), turn, attachments: homeDraft.attachments, nextDraft: { schemaVersion: 1, ...nextDraft },
+        });
+      } catch (error) {
+        turnReservations.delete(turn.turnId);
+        throw error;
+      }
+      try {
+        await testFaults?.beforeHomeSendJournal?.();
+        await writeOwnedAtomic(homeSendJournalPath, homeSendJournalFile(journal));
+      } catch (error) {
+        turnReservations.delete(turn.turnId);
+        throw error;
+      }
+      pendingHomeSendJournal = journal;
+      await testFaults?.afterHomeSendStage?.('journal');
+      await applyHomeSendJournal(journal);
+      pendingHomeSendJournal = null;
+      homeDraft = journal.nextDraft;
+      chats = [...chats, journal.chat];
+      return { detail: structuredClone(journal.chat), turn: structuredClone(turn), newlyAccepted: true };
+    }),
     createProject: (nameInput, folderInput = null) => serialize(async () => {
       const now = new Date().toISOString();
       const requestedFolder = requireFolderPath(folderInput, 'Рабочая папка проекта');
@@ -1884,6 +2325,9 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     }),
     deleteChat: (idInput) => serialize(async () => {
       const chat = findChat(idInput);
+      if (homeDraft.lastAcceptance?.chatId === chat.id) {
+        await saveHomeDraftRecord({ ...homeDraft, revision: homeDraft.revision + 1, lastAcceptance: null });
+      }
       const path = chatFolder(chat.id);
       await assertOwnedPath(storageRoot, path);
       const sourceInfo = await lstat(path);
