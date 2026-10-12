@@ -101,6 +101,47 @@ test('persists projects, chats, relationships, drafts, image kind, and settings'
   await assert.rejects(store.updateChat(chat.id, { modelId: '\0invalid' } as never));
 });
 
+test('changing the next model preserves accepted turns, messages, and historical usage IDs', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-model-family-migration-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  await store.updateSettings({ defaultModelId: 'GigaChat-2-Pro' });
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { modelId: 'GigaChat-2-Pro' });
+  const accepted = await store.acceptLocalMessage(chat.id, 'Оставить старую модель в принятом ходе', 'model-family-accepted-turn');
+  const receipt = {
+    localRequestId: '33333333-3333-4333-8333-333333333333',
+    chatId: chat.id,
+    requestKind: 'chat' as const,
+    modelId: 'GigaChat-2-Pro',
+    providerRequestId: 'historical-provider-request',
+    providerModel: 'GigaChat-2-Pro:2.0.28.2',
+    createdAt: timestamp,
+    status: 'completed' as const,
+    promptTokens: 12,
+    completionTokens: 4,
+    totalTokens: 16,
+    precachedPromptTokens: null,
+    conflictedFields: [],
+  };
+  await store.recordUsageReceipt(receipt);
+  await store.appendAssistantMessageFromRuntime(chat.id, accepted.turn.messageId, 'Сохранённый ответ');
+  const messagesBeforeChange = (await store.getChat(chat.id)).messages;
+
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Pro' });
+  await store.updateSettings({ defaultModelId: 'GigaChat-3-Lightning' });
+  const nextChat = await store.createChat();
+  const restored = await openStore(directory);
+
+  assert.equal(accepted.turn.modelId, 'GigaChat-2-Pro', 'accepted turns keep their original provider model');
+  assert.deepEqual((await restored.getChat(chat.id)).messages, messagesBeforeChange, 'model migration does not rewrite old messages');
+  assert.equal((await restored.getChat(chat.id)).modelId, 'GigaChat-3-Pro', 'only the next model selection changes');
+  assert.equal((await restored.getChat(nextChat.id)).modelId, 'GigaChat-3-Lightning');
+  const ledger = await restored.getUsageLedger();
+  assert.deepEqual(ledger.byModel.map((item) => item.key), ['GigaChat-2-Pro'], 'the raw usage model ID is retained');
+  assert.equal(ledger.totalTokens.knownTokens, 16);
+});
+
 test('persists deduplicated usage outside chat lifetime, including pending usage after chat deletion', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-usage-ledger-'));
   t.after(() => rm(directory, { recursive: true, force: true }));

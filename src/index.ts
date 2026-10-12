@@ -9,7 +9,8 @@ import { createLocalTools, createPowerShellHelper, resolvePowerShellHelperPath }
 import { createTurnRuntime, type PreparedCompactionContext, type TurnRuntime } from './runtime';
 import type { AcceptedTurnInput, ChatPatch, CompactSnapshot, FolderOpener, HookRunResult, ModelRegistrySnapshot, NotificationSettings, PreferredOpener, RuntimeAvailability, SettingsPatch, Theme, VoiceAvailability } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
-import { isModelAvailable, requireModelId } from './models';
+import { requireModelId } from './models';
+import { chatModelUnavailableReason, isChatModelAvailable } from './model-catalog';
 import { openCustomPermissions, parseCustomConfig } from './custom-permissions';
 import { createPermissionApprovals } from './permission-approvals';
 import { createSkillRegistry, isSkillId } from './skills';
@@ -748,8 +749,9 @@ async function createMainRuntime(
       if (providerConnection.getConnectionStatus().state !== 'connected') {
         throw new Error('Подключите GigaChat перед повтором этого хода.');
       }
-      if (!turn.modelId || !isModelAvailable(providerConnection.getModelRegistry(), turn.modelId)) {
-        throw new Error('Выбранная для этого хода модель сейчас недоступна. Выбор исходного хода сохранён.');
+      const initialModelError = chatModelUnavailableReason(providerConnection.getModelRegistry(), turn.modelId);
+      if (initialModelError) {
+        throw new Error(`Выбранная для этого хода модель недоступна: ${initialModelError} Выбор исходного хода сохранён.`);
       }
       if (turn.skillId && !await skills.getEnabled(turn.skillId)) {
         throw new Error('Skill исходного хода больше не включён; его выбор не заменён автоматически.');
@@ -759,7 +761,7 @@ async function createMainRuntime(
       }
       await store.reserveRetryTurn(original, turn);
       if (providerConnection.getConnectionStatus().state !== 'connected'
-        || !turn.modelId || !isModelAvailable(providerConnection.getModelRegistry(), turn.modelId)) {
+        || !isChatModelAvailable(providerConnection.getModelRegistry(), turn.modelId)) {
         throw new Error('Подключение или доступность модели изменились; повтор не поставлен в очередь.');
       }
       if (turn.skillId && !await skills.getEnabled(turn.skillId)) {
@@ -770,7 +772,7 @@ async function createMainRuntime(
       if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
       if (turn.operation === 'compaction' && !COMPACTION_QUALITY_VERIFIED) throw new Error(COMPACTION_UNAVAILABLE_REASON);
       await store.validateAcceptedTurn(turn);
-      if (!turn.modelId || !isModelAvailable(providerConnection.getModelRegistry(), turn.modelId)) {
+      if (!isChatModelAvailable(providerConnection.getModelRegistry(), turn.modelId)) {
         throw new GigaChatProviderError('model');
       }
       const projects = await store.listProjects();
@@ -1110,6 +1112,10 @@ async function registerIpcHandlers(
   handle('chats:update', async (idInput, patchInput) => {
     const id = requireId(idInput);
     const patch = requireChatPatch(patchInput);
+    if (patch.modelId !== undefined && patch.modelId !== null) {
+      const modelError = chatModelUnavailableReason(providerConnection.getModelRegistry(), patch.modelId);
+      if (modelError) throw new Error(`Нельзя выбрать эту модель для следующих ходов: ${modelError}`);
+    }
     const existing = await store.getChat(id);
     const nextProjectId = patch.projectId === undefined ? existing.projectId : patch.projectId;
     if (patch.projectId !== undefined && patch.nextTurnSkillId === undefined && existing.nextTurnSkillId) {
@@ -1279,6 +1285,10 @@ async function registerIpcHandlers(
   handle('usage:get-ledger', () => store.getUsageLedger());
   handle('settings:update', async (patchInput) => {
     const patch = requireSettingsPatch(patchInput);
+    if (patch.defaultModelId !== undefined && patch.defaultModelId !== null) {
+      const modelError = chatModelUnavailableReason(providerConnection.getModelRegistry(), patch.defaultModelId);
+      if (modelError) throw new Error(`Нельзя выбрать модель по умолчанию: ${modelError}`);
+    }
     if (patch.preferredOpener !== undefined) requirePreferredOpener(patch.preferredOpener);
     if (patch.defaultProjectsFolder !== undefined && patch.defaultProjectsFolder !== null) {
       await requireDirectory(patch.defaultProjectsFolder);

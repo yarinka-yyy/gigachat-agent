@@ -1,4 +1,4 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
 import {
   Archive,
   ArrowLeft,
@@ -85,7 +85,8 @@ import type {
   VoiceAvailability,
 } from './contracts';
 import type { PermissionProfile } from './permissions';
-import { isModelAvailable, modelIdsForSelection, unavailableModelRegistry, type GigaChatModelId } from './models';
+import { unavailableModelRegistry } from './models';
+import { chatModelOptions, isChatModelAvailable, legacyModelUpgrade, modelFamilyForId, type ChatModelId, type ChatModelOption } from './model-catalog';
 import gigaChatLogo from './assets/gigachat-logo.png';
 import { createInstructionAutosave, type SaveStatus } from './instruction-autosave';
 import { createChatForDraftSession, createNewChatDraftSession, createRendererOperationTracker, persistDraftSession, retryUnavailableReason, shouldOpenCreatedDraftChat, type NewChatDraftSession } from './renderer-operations';
@@ -194,6 +195,27 @@ const SETTINGS_SECTIONS: PageIcon[] = [
   { id: 'advanced', label: 'Дополнительно', icon: 'sliders' },
   { id: 'archive', label: 'Архив', icon: 'archive' },
 ];
+
+function chatModelOptionStatus(option: ChatModelOption): string {
+  if (option.selectable) return 'Готова к работе.';
+  if (option.quotaExhausted) return 'Пул этой модели исчерпан; автоматическая замена не выполняется.';
+  if (option.registryStatus === 'unavailable') return 'Подключите API, чтобы проверить модель.';
+  if (option.registryStatus === 'error') return 'Не удалось проверить актуальный список моделей.';
+  if (option.registryStatus === 'not-listed') return 'Модель отсутствует в актуальном списке API.';
+  if (option.basicWorkflow === 'unavailable') return 'Основные возможности модели недоступны.';
+  return 'Основные возможности модели ещё не проверены.';
+}
+
+function capabilityStatusText(status: ChatModelOption['capabilities']['textStream']): string {
+  if (status === 'verified') return 'проверено';
+  if (status === 'unavailable') return 'недоступно';
+  return 'не проверено';
+}
+
+function chatModelOptionTitle(option: ChatModelOption): string {
+  const capabilities = option.capabilities;
+  return `${option.displayName} · API ID ${option.currentId}. Текстовый поток: ${capabilityStatusText(capabilities.textStream)}; вызовы функций: ${capabilityStatusText(capabilities.functionCalls)}; локальное чтение: ${capabilityStatusText(capabilities.localRead)}; TXT: ${capabilityStatusText(capabilities.txt)}; PDF: ${capabilityStatusText(capabilities.pdf)}; PNG: ${capabilityStatusText(capabilities.png)}; расход токенов: ${capabilityStatusText(capabilities.usage)}. ${option.poolEvidence.details} Точные лимиты не проверены.`;
+}
 
 const DEFAULT_SETTINGS: Settings = {
   theme: 'emerald',
@@ -1504,9 +1526,19 @@ export default function App() {
     || Boolean(selectedChat && chatDetail?.id === selectedChat.id);
   const composerModelId = selectedChat && chatDetail?.id === selectedChat.id
     ? chatDetail.modelId ?? settings.defaultModelId : settings.defaultModelId;
-  const settingsModelIds = modelIdsForSelection(modelRegistry, settings.defaultModelId);
-  const composerModelIds = modelIdsForSelection(modelRegistry, composerModelId);
-  const composerModelAvailable = isModelAvailable(modelRegistry, composerModelId);
+  const availableChatModelOptions = chatModelOptions(modelRegistry);
+  const composerModelAvailable = isChatModelAvailable(modelRegistry, composerModelId);
+  const composerModelFamily = modelFamilyForId(composerModelId);
+  const composerModelUnknown = Boolean(composerModelId && !composerModelFamily);
+  const composerLegacyUpgrade = legacyModelUpgrade(composerModelId);
+  const composerUpgradeOption = composerLegacyUpgrade
+    ? availableChatModelOptions.find((option) => option.currentId === composerLegacyUpgrade.currentId) ?? null
+    : null;
+  const settingsLegacyUpgrade = legacyModelUpgrade(settings.defaultModelId);
+  const settingsModelUnknown = Boolean(settings.defaultModelId && !modelFamilyForId(settings.defaultModelId));
+  const settingsUpgradeOption = settingsLegacyUpgrade
+    ? availableChatModelOptions.find((option) => option.currentId === settingsLegacyUpgrade.currentId) ?? null
+    : null;
   const composerProjectId = route.page === 'chat' ? selectedChat?.projectId ?? null
     : route.page === 'home' ? selectedProjectId || null : null;
   const composerSkills = skillRegistry.skills
@@ -2385,7 +2417,7 @@ export default function App() {
     });
   }
 
-  async function changeComposerModel(modelId: GigaChatModelId): Promise<void> {
+  async function changeComposerModel(modelId: ChatModelId): Promise<void> {
     if (route.page === 'chat' && selectedChat) await updateChat(selectedChat, { modelId });
     else await updateLocalSettings({ defaultModelId: modelId });
   }
@@ -2402,6 +2434,22 @@ export default function App() {
       if (generation === modelRegistryRequestGeneration.current) setModelRegistryLoading(false);
     }
   }
+
+  const loadCurrentModelRegistry = useCallback(async (): Promise<void> => {
+    const generation = ++modelRegistryRequestGeneration.current;
+    try {
+      const snapshot = await window.gigaChat.models.getRegistry();
+      if (generation === modelRegistryRequestGeneration.current) setModelRegistry(snapshot);
+    } catch (error) {
+      if (generation === modelRegistryRequestGeneration.current) setNotice(getErrorMessage(error));
+    } finally {
+      if (generation === modelRegistryRequestGeneration.current) setModelRegistryLoading(false);
+    }
+  }, []);
+
+  useEffect(() => window.gigaChat.runtime.onUpdate((turn) => {
+    if (turn.errorCategory === 'quota') void loadCurrentModelRegistry();
+  }), [loadCurrentModelRegistry]);
 
   function saveCustomConfig(): Promise<void> {
     return trackRendererOperation(() => saveCustomConfigOperation());
@@ -2871,7 +2919,7 @@ export default function App() {
       case 'models':
         return (
           <>
-            <div className="settings-section-heading"><h2>Модели и лимиты</h2><p>Список загружается из API. Контекст, цены и возможности моделей не предполагаются без подтверждённых данных.</p></div>
+            <div className="settings-section-heading"><h2>Модели и лимиты</h2><p>Для чата доступны четыре семейства с актуальным ID. Размер контекста, точный баланс и остальные возможности не предполагаются без отдельных подтверждений.</p></div>
             <div className="settings-card connection-card">
               <div><strong>GigaChat API</strong><p>{modelRegistry.state === 'ready'
                 ? 'Список моделей загружен. Лимиты и дополнительные возможности неизвестны.'
@@ -2884,20 +2932,27 @@ export default function App() {
               </button>
             </div>
             <div className="model-settings-list">
-              {settingsModelIds.map((modelId) => {
-                const available = isModelAvailable(modelRegistry, modelId);
-                const selected = settings.defaultModelId === modelId;
-                const unavailableDescription = modelRegistry.state === 'ready'
-                  ? 'Модель исчезла из списка; сохранённый выбор оставлен без замены'
-                  : 'Доступ не подтверждён; сохранённый выбор оставлен без замены';
-                return <button type="button" key={modelId} disabled={!available}
+              {availableChatModelOptions.map((option) => {
+                const selected = settings.defaultModelId === option.currentId;
+                const description = chatModelOptionStatus(option);
+                return <button type="button" key={option.family} disabled={!option.selectable}
                   className={`permission-profile permission-profile-selectable${selected ? ' selected' : ''}`}
-                  aria-pressed={selected} onClick={() => available && void updateLocalSettings({ defaultModelId: modelId })}>
-                  <span className="permission-profile-copy"><strong>{modelId}</strong><span>{available ? 'Доступна по текущему списку API' : unavailableDescription}</span></span>
-                  <span className="status-label">{selected ? 'По умолчанию' : available ? 'Выбрать' : 'Недоступна'}</span>
+                  title={chatModelOptionTitle(option)} aria-label={`${option.displayName}: ${description}`}
+                  aria-pressed={selected} onClick={() => option.selectable && void updateLocalSettings({ defaultModelId: option.currentId })}>
+                  <span className="permission-profile-copy"><strong>{option.displayName}</strong><span>{description}</span></span>
+                  <span className="status-label">{selected ? 'По умолчанию' : option.selectable ? 'Выбрать' : 'Недоступна'}</span>
                 </button>;
               })}
-              {settingsModelIds.length === 0 && <p className="picker-caption">Список моделей появится после успешного подключения API.</p>}
+              {settingsLegacyUpgrade && <div className="settings-card" role="status">
+                <p title={`Сохранённая модель: ${settings.defaultModelId ?? ''}`}>Выбрана модель предыдущего поколения. Можно обновить выбор для следующих запросов на {settingsLegacyUpgrade.displayName}; история и уже принятые ходы останутся без изменений.</p>
+                <button type="button" className="quiet-button" disabled={!settingsUpgradeOption?.selectable}
+                  onClick={() => settingsUpgradeOption?.selectable && void updateLocalSettings({ defaultModelId: settingsUpgradeOption.currentId })}>
+                  Перейти на {settingsLegacyUpgrade.displayName} для следующих запросов
+                </button>
+              </div>}
+              {settingsModelUnknown && <div className="settings-card" role="status">
+                <p title={`Сохранённая модель: ${settings.defaultModelId ?? ''}`}>Сохранённый ID модели не входит в актуальный каталог чата. Автоматическая замена не выполняется; выберите проверенную модель вручную для следующих запросов.</p>
+              </div>}
               {settings.defaultModelId && <button type="button" className="quiet-button model-clear-button" onClick={() => void updateLocalSettings({ defaultModelId: null })}>Снять выбор модели по умолчанию</button>}
             </div>
             <EmptyState title="Лимиты пока неизвестны" description="Подтверждённые данные о лимитах появятся после подключения API." icon="gauge" />
@@ -3565,24 +3620,36 @@ export default function App() {
                   <ActionMenu className="composer-model-menu" placement="below" label="Выбрать модель GigaChat" onVisibilityChange={(id, visible) => {
                     trackNativeOverlay(id, visible);
                     if (visible && modelRegistry.state !== 'ready' && !modelRegistryLoading) void refreshModelRegistry();
+                    else if (visible) void loadCurrentModelRegistry();
                   }}
                     disabled={!canChangeComposerPermissionProfile}
-                    trigger={<><span>{composerModelId ? `${composerModelAvailable ? '' : modelRegistry.state === 'ready' ? 'Недоступна · ' : 'Доступ не подтверждён · '}${composerModelId}` : 'Выбрать модель'}</span><Icon name="chevron" /></>}>
+                    trigger={<><span title={composerModelId ?? undefined}>{composerModelId
+                      ? `${composerModelAvailable ? '' : 'Недоступна · '}${composerModelFamily?.displayName ?? 'Сохранённая модель'}`
+                      : 'Выбрать модель'}</span><Icon name="chevron" /> </>}>
                     <div className="model-picker-popup"><p className="picker-heading">Модель для следующих ходов</p>
                       <p className="picker-caption">{modelRegistry.state === 'ready'
-                        ? 'Список проверен; лимиты и дополнительные возможности неизвестны.'
-                        : 'Модели появятся после подключения API. Недоступная сохранённая модель не заменяется.'}</p>
-                      {composerModelIds.map((modelId) => {
-                        const available = isModelAvailable(modelRegistry, modelId);
-                        const unavailableDescription = modelRegistry.state === 'ready'
-                          ? 'Модель исчезла из списка; выбор сохранён'
-                          : 'Доступ не подтверждён; выбор сохранён';
-                        return <button type="button" className="model-picker-option" key={modelId} disabled={!available}
-                          aria-current={modelId === composerModelId} onClick={() => available && void changeComposerModel(modelId)}>
-                          <span><strong>{modelId}</strong><small>{available ? 'Доступна по текущему списку API' : unavailableDescription}</small></span>
-                          {modelId === composerModelId && <Icon name="check" />}
+                        ? 'Показаны четыре текущие модели. Доступность зависит от проверки и ответов API; старый выбор не подменяется.'
+                        : 'Подключите API и обновите список. Сохранённый выбор не заменяется автоматически.'}</p>
+                      {availableChatModelOptions.map((option) => {
+                        const description = chatModelOptionStatus(option);
+                        return <button type="button" className="model-picker-option" key={option.family} disabled={!option.selectable}
+                          title={chatModelOptionTitle(option)} aria-label={`${option.displayName}: ${description}`}
+                          aria-current={option.currentId === composerModelId}
+                          onClick={() => option.selectable && void changeComposerModel(option.currentId)}>
+                          <span><strong>{option.displayName}</strong><small>{description}</small></span>
+                          {option.currentId === composerModelId && <Icon name="check" />}
                         </button>;
                       })}
+                      {composerLegacyUpgrade && <div className="settings-card" role="status">
+                        <p title={`Сохранённая модель: ${composerModelId ?? ''}`}>Для следующих ходов можно перейти на {composerLegacyUpgrade.displayName}. Уже принятые ходы и их модели не изменятся.</p>
+                        <button type="button" className="quiet-button" disabled={!composerUpgradeOption?.selectable}
+                          onClick={() => composerUpgradeOption?.selectable && void changeComposerModel(composerUpgradeOption.currentId)}>
+                          Обновить выбор на {composerLegacyUpgrade.displayName}
+                        </button>
+                      </div>}
+                      {composerModelUnknown && <div className="settings-card" role="status">
+                        <p title={`Сохранённая модель: ${composerModelId ?? ''}`}>Сохранённый ID не входит в актуальный каталог чата. Уже принятые ходы останутся без изменений; для следующих запросов выберите модель вручную.</p>
+                      </div>}
                     </div>
                   </ActionMenu>
                   <span className="context-indicator" role="img" tabIndex={0} aria-label="Размер контекста неизвестен" title="Точный размер следующего контекста пока неизвестен."><ContextRing /></span>

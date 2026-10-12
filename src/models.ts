@@ -29,12 +29,3 @@ export function discoveredModelRegistry(ids: readonly unknown[]): ModelRegistryS
 export function isModelAvailable(registry: ModelRegistrySnapshot, modelId: GigaChatModelId | null): boolean {
   return modelId !== null && registry.state === 'ready' && registry.modelIds.includes(modelId);
 }
-
-export function modelIdsForSelection(
-  registry: ModelRegistrySnapshot,
-  selectedModelId: GigaChatModelId | null,
-): GigaChatModelId[] {
-  const ids = registry.state === 'ready' ? [...registry.modelIds] : [];
-  if (selectedModelId !== null && !ids.includes(selectedModelId)) ids.push(selectedModelId);
-  return ids;
-}

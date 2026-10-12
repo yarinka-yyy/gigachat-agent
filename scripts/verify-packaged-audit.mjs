@@ -8,6 +8,28 @@ import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 
 const require = createRequire(import.meta.url);
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const MAX_RENDERER_HOST_LOG_BYTES = 512 * 1024;
+
+function captureBounded(state, chunk) {
+  if (state.bytes >= MAX_RENDERER_HOST_LOG_BYTES) {
+    state.truncated = true;
+    return;
+  }
+  const data = Buffer.from(chunk, 'utf8');
+  let end = Math.min(data.length, MAX_RENDERER_HOST_LOG_BYTES - state.bytes);
+  if (end < data.length) {
+    while (end > 0 && (data[end] & 0xc0) === 0x80) end -= 1;
+    state.truncated = true;
+  }
+  if (end > 0) {
+    state.parts.push(data.subarray(0, end).toString('utf8'));
+    state.bytes += end;
+  }
+}
+
+function capturedText(state) {
+  return `${state.parts.join('')}${state.truncated ? '\n[child log truncated at 512 KiB]\n' : ''}`;
+}
 
 async function runNodeDriver() {
   const nativeWorkspaceMode = process.argv.includes('--native-browser-workspace');
@@ -94,23 +116,48 @@ async function runNodeDriver() {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   console.log(`Electron host spawned: ${child.pid}`);
-  let stdout = '';
-  let stderr = '';
-  child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; process.stdout.write(chunk); });
-  child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk; process.stderr.write(chunk); });
+  const stdout = { parts: [], bytes: 0, truncated: false };
+  const stderr = { parts: [], bytes: 0, truncated: false };
+  const stdoutPath = join(fixture, 'renderer-host.stdout.log');
+  const stderrPath = join(fixture, 'renderer-host.stderr.log');
+  let logsSaved = false;
+  const saveChildLogs = async () => {
+    if (logsSaved) return;
+    logsSaved = true;
+    await Promise.all([
+      writeFile(stdoutPath, capturedText(stdout), 'utf8'),
+      writeFile(stderrPath, capturedText(stderr), 'utf8'),
+    ]);
+  };
+  child.stdout.setEncoding('utf8').on('data', (chunk) => { captureBounded(stdout, chunk); process.stdout.write(chunk); });
+  child.stderr.setEncoding('utf8').on('data', (chunk) => { captureBounded(stderr, chunk); process.stderr.write(chunk); });
   const exitCode = await new Promise((resolveExit, reject) => {
+    let timedOut = false;
+    let killFallback;
     const timeout = setTimeout(() => {
+      timedOut = true;
       child.kill();
-      reject(new Error(`Electron renderer host timed out; fixture: ${fixture}`));
+      killFallback = setTimeout(async () => {
+        await saveChildLogs().catch(() => undefined);
+        reject(new Error(`Electron renderer host timed out; child logs: ${stdoutPath}, ${stderrPath}; fixture: ${fixture}`));
+      }, 5_000);
     }, holdForReview ? 10 * 60_000 : 120_000);
-    child.once('error', (error) => { clearTimeout(timeout); reject(error); });
-    child.once('close', (code, signal) => {
+    child.once('error', async (error) => {
       clearTimeout(timeout);
-      if (signal) reject(new Error(`Electron renderer host stopped by ${signal}; fixture: ${fixture}`));
+      if (killFallback) clearTimeout(killFallback);
+      await saveChildLogs().catch(() => undefined);
+      reject(new Error(`Electron renderer host error; child logs: ${stdoutPath}, ${stderrPath}; ${error.message}`));
+    });
+    child.once('close', async (code, signal) => {
+      clearTimeout(timeout);
+      if (killFallback) clearTimeout(killFallback);
+      await saveChildLogs();
+      if (timedOut) reject(new Error(`Electron renderer host timed out; child logs: ${stdoutPath}, ${stderrPath}; fixture: ${fixture}`));
+      else if (signal) reject(new Error(`Electron renderer host stopped by ${signal}; child logs: ${stdoutPath}, ${stderrPath}; fixture: ${fixture}`));
       else resolveExit(code ?? 1);
     });
   });
-  assert.equal(exitCode, 0, `Electron renderer host failed.\n${stderr}\n${stdout}\nFixture: ${fixture}`);
+  assert.equal(exitCode, 0, `Electron renderer host failed.\n${capturedText(stderr)}\n${capturedText(stdout)}\nChild logs: ${stdoutPath}, ${stderrPath}\nFixture: ${fixture}`);
   process.stdout.write(`Renderer fixture retained for review: ${fixture}\n`);
 }
 
@@ -1838,7 +1885,7 @@ async function runElectronHost() {
     assert.deepEqual(state.runtimeCancelCalls[0], { chatId: 'chat-a', turnId: runningTurn.id });
     const failedTurn = {
       ...runningTurn, status: 'failed', error: 'Synthetic network failure', errorCategory: 'network', retryEligible: true,
-      modelId: 'original/model',
+      modelId: 'GigaChat-3-Ultra',
       draft: 'Частичный ответ остаётся незавершённым.', activeDurationMs: 4200,
     };
     state.runtimeTurns.set('chat-a', [failedTurn]);
@@ -1873,10 +1920,20 @@ async function runElectronHost() {
     assert.deepEqual(state.connectionCalls, ['connect', 'connect'], 'retry recovery uses the existing Connect flow');
     passed('Connection status separates saved key, rejected OAuth, and ready chat without stale HTTP errors');
     await clickText('.settings-nav-item', 'Модели и лимиты');
-    state.modelRegistry = { state: 'ready', modelIds: ['original/model'], errorCategory: null };
+    const rawModels = [
+      'GigaChat-3-Ultra', 'GigaChat-2-Max', 'GigaChat-3-Pro', 'GigaChat-3-Lightning',
+      'GigaChat-2', 'GigaChat-2-Pro', 'Embeddings', 'Embeddings-2', 'EmbeddingsGigaR', 'GigaEmbeddings-3B-2025-09',
+    ];
+    state.modelRegistry = {
+      state: 'ready',
+      modelIds: rawModels,
+      errorCategory: null,
+    };
     await clickText('.connection-card button', 'Обновить список');
     await waitDom('connected model registry enables retry', `document.querySelector('.connection-card .status-pill')?.textContent.includes('Список загружен')`);
     assert.ok(state.modelRegistryCalls.includes('refresh'), 'renderer must refresh the actual model registry before retry');
+    await clickText('.model-settings-list .permission-profile-selectable', 'GigaChat Ultra');
+    await waitUntil('verified current model is saved for the next turn', () => state.appSettings.defaultModelId === 'GigaChat-3-Ultra');
     await capture('plan010-connected-model-registry');
     await click('button[aria-label="Назад"]');
     await waitDom('return to the original chat after registry refresh', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'`);
@@ -1904,6 +1961,49 @@ async function runElectronHost() {
     await waitDom('completed and cancelled turns hide the old retry action', `document.querySelectorAll('.runtime-retry').length === 0
       && [...document.querySelectorAll('.runtime-turn-summary')].some((summary) => summary.textContent.includes('Завершено'))
       && [...document.querySelectorAll('.runtime-turn-summary')].some((summary) => summary.textContent.includes('Отменено'))`);
+
+    const registryReadsBeforePicker = state.modelRegistryCalls.filter((method) => method === 'getRegistry').length;
+    await click('button[aria-label="Выбрать модель GigaChat"]');
+    await waitDom('current model picker is open before background quota event', `document.querySelector('.model-picker-popup .model-picker-option[aria-current="true"]')`);
+    assert.deepEqual(JSON.parse(await evaluate(`JSON.stringify([...document.querySelectorAll('.model-picker-option strong')].map((item) => item.textContent.trim()))`)),
+      ['GigaChat Ultra', 'GigaChat Max', 'GigaChat Pro', 'GigaChat Lite'],
+      'the rendered picker exposes exactly the four site names even when raw discovery includes legacy and embedding IDs');
+    await capture('stage1-four-family-model-picker');
+    await waitUntil('opening the model picker loads its current registry', () =>
+      state.modelRegistryCalls.filter((method) => method === 'getRegistry').length > registryReadsBeforePicker);
+    const registryReadsBeforeBackgroundQuota = state.modelRegistryCalls.filter((method) => method === 'getRegistry').length;
+    const refreshesBeforeBackgroundQuota = state.modelRegistryCalls.filter((method) => method === 'refresh').length;
+    state.modelRegistry = { ...state.modelRegistry, exhaustedModelIds: ['GigaChat-3-Ultra'] };
+    window.webContents.send('audit:runtime', {
+      id: 'turn-b-quota', chatId: 'chat-b', status: 'failed', createdAt: timestamp, activity: [],
+      errorCategory: 'quota', error: 'Synthetic HTTP 402',
+    });
+    await waitUntil('background chat quota invalidates the shared model registry', () =>
+      state.modelRegistryCalls.filter((method) => method === 'getRegistry').length === registryReadsBeforeBackgroundQuota + 1);
+    await waitDom('background quota disables the exact selected model in the current picker', `
+      document.querySelector('.model-picker-popup .model-picker-option[aria-current="true"]')?.disabled === true
+      && document.querySelector('.model-picker-popup .model-picker-option[aria-current="true"]')?.textContent.includes('Пул этой модели исчерпан')`);
+    assert.equal(state.appSettings.defaultModelId, 'GigaChat-3-Ultra', 'quota does not silently replace the saved current model');
+    assert.equal(state.modelRegistryCalls.filter((method) => method === 'refresh').length, refreshesBeforeBackgroundQuota,
+      'a runtime quota event reads the current registry without another /models generation request');
+    assert.deepEqual(state.modelRegistry.modelIds, rawModels,
+      'quota overlay leaves raw discovery intact');
+    await capture('stage1-exhausted-model-pool');
+    passed('Background-chat quota updates the current picker without fallback or another model request');
+    await sendKey('ESC');
+    state.details.get('chat-b').modelId = 'GigaChat-2-Pro';
+    await clickChat('Chat B');
+    await waitDom('legacy-model chat is loaded for next-selection migration', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'`);
+    await click('button[aria-label="Выбрать модель GigaChat"]');
+    await waitDom('legacy model warning is visible in the composer picker', `document.querySelector('.model-picker-popup .settings-card[role="status"]')?.textContent.includes('Для следующих ходов можно перейти на GigaChat Pro')`);
+    assert.equal(state.details.get('chat-b').modelId, 'GigaChat-2-Pro', 'opening the picker does not rewrite the saved legacy chat model');
+    assert.deepEqual(JSON.parse(await evaluate(`JSON.stringify([...document.querySelectorAll('.model-picker-option strong')].map((item) => item.textContent.trim()))`)),
+      ['GigaChat Ultra', 'GigaChat Max', 'GigaChat Pro', 'GigaChat Lite'],
+      'legacy warning does not add the old ID as a picker option');
+    await capture('stage1-legacy-model-warning');
+    await sendKey('ESC');
+    await clickChat('Chat A');
+    await waitDom('return to Chat A after legacy model preview', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'`);
     assert.equal(await evaluate(`document.querySelector('.context-indicator')?.getAttribute('aria-label')`), 'Размер контекста неизвестен');
     const historyBeforeCompact = state.details.get('chat-a').messages.length;
     const appendsBeforeCompact = state.appendCalls.length;

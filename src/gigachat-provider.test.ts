@@ -150,6 +150,107 @@ test('discovers future model IDs without inventing model capabilities', async ()
   assert.deepEqual(Object.keys(provider.getModelRegistry()).sort(), ['errorCategory', 'modelIds', 'state']);
 });
 
+test('keeps raw discovery complete but blocks legacy and embedding IDs from chat completion', async () => {
+  let completionRequests = 0;
+  const rawIds = [
+    'GigaChat-3-Ultra', 'GigaChat-2-Max', 'GigaChat-3-Pro', 'GigaChat-3-Lightning',
+    'GigaChat-2-Pro', 'GigaChat-2', 'GigaEmbeddings', 'GigaEmbeddings-3', 'vendor/model-v4',
+  ];
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => {
+      if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: rawIds.map((id) => ({ id })) });
+      completionRequests += 1;
+      return eventStreamResponse([
+        Buffer.from('data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'),
+        Buffer.from('data: [DONE]\n\n'),
+      ]);
+    }),
+  });
+  assert.equal((await provider.connect()).state, 'connected');
+  assert.deepEqual(provider.getModelRegistry().modelIds, rawIds, 'raw /models results remain available for diagnostics');
+
+  for (const modelId of ['GigaChat-2-Pro', 'GigaChat-2', 'GigaEmbeddings', 'GigaEmbeddings-3', 'vendor/model-v4']) {
+    const events: ProviderEvent[] = [];
+    for await (const event of provider.stream({
+      system: [], messages: [{ id: `user-${modelId}`, role: 'user', text: 'Тест', createdAt: '2026-10-09T00:00:00.000Z' }],
+      permissionProfile: 'ask', modelId,
+    }, new AbortController().signal)) events.push(event);
+    assert.deepEqual(events, [{ type: 'error', category: 'model', retryable: false }], `${modelId} must not enter chat completion`);
+  }
+  assert.equal(completionRequests, 0);
+
+  const events: ProviderEvent[] = [];
+  for await (const event of provider.stream({
+    system: [], messages: [{ id: 'ultra-user', role: 'user', text: 'Тест', createdAt: '2026-10-09T00:00:00.000Z' }],
+    permissionProfile: 'ask', modelId: 'GigaChat-3-Ultra',
+  }, new AbortController().signal)) events.push(event);
+  assert.deepEqual(events, [{ type: 'activity', activity: 'receiving' }, { type: 'completed' }]);
+  assert.equal(completionRequests, 1);
+});
+
+test('a 402 exhausts only its current model, survives discovery refresh, and clears on reconnect', async () => {
+  const rawIds = ['GigaChat-3-Ultra', 'GigaChat-2-Max', 'GigaChat-3-Pro', 'vendor/model-v4'];
+  const requests: ProviderTransportRequest[] = [];
+  let completionRequests = 0;
+  let discoveryRequests = 0;
+  let failWithQuota = true;
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => {
+      requests.push(request);
+      if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
+      if (request.url.endsWith('/models')) {
+        discoveryRequests += 1;
+        return jsonResponse(200, { data: rawIds.map((id) => ({ id })) });
+      }
+      completionRequests += 1;
+      return failWithQuota
+        ? jsonResponse(402, { message: 'sensitive provider detail must not escape' })
+        : eventStreamResponse([Buffer.from('data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')]);
+    }),
+  });
+
+  assert.equal((await provider.connect()).state, 'connected');
+  const request: ProviderTurnRequest = {
+    system: [],
+    messages: [{ id: 'quota-user', role: 'user', text: 'synthetic quota check', createdAt: '2026-10-09T00:00:00.000Z' }],
+    permissionProfile: 'ask',
+    modelId: 'GigaChat-3-Ultra',
+  };
+  const firstEvents: ProviderEvent[] = [];
+  for await (const event of provider.stream(request, new AbortController().signal)) firstEvents.push(event);
+  assert.deepEqual(firstEvents, [{ type: 'error', category: 'quota', retryable: false }]);
+
+  const exhaustedSnapshot = provider.getModelRegistry();
+  assert.deepEqual(exhaustedSnapshot.modelIds, rawIds, 'quota does not rewrite raw discovery');
+  assert.deepEqual(exhaustedSnapshot.exhaustedModelIds, ['GigaChat-3-Ultra']);
+  exhaustedSnapshot.exhaustedModelIds?.push('GigaChat-2-Max');
+  assert.deepEqual(provider.getModelRegistry().exhaustedModelIds, ['GigaChat-3-Ultra'], 'snapshot arrays are defensive copies');
+
+  await provider.listModels();
+  assert.deepEqual(provider.getModelRegistry().modelIds, rawIds);
+  assert.deepEqual(provider.getModelRegistry().exhaustedModelIds, ['GigaChat-3-Ultra'], 'ordinary /models refresh does not prove quota renewal');
+
+  failWithQuota = false;
+  const blockedEvents: ProviderEvent[] = [];
+  for await (const event of provider.stream(request, new AbortController().signal)) blockedEvents.push(event);
+  assert.deepEqual(blockedEvents, [{ type: 'error', category: 'quota', retryable: false }]);
+  assert.equal(completionRequests, 1, 'an exhausted model is blocked before another billable request');
+
+  assert.equal((await provider.connect()).state, 'connected');
+  assert.equal(provider.getModelRegistry().exhaustedModelIds, undefined, 'a fresh explicit connection attempt resets session quota state');
+  const reconnectedEvents: ProviderEvent[] = [];
+  for await (const event of provider.stream(request, new AbortController().signal)) reconnectedEvents.push(event);
+  assert.deepEqual(reconnectedEvents, [{ type: 'activity', activity: 'receiving' }, { type: 'completed' }]);
+  assert.equal(completionRequests, 2);
+  assert.equal(discoveryRequests, 3);
+  assert.equal(requests.some((item) => JSON.stringify(item).includes('sensitive provider detail')), false);
+});
+
 test('OAuth canonicalizes Base64 without changing the credential bytes', async (t) => {
   const credentials = '00000000-0000-4000-8000-000000000001:00000000-0000-4000-8000-000000000002';
   const canonical = Buffer.from(credentials, 'utf8').toString('base64');
@@ -168,7 +269,7 @@ test('OAuth canonicalizes Base64 without changing the credential bytes', async (
             assert.equal(request.headers.Accept, 'application/json');
             return jsonResponse(200, token('synthetic-token'));
           }
-          return jsonResponse(200, { data: [{ id: 'test-model' }] });
+          return jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }] });
         }),
       });
       assert.deepEqual(await provider.connect(), { state: 'connected', errorCategory: null });
@@ -200,7 +301,7 @@ test('model discovery errors identify their stage and disappear after a successf
     now: () => FIXED_NOW,
     transport: fakeTransport((request) => request.url === GIGACHAT_OAUTH_URL
       ? jsonResponse(200, token('synthetic-token'))
-      : ++modelRequests === 1 ? jsonResponse(500, { private: 'not exposed' }) : jsonResponse(200, { data: [{ id: 'test-model' }] })),
+      : ++modelRequests === 1 ? jsonResponse(500, { private: 'not exposed' }) : jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }] })),
   });
   assert.deepEqual(await provider.connect(), { state: 'error', errorCategory: 'network', failedStep: 'models', httpStatus: 500 });
   assert.deepEqual(await provider.connect(), { state: 'connected', errorCategory: null });
@@ -259,7 +360,7 @@ test('streams GigaChat v1 SSE across split UTF-8, CRLF and multiline data frames
     now: () => FIXED_NOW,
     transport: fakeTransport((request) => {
       if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
-      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'future/model-v2' }] });
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }] });
       completionRequests.push(request);
       return eventStreamResponse([
         firstFrame.subarray(0, splitAt), firstFrame.subarray(splitAt),
@@ -286,7 +387,7 @@ test('streams GigaChat v1 SSE across split UTF-8, CRLF and multiline data frames
       functionsStateId: 'state-1', result: '{"ok":true,"result":"текст"}',
     }],
     permissionProfile: 'ask',
-    modelId: 'future/model-v2',
+    modelId: 'GigaChat-3-Ultra',
   }, new AbortController().signal)) events.push(event);
 
   assert.deepEqual(events, [
@@ -302,7 +403,7 @@ test('streams GigaChat v1 SSE across split UTF-8, CRLF and multiline data frames
   const requestBody = JSON.parse(completionRequests[0]?.body ?? '{}') as {
     model: string; messages: Array<Record<string, unknown>>; functions: Array<{ name: string }>; function_call: string; stream: boolean;
   };
-  assert.equal(requestBody.model, 'future/model-v2');
+  assert.equal(requestBody.model, 'GigaChat-3-Ultra');
   assert.deepEqual(requestBody.messages, [
     { role: 'system', content: '[Runtime]\nRuntime rules\n\n[Rules]\nПравила' },
     { role: 'user', content: 'Вопрос' },
@@ -324,7 +425,7 @@ test('emits validated terminal usage before a later missing-DONE protocol error'
     transport: fakeTransport((request) => request.url === GIGACHAT_OAUTH_URL
       ? jsonResponse(200, token('synthetic-token'))
       : request.url.endsWith('/models')
-        ? jsonResponse(200, { data: [{ id: 'test-model' }] })
+        ? jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }] })
         : eventStreamResponse([Buffer.from(`data: ${JSON.stringify({
           id: 'response-usage', model: 'provider-model-v3',
           usage: { prompt_tokens: 8, total_tokens: 10 },
@@ -335,7 +436,7 @@ test('emits validated terminal usage before a later missing-DONE protocol error'
   const events: ProviderEvent[] = [];
   for await (const event of provider.stream({
     system: [], messages: [{ id: 'message-1', role: 'user', text: 'Question', createdAt: '2026-10-09T00:00:00.000Z' }],
-    permissionProfile: 'ask', modelId: 'test-model',
+    permissionProfile: 'ask', modelId: 'GigaChat-3-Ultra',
   }, new AbortController().signal)) events.push(event);
 
   assert.deepEqual(events, [
@@ -353,7 +454,7 @@ test('rejects malformed usage counts without emitting an unvalidated receipt', a
     transport: fakeTransport((request) => request.url === GIGACHAT_OAUTH_URL
       ? jsonResponse(200, token('synthetic-token'))
       : request.url.endsWith('/models')
-        ? jsonResponse(200, { data: [{ id: 'test-model' }] })
+        ? jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }] })
         : eventStreamResponse([Buffer.from(`data: ${JSON.stringify({
           usage: { prompt_tokens: -1 }, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
         })}\n\n`), Buffer.from('data: [DONE]\n\n') ])),
@@ -362,7 +463,7 @@ test('rejects malformed usage counts without emitting an unvalidated receipt', a
   const events: ProviderEvent[] = [];
   for await (const event of provider.stream({
     system: [], messages: [{ id: 'message-1', role: 'user', text: 'Question', createdAt: '2026-10-09T00:00:00.000Z' }],
-    permissionProfile: 'ask', modelId: 'test-model',
+    permissionProfile: 'ask', modelId: 'GigaChat-3-Ultra',
   }, new AbortController().signal)) events.push(event);
   assert.equal(events.some((event) => event.type === 'usage'), false);
   assert.equal(events[events.length - 1]?.type, 'error');
@@ -375,7 +476,7 @@ test('normalizes an unknown bounded function call with object arguments only aft
     now: () => FIXED_NOW,
     transport: fakeTransport((request) => {
       if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
-      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'test-model' }] });
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }] });
       return {
         statusCode: 200,
         headers: { 'content-type': 'text/event-stream' },
@@ -393,7 +494,7 @@ test('normalizes an unknown bounded function call with object arguments only aft
   const events: ProviderEvent[] = [];
   for await (const event of provider.stream({
     system: [], messages: [{ id: 'message-1', role: 'user', text: 'Задача', createdAt: '2026-10-09T00:00:00.000Z' }],
-    permissionProfile: 'ask', modelId: 'test-model',
+    permissionProfile: 'ask', modelId: 'GigaChat-3-Ultra',
   }, new AbortController().signal)) {
     if (event.type === 'function-call') assert.equal(doneYielded, true);
     events.push(event);
@@ -445,14 +546,14 @@ test('rejects malformed, incomplete, oversized, and unsupported terminal SSE eve
         transport: fakeTransport((request) => request.url === GIGACHAT_OAUTH_URL
           ? jsonResponse(200, token('synthetic-token'))
           : request.url.endsWith('/models')
-            ? jsonResponse(200, { data: [{ id: 'test-model' }] })
+            ? jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }] })
             : item.response),
       });
       assert.equal((await provider.connect()).state, 'connected');
       const events: ProviderEvent[] = [];
       for await (const event of provider.stream({
         system: [], messages: [{ id: 'message-1', role: 'user', text: 'Задача', createdAt: '2026-10-09T00:00:00.000Z' }],
-        permissionProfile: 'ask', modelId: 'test-model',
+        permissionProfile: 'ask', modelId: 'GigaChat-3-Ultra',
       }, new AbortController().signal)) events.push(event);
       assert.deepEqual(events[events.length - 1], { type: 'error', category: item.category, retryable: false });
       assert.equal(events.some((event) => event.type === 'completed'), false);
@@ -471,7 +572,7 @@ test('DONE closes a healthy SSE stream without waiting for HTTP EOF', async () =
     now: () => FIXED_NOW,
     transport: fakeTransport((request) => {
       if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
-      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'test-model' }] });
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }] });
       return {
         statusCode: 200,
         headers: { 'content-type': 'text/event-stream' },
@@ -493,7 +594,7 @@ test('DONE closes a healthy SSE stream without waiting for HTTP EOF', async () =
   const events: ProviderEvent[] = [];
   for await (const event of provider.stream({
     system: [], messages: [{ id: 'message-1', role: 'user', text: 'Задача', createdAt: '2026-10-09T00:00:00.000Z' }],
-    permissionProfile: 'ask', modelId: 'test-model',
+    permissionProfile: 'ask', modelId: 'GigaChat-3-Ultra',
   }, new AbortController().signal)) events.push(event);
 
   assert.deepEqual(events, [
@@ -515,7 +616,7 @@ test('does not send a model request for an ID removed by the latest registry ref
       if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
       if (request.url.endsWith('/models')) {
         modelRequests += 1;
-        return jsonResponse(200, { data: [{ id: modelRequests === 1 ? 'old-model' : 'current-model' }] });
+        return jsonResponse(200, { data: [{ id: modelRequests === 1 ? 'GigaChat-3-Ultra' : 'GigaChat-2-Max' }] });
       }
       completionRequests += 1;
       return eventStreamResponse([Buffer.from('data: [DONE]\n\n')]);
@@ -526,7 +627,7 @@ test('does not send a model request for an ID removed by the latest registry ref
   const events: ProviderEvent[] = [];
   for await (const event of provider.stream({
     system: [], messages: [{ id: 'message-1', role: 'user', text: 'Задача', createdAt: '2026-10-09T00:00:00.000Z' }],
-    permissionProfile: 'ask', modelId: 'old-model',
+    permissionProfile: 'ask', modelId: 'GigaChat-3-Ultra',
   }, new AbortController().signal)) events.push(event);
   assert.deepEqual(events, [{ type: 'error', category: 'model', retryable: false }]);
   assert.equal(completionRequests, 0);
@@ -540,7 +641,7 @@ test('disconnect aborts an active SSE response with a safe cancel event', async 
     now: () => FIXED_NOW,
     transport: fakeTransport((request) => {
       if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
-      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'test-model' }] });
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }] });
       return {
         statusCode: 200,
         headers: { 'content-type': 'text/event-stream' },
@@ -557,7 +658,7 @@ test('disconnect aborts an active SSE response with a safe cancel event', async 
   assert.equal((await provider.connect()).state, 'connected');
   const iterator = provider.stream({
     system: [], messages: [{ id: 'message-1', role: 'user', text: 'Задача', createdAt: '2026-10-09T00:00:00.000Z' }],
-    permissionProfile: 'ask', modelId: 'test-model',
+    permissionProfile: 'ask', modelId: 'GigaChat-3-Ultra',
   }, new AbortController().signal)[Symbol.asyncIterator]();
 
   assert.deepEqual(await iterator.next(), { done: false, value: { type: 'activity', activity: 'receiving' } });
@@ -941,7 +1042,7 @@ test('uses the documented token-count REST array and rejects SDK-wrapper respons
     transport: fakeTransport((request) => {
       requests.push(request);
       if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-access-token'));
-      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-test-model' }] });
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }, { id: 'GigaChat-test-model' }] });
       return jsonResponse(200, malformed
         ? { tokens: [{ object: 'tokens', tokens: 3, characters: 4 }] }
         : [{ object: 'tokens', tokens: 3, characters: 4 }, { object: 'tokens', tokens: 7, characters: 8 }]);
@@ -968,7 +1069,7 @@ test('rejects oversized serialized continuation before transport, including prot
     transport: fakeTransport((request) => {
       transportRequests += 1;
       if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-access-token'));
-      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-test-model' }] });
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }] });
       return eventStreamResponse([Buffer.from('data: [DONE]\n\n')]);
     }),
   });
@@ -982,7 +1083,7 @@ test('rejects oversized serialized continuation before transport, including prot
     messages: [{ id: 'user-1', role: 'user', text: 'prompt', createdAt: atFixture }],
     protocolHistory: [exchange('user-1'), exchange('user-1')],
     permissionProfile: 'ask',
-    modelId: 'GigaChat-test-model',
+    modelId: 'GigaChat-3-Ultra',
   };
   const events: ProviderEvent[] = [];
   for await (const event of provider.stream(request, new AbortController().signal)) events.push(event);

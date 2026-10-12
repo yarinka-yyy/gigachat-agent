@@ -1,4 +1,5 @@
 import type { ModelRegistrySnapshot, RuntimeTurnSnapshot } from './contracts';
+import { chatModelUnavailableReason, isChatModelAvailable } from './model-catalog';
 
 export interface NewChatDraftSession<TProfile extends string = string> {
   text: string;
@@ -15,7 +16,9 @@ export function retryUnavailableReason(
   if (registry.state === 'unavailable') return 'Подключите API и загрузите список моделей перед повтором.';
   if (registry.state === 'error') return 'Не удалось обновить список моделей; проверьте подключение API.';
   if (!turn.modelId) return 'Для исходного хода не указана модель; повтор недоступен.';
-  if (!registry.modelIds.includes(turn.modelId)) return 'Исходная модель сейчас недоступна; сохранённый выбор не заменён.';
+  if (!isChatModelAvailable(registry, turn.modelId)) {
+    return `Исходная модель сейчас недоступна для повтора: ${chatModelUnavailableReason(registry, turn.modelId) ?? 'проверка не пройдена'}`;
+  }
   return null;
 }
 

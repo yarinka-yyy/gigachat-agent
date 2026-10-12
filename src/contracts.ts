@@ -205,8 +205,11 @@ export interface ProviderConnectionSnapshot {
 
 export interface ModelRegistrySnapshot {
   state: 'unavailable' | 'ready' | 'error';
+  /** Exact raw IDs from /models. This list is never filtered by chat-family policy. */
   modelIds: GigaChatModelId[];
   errorCategory: ProviderErrorCategory | null;
+  /** IDs for which the API returned HTTP 402 in this provider session. */
+  exhaustedModelIds?: GigaChatModelId[];
 }
 
 export interface ProviderFunctionCall {
