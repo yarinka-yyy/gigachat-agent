@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, type UIEvent as ReactUIEvent } from 'react';
 import {
   Archive,
   ArrowLeft,
@@ -100,10 +100,12 @@ import { sidebarSections } from './sidebar-sections';
 import { attachmentContentType, attachmentSendBlocker, evaluateAttachmentPolicy } from './attachment-policy';
 import { hookEventLabel, mergeRuntimeTurnSnapshots, mergeTranscriptTurns } from './chat-transcript';
 import type { TranscriptTurn } from './chat-transcript';
+import { isNearChatScrollEnd, preserveChatScrollAnchor } from './chat-navigation';
 import ChatTranscript from './components/ChatTranscript';
 
 type Page = 'home' | 'chat' | 'settings' | 'onboarding' | 'images' | 'video' | 'podcasts' | 'archive' | 'profile';
 type Route = { page: Page; id?: string };
+type ChatScrollBookmark = { kind: 'end' } | { kind: 'message'; messageId: string; offset: number };
 type ChatLoadState = { chatId: string; status: 'loading' | 'ready' | 'error'; error?: string };
 type Navigation = { history: Route[]; index: number };
 type SettingsSection =
@@ -865,6 +867,11 @@ export default function App() {
   const draftRef = useRef('');
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const mainPanelRef = useRef<HTMLElement>(null);
+  const viewAreaRef = useRef<HTMLDivElement>(null);
+  const chatScrollBookmarks = useRef(new Map<string, ChatScrollBookmark>());
+  const chatScrollFollows = useRef(new Map<string, boolean>());
+  const programmaticChatScroll = useRef<{ chatId: string; scrollTop: number } | null>(null);
+  const restoredChatDetailGeneration = useRef(-1);
   const draftSave = useRef<Promise<unknown>>(Promise.resolve());
   const dialogRef = useRef<HTMLDialogElement>(null);
   const approvalDialogRef = useRef<HTMLDialogElement>(null);
@@ -1520,6 +1527,129 @@ export default function App() {
     if (!selectedChat || !chatDetail || chatDetail.id !== selectedChat.id) return [];
     return mergeTranscriptTurns(selectedChat.id, chatDetail.messages, chatDetail.turns, runtimeTurns);
   }, [chatDetail, runtimeTurns, selectedChat?.id]);
+  const setProgrammaticChatScrollTop = useCallback((area: HTMLDivElement, chatId: string, top: number): void => {
+    const boundedTop = Math.max(0, Math.min(top, area.scrollHeight - area.clientHeight));
+    if (Math.abs(area.scrollTop - boundedTop) <= 1) return;
+    programmaticChatScroll.current = { chatId, scrollTop: boundedTop };
+    area.scrollTop = boundedTop;
+  }, []);
+
+  const restoreChatViewport = useCallback((chatId: string): void => {
+    const area = viewAreaRef.current;
+    if (!area) return;
+    const bookmark = chatScrollBookmarks.current.get(chatId);
+    if (!bookmark || bookmark.kind === 'end') {
+      setProgrammaticChatScrollTop(area, chatId, area.scrollHeight);
+      chatScrollBookmarks.current.set(chatId, { kind: 'end' });
+      chatScrollFollows.current.set(chatId, true);
+      return;
+    }
+    const anchor = [...area.querySelectorAll<HTMLElement>('.transcript-message[data-message-id]')]
+      .find((element) => element.dataset.messageId === bookmark.messageId);
+    if (!anchor) {
+      setProgrammaticChatScrollTop(area, chatId, area.scrollHeight);
+      chatScrollBookmarks.current.set(chatId, { kind: 'end' });
+      chatScrollFollows.current.set(chatId, true);
+      return;
+    }
+    const areaTop = area.getBoundingClientRect().top;
+    setProgrammaticChatScrollTop(area, chatId,
+      preserveChatScrollAnchor(area.scrollTop, anchor.getBoundingClientRect().top, areaTop, bookmark.offset));
+  }, [setProgrammaticChatScrollTop]);
+
+  function handleViewAreaScroll(event: ReactUIEvent<HTMLDivElement>): void {
+    if (event.target !== event.currentTarget) return;
+    const area = event.currentTarget;
+    const currentRoute = routeRef.current;
+    const chatId = currentRoute.page === 'chat' ? currentRoute.id : undefined;
+    if (!chatId || chatDetail?.id !== chatId || chatLoadState.chatId !== chatId || chatLoadState.status !== 'ready') return;
+    const expectedScroll = programmaticChatScroll.current;
+    if (expectedScroll) {
+      programmaticChatScroll.current = null;
+      if (expectedScroll.chatId !== chatId || Math.abs(expectedScroll.scrollTop - area.scrollTop) <= 1) return;
+    }
+    if (isNearChatScrollEnd({ scrollTop: area.scrollTop, scrollHeight: area.scrollHeight, clientHeight: area.clientHeight })) {
+      chatScrollBookmarks.current.set(chatId, { kind: 'end' });
+      chatScrollFollows.current.set(chatId, true);
+      return;
+    }
+    chatScrollFollows.current.set(chatId, false);
+    const areaBounds = area.getBoundingClientRect();
+    const messageElements = [...area.querySelectorAll<HTMLElement>('.transcript-message[data-message-id]')];
+    const precedingMessages = messageElements.filter((element) => element.getBoundingClientRect().top <= areaBounds.top + 8);
+    const anchor = messageElements.find((element) => {
+      const bounds = element.getBoundingClientRect();
+      return bounds.bottom > areaBounds.top + 8 && bounds.top < areaBounds.bottom;
+    }) ?? precedingMessages[precedingMessages.length - 1];
+    if (!anchor?.dataset.messageId) return;
+    chatScrollBookmarks.current.set(chatId, {
+      kind: 'message',
+      messageId: anchor.dataset.messageId,
+      offset: anchor.getBoundingClientRect().top - areaBounds.top,
+    });
+    chatScrollFollows.current.set(chatId, false);
+  }
+
+  function navigateToChatMessage(messageId: string, followStream: boolean): void {
+    const area = viewAreaRef.current;
+    const currentRoute = routeRef.current;
+    const chatId = currentRoute.page === 'chat' ? currentRoute.id : undefined;
+    if (!area || !chatId || chatDetail?.id !== chatId || chatLoadState.status !== 'ready') return;
+    const target = [...area.querySelectorAll<HTMLElement>('.transcript-message[data-message-id]')]
+      .find((element) => element.dataset.messageId === messageId);
+    if (!target) return;
+    const offset = 58;
+    const areaTop = area.getBoundingClientRect().top;
+    const nextScrollTop = preserveChatScrollAnchor(area.scrollTop, target.getBoundingClientRect().top, areaTop, offset);
+    chatScrollBookmarks.current.set(chatId, { kind: 'message', messageId, offset });
+    chatScrollFollows.current.set(chatId, followStream);
+    setProgrammaticChatScrollTop(area, chatId, nextScrollTop);
+  }
+
+  function returnChatToCurrentFlow(chatId: string): void {
+    chatScrollBookmarks.current.set(chatId, { kind: 'end' });
+    chatScrollFollows.current.set(chatId, true);
+    if (routeRef.current.page === 'chat' && routeRef.current.id === chatId && viewAreaRef.current) {
+      setProgrammaticChatScrollTop(viewAreaRef.current, chatId, viewAreaRef.current.scrollHeight);
+    }
+  }
+
+  useLayoutEffect(() => {
+    const chatId = route.page === 'chat' ? route.id : undefined;
+    if (!chatId || chatDetail?.id !== chatId || chatLoadState.chatId !== chatId || chatLoadState.status !== 'ready') return;
+    const generation = chatDetailLoadGeneration.current;
+    if (restoredChatDetailGeneration.current === generation) return;
+    restoredChatDetailGeneration.current = generation;
+    restoreChatViewport(chatId);
+  }, [route.page, route.id, chatDetail?.id, chatLoadState.chatId, chatLoadState.status, restoreChatViewport]);
+
+  useEffect(() => {
+    const chatId = route.page === 'chat' ? route.id : undefined;
+    const area = viewAreaRef.current;
+    const history = area?.querySelector<HTMLElement>('.chat-history');
+    if (!chatId || chatDetail?.id !== chatId || chatLoadState.chatId !== chatId || chatLoadState.status !== 'ready' || !area || !history) return undefined;
+    const preservePosition = (): void => {
+      const bookmark = chatScrollBookmarks.current.get(chatId);
+      if (!bookmark || bookmark.kind === 'end') {
+        setProgrammaticChatScrollTop(area, chatId, area.scrollHeight);
+        chatScrollBookmarks.current.set(chatId, { kind: 'end' });
+      } else restoreChatViewport(chatId);
+    };
+    const observer = new ResizeObserver(preservePosition);
+    observer.observe(area);
+    observer.observe(history);
+    return () => observer.disconnect();
+  }, [route.page, route.id, chatDetail?.id, chatLoadState.chatId, chatLoadState.status, restoreChatViewport, setProgrammaticChatScrollTop]);
+
+  useLayoutEffect(() => {
+    const chatId = route.page === 'chat' ? route.id : undefined;
+    const area = viewAreaRef.current;
+    if (!chatId || !area || chatDetail?.id !== chatId || chatLoadState.chatId !== chatId || chatLoadState.status !== 'ready'
+      || !chatScrollFollows.current.get(chatId)) return;
+    setProgrammaticChatScrollTop(area, chatId, area.scrollHeight);
+    chatScrollBookmarks.current.set(chatId, { kind: 'end' });
+  }, [route.page, route.id, chatDetail?.id, chatLoadState.chatId, chatLoadState.status, transcriptTurns, setProgrammaticChatScrollTop]);
+
   const chatComposerReady = route.page === 'home' ? homeDraftRecord !== null
     : route.page !== 'chat' || (chatLoadState.chatId === route.id
       && chatLoadState.status === 'ready' && chatDetail?.id === route.id);
@@ -1898,6 +2028,7 @@ export default function App() {
         }
         updateHomeDraftError('');
         setChats(await window.gigaChat.chats.list());
+        returnChatToCurrentFlow(accepted.detail.id);
         if (sourceRouteGeneration === routeGeneration.current && routeRef.current.page === 'home') {
           navigate({ page: 'chat', id: accepted.detail.id });
         }
@@ -1912,6 +2043,7 @@ export default function App() {
       await acceptedPermissionSave;
       await acceptedSkillSave;
       const detail = await window.gigaChat.chats.appendLocalMessage(chatId, value, initialChatAttachments.map((attachment) => attachment.id));
+      returnChatToCurrentFlow(chatId);
       const stillCurrent = sourceRouteGeneration === routeGeneration.current
         && sourceDraftRevision === draftRevision.current
         && routeRef.current.page === 'chat' && routeRef.current.id === chatId;
@@ -3292,6 +3424,8 @@ export default function App() {
             {chatDetail?.id === selectedChat.id && chatLoadState.status === 'ready' && <ChatTranscript
               messages={chatDetail.messages}
               turns={transcriptTurns}
+              artifacts={chatDetail.artifacts}
+              onNavigateToMessage={navigateToChatMessage}
               onCopyMessage={(messageId) => window.gigaChat.chats.copyMessage(selectedChat.id, messageId)}
               renderAttachments={(message) => {
                 const linkedAttachments = (message.attachmentIds ?? []).map((id) =>
@@ -3588,7 +3722,8 @@ export default function App() {
           }}>
           {(() => {
             const chatContent = <>
-          <div className={route.page === 'home' ? 'view-area home-view' : route.page === 'settings' ? 'view-area settings-view' : route.page === 'onboarding' ? 'view-area onboarding-view' : 'view-area'}>{renderContent()}</div>
+          <div ref={viewAreaRef} onScroll={handleViewAreaScroll}
+            className={route.page === 'home' ? 'view-area home-view' : route.page === 'settings' ? 'view-area settings-view' : route.page === 'onboarding' ? 'view-area onboarding-view' : route.page === 'chat' ? 'view-area chat-view-area' : 'view-area'}>{renderContent()}</div>
           {(route.page === 'home' || route.page === 'chat') && (
             <div className="composer-stack">
               {composerCompletion && <div id="composer-suggestions" className="composer-suggestions" role="listbox" aria-label={composerCompletion.kind === 'command' ? 'Команды' : 'Локальные Skills'}>

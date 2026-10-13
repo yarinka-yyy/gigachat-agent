@@ -949,14 +949,26 @@ async function runElectronHost() {
       await sleep(350);
     }
   };
-  const click = async (selector) => {
-    const result = await evaluate(`(() => { const element = document.querySelector(${JSON.stringify(selector)}); if (!element || element.disabled) return false; element.click(); return true; })()`);
-    assert.equal(result, true, `button not found or disabled: ${selector}`);
+  const actionTargetExpression = (selector, value) => `(() => {
+    const matches = [...document.querySelectorAll(${JSON.stringify(selector)})];
+    const target = matches.find((item) => ${value == null ? 'true' : `item.textContent.includes(${JSON.stringify(value)})`}
+      && item.isConnected && !item.disabled && item.getAttribute('aria-disabled') !== 'true'
+      && item.getClientRects().length > 0 && getComputedStyle(item).visibility !== 'hidden'
+      && getComputedStyle(item).display !== 'none'
+      && item.getBoundingClientRect().width > 0 && item.getBoundingClientRect().height > 0);
+    return target ?? null;
+  })()`;
+  const clickAction = async (selector, value, description) => {
+    const targetExpression = actionTargetExpression(selector, value);
+    await waitUntil(`visible enabled action: ${description}`, () => evaluate(`(() => {
+      const element = ${targetExpression};
+      if (!element) return false;
+      element.click();
+      return true;
+    })()`));
   };
-  const clickText = async (selector, value) => {
-    const result = await evaluate(`(() => { const element = [...document.querySelectorAll(${JSON.stringify(selector)})].find((item) => item.textContent.includes(${JSON.stringify(value)})); if (!element || element.disabled) return false; element.click(); return true; })()`);
-    assert.equal(result, true, `visible action not found: ${value}`);
-  };
+  const click = async (selector) => clickAction(selector, null, selector);
+  const clickText = async (selector, value) => clickAction(selector, value, value);
   const sendMouseClick = async (selector, text) => {
     const rect = await evaluate(`(() => {
       const element = [...document.querySelectorAll(${JSON.stringify(selector)})].find((item) => ${text == null ? 'true' : `item.textContent.includes(${JSON.stringify(text)})`});
@@ -966,6 +978,29 @@ async function runElectronHost() {
       return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
     })()`);
     assert.ok(rect, `visible input target not found: ${text ?? selector}`);
+    const zoom = window.webContents.getZoomFactor();
+    const x = Math.round(rect.x * zoom);
+    const y = Math.round(rect.y * zoom);
+    window.webContents.sendInputEvent({ type: 'mouseMove', x, y });
+    window.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+    window.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+  };
+  const sendVisibleMouseClick = async (selector) => {
+    const rect = await evaluate(`(() => {
+      const element = document.querySelector(${JSON.stringify(selector)});
+      if (!element || element.disabled || !element.isConnected || element.getClientRects().length === 0) return null;
+      const bounds = element.getBoundingClientRect();
+      if (bounds.width <= 0 || bounds.height <= 0 || bounds.bottom <= 0 || bounds.top >= innerHeight) return null;
+      const list = element.closest('.chat-navigation-list');
+      if (list) {
+        const listBounds = list.getBoundingClientRect();
+        if (bounds.top < listBounds.top || bounds.bottom > listBounds.bottom) return null;
+      }
+      const hit = document.elementFromPoint(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2);
+      if (hit !== element && !element.contains(hit)) return null;
+      return { x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2 };
+    })()`);
+    assert.ok(rect, `visible click target not found without scrolling: ${selector}`);
     const zoom = window.webContents.getZoomFactor();
     const x = Math.round(rect.x * zoom);
     const y = Math.round(rect.y * zoom);
@@ -2798,6 +2833,7 @@ async function runElectronHost() {
     await waitDom('API connection is ready before explicit quota reset', `[...document.querySelectorAll('.connection-setup button')].some((button) => button.textContent.includes('Отключить'))`);
     await clickText('.connection-setup button', 'Отключить');
     await waitUntil('explicit disconnect clears the connected session', () => state.connectionStatus.state === 'not-configured');
+    await waitDom('disconnect action rerenders before reconnect', `[...document.querySelectorAll('.connection-setup button')].some((button) => button.textContent.includes('Проверить подключение') && !button.disabled && button.getClientRects().length > 0)`);
     await clickText('.connection-setup button', 'Проверить подключение');
     await waitUntil('explicit reconnect starts a fresh model allowance session', () => state.connectionStatus.state === 'connected'
       && !state.modelRegistry.exhaustedModelIds?.includes('GigaChat-3-Ultra'));
@@ -4130,11 +4166,387 @@ async function runElectronHost() {
         createdAt: timestamp,
       });
     }
+    const navigationUser = {
+      id: 'stage5-navigation-user', role: 'user',
+      text: 'Проверь, как навигация сохраняет положение при продолжении ответа.', createdAt: timestamp,
+    };
+    themeChat.messages.push(navigationUser);
     themeChat.turns.push({
       turnId: 'stage4-theme-turn', anchorMessageId: themeAnchor.id, assistantMessageId: themeAnswer.id,
       modelId: 'GigaChat-3-Ultra', status: 'completed', createdAt: timestamp, startedAt: timestamp, endedAt: timestamp,
       queueDurationMs: 140, activeDurationMs: 2000, activity: [{ kind: 'provider', at: timestamp, activity: 'receiving' }],
     });
+    const verifyStage5Navigation = async (name) => {
+      const expectedUserIds = themeChat.messages.filter((message) => message.role === 'user').map((message) => message.id);
+      const inspectRail = async () => JSON.parse(await evaluate(`JSON.stringify((() => {
+        const area = document.querySelector('.view-area.chat-view-area');
+        const nav = document.querySelector('.chat-navigation');
+        const list = document.querySelector('.chat-navigation-list');
+        const history = document.querySelector('.chat-history');
+        const composer = document.querySelector('.composer-stack');
+        const box = (element) => {
+          if (!element) return null;
+          const rect = element.getBoundingClientRect();
+          return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width, height: rect.height };
+        };
+        const buttons = [...document.querySelectorAll('.chat-navigation-mark')];
+        const preview = document.querySelector('.chat-navigation-preview');
+        return {
+          area: box(area), nav: box(nav), list: { ...box(list), scrollHeight: list?.scrollHeight ?? 0,
+            clientHeight: list?.clientHeight ?? 0, maxHeight: Number.parseFloat(getComputedStyle(list).maxHeight) || 0,
+            contentHeight: area?.scrollHeight ?? 0, viewportHeight: area?.clientHeight ?? 0 },
+          history: box(history), composer: box(composer),
+          userIds: [...document.querySelectorAll('.chat-history .transcript-message.message-user[data-message-id]')].map((message) => message.dataset.messageId),
+          marks: buttons.map((button) => {
+            const rect = button.getBoundingClientRect();
+            const bar = button.querySelector('.chat-navigation-mark-bar');
+            return { id: button.dataset.navigationMessageId, top: rect.top, bottom: rect.bottom, height: rect.height,
+              width: bar?.getBoundingClientRect().width ?? 0, tabIndex: button.tabIndex,
+              color: bar ? getComputedStyle(bar).backgroundColor : null,
+              expanded: button.classList.contains('expanded'), focused: button.classList.contains('focused') };
+          }),
+          previewText: preview?.textContent ?? null,
+          preview: box(preview),
+          viewportWidth: innerWidth,
+          viewportHeight: innerHeight,
+          rightScrollbarButton: area ? getComputedStyle(area, '::-webkit-scrollbar-button').display : null,
+        };
+      })())`));
+      const targetOffset = async (messageId) => {
+        const value = await evaluate(`(() => {
+          const area = document.querySelector('.view-area.chat-view-area');
+          const target = [...document.querySelectorAll('.chat-history .transcript-message[data-message-id]')]
+            .find((message) => message.dataset.messageId === ${JSON.stringify(messageId)});
+          return area && target ? target.getBoundingClientRect().top - area.getBoundingClientRect().top : null;
+        })()`);
+        return value === null ? null : Number(value);
+      };
+      const inspectTargetGeometry = async (messageId) => JSON.parse(await evaluate(`JSON.stringify((() => {
+        const area = document.querySelector('.view-area.chat-view-area');
+        const target = [...document.querySelectorAll('.chat-history .transcript-message[data-message-id]')]
+          .find((message) => message.dataset.messageId === ${JSON.stringify(messageId)});
+        if (!area || !target) return null;
+        const areaRect = area.getBoundingClientRect();
+        const targetRect = target.getBoundingClientRect();
+        const currentOffset = targetRect.top - areaRect.top;
+        const requestedScrollTop = area.scrollTop + currentOffset - 58;
+        const maxScrollTop = Math.max(0, area.scrollHeight - area.clientHeight);
+        const destinationScrollTop = Math.max(0, Math.min(requestedScrollTop, maxScrollTop));
+        return {
+          messageId: target.dataset.messageId, currentOffset, expectedOffset: currentOffset - (destinationScrollTop - area.scrollTop),
+          scrollTop: area.scrollTop, requestedScrollTop, destinationScrollTop, maxScrollTop,
+          ownerTop: areaRect.top, ownerBottom: areaRect.bottom, ownerHeight: area.clientHeight,
+          targetTop: targetRect.top, targetBottom: targetRect.bottom,
+          wasClamped: Math.abs(destinationScrollTop - requestedScrollTop) > 0.5,
+        };
+      })())`));
+      const navigationExpectedOffset = async (messageId, label) => {
+        const geometry = await inspectTargetGeometry(messageId);
+        assert.equal(geometry?.messageId, messageId,
+          `${label}: target is present before navigation: ${JSON.stringify(geometry)}`);
+        assert.ok(!geometry.wasClamped || geometry.destinationScrollTop <= 1
+          || Math.abs(geometry.destinationScrollTop - geometry.maxScrollTop) <= 1,
+        `${label}: a bounded target offset is caused by an actual scroll boundary: ${JSON.stringify(geometry)}`);
+        return geometry.expectedOffset;
+      };
+      const waitForTargetOffset = async (messageId, label, expectedOffset = 58) => {
+        try {
+          await waitUntil(label, async () => {
+            const offset = await targetOffset(messageId);
+            return offset !== null && Math.abs(offset - expectedOffset) <= 5;
+          });
+        } catch (error) {
+          const geometry = await inspectTargetGeometry(messageId).catch(() => null);
+          throw new Error(`${error instanceof Error ? error.message : String(error)}; expected target offset ${expectedOffset}; geometry ${JSON.stringify(geometry)}`);
+        }
+      };
+      const moveMarkIntoRailView = async (messageId) => {
+        await evaluate(`(() => {
+          const list = document.querySelector('.chat-navigation-list');
+          const button = [...document.querySelectorAll('.chat-navigation-mark')]
+            .find((item) => item.dataset.navigationMessageId === ${JSON.stringify(messageId)});
+          if (!list || !button) return false;
+          const listRect = list.getBoundingClientRect();
+          const buttonRect = button.getBoundingClientRect();
+          if (buttonRect.top < listRect.top) list.scrollTop -= listRect.top - buttonRect.top;
+          else if (buttonRect.bottom > listRect.bottom) list.scrollTop += buttonRect.bottom - listRect.bottom;
+          return true;
+        })()`);
+        await waitUntil(`request ${messageId} is inside the rail viewport`, () => evaluate(`(() => {
+          const list = document.querySelector('.chat-navigation-list');
+          const button = [...document.querySelectorAll('.chat-navigation-mark')]
+            .find((item) => item.dataset.navigationMessageId === ${JSON.stringify(messageId)});
+          if (!list || !button) return false;
+          const listRect = list.getBoundingClientRect();
+          const buttonRect = button.getBoundingClientRect();
+          return buttonRect.top >= listRect.top && buttonRect.bottom <= listRect.bottom;
+        })()`));
+      };
+
+      const resting = await inspectRail();
+      assert.deepEqual(resting.marks.map((mark) => mark.id), expectedUserIds,
+        `${name}: request marks follow exactly the persisted user message IDs`);
+      assert.deepEqual(resting.userIds, expectedUserIds,
+        `${name}: the rendered transcript still has every accepted user target`);
+      assert.ok(resting.area && resting.nav && resting.list && resting.history && resting.composer,
+        `${name}: the rail, chat scroll owner, history and composer are present`);
+      assert.ok(resting.nav.left >= resting.area.left - 1 && resting.nav.right < resting.history.left,
+        `${name}: the rail sits inside the chat pane before its history column: ${JSON.stringify(resting)}`);
+      assert.ok(resting.nav.top >= resting.area.top - 1 && resting.nav.bottom <= resting.area.bottom + 1,
+        `${name}: the rail is bounded by the actual chat scroll owner: ${JSON.stringify(resting)}`);
+      assert.ok(resting.list.maxHeight <= resting.area.height + 1,
+        `${name}: the rail's own scroll limit uses the chat viewport height: ${JSON.stringify(resting.list)}`);
+      assert.ok(resting.list.contentHeight > resting.list.viewportHeight,
+        `${name}: the main view-area remains the actual long-history scroll owner: ${JSON.stringify(resting.list)}`);
+      assert.equal(resting.previewText, null, `${name}: no preview or ghost-focused mark is open at rest`);
+      assert.equal(resting.marks.filter((mark) => mark.expanded || mark.focused).length, 0,
+        `${name}: marks do not expand before real hover or keyboard focus`);
+      assert.ok(resting.marks.every((mark) => mark.height >= 28 && Math.abs(mark.width - 8) <= 1),
+        `${name}: rail targets remain large enough and bars are horizontal at rest: ${JSON.stringify(resting.marks)}`);
+      assert.notEqual(resting.marks[resting.marks.length - 1]?.color, resting.marks[0]?.color,
+        `${name}: the latest request uses the foreground color while earlier requests stay muted`);
+      for (let index = 1; index < resting.marks.length; index += 1) {
+        assert.ok(resting.marks[index - 1].bottom <= resting.marks[index].top + 1,
+          `${name}: adjacent rail targets do not overlap: ${JSON.stringify(resting.marks.slice(index - 1, index + 1))}`);
+      }
+      assert.equal(resting.marks[resting.marks.length - 1]?.tabIndex, 0, `${name}: latest request is the initial keyboard tab stop`);
+      assert.ok(resting.marks.slice(0, -1).every((mark) => mark.tabIndex === -1), `${name}: only the latest request is tabbable initially`);
+      assert.equal(resting.rightScrollbarButton, 'none', `${name}: the chat area hides only its decorative scrollbar button`);
+
+      const navigationDebuggerWasAttached = window.webContents.debugger.isAttached();
+      if (!navigationDebuggerWasAttached) window.webContents.debugger.attach('1.3');
+      try {
+        await window.webContents.debugger.sendCommand('Emulation.setEmulatedMedia', {
+          features: [{ name: 'prefers-reduced-motion', value: 'reduce' }],
+        });
+        await waitDom(`${name} request rail sees reduced-motion preference`, `matchMedia('(prefers-reduced-motion: reduce)').matches`);
+        const navigationMotion = JSON.parse(await evaluate(`JSON.stringify((() => {
+          const bar = document.querySelector('.chat-navigation-mark-bar');
+          const durations = getComputedStyle(bar).transitionDuration.split(',').map((value) => {
+            const duration = value.trim();
+            const amount = Number.parseFloat(duration);
+            return duration.endsWith('ms') ? amount : amount * 1000;
+          });
+          return { reduced: matchMedia('(prefers-reduced-motion: reduce)').matches, transitionMs: Math.max(...durations) };
+        })())`));
+        assert.equal(navigationMotion.reduced, true);
+        assert.ok(navigationMotion.transitionMs <= 0.011,
+          `${name}: request rail motion is disabled under reduced-motion preference: ${JSON.stringify(navigationMotion)}`);
+        passed('Rendered request rail respects reduced-motion preference');
+      } finally {
+        await window.webContents.debugger.sendCommand('Emulation.setEmulatedMedia', { features: [] });
+        if (!navigationDebuggerWasAttached && window.webContents.debugger.isAttached()) window.webContents.debugger.detach();
+      }
+
+      const hoverId = expectedUserIds[expectedUserIds.length - 2];
+      const hoverSelector = `.chat-navigation-mark[data-navigation-message-id="${hoverId}"]`;
+      const clickId = expectedUserIds[expectedUserIds.length - 6];
+      const clickSelector = `.chat-navigation-mark[data-navigation-message-id="${clickId}"]`;
+      await moveMarkIntoRailView(hoverId);
+      await movePointerTo(hoverSelector);
+      const expectedExpandedBarWidth = Number(await evaluate(`matchMedia('(max-width: 620px)').matches ? 20 : 24`));
+      await waitUntil(`${name} hover expands only its own request bar`, async () => {
+        const state = await inspectRail();
+        return state.marks.find((mark) => mark.id === hoverId)?.width >= expectedExpandedBarWidth - 1;
+      });
+      const hovered = await inspectRail();
+      assert.deepEqual(hovered.marks.filter((mark) => mark.expanded).map((mark) => mark.id), [hoverId],
+        `${name}: hovering expands only the pointed-to bar`);
+      assert.ok(hovered.marks.find((mark) => mark.id === hoverId).width >= expectedExpandedBarWidth - 1
+        && hovered.marks.find((mark) => mark.id === hoverId).width > resting.marks.find((mark) => mark.id === hoverId).width + 8,
+        `${name}: the hovered horizontal bar expands measurably`);
+      assert.ok(hovered.marks.filter((mark) => mark.id !== hoverId).every((mark) =>
+        Math.abs(mark.width - resting.marks.find((before) => before.id === mark.id).width) <= 1),
+      `${name}: neighboring bars keep their original widths`);
+      const hoverMessage = themeChat.messages.find((message) => message.id === hoverId);
+      assert.ok(hovered.previewText?.includes(hoverMessage.text), `${name}: preview contains the original user request`);
+      assert.ok(hovered.previewText?.includes('2026') && /\b\d{2}:\d{2}\b/.test(hovered.previewText), `${name}: preview exposes local date and time`);
+      assert.ok(hovered.previewText?.includes('Статус'), `${name}: preview exposes a truthful saved status`);
+      assert.ok(hovered.preview.left >= hovered.area.left - 1 && hovered.preview.right <= hovered.area.right + 1
+        && hovered.preview.top >= hovered.area.top - 1 && hovered.preview.bottom <= hovered.area.bottom + 1,
+      `${name}: contextual preview stays within the chat pane: ${JSON.stringify(hovered)}`);
+      assert.ok(Math.abs(hovered.composer.top - resting.composer.top) <= 1 && Math.abs(hovered.composer.bottom - resting.composer.bottom) <= 1,
+        `${name}: opening a preview does not move the composer`);
+      await capture('stage5-request-navigation-hover-preview');
+      await movePointerTo('.chat-header-title');
+      await waitDom(`${name} hover preview closes when the pointer leaves the rail`, `!document.querySelector('.chat-navigation-preview')`);
+
+      const firstId = expectedUserIds[0];
+      const latestId = expectedUserIds[expectedUserIds.length - 1];
+      const latestSelector = `.chat-navigation-mark[data-navigation-message-id="${latestId}"]`;
+      await evaluate(`document.querySelector(${JSON.stringify(latestSelector)})?.focus()`);
+      await sendKey('HOME');
+      await waitUntil(`${name} Home focuses the first request`, () => evaluate(`document.activeElement?.dataset.navigationMessageId === ${JSON.stringify(firstId)}`));
+      await sendKey('DOWN');
+      await waitUntil(`${name} ArrowDown advances one request`, () => evaluate(`document.activeElement?.dataset.navigationMessageId === ${JSON.stringify(expectedUserIds[1])}`));
+      await sendKey('UP');
+      await waitUntil(`${name} ArrowUp returns to the prior request`, () => evaluate(`document.activeElement?.dataset.navigationMessageId === ${JSON.stringify(firstId)}`));
+      await sendKey('END');
+      await waitUntil(`${name} End focuses the latest request`, () => evaluate(`document.activeElement?.dataset.navigationMessageId === ${JSON.stringify(latestId)}`));
+      await sendKey('ESC');
+      await waitDom(`${name} Escape closes the contextual preview`, `!document.querySelector('.chat-navigation-preview')`);
+
+      await moveMarkIntoRailView(clickId);
+      const pointerGeometry = await inspectTargetGeometry(clickId);
+      assert.equal(pointerGeometry?.messageId, clickId, `${name}: pointer target exists before activation`);
+      assert.equal(pointerGeometry.wasClamped, false,
+        `${name}: older pointer target has enough later content for the requested offset: ${JSON.stringify(pointerGeometry)}`);
+      assert.ok(Math.abs(pointerGeometry.expectedOffset - 58) <= 1,
+        `${name}: older pointer target is geometrically reachable at the requested offset: ${JSON.stringify(pointerGeometry)}`);
+      const scrollBeforeClick = Number(await evaluate(`document.querySelector('.view-area.chat-view-area')?.scrollTop ?? 0`));
+      await sendVisibleMouseClick(clickSelector);
+      await waitForTargetOffset(clickId, `${name} pointer activation aligns its actual user target`, pointerGeometry.expectedOffset);
+      const scrollAfterClick = Number(await evaluate(`document.querySelector('.view-area.chat-view-area')?.scrollTop ?? 0`));
+      assert.notEqual(scrollAfterClick, scrollBeforeClick, `${name}: request activation changes the actual chat scroll owner`);
+
+      const previousRuntimeTurns = state.runtimeTurns.get('chat-b') ?? [];
+      const stage5Turn = {
+        id: 'stage5-navigation-turn', chatId: 'chat-b', status: 'running', createdAt: timestamp, startedAt: timestamp,
+        anchorMessageId: latestId, assistantMessageId: 'stage5-navigation-assistant', modelId: 'GigaChat-3-Ultra',
+        queueDurationMs: 0, activeDurationMs: 0, activity: [], draft: 'Ответ начал поступать.',
+      };
+      const publishStage5Turn = (turn) => {
+        state.runtimeTurns.set('chat-b', [...(state.runtimeTurns.get('chat-b') ?? []).filter((item) => item.id !== turn.id), turn]);
+        window.webContents.send('audit:runtime', turn);
+      };
+      publishStage5Turn(stage5Turn);
+      await waitDom(`${name} latest mark reports the active runtime state`, `document.querySelector(${JSON.stringify(latestSelector)})?.getAttribute('aria-label').includes('Выполняется')`);
+      await evaluate(`document.querySelector(${JSON.stringify(latestSelector)})?.focus()`);
+      const latestGeometry = await inspectTargetGeometry(latestId);
+      assert.equal(latestGeometry?.messageId, latestId, `${name}: latest target exists before Enter`);
+      assert.equal(latestGeometry.wasClamped, true,
+        `${name}: short active draft keeps latest target at the real scroll boundary: ${JSON.stringify(latestGeometry)}`);
+      assert.ok(Math.abs(latestGeometry.destinationScrollTop - latestGeometry.maxScrollTop) <= 1,
+        `${name}: latest target clamp is the actual end of the view-area: ${JSON.stringify(latestGeometry)}`);
+      const latestExpectedOffset = latestGeometry.expectedOffset;
+      await sendNativeButtonKey('ENTER', '\r');
+      await waitForTargetOffset(latestId, `${name} Enter follows the latest active request to its actual user message`, latestExpectedOffset);
+
+      const originalSize = window.getSize();
+      const originalZoom = window.webContents.getZoomFactor();
+      const widthBeforeResize = Number(await evaluate(`document.querySelector('.view-area.chat-view-area')?.clientWidth ?? 0`));
+      try {
+        window.setSize(originalSize[0] + 60, originalSize[1]);
+        await waitUntil(`${name} resize changes the actual chat viewport`, async () =>
+          Number(await evaluate(`document.querySelector('.view-area.chat-view-area')?.clientWidth ?? 0`)) > widthBeforeResize + 10);
+        const resizedLatestOffset = await navigationExpectedOffset(latestId, `${name} latest target geometry after resize`);
+        await waitForTargetOffset(latestId, `${name} ResizeObserver preserves the armed latest anchor before another delta`, resizedLatestOffset);
+        window.setSize(originalSize[0], originalSize[1]);
+        await waitUntil(`${name} viewport returns to its original width`, async () =>
+          Math.abs(Number(await evaluate(`document.querySelector('.view-area.chat-view-area')?.clientWidth ?? 0`)) - widthBeforeResize) <= 2);
+        const restoredLatestOffset = await navigationExpectedOffset(latestId, `${name} latest target geometry after restoring width`);
+        await waitForTargetOffset(latestId, `${name} restored width keeps the latest anchor in place`, restoredLatestOffset);
+      } finally {
+        window.webContents.setZoomFactor(originalZoom);
+        window.setSize(originalSize[0], originalSize[1]);
+      }
+
+      const firstStream = {
+        ...stage5Turn, draft: `Первая часть потока. ${'Ответ продолжается без потери текущего хода. '.repeat(170)}STAGE5_STREAM_END_1`, activeDurationMs: 1200,
+      };
+      publishStage5Turn(firstStream);
+      await waitDom(`${name} streaming text reaches its first long delta`, `document.querySelector('.transcript-draft')?.textContent.includes('STAGE5_STREAM_END_1')`);
+      await waitUntil(`${name} a near-end reader follows the stream to the bottom`, () => evaluate(`(() => {
+        const area = document.querySelector('.view-area.chat-view-area');
+        return Boolean(area) && area.scrollHeight - area.clientHeight - area.scrollTop <= 120;
+      })()`));
+
+      await moveMarkIntoRailView(hoverId);
+      const olderClickExpectedOffset = await navigationExpectedOffset(hoverId, `${name} older target geometry before pointer activation`);
+      await sendVisibleMouseClick(hoverSelector);
+      await waitForTargetOffset(hoverId, `${name} selecting an older request places its user message in view`, olderClickExpectedOffset);
+      const oldOffsetBeforeDelta = await targetOffset(hoverId);
+      await evaluate(`document.querySelector(${JSON.stringify(hoverSelector)})?.focus()`);
+      const olderSpaceExpectedOffset = await navigationExpectedOffset(hoverId, `${name} older target geometry before Space`);
+      await sendNativeButtonKey('SPACE', ' ');
+      await waitForTargetOffset(hoverId, `${name} Space activates the focused older request`, olderSpaceExpectedOffset);
+      const oldStream = {
+        ...firstStream, draft: `${firstStream.draft}\n${'Ещё один пакет текста не должен уводить чтение вниз. '.repeat(150)}STAGE5_STREAM_END_2`, activeDurationMs: 2400,
+      };
+      publishStage5Turn(oldStream);
+      await waitDom(`${name} older reader receives another stream delta`, `document.querySelector('.transcript-draft')?.textContent.includes('STAGE5_STREAM_END_2')`);
+      await waitUntil(`${name} old user anchor remains at its saved viewport offset`, async () => {
+        const offset = await targetOffset(hoverId);
+        return offset !== null && Math.abs(offset - oldOffsetBeforeDelta) <= 3;
+      });
+      const readingGap = Number(await evaluate(`(() => {
+        const area = document.querySelector('.view-area.chat-view-area');
+        return area ? area.scrollHeight - area.clientHeight - area.scrollTop : 0;
+      })()`));
+      assert.ok(readingGap > 120, `${name}: reading an older request does not snap to the streaming end`);
+
+      const oldOffsetBeforeSwitch = await targetOffset(hoverId);
+      await clickChat('Chat A');
+      await waitDom(`${name} navigation fixture switches to the other chat`, `document.querySelector('.chat-header-title')?.textContent === 'Chat A'`);
+      await clickChat('Chat B');
+      await waitDom(`${name} navigation fixture returns to the correct chat and loaded history`, `document.querySelector('.chat-header-title')?.textContent === 'Chat B'
+        && document.querySelector('[data-message-id="${hoverId}"]')`);
+      await waitUntil(`${name} switching chats restores the same user target and offset`, async () => {
+        const offset = await targetOffset(hoverId);
+        return offset !== null && Math.abs(offset - oldOffsetBeforeSwitch) <= 3;
+      });
+      await waitUntil(`${name} the stream remains attached to its own request after chat restore`, () =>
+        evaluate(`document.querySelector('.transcript-draft')?.textContent.includes('STAGE5_STREAM_END_2')`));
+      const areaBeforeWheel = JSON.parse(await evaluate(`JSON.stringify((() => {
+        const area = document.querySelector('.view-area.chat-view-area');
+        const rect = area?.getBoundingClientRect();
+        return { scrollTop: area?.scrollTop ?? 0, x: rect ? rect.left + rect.width / 2 : 0, y: rect ? rect.top + rect.height / 2 : 0 };
+      })())`));
+      window.show();
+      window.focus();
+      window.webContents.focus();
+      await waitUntil(`${name} native wheel target window has focus`, () => window.isFocused());
+      const wheelZoom = window.webContents.getZoomFactor();
+      await evaluate(`(() => {
+        const area = document.querySelector('.view-area.chat-view-area');
+        window.__auditNavigationWheel = null;
+        area?.addEventListener('wheel', (event) => {
+          window.__auditNavigationWheel = { deltaY: event.deltaY, targetInArea: area.contains(event.target) };
+        }, { once: true, capture: true });
+      })()`);
+      window.webContents.sendInputEvent({ type: 'mouseMove', x: Math.round(areaBeforeWheel.x * wheelZoom),
+        y: Math.round(areaBeforeWheel.y * wheelZoom) });
+      window.webContents.sendInputEvent({ type: 'mouseWheel', x: Math.round(areaBeforeWheel.x * wheelZoom),
+        y: Math.round(areaBeforeWheel.y * wheelZoom), deltaX: 0, deltaY: -420 });
+      await waitUntil(`${name} native wheel still scrolls the chat view`, () =>
+        evaluate(`document.querySelector('.view-area.chat-view-area')?.scrollTop > ${areaBeforeWheel.scrollTop + 20}
+          && window.__auditNavigationWheel?.deltaY > 0 && window.__auditNavigationWheel?.targetInArea === true`));
+      const cancelledStage5Turn = {
+        ...stage5Turn, status: 'cancelled', endedAt: new Date(Date.parse(timestamp) + 3000).toISOString(),
+        queueDurationMs: 0, activeDurationMs: 2400, activity: [], draft: '',
+      };
+      publishStage5Turn(cancelledStage5Turn);
+      await waitDom(`${name} synthetic stream reaches a terminal state before the theme capture`, `document.querySelector(${JSON.stringify(latestSelector)})?.getAttribute('aria-label').includes('Остановлено')`);
+
+      const originalWindowSize = window.getSize();
+      const originalWindowZoom = window.webContents.getZoomFactor();
+      try {
+        window.webContents.setZoomFactor(1);
+        window.setSize(600, originalWindowSize[1]);
+        await waitUntil(`${name} narrow chat viewport is ready`, () => evaluate(`innerWidth <= 620
+          && document.querySelector('.view-area.chat-view-area')?.clientWidth > 0`));
+        const narrow = await inspectRail();
+        assert.deepEqual(narrow.marks.map((mark) => mark.id), expectedUserIds,
+          `${name}: all request targets remain available in a narrow chat pane`);
+        assert.ok(narrow.area.width < 620 && narrow.nav.right < narrow.history.left
+          && narrow.nav.bottom <= narrow.area.bottom + 1,
+        `${name}: the narrow rail remains inside the measured scroll owner: ${JSON.stringify(narrow)}`);
+        assert.ok(narrow.composer.height > 0 && narrow.composer.bottom <= narrow.viewportHeight + 2,
+          `${name}: the composer remains visible and outside the rail in a narrow window: ${JSON.stringify(narrow)}`);
+        await capture('stage5-request-navigation-narrow');
+      } finally {
+        window.webContents.setZoomFactor(originalWindowZoom);
+        window.setSize(originalWindowSize[0], originalWindowSize[1]);
+        await waitUntil(`${name} theme viewport is restored after the narrow rail check`, () => evaluate(`innerWidth > 620`));
+      }
+      await movePointerTo('.chat-header-title');
+      await evaluate(`document.activeElement?.blur()`);
+      await evaluate(`document.querySelector('[data-message-id="stage4-theme-user"]')?.scrollIntoView({ block: 'center' })`);
+      await movePointerTo('.chat-header-title');
+      assert.equal(previousRuntimeTurns.some((turn) => turn.id === stage5Turn.id), false,
+        `${name}: the test-only turn ID does not collide with earlier runtime state`);
+      passed('Rendered request rail maps user IDs, expands one mark, supports mouse/keyboard, and preserves scroll anchors through streaming, resize and chat switches');
+    };
     const captureChatTranscriptTheme = async (name) => {
       await waitDom(`${name} linked transcript is visible`, `document.querySelector('[data-message-id="stage4-theme-user"]')
         && document.querySelector('[data-turn-id="stage4-theme-turn"]')
@@ -4142,6 +4554,10 @@ async function runElectronHost() {
       await evaluate(`document.activeElement?.blur()`);
       await evaluate(`document.querySelector('[data-message-id="stage4-theme-user"]')?.scrollIntoView({ block: 'center' })`);
       await movePointerTo('.chat-header-title');
+      if (!stage5NavigationChecked) {
+        await verifyStage5Navigation(name);
+        stage5NavigationChecked = true;
+      }
       const readShortBubbleState = async () => JSON.parse(await evaluate(`JSON.stringify((() => {
         const history = document.querySelector('.chat-history');
         const anchor = document.querySelector('[data-message-id="stage4-theme-user"]');
@@ -4256,6 +4672,7 @@ async function runElectronHost() {
     ];
     const themeSamples = [];
     const browserWorkspaceThemeSamples = [];
+    let stage5NavigationChecked = false;
     await clickChat('Chat B');
     await waitDom('Chat B is active before setting the transcript theme viewport', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'`);
     await click('button[aria-label="Показать браузер"]');
@@ -4359,6 +4776,25 @@ async function runElectronHost() {
           assert.notEqual(workspaceThemeSample.toggleColor, 'rgba(0, 0, 0, 0)', `${themeCase.label}: actual workspace action icon has a resolved color`);
           assert.equal(workspaceThemeSample.togglePressed, String(full), `${themeCase.label}: actual workspace icon state matches split/full mode`);
           assert.ok(workspaceThemeSample.iconStroke && workspaceThemeSample.iconPath, `${themeCase.label}: actual workspace button renders its SVG icon`);
+          if (!full && index === 0) {
+            const splitRail = JSON.parse(await evaluate(`JSON.stringify((() => {
+              const box = (selector) => {
+                const element = document.querySelector(selector);
+                if (!element) return null;
+                const rect = element.getBoundingClientRect();
+                return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width, height: rect.height };
+              };
+              return { area: box('.view-area.chat-view-area'), nav: box('.chat-navigation'),
+                history: box('.chat-history'), browser: box('.browser-pane'), composer: box('.composer-stack') };
+            })())`));
+            assert.ok(splitRail.area?.width > 0 && splitRail.nav?.width > 0 && splitRail.browser?.width > 0,
+              `split layout shows both chat rail and browser pane: ${JSON.stringify(splitRail)}`);
+            assert.ok(splitRail.nav.left >= splitRail.area.left - 1 && splitRail.nav.right < splitRail.history.left
+              && splitRail.area.right <= splitRail.browser.left + 1,
+            `split rail stays inside the chat pane without covering the browser: ${JSON.stringify(splitRail)}`);
+            assert.ok(splitRail.composer.height > 0, `split layout keeps the composer available: ${JSON.stringify(splitRail)}`);
+            await capture('stage5-request-navigation-split');
+          }
           browserWorkspaceThemeSamples.push({ requested: themeCase.value, resolved: resolvedTheme, ...workspaceThemeSample });
           await capture(`browser-workspace-theme-${themeCase.value}-${full ? 'full' : 'split'}`);
           if (full) {
