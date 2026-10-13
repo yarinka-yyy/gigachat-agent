@@ -522,7 +522,7 @@ test('schema 8 home-send journal recovers linked local files without inventing a
   assert.equal(accepted?.turn.messages[0]?.attachmentIds, undefined);
   assert.deepEqual(await readFile(await recovered.getArtifactPath(detail.id, staged.attachments[0]!.id)), Buffer.from('local bytes from schema 8'));
   const savedChat = JSON.parse(await readFile(join(directory, 'chats', detail.id, 'chat.json'), 'utf8')) as Record<string, unknown>;
-  assert.equal(savedChat.schemaVersion, 10);
+  assert.equal(savedChat.schemaVersion, 11);
 });
 
 test('schema 8 compact snapshot validates against its original linked-file prefix then upgrades the hash', async (t) => {
@@ -560,7 +560,7 @@ test('schema 8 compact snapshot validates against its original linked-file prefi
   assert.equal(detail.compactSnapshot?.coveredPrefixHash, hashCompactionPrefix(detail.messages, []));
   assert.equal(await readFile(await restored.getArtifactPath(chat.id, pendingId), 'utf8'), 'local attachment bytes');
   const saved = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown>;
-  assert.equal(saved.schemaVersion, 10);
+  assert.equal(saved.schemaVersion, 11);
   assert.deepEqual((saved.compactSnapshot as CompactSnapshot).coveredPrefixHash, detail.compactSnapshot?.coveredPrefixHash);
 });
 
@@ -1187,7 +1187,7 @@ test('migrates v1 projects, chats, drafts, and theme without losing data', async
   assert.equal(JSON.parse(await readFile(join(directory, 'projects.json'), 'utf8')).schemaVersion, 2);
   assert.equal(JSON.parse(await readFile(join(directory, 'chats.json'), 'utf8')).schemaVersion, 1);
   assert.equal(await readFile(join(directory, 'chats.json.bak'), 'utf8'), await readFile(join(directory, 'chats.json'), 'utf8'));
-  assert.equal(JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')).schemaVersion, 10);
+  assert.equal(JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')).schemaVersion, 11);
   assert.equal(JSON.parse(await readFile(join(directory, 'settings.json'), 'utf8')).schemaVersion, 10);
   await store.deleteChat(chat.id);
   assert.deepEqual(await (await openStore(directory)).listChats(), []);
@@ -1245,7 +1245,7 @@ test('unfinished legacy migration preserves existing invalid chat details', asyn
         assert.deepEqual(restored.messages, kind === 'valid' ? detail.messages : []);
         if (validUnmarkedLegacyDetail) {
           const migratedDetail = JSON.parse(await readFile(detailPath, 'utf8')) as Record<string, unknown>;
-          assert.equal(migratedDetail.schemaVersion, 10);
+          assert.equal(migratedDetail.schemaVersion, 11);
           assert.equal(migratedDetail.compactSnapshot, null);
           assert.equal(migratedDetail.draft, 'newer draft');
         }
@@ -1581,8 +1581,74 @@ test('schema 9 compact metadata survives turn-record migration without invented 
   assert.deepEqual(migrated.compactSnapshot, snapshot);
   assert.deepEqual(migrated.turns, [], 'schema 9 history has no reliable turn metadata to invent');
   const saved = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  assert.equal(saved.schemaVersion, 10);
+  assert.equal(saved.schemaVersion, 11);
   assert.deepEqual(saved.compactSnapshot, snapshot);
+});
+
+test('migrates a schema 10 chat to 11 without rewriting attachment links, raw usage, or unknown Skill history', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-chat-v10-usage-migration-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = join(directory, 'linked.txt');
+  await writeFile(source, 'schema ten attachment bytes', 'utf8');
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Pro' });
+  const staged = await store.stageChatDraftFile(chat.id, source);
+  const attachmentId = staged.draftAttachments[0]?.id;
+  assert.ok(attachmentId);
+  const accepted = await store.acceptLocalMessage(chat.id, 'Сохранить принятую историю.', 'turn-v10-preserved', [attachmentId]);
+  await appendAcceptedAnswer(store, accepted.turn, 'Исторический ответ.');
+  await store.updateChat(chat.id, { draft: 'Оставить текущий черновик.' });
+  const prefix = await store.getCompactionPrefix(chat.id, accepted.turn.messageId);
+  const snapshot: CompactSnapshot = {
+    id: 'schema-ten-compact', version: 1, boundaryMessageId: accepted.turn.messageId,
+    coveredThroughMessageId: prefix.coveredThroughMessageId, coveredPrefixHash: prefix.coveredPrefixHash,
+    text: 'Сводка прежней истории.', modelId: 'GigaChat-3-Pro', provenance: 'fixture', createdAt: timestamp,
+  };
+  await store.commitCompactSnapshot(chat.id, snapshot, null);
+  const usage = {
+    localRequestId: '44444444-4444-4444-8444-444444444444', chatId: chat.id,
+    requestKind: 'chat' as const, modelId: 'GigaChat-3-Pro', providerRequestId: 'schema-ten-request',
+    providerModel: 'GigaChat-3-Pro:fixture', createdAt: timestamp, status: 'completed' as const,
+    promptTokens: 31, completionTokens: 7, totalTokens: 38, precachedPromptTokens: 4, conflictedFields: [],
+  };
+  await store.recordUsageReceipt(usage);
+  const before = await store.getChat(chat.id);
+  const usageBefore = await store.getUsageLedger();
+
+  const chatPath = join(directory, 'chats', chat.id, 'chat.json');
+  const schemaTen = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown>;
+  schemaTen.schemaVersion = 10;
+  for (const value of schemaTen.turns as Array<Record<string, unknown>>) {
+    delete value.pendingSkillId;
+    delete value.invokedSkillId;
+  }
+  await writeFile(chatPath, JSON.stringify(schemaTen), 'utf8');
+
+  const restored = await openStore(directory);
+  const migrated = await restored.getChat(chat.id);
+  assert.deepEqual(migrated.messages, before.messages);
+  assert.deepEqual(migrated.artifacts, before.artifacts);
+  assert.deepEqual(migrated.draftAttachments, before.draftAttachments);
+  assert.deepEqual(migrated.messages[0]?.attachmentIds, [attachmentId]);
+  assert.equal(migrated.draft, 'Оставить текущий черновик.');
+  assert.deepEqual(migrated.compactSnapshot, snapshot);
+  const withoutSkillMetadata = (turn: (typeof before.turns)[number]): Record<string, unknown> => {
+    const copy: Record<string, unknown> = { ...turn };
+    delete copy.pendingSkillId;
+    delete copy.invokedSkillId;
+    return copy;
+  };
+  assert.deepEqual(migrated.turns.map(withoutSkillMetadata), before.turns.map(withoutSkillMetadata));
+  assert.equal(migrated.turns[0]?.turnId, accepted.turn.turnId);
+  assert.equal(migrated.turns[0]?.invokedSkillId, undefined, 'schema 10 has no reliable Skill-use marker');
+  assert.deepEqual(await restored.getUsageLedger(), usageBefore);
+  assert.equal((await restored.getUsageLedger()).totalTokens.knownTokens, 38);
+  assert.equal((await restored.getUsageProfileView(0)).skills.unknownTurnCount, 1,
+    'legacy completed turn remains unknown rather than being migrated to known-no-Skill');
+  const saved = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown>;
+  assert.equal(saved.schemaVersion, 11);
+  assert.equal(((saved.turns as Array<Record<string, unknown>>)[0])?.invokedSkillId, undefined);
 });
 
 test('schema 9 home-send journal recovers a stable interrupted turn without replaying it', async (t) => {
@@ -1632,7 +1698,7 @@ test('schema 9 home-send journal recovers a stable interrupted turn without repl
   assert.equal(detail.messages.some((message) => message.role === 'assistant'), false);
   assert.deepEqual(accepted?.turn.messages.map((message) => message.id), [detail.messages[0]?.id]);
   assert.equal(await readFile(source, 'utf8'), 'preserved local source');
-  assert.equal((JSON.parse(await readFile(join(directory, 'chats', detail.id, 'chat.json'), 'utf8')) as Record<string, unknown>).schemaVersion, 10);
+  assert.equal((JSON.parse(await readFile(join(directory, 'chats', detail.id, 'chat.json'), 'utf8')) as Record<string, unknown>).schemaVersion, 11);
 });
 
 test('persists each provider pairing while reusing a completed side effect for a new state ID', async (t) => {
@@ -1685,7 +1751,7 @@ test('migrates existing chat detail schema 3 and preserves its draft', async (t)
   assert.equal((await restored.getChat(chat.id)).draft, 'Сохранённый черновик');
   assert.equal((await restored.getChat(chat.id)).nextTurnPermissionProfile, null);
   const migrated = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  assert.equal(migrated.schemaVersion, 10);
+  assert.equal(migrated.schemaVersion, 11);
   assert.equal(migrated.nextTurnPermissionProfile, null);
   assert.equal(migrated.nextTurnSkillId, null);
 });
@@ -1712,7 +1778,7 @@ test('migrates schema 8 with an empty pending list and preserves legacy messageI
   assert.equal(detail.artifacts[0]?.messageId, null);
   assert.deepEqual(detail.draftAttachments, []);
   const saved = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  assert.equal(saved.schemaVersion, 10);
+  assert.equal(saved.schemaVersion, 11);
   assert.deepEqual(saved.draftAttachments, []);
 });
 
@@ -1736,7 +1802,7 @@ test('migrates chat detail schema 4 to 5 without changing history or artifacts',
   assert.equal(detail.nextTurnSkillId, null);
   assert.equal(detail.draft, 'Черновик');
   assert.equal(detail.messages[0]?.text, 'Сохранённая история');
-  assert.equal(JSON.parse(await readFile(path, 'utf8')).schemaVersion, 10);
+  assert.equal(JSON.parse(await readFile(path, 'utf8')).schemaVersion, 11);
 });
 
 test('migrates previous settings and chat schemas with an empty model choice', async (t) => {
@@ -1759,7 +1825,7 @@ test('migrates previous settings and chat schemas with an empty model choice', a
   assert.equal((await restored.getChat(chat.id)).modelId, null);
   assert.equal((await restored.getSettings()).defaultModelId, null);
   assert.equal((await restored.getSettings()).microphoneConsent, 'unasked');
-  assert.equal(JSON.parse(await readFile(chatPath, 'utf8')).schemaVersion, 10);
+  assert.equal(JSON.parse(await readFile(chatPath, 'utf8')).schemaVersion, 11);
   assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).schemaVersion, 10);
 });
 
@@ -2418,4 +2484,260 @@ test('refuses symlinked app-owned paths after the store has opened', async (t) =
   await assert.rejects(store.getChatFolder(chat.id), /символическую ссылку/);
   await assert.rejects(store.deleteChat(chat.id), /символическую ссылку/);
   assert.equal(await readFile(join(outside, 'keep.txt'), 'utf8'), 'outside');
+});
+
+test('cancellation during a committed prepared-Skill save clears pending use before the first provider step and releases FIFO', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-skill-pending-cancel-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Pro', nextTurnSkillId: 'global/review' });
+  const first = await store.acceptLocalMessage(chat.id, 'Отменить до первого шага.', 'turn-skill-cancel-before-next');
+  await store.updateChat(chat.id, { nextTurnSkillId: null });
+  const second = await store.acceptLocalMessage(chat.id, 'Следующий ход.', 'turn-skill-cancel-next');
+  const pendingSaved = deferred();
+  const saveGate = deferred();
+  const secondTerminal = deferred();
+  const firstIteratorSteps: string[] = [];
+  const provider: GigaChatProvider = {
+    stream: async function* (request): AsyncGenerator<ProviderEvent> {
+      const prompt = request.messages[request.messages.length - 1]?.text ?? '';
+      firstIteratorSteps.push(prompt);
+      yield { type: 'text-delta', text: `Ответ: ${prompt}` };
+      yield { type: 'completed' };
+    },
+  };
+  let heldPendingSave = false;
+  const runtime = createTurnRuntime({
+    provider,
+    tools: {} as never,
+    prepareTurn: async (turn) => ({
+      system: turn.skillId ? [{ source: 'skill' as const, label: 'Skill', text: 'Инструкции Skill.' }] : [],
+      messages: structuredClone(turn.messages),
+      modelId: turn.modelId,
+      permissionProfile: turn.permissionProfile,
+    }),
+    consumeTurn: (turn, signal) => store.consumeTurnReservation(turn, signal),
+    releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
+    persistTurnRecord: async (snapshot) => {
+      await store.updateRuntimeTurn(snapshot);
+      if (!heldPendingSave && snapshot.id === first.turn.turnId && snapshot.status === 'running'
+        && snapshot.pendingSkillId === 'global/review' && snapshot.invokedSkillId === null) {
+        heldPendingSave = true;
+        pendingSaved.resolve();
+        await saveGate.promise;
+      }
+    },
+    recordUsageReceipt: (receipt) => store.recordUsageReceipt(receipt),
+    appendAssistant: async (turn, text, signal, functionsStateId, terminalTurn) => {
+      await store.appendAssistantMessageFromRuntime(turn, text, terminalTurn!, signal, functionsStateId);
+    },
+    onUpdate: (snapshot) => {
+      if (snapshot.id === second.turn.turnId && ['completed', 'failed', 'cancelled'].includes(snapshot.status)) {
+        secondTerminal.resolve();
+      }
+    },
+  });
+
+  const firstRuntimeId = runtime.enqueue(first.turn);
+  assert.ok(firstRuntimeId);
+  assert.ok(runtime.enqueue(second.turn));
+  await pendingSaved.promise;
+  const beforeCancel = await store.getChat(chat.id);
+  const pendingRecord = beforeCancel.turns.find((turn) => turn.turnId === first.turn.turnId);
+  assert.equal(pendingRecord?.pendingSkillId, 'global/review', 'the pending marker is durably committed before cancellation');
+  assert.equal(pendingRecord?.invokedSkillId, null);
+  assert.equal(firstIteratorSteps.length, 0);
+
+  assert.equal(runtime.cancel(firstRuntimeId), true);
+  await assert.rejects(runtime.whenIdle(), /очередь приостановлена/i);
+  saveGate.resolve();
+  await secondTerminal.promise;
+  await runtime.whenIdle();
+
+  const reloaded = await openStore(directory);
+  const detail = await reloaded.getChat(chat.id);
+  const cancelled = detail.turns.find((turn) => turn.turnId === first.turn.turnId);
+  const completed = detail.turns.find((turn) => turn.turnId === second.turn.turnId);
+  assert.equal(cancelled?.status, 'cancelled');
+  assert.equal(cancelled?.pendingSkillId, null);
+  assert.equal(cancelled?.invokedSkillId, null, 'cancellation before iterator.next is a known non-invocation');
+  assert.equal(completed?.status, 'completed');
+  assert.deepEqual(firstIteratorSteps, ['Следующий ход.']);
+  const view = await reloaded.getUsageProfileView(0);
+  assert.equal(view.skills.invocationCount, 0);
+  assert.equal(view.skills.unknownTurnCount, 0);
+});
+
+test('confirms one durable Skill invocation across provider tool continuations', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-skill-confirmed-continuation-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Pro', nextTurnSkillId: 'global/review' });
+  const accepted = await store.acceptLocalMessage(chat.id, 'Прочитай файл.', 'turn-skill-continuation');
+  const requests: ProviderTurnRequest[] = [];
+  const provider: GigaChatProvider = {
+    stream: async function* (request): AsyncGenerator<ProviderEvent> {
+      requests.push(structuredClone(request));
+      if (requests.length === 1) {
+        yield {
+          type: 'function-call',
+          functionCall: {
+            name: 'read', arguments: { path: 'fixture.txt' }, content: null,
+            functionsStateId: 'skill-continuation-state', terminalReason: 'function_call',
+          },
+        };
+        return;
+      }
+      yield { type: 'text-delta', text: 'Файл прочитан.' };
+      yield { type: 'completed' };
+    },
+  };
+  const runtime = createTurnRuntime({
+    provider,
+    tools: { read: async () => 'synthetic fixture bytes' } as never,
+    prepareTurn: async (turn) => ({
+      system: turn.skillId ? [{ source: 'skill' as const, label: 'Skill', text: 'Инструкции Skill.' }] : [],
+      messages: structuredClone(turn.messages),
+      modelId: turn.modelId,
+      permissionProfile: turn.permissionProfile,
+    }),
+    consumeTurn: (turn, signal) => store.consumeTurnReservation(turn, signal),
+    releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
+    persistTurnRecord: (turn) => store.updateRuntimeTurn(turn),
+    recordUsageReceipt: (receipt) => store.recordUsageReceipt(receipt),
+    beginToolReceipt: (turn, receipt) => store.beginToolReceipt(turn.chatId, turn.messageId, receipt),
+    completeToolReceipt: (turn, receiptId, status, result) => store.completeToolReceipt(turn.chatId, turn.messageId, receiptId, status, result),
+    appendAssistant: async (turn, text, signal, functionsStateId, terminalTurn) => {
+      await store.appendAssistantMessageFromRuntime(turn, text, terminalTurn!, signal, functionsStateId);
+    },
+  });
+
+  assert.ok(runtime.enqueue(accepted.turn));
+  await runtime.whenIdle();
+
+  const reloaded = await openStore(directory);
+  const detail = await reloaded.getChat(chat.id);
+  const turn = detail.turns.find((item) => item.turnId === accepted.turn.turnId);
+  assert.equal(requests.length, 2);
+  assert.ok(requests.every((request) => request.system.some((layer) => layer.source === 'skill')));
+  assert.equal(turn?.status, 'completed');
+  assert.equal(turn?.pendingSkillId, null);
+  assert.equal(turn?.invokedSkillId, 'global/review');
+  assert.equal((await reloaded.getUsageProfileView(0)).skills.invocationCount, 1);
+  assert.ok(turn && turn.status === 'completed');
+  const tampered: RuntimeTurnSnapshot = {
+    id: turn.turnId, chatId: chat.id, anchorMessageId: turn.anchorMessageId,
+    assistantMessageId: turn.assistantMessageId, modelId: turn.modelId, status: 'completed',
+    createdAt: turn.createdAt,
+    ...(turn.startedAt ? { startedAt: turn.startedAt } : {}),
+    ...(turn.endedAt ? { endedAt: turn.endedAt } : {}),
+    ...(turn.queueDurationMs === undefined ? {} : { queueDurationMs: turn.queueDurationMs }),
+    ...(turn.activeDurationMs === undefined ? {} : { activeDurationMs: turn.activeDurationMs }),
+    pendingSkillId: null, invokedSkillId: 'global/another-skill', activity: turn.activity,
+  };
+  await assert.rejects(reloaded.updateRuntimeTurn(tampered), /Фактически использованный Skill не может быть изменён/);
+  assert.equal((await reloaded.getChat(chat.id)).turns.find((item) => item.turnId === turn.turnId)?.invokedSkillId,
+    'global/review', 'the rejected update must preserve the immutable confirmed Skill ID');
+});
+
+test('observes a rejected first provider step while durable Skill confirmation is pending', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-skill-next-rejection-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Pro', nextTurnSkillId: 'global/review' });
+  const first = await store.acceptLocalMessage(chat.id, 'Первый запрос завершится транспортной ошибкой.', 'turn-skill-next-reject');
+  await store.updateChat(chat.id, { nextTurnSkillId: null });
+  const second = await store.acceptLocalMessage(chat.id, 'Следующий запрос должен продолжиться.', 'turn-skill-next-after-reject');
+  const confirmationCommitted = deferred();
+  const confirmationGate = deferred();
+  const firstStepInvoked = deferred();
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+  process.on('unhandledRejection', onUnhandled);
+  t.after(() => process.off('unhandledRejection', onUnhandled));
+  let heldConfirmation = false;
+  const provider: GigaChatProvider = {
+    stream: async function* (request): AsyncGenerator<ProviderEvent> {
+      const prompt = request.messages[request.messages.length - 1]?.text ?? '';
+      if (prompt === 'Первый запрос завершится транспортной ошибкой.') {
+        firstStepInvoked.resolve();
+        throw new Error('synthetic immediate provider rejection');
+      }
+      yield { type: 'text-delta', text: 'Второй ответ.' };
+      yield { type: 'completed' };
+    },
+  };
+  const runtime = createTurnRuntime({
+    provider,
+    tools: {} as never,
+    prepareTurn: async (turn) => ({
+      system: turn.skillId ? [{ source: 'skill' as const, label: 'Skill', text: 'Инструкции Skill.' }] : [],
+      messages: structuredClone(turn.messages),
+      modelId: turn.modelId,
+      permissionProfile: turn.permissionProfile,
+    }),
+    consumeTurn: (turn, signal) => store.consumeTurnReservation(turn, signal),
+    releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
+    persistTurnRecord: async (snapshot) => {
+      await store.updateRuntimeTurn(snapshot);
+      if (!heldConfirmation && snapshot.id === first.turn.turnId && snapshot.invokedSkillId === 'global/review'
+        && snapshot.pendingSkillId === null && snapshot.status === 'running') {
+        heldConfirmation = true;
+        confirmationCommitted.resolve();
+        await confirmationGate.promise;
+      }
+    },
+    recordUsageReceipt: (receipt) => store.recordUsageReceipt(receipt),
+    appendAssistant: async (turn, text, signal, functionsStateId, terminalTurn) => {
+      await store.appendAssistantMessageFromRuntime(turn, text, terminalTurn!, signal, functionsStateId);
+    },
+  });
+
+  assert.ok(runtime.enqueue(first.turn));
+  assert.ok(runtime.enqueue(second.turn));
+  await confirmationCommitted.promise;
+  await firstStepInvoked.promise;
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.deepEqual(unhandled, [], 'the first next() rejection is observed during the delayed durable confirmation');
+  confirmationGate.resolve();
+  await runtime.whenIdle();
+
+  const reloaded = await openStore(directory);
+  const detail = await reloaded.getChat(chat.id);
+  const failed = detail.turns.find((turn) => turn.turnId === first.turn.turnId);
+  const completed = detail.turns.find((turn) => turn.turnId === second.turn.turnId);
+  assert.equal(failed?.status, 'failed');
+  assert.equal(failed?.invokedSkillId, 'global/review', 'the Skill is confirmed once iterator.next() was invoked, even if it rejects immediately');
+  assert.equal(failed?.pendingSkillId, null);
+  assert.equal(completed?.status, 'completed');
+  assert.equal((await reloaded.getUsageProfileView(0)).skills.invocationCount, 1);
+});
+
+test('reload preserves an interrupted pending Skill as unknown instead of recording a false invocation', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-skill-pending-interrupted-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Pro' });
+  const accepted = await store.acceptLocalMessage(chat.id, 'Возможный вызов.', 'turn-skill-pending-interrupted');
+  const running: RuntimeTurnSnapshot = {
+    id: accepted.turn.turnId, chatId: chat.id, anchorMessageId: accepted.turn.messageId,
+    assistantMessageId: accepted.turn.assistantMessageId, modelId: accepted.turn.modelId,
+    status: 'running', createdAt: accepted.turn.messages[accepted.turn.messages.length - 1]!.createdAt,
+    startedAt: timestamp, pendingSkillId: 'global/review', invokedSkillId: null, activity: [],
+  };
+  await store.updateRuntimeTurn(running);
+
+  const reloaded = await openStore(directory);
+  const detail = await reloaded.getChat(chat.id);
+  const recovered = detail.turns.find((turn) => turn.turnId === accepted.turn.turnId);
+  assert.equal(recovered?.status, 'interrupted');
+  assert.equal(recovered?.pendingSkillId, 'global/review');
+  assert.equal(recovered?.invokedSkillId, null);
+  const view = await reloaded.getUsageProfileView(0);
+  assert.equal(view.skills.invocationCount, 0);
+  assert.equal(view.skills.unknownTurnCount, 1);
 });

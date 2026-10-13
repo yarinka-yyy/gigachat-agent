@@ -152,6 +152,8 @@ function copyTurn(turn: RuntimeTurn): RuntimeTurnSnapshot {
     assistantMessageId: turn.input.assistantMessageId,
     ...(turn.input.operation ? { operation: turn.input.operation } : {}),
     modelId: turn.input.modelId,
+    pendingSkillId: turn.pendingSkillId ?? null,
+    invokedSkillId: turn.invokedSkillId ?? null,
     status: turn.status,
     createdAt: turn.createdAt,
     ...(turn.startedAt ? { startedAt: turn.startedAt } : {}),
@@ -698,6 +700,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     let interruptHooksRan = false;
     let reservationConsumed = false;
     let turnTimedOut = false;
+    let providerCallStarted = false;
     let answer = '';
     let activeUsageReceipt: UsageReceipt | null = null;
     let usagePersistenceTimedOut = false;
@@ -917,13 +920,46 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         await persistUsageReceipt(initialUsagePersistence);
         activeUsageReceipt = usageReceipt;
         if (controller.signal.aborted) throw abortError();
+        if (toolRounds === 0 && turn.input.operation !== 'compaction' && turn.input.skillId
+          && request.system.some((layer) => layer.source === 'skill' && layer.text.trim().length > 0)) {
+          turn.pendingSkillId = turn.input.skillId;
+          await waitTracked(
+            scheduleTurnRecord(turn),
+            operationTimeoutMs,
+            'TURN_RECORD_SAVE_TIMEOUT',
+            'Сохранение подготовки Skill ожидается; очередь приостановлена.',
+          );
+          if (controller.signal.aborted) {
+            turn.pendingSkillId = null;
+            throw abortError();
+          }
+        }
         stopState.streamConfirmed = false;
         iterator = options.provider.stream(request, controller.signal)[Symbol.asyncIterator]();
         let completed = false;
         let completedFunctionsStateId: string | undefined;
         let functionCall: ProviderFunctionCall | null = null;
         for (;;) {
-          pendingNext = Promise.resolve().then(() => iterator!.next());
+          if (!providerCallStarted) {
+            let firstNext: Promise<IteratorResult<ProviderEvent>>;
+            try { firstNext = iterator.next(); }
+            finally { providerCallStarted = true; }
+            pendingNext = Promise.resolve(firstNext);
+            void pendingNext.catch(() => undefined);
+            if (turn.pendingSkillId) {
+              turn.invokedSkillId = turn.pendingSkillId;
+              turn.pendingSkillId = null;
+              await waitTracked(
+                scheduleTurnRecord(turn),
+                operationTimeoutMs,
+                'TURN_RECORD_SAVE_TIMEOUT',
+                'Сохранение использования Skill ожидается; очередь приостановлена.',
+              );
+              if (controller.signal.aborted) throw abortError();
+            }
+          } else {
+            pendingNext = Promise.resolve().then(() => iterator!.next());
+          }
           const result = await waitFor(pendingNext, controller.signal, nextTimeoutMs, 'PROVIDER_STEP_TIMEOUT');
           pendingNext = null;
           if (controller.signal.aborted) throw abortError();
@@ -1187,6 +1223,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         break;
       }
     } catch (error) {
+      if (!providerCallStarted) turn.pendingSkillId = null;
       flushDraft();
       if (!turn.cancelRequested && !isAbortError(error) && !naturallyDone) controller.abort();
       if (!(await confirmStop(turn, iterator, pendingNext, naturallyDone))) {
@@ -1318,6 +1355,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       anchorMessageId: input.messageId,
       assistantMessageId: input.assistantMessageId,
       status: 'queued',
+      pendingSkillId: null,
+      invokedSkillId: null,
       createdAt: queuedAt ?? input.messages.find((message) => message.id === input.messageId)?.createdAt ?? new Date().toISOString(),
       activity: [],
       cancelRequested: false,

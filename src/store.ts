@@ -3,13 +3,14 @@ import { Buffer } from 'node:buffer';
 import { constants } from 'node:fs';
 import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { DEFAULT_NOTIFICATION_SETTINGS, PROVIDER_ERROR_CATEGORIES, type AcceptedTurnInput, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type ChatTurnRecord, type CompactSnapshot, type CompactionPrefix, type HomeDraftAttachment, type HomeDraftInput, type HomeDraftRecord, type HookEvent, type HookRunResult, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderErrorCategory, type ProviderProtocolExchange, type ProviderToolName, type ProviderUploadLedgerEntry, type RuntimeActivity, type RuntimeTurnSnapshot, type Settings, type SettingsPatch, type Theme, type UsageLedgerSummary, type UsageReceipt } from './contracts';
+import { DEFAULT_NOTIFICATION_SETTINGS, PROVIDER_ERROR_CATEGORIES, type AcceptedTurnInput, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type ChatTurnRecord, type CompactSnapshot, type CompactionPrefix, type HomeDraftAttachment, type HomeDraftInput, type HomeDraftRecord, type HookEvent, type HookRunResult, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderErrorCategory, type ProviderProtocolExchange, type ProviderToolName, type ProviderUploadLedgerEntry, type RuntimeActivity, type RuntimeTurnSnapshot, type Settings, type SettingsPatch, type Theme, type UsageLedgerSummary, type UsageProfileView, type UsageReceipt } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { requireModelId } from './models';
 import { isSkillId } from './skills';
 import { validateProjectFolder, validateProjectInstructionsPath } from './project-paths';
 import { createInstructionDocument, instructionFileHash } from './instruction-documents';
 import { MAX_USAGE_RECEIPTS, mergeUsageReceipt, summarizeUsage, validateUsageReceipt } from './usage';
+import { buildUsageProfileView } from './usage-view';
 import { hashCompactionPrefix, validateCompactSummary } from './context';
 import { attachmentContentType, inspectLocalAttachmentContent, LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES } from './attachment-policy';
 
@@ -124,6 +125,7 @@ export interface LocalStore {
   getSettings(): Promise<Settings>;
   updateSettings(patch: unknown): Promise<Settings>;
   getLocalUsageStats(): Promise<LocalUsageStats>;
+  getUsageProfileView(installedSkillCount: number | null): Promise<UsageProfileView>;
   recordUsageReceipt(receipt: unknown): Promise<void>;
   getUsageLedger(): Promise<UsageLedgerSummary>;
   getProviderUploadEntries(accountScope: unknown): Promise<ProviderUploadLedgerEntry[]>;
@@ -575,6 +577,8 @@ function validateChatTurnRecord(value: unknown): ChatTurnRecord {
   if (!isRecord(value) || !(CHAT_TURN_STATUSES as readonly unknown[]).includes(value.status)
     || (value.operation !== undefined && value.operation !== 'compaction')
     || (value.modelId !== null && value.modelId !== undefined && typeof value.modelId !== 'string')
+    || (value.pendingSkillId !== undefined && value.pendingSkillId !== null && !isSkillId(value.pendingSkillId))
+    || (value.invokedSkillId !== undefined && value.invokedSkillId !== null && !isSkillId(value.invokedSkillId))
     || !Array.isArray(value.activity) || value.activity.length > MAX_TURN_ACTIVITY_PER_TURN
     || (value.startedAt !== undefined && !Number.isFinite(Date.parse(String(value.startedAt))))
     || (value.endedAt !== undefined && !Number.isFinite(Date.parse(String(value.endedAt))))
@@ -587,6 +591,8 @@ function validateChatTurnRecord(value: unknown): ChatTurnRecord {
   const operation = value.operation as 'compaction' | undefined;
   const assistantMessageId = value.assistantMessageId === null ? null : requireId(value.assistantMessageId);
   if ((operation === 'compaction') !== (assistantMessageId === null)
+    || value.pendingSkillId != null && value.invokedSkillId != null
+    || value.status === 'queued' && (value.pendingSkillId != null || value.invokedSkillId != null)
     || (value.status !== 'queued' && value.status !== 'running' && value.endedAt === undefined)) {
     throw new Error('Идентификаторы или время завершения хода не согласованы.');
   }
@@ -595,6 +601,8 @@ function validateChatTurnRecord(value: unknown): ChatTurnRecord {
     anchorMessageId: requireId(value.anchorMessageId),
     assistantMessageId,
     modelId: value.modelId === null || value.modelId === undefined ? null : requireModelId(value.modelId),
+    ...(value.pendingSkillId === undefined ? {} : { pendingSkillId: value.pendingSkillId as string | null }),
+    ...(value.invokedSkillId === undefined ? {} : { invokedSkillId: value.invokedSkillId as string | null }),
     ...(operation ? { operation } : {}),
     status: value.status as ChatTurnRecord['status'],
     createdAt: requireTimestamp(value.createdAt),
@@ -620,6 +628,8 @@ function recordForAcceptedTurn(turn: AcceptedTurnInput): ChatTurnRecord {
     anchorMessageId: turn.messageId,
     assistantMessageId: turn.assistantMessageId,
     modelId: turn.modelId,
+    pendingSkillId: null,
+    invokedSkillId: null,
     ...(turn.operation ? { operation: turn.operation } : {}),
     status: 'queued',
     createdAt: anchor.createdAt,
@@ -633,6 +643,8 @@ function recordFromRuntimeTurn(turn: RuntimeTurnSnapshot): ChatTurnRecord {
     anchorMessageId: turn.anchorMessageId,
     assistantMessageId: turn.assistantMessageId,
     modelId: turn.modelId ?? null,
+    ...(turn.pendingSkillId === undefined ? {} : { pendingSkillId: turn.pendingSkillId }),
+    ...(turn.invokedSkillId === undefined ? {} : { invokedSkillId: turn.invokedSkillId }),
     ...(turn.operation ? { operation: turn.operation } : {}),
     status: turn.status,
     createdAt: turn.createdAt,
@@ -647,12 +659,12 @@ function recordFromRuntimeTurn(turn: RuntimeTurnSnapshot): ChatTurnRecord {
 }
 
 function validateChatDetail(value: unknown): Loaded<ChatDetail> {
-  if (!isRecord(value) || (value.schemaVersion !== 3 && value.schemaVersion !== 4 && value.schemaVersion !== 5 && value.schemaVersion !== 6 && value.schemaVersion !== 7 && value.schemaVersion !== 8 && value.schemaVersion !== 9 && value.schemaVersion !== 10)
+  if (!isRecord(value) || (value.schemaVersion !== 3 && value.schemaVersion !== 4 && value.schemaVersion !== 5 && value.schemaVersion !== 6 && value.schemaVersion !== 7 && value.schemaVersion !== 8 && value.schemaVersion !== 9 && value.schemaVersion !== 10 && value.schemaVersion !== 11)
     || !Array.isArray(value.messages) || !Array.isArray(value.artifacts)
     || (value.schemaVersion >= 7 && !Array.isArray(value.toolReceipts))
     || (value.schemaVersion >= 8 && !('compactSnapshot' in value))
     || (value.schemaVersion >= 9 && !Array.isArray(value.draftAttachments))
-    || (value.schemaVersion === 10 && !Array.isArray(value.turns))
+    || (value.schemaVersion >= 10 && !Array.isArray(value.turns))
     || (value.schemaVersion < 10 && value.turns !== undefined)) {
     throw new Error('Invalid chat detail.');
   }
@@ -803,7 +815,7 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
     value: { ...chat, messages, artifacts, draftAttachments, toolReceipts, turns, nextTurnPermissionProfile, nextTurnSkillId,
       modelId: version >= 6 && value.modelId !== null ? requireModelId(value.modelId) : null,
       compactSnapshot },
-    needsWrite: version < 10,
+    needsWrite: version < 11,
   };
 }
 
@@ -815,7 +827,44 @@ function summary(chat: ChatDetail): ChatSummary {
 }
 
 function detailFile(chat: ChatDetail): Record<string, unknown> {
-  return { schemaVersion: 10, ...chat };
+  return { schemaVersion: 11, ...chat };
+}
+
+function preserveSkillInvocation(existing: ChatTurnRecord | null, next: ChatTurnRecord): ChatTurnRecord {
+  if (!existing) return next;
+  const previousSkillId = existing.invokedSkillId;
+  const nextSkillId = next.invokedSkillId;
+  if (previousSkillId === undefined) {
+    if (nextSkillId !== undefined || next.pendingSkillId !== existing.pendingSkillId) {
+      throw new Error('Нельзя восстановить неизвестную историю использования Skill.');
+    }
+    return next;
+  }
+  if (previousSkillId !== null) {
+    if (nextSkillId !== undefined && nextSkillId !== previousSkillId || next.pendingSkillId != null) {
+      throw new Error('Фактически использованный Skill не может быть изменён.');
+    }
+    return { ...next, invokedSkillId: previousSkillId, pendingSkillId: null };
+  }
+
+  const previousPending = existing.pendingSkillId;
+  if (nextSkillId != null && nextSkillId !== previousPending) {
+    throw new Error('Skill нельзя подтвердить без совпадающего сохранённого намерения.');
+  }
+  if (nextSkillId != null && next.pendingSkillId != null) {
+    throw new Error('Использованный Skill не может оставаться ожидающим подтверждения.');
+  }
+  if (next.pendingSkillId === undefined && previousPending !== undefined) {
+    return { ...next, invokedSkillId: nextSkillId ?? null, pendingSkillId: previousPending };
+  }
+  if (previousPending != null && next.pendingSkillId != null && next.pendingSkillId !== previousPending) {
+    throw new Error('Ожидающий Skill не может быть заменён другим.');
+  }
+  if (previousPending === undefined && next.pendingSkillId != null && nextSkillId == null) {
+    return next;
+  }
+  if (nextSkillId === undefined) return { ...next, invokedSkillId: null };
+  return next;
 }
 
 function validateHomeDraftAttachment(value: unknown): HomeDraftAttachment {
@@ -2752,7 +2801,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     }),
     updateRuntimeTurn: (turnInput) => serialize(async () => {
       const snapshot = structuredClone(turnInput);
-      const record = recordFromRuntimeTurn(snapshot);
+      let record = recordFromRuntimeTurn(snapshot);
       const chat = findChat(snapshot.chatId);
       if (!chat.messages.some((message) => message.id === record.anchorMessageId && message.role === 'user')) {
         throw new Error('Исходное сообщение хода отсутствует в чате.');
@@ -2760,6 +2809,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       const existingIndex = chat.turns.findIndex((item) => item.turnId === record.turnId);
       const existing = existingIndex >= 0 ? chat.turns[existingIndex] : null;
       if (existing) {
+        record = preserveSkillInvocation(existing, record);
         if (existing.anchorMessageId !== record.anchorMessageId || existing.assistantMessageId !== record.assistantMessageId
           || existing.modelId !== record.modelId || existing.operation !== record.operation) {
           throw new Error('Запись runtime не совпадает с принятым ходом.');
@@ -2825,6 +2875,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         || currentTurn.operation || currentTurn.status === 'interrupted')) {
         throw new Error('Запись ответа не совпадает с историей хода.');
       }
+      const completedTurn = preserveSkillInvocation(currentTurn, terminalTurn);
       const existingMessage = chat.messages.find((message) => message.id === acceptedTurn.assistantMessageId);
       if (existingMessage) {
         const savedTurn = currentTurn;
@@ -2843,7 +2894,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       };
       const messages = [...chat.messages];
       messages.splice(anchor + 1, 0, message);
-      const completedRecord = { ...terminalTurn, createdAt: currentTurn?.createdAt ?? terminalTurn.createdAt };
+      const completedRecord = { ...completedTurn, createdAt: currentTurn?.createdAt ?? completedTurn.createdAt };
       const turns = [...chat.turns];
       if (currentTurnIndex >= 0) turns[currentTurnIndex] = completedRecord;
       else turns.push(completedRecord);
@@ -2884,7 +2935,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
           throw new Error('Запись сводки не совпадает с историей хода.');
         }
         turns = [...chat.turns];
-        const completed = { ...terminalTurn, createdAt: existing?.createdAt ?? terminalTurn.createdAt };
+        const completed = { ...preserveSkillInvocation(existing, terminalTurn), createdAt: existing?.createdAt ?? terminalTurn.createdAt };
         if (index < 0) turns.push(completed);
         else turns[index] = completed;
       }
@@ -3020,6 +3071,17 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       });
     },
     getUsageLedger: () => serialize(async () => structuredClone(summarizeUsage(usageReceipts))),
+    getUsageProfileView: (installedSkillCount) => serialize(async () => buildUsageProfileView({
+      generatedAt: new Date().toISOString(),
+      timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+      receipts: usageReceipts,
+      chats: chats.map((chat) => ({
+        id: chat.id, title: chat.title, archived: chat.archived, messages: chat.messages,
+        turns: chat.turns, toolReceipts: chat.toolReceipts,
+      })),
+      projects: projects.map((project) => ({ id: project.id })),
+      installedSkillCount,
+    })),
     getProviderUploadEntries: (scopeInput) => serialize(async () => {
       if (typeof scopeInput !== 'string' || !/^[a-f0-9]{64}$/.test(scopeInput)) throw new Error('Не удалось подтвердить область файлового аккаунта.');
       return structuredClone(providerUploadEntries.filter((entry) => entry.accountScope === scopeInput));

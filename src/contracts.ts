@@ -201,6 +201,53 @@ export interface UsageLedgerSummary extends UsageAggregate {
   byDay: UsageAggregate[];
 }
 
+export interface UsageProfileChatRow {
+  chatId: string | null;
+  title: string;
+  archived: boolean | null;
+  aggregate: UsageAggregate;
+}
+
+export interface UsageProfileDay {
+  date: string;
+  aggregate: UsageAggregate;
+  byFamily: UsageAggregate[];
+}
+
+export interface UsageProfileView {
+  generatedAt: string;
+  timeZone: string;
+  total: UsageAggregate;
+  byFamily: UsageAggregate[];
+  byModel: UsageAggregate[];
+  byChat: UsageProfileChatRow[];
+  providerIdentityConflictCount: number;
+  localActivity: {
+    activityDates: string[];
+    activityDayCount: number;
+    streakDays: number;
+    today: UsageAggregate;
+    week: UsageAggregate;
+    month: UsageAggregate;
+    rollingYear: { startDate: string; endDate: string; days: UsageProfileDay[] };
+  };
+  chats: {
+    count: number;
+    longestByMessages: { chatId: string; title: string; messageCount: number } | null;
+    maxTokens: {
+      chatId: string | null;
+      title: string;
+      knownTokens: number;
+      unknownRequests: number;
+      conflictedRequests: number;
+      complete: boolean;
+    } | null;
+  };
+  projects: { count: number };
+  skills: { installedCount: number | null; invocationCount: number; unknownTurnCount: number; bySkill: Array<{ skillId: string; invocationCount: number }> };
+  tools: { invocationCount: number; unknownInvocationCount: number; byTool: Array<{ tool: string; invocationCount: number; unknownInvocationCount: number }> };
+}
+
 export const PROVIDER_ERROR_CATEGORIES = [
   'auth', 'tls', 'network', 'rate-limit', 'quota', 'model', 'context', 'protocol', 'tool', 'storage', 'cancel',
 ] as const;
@@ -323,6 +370,10 @@ export interface RuntimeTurnSnapshot {
   assistantMessageId: string | null;
   operation?: 'compaction';
   modelId?: GigaChatModelId | null;
+  /** Non-null between preparing a Skill layer and invoking the first provider iterator step. */
+  pendingSkillId?: string | null;
+  /** Set only after the first provider iterator step is invoked. */
+  invokedSkillId?: string | null;
   status: RuntimeTurnStatus;
   createdAt: string;
   startedAt?: string;
@@ -341,6 +392,10 @@ export interface ChatTurnRecord {
   anchorMessageId: string;
   assistantMessageId: string | null;
   modelId: GigaChatModelId | null;
+  /** Missing in migrated history means pending/call state was not recorded. */
+  pendingSkillId?: string | null;
+  /** Missing in migrated history means the old Skill-use count is unknown. */
+  invokedSkillId?: string | null;
   operation?: 'compaction';
   status: RuntimeTurnStatus | 'interrupted';
   createdAt: string;
@@ -735,6 +790,7 @@ export interface AppApi {
   usage: {
     getLocalStats(): Promise<LocalUsageStats>;
     getLedger(): Promise<UsageLedgerSummary>;
+    getProfileView(): Promise<UsageProfileView>;
   };
   onCloseRequested(flush: () => Promise<void>, onFailure: (result: CloseFailure) => void): () => void;
   retryClose(discardBrowserMetadata?: boolean): Promise<CloseAttemptResult>;

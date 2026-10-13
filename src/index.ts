@@ -995,14 +995,14 @@ async function registerIpcHandlers(
     'models:get-registry', 'models:refresh',
     'onboarding:browser-back', 'onboarding:browser-reload', 'onboarding:browser-bounds',
     'browser:status', 'browser:bounds', 'runtime:cancel',
-    'home-draft:attachment-preview', 'settings:get', 'usage:local-stats', 'usage:get-ledger', 'settings:open-projects-folder', 'settings:list-openers', 'settings:app-info',
+    'home-draft:attachment-preview', 'settings:get', 'usage:local-stats', 'usage:get-ledger', 'usage:get-profile-view', 'settings:open-projects-folder', 'settings:list-openers', 'settings:app-info',
     'settings:get-auto-start', 'settings:read-instructions',
   ]);
   const readOnlyChannels = new Set([
     'projects:list', 'projects:read-instructions', 'projects:instructions-backup-path',
     'chats:list', 'chats:get', 'chats:draft-attachment-preview', 'chats:artifact-preview', 'home-draft:get', 'home-draft:attachment-preview', 'runtime:list', 'runtime:status', 'permissions:read-config',
     'voice:status', 'skills:list', 'skills:read-source', 'hooks:list', 'hooks:inspect', 'onboarding:key-status', 'onboarding:connection-status', 'models:get-registry',
-    'onboarding:browser-status', 'browser:status', 'settings:get', 'usage:local-stats', 'usage:get-ledger',
+    'onboarding:browser-status', 'browser:status', 'settings:get', 'usage:local-stats', 'usage:get-ledger', 'usage:get-profile-view',
     'settings:list-openers', 'settings:app-info', 'settings:get-auto-start', 'settings:read-instructions',
   ]);
   const availableDuringClose = new Set([
@@ -1493,6 +1493,11 @@ async function registerIpcHandlers(
   handle('settings:get', () => store.getSettings());
   handle('usage:local-stats', () => store.getLocalUsageStats());
   handle('usage:get-ledger', () => store.getUsageLedger());
+  handle('usage:get-profile-view', async () => {
+    const registry = await skills.list().catch(() => null);
+    const installedSkillCount = registry && registry.issues.length === 0 ? registry.skills.length : null;
+    return store.getUsageProfileView(installedSkillCount);
+  });
   handle('settings:update', async (patchInput) => {
     const patch = requireSettingsPatch(patchInput);
     if (patch.defaultModelId !== undefined && patch.defaultModelId !== null) {
