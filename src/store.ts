@@ -110,6 +110,7 @@ export interface LocalStore {
   acceptLocalMessage(id: unknown, text: unknown, turnId: unknown, attachmentIds?: unknown, expectedModelId?: unknown, validateBeforeCommit?: () => void): Promise<{ detail: ChatDetail; turn: AcceptedTurnInput }>;
   acceptCompactionTurn(id: unknown, turnId: unknown): Promise<{ detail: ChatDetail; turn: AcceptedTurnInput }>;
   releaseTurnReservation(turnId: unknown): void;
+  markQueuedTurnNotSent(turn: AcceptedTurnInput, reason: unknown): Promise<{ detail: ChatDetail; marked: boolean }>;
   reserveRetryTurn(original: AcceptedTurnInput, retry: AcceptedTurnInput): Promise<void>;
   consumeTurnReservation(turn: AcceptedTurnInput, signal?: AbortSignal): Promise<void>;
   validateAcceptedTurn(turn: AcceptedTurnInput): Promise<void>;
@@ -1987,6 +1988,9 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     messageId: string,
     operation?: 'compaction',
   ): AcceptedTurnInput => {
+    if (detail.turns.length >= MAX_TURN_RECORDS_PER_CHAT) {
+      throw new Error('Достигнут безопасный предел записей ходов в чате; история сохранена.');
+    }
     const project = detail.projectId ? projects.find((item) => item.id === detail.projectId) : null;
     const revisions = selectionRevisions.get(detail.id) ?? { permissionProfile: 0, skill: 0 };
     const profileAlreadyReserved = [...turnReservations.values()].some((item) => item.chatId === detail.id
@@ -2633,6 +2637,35 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     releaseTurnReservation: (turnIdInput) => {
       if (typeof turnIdInput === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(turnIdInput)) turnReservations.delete(turnIdInput);
     },
+    markQueuedTurnNotSent: (turnInput, reasonInput) => serialize(async () => {
+      const accepted = validateAcceptedTurnRecord(structuredClone(turnInput), false);
+      if (accepted.operation || accepted.assistantMessageId === null || typeof reasonInput !== 'string'
+        || !reasonInput.trim() || reasonInput.length > 500) {
+        throw new Error('Некорректная запись хода, который не был отправлен.');
+      }
+      const chat = validateAcceptedTurnBinding(accepted);
+      const index = chat.turns.findIndex((item) => item.turnId === accepted.turnId);
+      const existing = index >= 0 ? chat.turns[index] : null;
+      if (!existing || existing.anchorMessageId !== accepted.messageId
+        || existing.assistantMessageId !== accepted.assistantMessageId || existing.modelId !== accepted.modelId
+        || existing.operation !== accepted.operation) {
+        throw new Error('Запись принятого хода изменилась перед фиксацией результата очереди.');
+      }
+      if (existing.status !== 'queued' || existing.startedAt !== undefined || existing.endedAt !== undefined
+        || existing.activity.length > 0) {
+        return { detail: structuredClone(chat), marked: false };
+      }
+      const failed: ChatTurnRecord = {
+        ...existing,
+        status: 'failed',
+        endedAt: new Date().toISOString(),
+        error: reasonInput,
+      };
+      const turns = [...chat.turns];
+      turns[index] = failed;
+      await saveChat({ ...chat, turns, updatedAt: new Date().toISOString() });
+      return { detail: structuredClone(findChat(chat.id)), marked: true };
+    }),
     reserveRetryTurn: (originalInput, retryInput) => serialize(async () => {
       const original = structuredClone(originalInput);
       const retry = structuredClone(retryInput);

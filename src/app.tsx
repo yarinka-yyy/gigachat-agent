@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
 import {
   Archive,
   ArrowLeft,
@@ -70,10 +70,8 @@ import type {
   UsageCounterSummary,
   UsageLedgerSummary,
   ModelRegistrySnapshot,
-  ProviderErrorCategory,
   Project,
   ProjectPatch,
-  RuntimeActivity,
   RuntimeTurnSnapshot,
   SkillRecord,
   SkillRegistrySnapshot,
@@ -100,6 +98,9 @@ import BrowserPanel from './components/BrowserPanel';
 import { createPreviewExitTimer, maxSidebarWidth as computeMaxSidebarWidth } from './sidebar-behavior';
 import { sidebarSections } from './sidebar-sections';
 import { attachmentContentType, attachmentSendBlocker, evaluateAttachmentPolicy } from './attachment-policy';
+import { hookEventLabel, mergeRuntimeTurnSnapshots, mergeTranscriptTurns } from './chat-transcript';
+import type { TranscriptTurn } from './chat-transcript';
+import ChatTranscript from './components/ChatTranscript';
 
 type Page = 'home' | 'chat' | 'settings' | 'onboarding' | 'images' | 'video' | 'podcasts' | 'archive' | 'profile';
 type Route = { page: Page; id?: string };
@@ -703,71 +704,12 @@ function getErrorMessage(error: unknown): string {
     : 'Не удалось выполнить действие.';
 }
 
-function runtimeStatusLabel(status: RuntimeTurnSnapshot['status']): string {
-  if (status === 'queued') return 'Ожидает завершения активного хода';
-  if (status === 'running') return 'Выполняется';
-  if (status === 'completed') return 'Завершено';
-  if (status === 'cancelled') return 'Отменено';
-  return 'Ошибка';
-}
-
-function runtimeErrorCategoryLabel(category: ProviderErrorCategory | undefined): string | null {
-  if (!category) return null;
-  const labels: Record<ProviderErrorCategory, string> = {
-    auth: 'Авторизация', tls: 'TLS', network: 'Сеть', 'rate-limit': 'Лимит запросов', quota: 'Квота',
-    model: 'Модель', context: 'Контекст', protocol: 'Протокол', tool: 'Локальный инструмент',
-    storage: 'Сохранение', cancel: 'Отмена',
-  };
-  return labels[category];
-}
-
-function runtimeActivityLabel(activity: RuntimeActivity): string {
-  if (activity.kind === 'tool') {
-    type ToolActivity = Extract<RuntimeActivity, { kind: 'tool' }>;
-    const names: Record<ToolActivity['tool'], string> = {
-      list: 'Список файлов', search: 'Поиск', read: 'Чтение файла', write: 'Запись файла', open: 'Открытие', powershell: 'PowerShell',
-    };
-    const phases: Record<ToolActivity['phase'], string> = {
-      started: 'запущен', completed: 'завершён', failed: 'ошибка', cancelled: 'отменён',
-    };
-    return `${names[activity.tool]}: ${phases[activity.phase]}`;
-  }
-  if (activity.kind === 'hook') {
-    const status = hookStatusLabel(activity.status);
-    return `Hook ${activity.hookName}: ${hookEventLabel(activity.event)} · ${status}${activity.reason ? ` — ${activity.reason}` : ''}`;
-  }
-  if (activity.activity === 'connecting') return 'Подключение к GigaChat';
-  if (activity.activity === 'receiving') return 'Получение ответа';
-  if (activity.activity === 'waiting-for-tool') return 'Ожидание инструмента';
-  if (activity.activity === 'function-progress') {
-    const label = activity.functionName === 'get_file_content' ? 'Чтение вложения' : 'Обработка изображения';
-    return activity.detail ? `${label}: ${activity.detail}` : label;
-  }
-  return activity.activity === 'tool-started' ? 'Запуск инструмента' : 'Инструмент завершён';
-}
-
 function hookStatusLabel(status: HookRunResult['status']): string {
   if (status === 'completed') return 'завершён';
   if (status === 'blocked') return 'заблокирован';
   if (status === 'skipped') return 'пропущен';
   if (status === 'cancelled') return 'отменён';
   return 'ошибка';
-}
-
-function elapsedLabel(durationMs: number | undefined): string | null {
-  if (durationMs === undefined || !Number.isFinite(durationMs) || durationMs < 0) return null;
-  return `${Math.round(durationMs / 1000)} с`;
-}
-
-function hookEventLabel(event: HookEvent): string {
-  const labels: Record<HookEvent, string> = {
-    'session-start': 'Начало сессии', 'project-start': 'Открытие проекта',
-    'user-prompt-submitted': 'Отправка запроса', 'before-tool': 'Перед инструментом',
-    'after-tool': 'После инструмента', 'permission-request': 'Запрос разрешения',
-    'before-compaction': 'Перед сжатием контекста', 'after-compaction': 'После сжатия контекста',
-    interrupt: 'Прерывание', stop: 'Остановка', 'session-end': 'Завершение сессии', 'project-end': 'Завершение проекта',
-  };
-  return labels[event];
 }
 
 function sameRoute(left: Route | undefined, right: Route): boolean {
@@ -1455,9 +1397,7 @@ export default function App() {
         || routeRevision !== routeGeneration.current
         || routeRef.current.page !== 'chat' || routeRef.current.id !== chatId || turn.chatId !== chatId) return;
       setRuntimeTurns((current) => {
-        const byId = new Map(current.map((item) => [item.id, item]));
-        byId.set(turn.id, turn);
-        return [...byId.values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt)).slice(-12);
+        return mergeRuntimeTurnSnapshots(chatId, current, [turn]);
       });
       if (turn.status === 'completed' || turn.status === 'failed' || turn.status === 'cancelled') {
         const profileRevision = permissionProfileRevision.current;
@@ -1503,9 +1443,7 @@ export default function App() {
         || routeRevision !== routeGeneration.current
         || routeRef.current.page !== 'chat' || routeRef.current.id !== chatId) return;
       setRuntimeTurns((current) => {
-        const byId = new Map(turns.map((turn) => [turn.id, turn]));
-        for (const turn of current) if (!byId.has(turn.id)) byId.set(turn.id, turn);
-        return [...byId.values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt)).slice(-12);
+        return mergeRuntimeTurnSnapshots(chatId, turns, current);
       });
     }).catch((error: unknown) => {
       if (!cancelled && generation === chatDetailLoadGeneration.current
@@ -1578,6 +1516,10 @@ export default function App() {
   const archivedProjects = projects.filter((project) => project.archived);
   const archivedChats = chats.filter((chat) => chat.archived);
   const selectedChat = chats.find((chat) => chat.id === route.id);
+  const transcriptTurns = useMemo(() => {
+    if (!selectedChat || !chatDetail || chatDetail.id !== selectedChat.id) return [];
+    return mergeTranscriptTurns(selectedChat.id, chatDetail.messages, chatDetail.turns, runtimeTurns);
+  }, [chatDetail, runtimeTurns, selectedChat?.id]);
   const chatComposerReady = route.page === 'home' ? homeDraftRecord !== null
     : route.page !== 'chat' || (chatLoadState.chatId === route.id
       && chatLoadState.status === 'ready' && chatDetail?.id === route.id);
@@ -1961,7 +1903,7 @@ export default function App() {
         }
         showSuccess(accepted.queued
           ? 'Сообщение сохранено и поставлено в очередь GigaChat.'
-          : 'Сообщение сохранено локально; подключите API и выберите доступную модель для отправки.');
+          : 'Сообщение сохранено локально; состояние отправки показано в чате.');
         return;
       }
       const chatId = sourceRoute.page === 'chat' ? sourceRoute.id : undefined;
@@ -1990,10 +1932,7 @@ export default function App() {
         setChatDraftSaveError(null);
       }
       setChats(await window.gigaChat.chats.list());
-      const connectionStatus = await window.gigaChat.onboarding.getConnectionStatus().catch(() => null);
-      if (stillCurrent) showSuccess(connectionStatus?.state === 'connected'
-        ? 'Сообщение сохранено и поставлено в очередь GigaChat.'
-        : 'Сообщение сохранено локально; подключите GigaChat перед отправкой.');
+      if (stillCurrent) showSuccess('Сообщение сохранено.');
     } catch (error) {
       rendererOperations.current.reportFailure(error);
       setNotice(getErrorMessage(error));
@@ -3350,67 +3289,42 @@ export default function App() {
               <strong>Черновик не сохранён</strong><p>{chatDraftSaveError?.message} Текст оставлен в редакторе.</p>
               <button type="button" className="secondary-button" onClick={() => saveChatDraft(selectedChat.id, draftRef.current)}>Повторить сохранение</button>
             </div>}
-            {chatDetail?.id === selectedChat.id && chatLoadState.status === 'ready' && chatDetail.messages.length ? <div className="chat-history" aria-label="История сообщений">
-              {chatDetail.messages.map((message) => {
+            {chatDetail?.id === selectedChat.id && chatLoadState.status === 'ready' && <ChatTranscript
+              messages={chatDetail.messages}
+              turns={transcriptTurns}
+              onCopyMessage={(messageId) => window.gigaChat.chats.copyMessage(selectedChat.id, messageId)}
+              renderAttachments={(message) => {
                 const linkedAttachments = (message.attachmentIds ?? []).map((id) =>
                   chatDetail.artifacts.find((artifact) => artifact.id === id && artifact.messageId === message.id) ?? null);
-                return <article key={message.id} className={`chat-message message-${message.role}`}>
-                  <span className="message-author">{message.role === 'user' ? 'Вы' : message.source === 'runtime' ? 'GigaChat' : 'GigaChat · пример'}</span>
-                  <p>{message.text}</p>
-                  {linkedAttachments.length > 0 && <div className="message-attachments" aria-label="Вложения этого сообщения">
-                    {linkedAttachments.map((artifact, index) => artifact
-                      ? <button type="button" className="message-attachment" key={artifact.id}
-                        aria-label={`Открыть ${artifact.name}`} onClick={() => void window.gigaChat.chats.openArtifact(chatDetail.id, artifact.id).catch((error: unknown) => setNotice(getErrorMessage(error)))}>
-                        <AttachmentThumbnail source="artifact" chatId={chatDetail.id} attachmentId={artifact.id} image={attachmentContentType(artifact.name)?.kind === 'image'} />
-                        <span className="message-attachment-copy"><strong>{artifact.name}</strong><small>{attachmentFormatLabel(artifact.name)} · {attachmentSizeLabel(artifact.size)}</small></span>
-                      </button>
-                      : <span className="message-attachment attachment-missing" key={`${message.id}-missing-${index}`}>Файл недоступен</span>)}
-                  </div>}
-                </article>;
-              })}
-            </div> : null}
-            {runtimeTurns.length ? <section className="runtime-timeline" aria-label="Состояние локального хода">
-              {runtimeTurns.map((turn) => {
-                const retryReason = turn.retryEligible ? retryUnavailableReason(turn, modelRegistry) : null;
-                return <article className="runtime-turn" key={turn.id}>
-                <div className="runtime-turn-heading">
-                  <details className="runtime-turn-details" open={turn.status === 'queued' || turn.status === 'running'}>
-                    <summary className="runtime-turn-summary">
-                      <strong>{runtimeStatusLabel(turn.status)}</strong>
-                      {turn.queueDurationMs !== undefined && <small>Очередь · {elapsedLabel(turn.queueDurationMs)}</small>}
-                      {turn.activeDurationMs !== undefined && <small>Работа · {elapsedLabel(turn.activeDurationMs)}</small>}
-                      {runtimeErrorCategoryLabel(turn.errorCategory) && <small>Причина · {runtimeErrorCategoryLabel(turn.errorCategory)}</small>}
-                    </summary>
-                    <div className="runtime-turn-body">
-                      {turn.activity.length > 0 && <ul className="runtime-activity-list">
-                        {turn.activity.map((activity, index) => <li key={`${turn.id}-${index}`}>{runtimeActivityLabel(activity)}{activity.kind === 'tool' && activity.durationMs !== undefined ? ` · ${elapsedLabel(activity.durationMs)}` : ''}</li>)}
-                      </ul>}
-                      {turn.draft && <div className="runtime-turn-draft" aria-live="polite">
-                        <span className="message-author">{turn.status === 'running' ? 'Ответ от GigaChat' : 'GigaChat · незавершённый ответ'}</span>
-                        <p>{turn.draft}</p>
-                        {(turn.status === 'failed' || turn.status === 'cancelled') && <small>Ответ не добавлен в историю чата.</small>}
-                      </div>}
-                      {turn.error && <p className="runtime-error" role="alert">{turn.error}</p>}
-                    </div>
-                  </details>
-                  <div className="runtime-turn-actions">
-                    {(turn.status === 'queued' || turn.status === 'running') && <button type="button" className="quiet-button runtime-cancel" onClick={() => {
-                      void window.gigaChat.runtime.cancel(turn.chatId, turn.id).catch((error: unknown) => setNotice(getErrorMessage(error)));
-                    }}>{turn.status === 'queued' ? 'Убрать из очереди' : 'Остановить'}</button>}
-                    {turn.retryEligible && <>
-                      <button type="button" className="quiet-button runtime-retry" disabled={retryingTurnIds.has(turn.id) || retryReason !== null}
-                        title={retryReason ?? undefined}
-                        onClick={() => void retryRuntimeTurn(turn)}>{retryingTurnIds.has(turn.id) ? 'Постановка…' : 'Повторить ход'}</button>
-                      {retryReason && <small className="runtime-retry-hint">{retryReason}</small>}
-                    </>}
-                    {turn.errorCategory === 'auth' || turn.errorCategory === 'tls' || turn.errorCategory === 'network'
-                      ? <button type="button" className="quiet-button runtime-reconnect" onClick={() => openSettings('browser')}>Проверить подключение</button>
-                      : null}
-                  </div>
-                </div>
-                </article>;
-              })}
-            </section> : null}
+                return linkedAttachments.length > 0 ? <div className="message-attachments" aria-label="Вложения этого сообщения">
+                  {linkedAttachments.map((artifact, index) => artifact
+                    ? <button type="button" className="message-attachment" key={artifact.id}
+                      aria-label={`Открыть ${artifact.name}`} onClick={() => void window.gigaChat.chats.openArtifact(chatDetail.id, artifact.id).catch((error: unknown) => setNotice(getErrorMessage(error)))}>
+                      <AttachmentThumbnail source="artifact" chatId={chatDetail.id} attachmentId={artifact.id} image={attachmentContentType(artifact.name)?.kind === 'image'} />
+                      <span className="message-attachment-copy"><strong>{artifact.name}</strong><small>{attachmentFormatLabel(artifact.name)} · {attachmentSizeLabel(artifact.size)}</small></span>
+                    </button>
+                    : <span className="message-attachment attachment-missing" key={`${message.id}-missing-${index}`}>Файл недоступен</span>)}
+                </div> : null;
+              }}
+              renderTurnActions={(turn: TranscriptTurn) => {
+                const runtimeTurn = turn.runtimeSnapshot;
+                const retryReason = runtimeTurn?.retryEligible ? retryUnavailableReason(runtimeTurn, modelRegistry) : null;
+                return <>
+                  {runtimeTurn && (turn.status === 'queued' || turn.status === 'running') && <button type="button" className="quiet-button runtime-cancel" onClick={() => {
+                    void window.gigaChat.runtime.cancel(turn.chatId, turn.turnId).catch((error: unknown) => setNotice(getErrorMessage(error)));
+                  }}>{turn.status === 'queued' ? 'Убрать из очереди' : 'Остановить'}</button>}
+                  {runtimeTurn?.retryEligible && <>
+                    <button type="button" className="quiet-button runtime-retry" disabled={retryingTurnIds.has(turn.turnId) || retryReason !== null}
+                      title={retryReason ?? undefined}
+                      onClick={() => void retryRuntimeTurn(runtimeTurn)}>{retryingTurnIds.has(turn.turnId) ? 'Постановка…' : 'Повторить ход'}</button>
+                    {retryReason && <small className="runtime-retry-hint">{retryReason}</small>}
+                  </>}
+                  {turn.errorCategory === 'auth' || turn.errorCategory === 'tls' || turn.errorCategory === 'network'
+                    ? <button type="button" className="quiet-button runtime-reconnect" onClick={() => openSettings('browser')}>Проверить подключение</button>
+                    : null}
+                </>;
+              }}
+            />}
             {chatDetail?.artifacts.some((artifact) => artifact.messageId === null) ? <section className="chat-files" aria-label="Старые локальные файлы">
               <h2>Старые локальные файлы</h2>
               {chatDetail.artifacts.filter((artifact) => artifact.messageId === null).map((artifact) => {

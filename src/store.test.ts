@@ -373,6 +373,63 @@ test('explicit home send creates one linked chat and returns the same frozen sna
   assert.notEqual(draft.revision, withFile.revision);
 });
 
+test('accepted but unqueued turns become durable not-sent without overwriting later runtime state', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-not-sent-turn-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const draft = await store.saveHomeDraft({
+    revision: 1, text: 'Сохрани этот запрос', projectId: null,
+    permissionProfile: 'ask', skillId: null, modelId: 'GigaChat-3-Pro',
+  });
+  const accepted = await store.acceptHomeDraft(draft.revision, 'home-not-sent-turn');
+  const reason = 'Сохранено локально, не отправлено. Подключитесь и отправьте сообщение ещё раз.';
+  const marked = await store.markQueuedTurnNotSent(accepted.turn, reason);
+  assert.equal(marked.marked, true);
+  const unsent = marked.detail.turns.find((item) => item.turnId === accepted.turn.turnId);
+  assert.equal(unsent?.status, 'failed');
+  assert.equal(unsent?.startedAt, undefined);
+  assert.ok(unsent?.endedAt);
+  assert.equal(unsent?.error, reason);
+  assert.deepEqual(marked.detail.messages.map(({ role, text }) => ({ role, text })), [{ role: 'user', text: 'Сохрани этот запрос' }]);
+  assert.equal(marked.detail.modelId, 'GigaChat-3-Pro');
+  assert.equal(marked.detail.nextTurnPermissionProfile, null);
+
+  const duplicate = await store.acceptHomeDraft(draft.revision, 'ignored-duplicate-turn-id');
+  assert.equal(duplicate.newlyAccepted, false);
+  assert.equal(duplicate.turn.turnId, accepted.turn.turnId);
+  assert.equal((await store.markQueuedTurnNotSent(accepted.turn, 'Новое сообщение не должно заменить причину.')).marked, false);
+
+  const chat = await store.createChat();
+  const runningAccepted = await store.acceptLocalMessage(chat.id, 'Уже выполняющийся ход', 'running-not-sent-check');
+  const queuedRecord = (await store.getChat(chat.id)).turns.find((item) => item.turnId === runningAccepted.turn.turnId);
+  assert.ok(queuedRecord);
+  await store.updateRuntimeTurn({
+    id: runningAccepted.turn.turnId, chatId: chat.id, anchorMessageId: runningAccepted.turn.messageId,
+    assistantMessageId: runningAccepted.turn.assistantMessageId, modelId: runningAccepted.turn.modelId,
+    status: 'running', createdAt: queuedRecord.createdAt, startedAt: timestamp, activity: [],
+  });
+  const runningBefore = (await store.getChat(chat.id)).turns.find((item) => item.turnId === runningAccepted.turn.turnId);
+  assert.equal((await store.markQueuedTurnNotSent(runningAccepted.turn, reason)).marked, false);
+  assert.deepEqual((await store.getChat(chat.id)).turns.find((item) => item.turnId === runningAccepted.turn.turnId), runningBefore);
+  await appendAcceptedAnswer(store, runningAccepted.turn, 'Ход действительно завершён.');
+  const completedBefore = (await store.getChat(chat.id)).turns.find((item) => item.turnId === runningAccepted.turn.turnId);
+  assert.equal(completedBefore?.status, 'completed');
+  assert.equal((await store.markQueuedTurnNotSent(runningAccepted.turn, reason)).marked, false);
+  assert.deepEqual((await store.getChat(chat.id)).turns.find((item) => item.turnId === runningAccepted.turn.turnId), completedBefore);
+
+  const reopened = await openStore(directory);
+  const restoredHome = await reopened.getChat(accepted.turn.chatId);
+  assert.equal(restoredHome.turns.find((item) => item.turnId === accepted.turn.turnId)?.status, 'failed');
+  assert.equal(restoredHome.turns.find((item) => item.turnId === accepted.turn.turnId)?.startedAt, undefined);
+  assert.deepEqual(restoredHome.messages.map(({ role, text }) => ({ role, text })), [{ role: 'user', text: 'Сохрани этот запрос' }]);
+  assert.equal(restoredHome.modelId, 'GigaChat-3-Pro');
+  const restoredRunningChat = await reopened.getChat(chat.id);
+  assert.equal(restoredRunningChat.messages.filter((message) => message.role === 'assistant').length, 1);
+  assert.equal(restoredRunningChat.turns.find((item) => item.turnId === runningAccepted.turn.turnId)?.status, 'completed');
+  store.releaseTurnReservation(accepted.turn.turnId);
+  store.releaseTurnReservation(runningAccepted.turn.turnId);
+});
+
 test('a failed home-send journal write leaves the unsent draft and files available', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-home-send-failure-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -1438,6 +1495,63 @@ test('trusted runtime assistant append preserves draft and final provider state 
   const restored = await (await openStore(directory)).getChat(chat.id);
   assert.deepEqual(restored.messages, detail.messages);
   assert.deepEqual(restored.turns, detail.turns);
+});
+
+test('accepted chat and compaction turns stop at the persisted per-chat record limit without changing data', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-turn-capacity-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const source = join(directory, 'pending.txt');
+  await writeFile(source, 'LOCAL_ATTACHMENT_STAYS_PENDING', 'utf8');
+  const staged = await store.stageChatDraftFile(chat.id, source);
+  await store.appendLocalMessage(chat.id, 'Сохранённое сообщение-якорь');
+  await store.updateChat(chat.id, { draft: 'Оставить черновик при достижении предела.' });
+
+  const chatPath = join(directory, 'chats', chat.id, 'chat.json');
+  const raw = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown>;
+  const beforeCapacity = await store.getChat(chat.id);
+  const anchor = beforeCapacity.messages[0];
+  assert.ok(anchor?.role === 'user');
+  raw.turns = Array.from({ length: 50_000 }, (_, index) => ({
+    turnId: `capacity-turn-${index}`,
+    anchorMessageId: anchor.id,
+    assistantMessageId: `capacity-answer-${index}`,
+    modelId: beforeCapacity.modelId,
+    status: 'interrupted',
+    createdAt: timestamp,
+    endedAt: timestamp,
+    activity: [],
+  }));
+  await writeFile(chatPath, JSON.stringify(raw), 'utf8');
+  const capacityBytes = await readFile(chatPath);
+
+  const atCapacity = await openStore(directory);
+  const original = await atCapacity.getChat(chat.id);
+  assert.equal(original.turns.length, 50_000);
+  assert.equal(original.draft, 'Оставить черновик при достижении предела.');
+  assert.deepEqual(original.draftAttachments, staged.draftAttachments);
+  await assert.rejects(
+    atCapacity.acceptLocalMessage(chat.id, 'Этот текст не должен быть принят.', 'turn-over-capacity', [staged.draftAttachments[0]!.id]),
+    /предел записей ходов/i,
+  );
+  await assert.rejects(
+    atCapacity.acceptCompactionTurn(chat.id, 'compact-over-capacity'),
+    /предел записей ходов/i,
+  );
+
+  assert.deepEqual(await readFile(chatPath), capacityBytes, 'rejected acceptance does not rewrite the chat file');
+  const unchanged = await atCapacity.getChat(chat.id);
+  assert.deepEqual(unchanged.messages, original.messages);
+  assert.deepEqual(unchanged.draftAttachments, original.draftAttachments);
+  assert.equal(unchanged.draft, original.draft);
+  assert.equal(unchanged.turns.length, 50_000);
+
+  const reloaded = await (await openStore(directory)).getChat(chat.id);
+  assert.deepEqual(reloaded.messages, original.messages);
+  assert.deepEqual(reloaded.draftAttachments, original.draftAttachments);
+  assert.equal(reloaded.draft, original.draft);
+  assert.equal(reloaded.turns.length, 50_000, 'the at-capacity chat remains readable after restart');
 });
 
 test('schema 9 compact metadata survives turn-record migration without invented history', async (t) => {

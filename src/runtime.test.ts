@@ -8,7 +8,7 @@ import type { AcceptedTurnInput, ChatToolReceipt, GigaChatProvider, HookDispatch
 import type { LocalTools } from './local-tools';
 import { LocalToolError } from './local-tools';
 import { HookDispatchAbortError } from './hooks';
-import { createTurnRuntime, type ToolReceiptInput, type ToolReceiptStart, type TurnRuntimeOptions } from './runtime';
+import { createTurnRuntime, queueAcceptedTurnOrMarkNotSent, type ToolReceiptInput, type ToolReceiptStart, type TurnRuntimeOptions } from './runtime';
 import { mergeUsageReceipt } from './usage';
 import { MISSING_REMOTE_ATTACHMENT_MESSAGE, prepareTurnAttachments } from './attachments';
 import { serializeProviderTurnRequest } from './gigachat-provider';
@@ -147,6 +147,51 @@ function deferredValue<T>(): { promise: Promise<T>; resolve(value: T): void } {
   const promise = new Promise<T>((done) => { resolve = done; });
   return { promise, resolve };
 }
+
+test('accepted turns blocked from queueing persist not-sent before releasing their reservation', async () => {
+  for (const blockedBy of ['disconnected', 'unavailable model']) {
+    const calls: string[] = [];
+    const result = await queueAcceptedTurnOrMarkNotSent({
+      shouldQueue: false,
+      enqueue: () => { calls.push('enqueue'); return 'turn'; },
+      markNotSent: async () => { calls.push('persist'); return blockedBy; },
+      releaseReservation: () => { calls.push('release'); },
+    });
+    assert.deepEqual(result, { queued: false, persisted: blockedBy });
+    assert.deepEqual(calls, ['persist', 'release']);
+  }
+
+  for (const enqueue of [() => null, () => { throw new Error('synthetic queue failure'); }]) {
+    const calls: string[] = [];
+    const result = await queueAcceptedTurnOrMarkNotSent({
+      shouldQueue: true,
+      enqueue: () => { calls.push('enqueue'); return enqueue(); },
+      markNotSent: async () => { calls.push('persist'); return 'saved'; },
+      releaseReservation: () => { calls.push('release'); },
+    });
+    assert.deepEqual(result, { queued: false, persisted: 'saved' });
+    assert.deepEqual(calls, ['enqueue', 'persist', 'release']);
+  }
+
+  const queuedCalls: string[] = [];
+  const queued = await queueAcceptedTurnOrMarkNotSent({
+    shouldQueue: true,
+    enqueue: () => { queuedCalls.push('enqueue'); return 'turn'; },
+    markNotSent: async () => { queuedCalls.push('persist'); return undefined; },
+    releaseReservation: () => { queuedCalls.push('release'); },
+  });
+  assert.deepEqual(queued, { queued: true });
+  assert.deepEqual(queuedCalls, ['enqueue']);
+
+  const failedSaveCalls: string[] = [];
+  await assert.rejects(queueAcceptedTurnOrMarkNotSent({
+    shouldQueue: false,
+    enqueue: () => { failedSaveCalls.push('enqueue'); return 'turn'; },
+    markNotSent: async () => { failedSaveCalls.push('persist'); throw new Error('synthetic terminal save failure'); },
+    releaseReservation: () => { failedSaveCalls.push('release'); },
+  }), /synthetic terminal save failure/);
+  assert.deepEqual(failedSaveCalls, ['persist', 'release']);
+});
 
 function saveUsageReceipt(records: Map<string, UsageReceipt>, receipt: UsageReceipt): void {
   const existing = records.get(receipt.localRequestId);
@@ -1857,6 +1902,8 @@ test('explicit retry preserves the accepted turn and does not replay a completed
   });
   const firstId = runtime.enqueue(accepted);
   assert.equal(firstId, accepted.turnId);
+  assert.equal(runtime.list('chat-one')[0]?.createdAt, first.messages[0]?.createdAt,
+    'the first attempt remains anchored to the accepted user message time');
   await runtime.whenIdle();
   assert.equal(runtime.list('chat-one')[0]?.status, 'failed');
   assert.equal(runtime.list('chat-one')[0]?.errorCategory, 'network');
@@ -1867,12 +1914,17 @@ test('explicit retry preserves the accepted turn and does not replay a completed
   accepted.permissionProfile = 'ask';
   accepted.projectWorkingFolder = 'C:\\Other';
   accepted.skillId = null;
+  const retryRequestedAt = Date.now();
   const retryId = await runtime.retry(accepted.turnId, 'chat-one');
   assert.ok(retryId);
   await runtime.whenIdle();
   assert.equal(runtime.list('chat-one').length, 2);
   assert.equal(runtime.list('chat-one')[1]?.id, retryId);
   assert.equal(runtime.list('chat-one')[1]?.status, 'completed');
+  assert.ok(Date.parse(runtime.list('chat-one')[1]!.createdAt) >= retryRequestedAt - 1000,
+    'the retry attempt starts its queue clock when it is accepted');
+  assert.ok((runtime.list('chat-one')[1]?.queueDurationMs ?? Number.POSITIVE_INFINITY) < 10_000,
+    'time spent on the original attempt is not reported as retry queue time');
   assert.equal(runtime.list('chat-one')[0]?.retryEligible, undefined);
   assert.equal(retryInputs.length, 1);
   assert.notEqual(retryInputs[0]?.turnId, accepted.turnId);

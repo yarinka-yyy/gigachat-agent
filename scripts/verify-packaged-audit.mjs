@@ -168,6 +168,7 @@ async function runElectronHost() {
   console.log('Electron API loaded');
   const nativeWorkspaceMode = process.argv.includes('--native-browser-workspace');
   const holdForReview = process.argv.includes('--hold-for-review');
+  const skipSidebarPointerCapture = process.argv.includes('--skip-sidebar-pointer-capture');
   const fixture = process.env.GIGACHAT_AUDIT_ROOT;
   assert.ok(fixture, 'synthetic GIGACHAT_AUDIT_ROOT is required');
   const fixturePath = await realpath(fixture);
@@ -181,7 +182,7 @@ async function runElectronHost() {
   const makeChat = (id, title, projectId = null) => ({ id, title, projectId, pinned: false, archived: false, createdAt: timestamp, updatedAt: timestamp, kind: 'text' });
   const makeDetail = (summary, text, draft = '') => ({
     ...summary, draft, nextTurnPermissionProfile: null, modelId: null, nextTurnSkillId: null,
-    messages: [{ id: `${summary.id}-message`, role: 'assistant', text, createdAt: timestamp }], artifacts: [], draftAttachments: [],
+    messages: [{ id: `${summary.id}-message`, role: 'assistant', text, createdAt: timestamp }], turns: [], toolReceipts: [], artifacts: [], draftAttachments: [], compactSnapshot: null,
   });
   const makeBrowserTab = (id, title, url) => ({ id, title, url, canGoBack: false, canGoForward: false, loading: false, error: null });
   const projects = [
@@ -213,7 +214,7 @@ async function runElectronHost() {
     deferChatDraftRemovals: false, pendingChatDraftRemovals: [],
     deferHomeDraftSendResponse: false, pendingHomeDraftSends: [], homeDraftSendCalls: [], rejectNextHomeDraftSend: false,
     homeDraftAttachmentSequence: 0, homeDraftAcceptanceSequence: 0,
-    runtimeTurns: new Map(), retryCalls: [], runtimeCancelCalls: [],
+    runtimeTurns: new Map(), retryCalls: [], runtimeCancelCalls: [], copyMessageCalls: [], rejectNextCopyMessage: false,
     modelRegistry: { state: 'unavailable', modelIds: [], errorCategory: null }, modelRegistryCalls: [],
     connectionStatus: { state: 'not-configured', errorCategory: null }, connectionCalls: [], nextConnectionFailure: null,
     keyStatus: { available: true, saved: false, usable: false },
@@ -320,7 +321,7 @@ async function runElectronHost() {
     const detail = {
       ...summary, draft: '', nextTurnPermissionProfile: permissionProfile === state.appSettings.defaultPermissionProfile ? null : permissionProfile,
       modelId: state.homeDraft.modelId ?? state.appSettings.defaultModelId, nextTurnSkillId: state.homeDraft.skillId,
-      messages: [message], toolReceipts: [], draftAttachments: [], artifacts: state.homeDraft.attachments.map((attachment) => ({
+      messages: [message], turns: [], toolReceipts: [], draftAttachments: [], artifacts: state.homeDraft.attachments.map((attachment) => ({
         id: attachment.id, name: attachment.name, storedName: attachment.storedName, size: attachment.size,
         sha256: attachment.sha256, createdAt: attachment.createdAt, messageId: message.id,
       })), compactSnapshot: null,
@@ -328,16 +329,28 @@ async function runElectronHost() {
     const turn = {
       turnId: `home-turn-${index}`, chatId: id, projectId: state.homeDraft.projectId,
       projectWorkingFolder: state.projects.find((project) => project.id === state.homeDraft.projectId)?.workingFolder ?? null,
-      messageId: message.id, historyBoundary: 0, messages: [message], permissionProfile, modelId: detail.modelId,
+      messageId: message.id, assistantMessageId: `home-assistant-${index}`, historyBoundary: 1, messages: [message],
+      ...(message.attachmentIds?.length ? { attachmentIds: [...message.attachmentIds] } : {}),
+      permissionProfile, modelId: detail.modelId,
       skillId: state.homeDraft.skillId, reservation: { permissionProfileRevision: null, skillRevision: null },
     };
+    detail.turns = [{
+      turnId: turn.turnId, anchorMessageId: message.id, assistantMessageId: turn.assistantMessageId,
+      modelId: turn.modelId, status: 'failed', createdAt: timestamp, endedAt: timestamp,
+      error: 'Сообщение сохранено локально, но не поставлено в очередь.', activity: [],
+    }];
+    assert.equal(turn.historyBoundary, turn.messages.length, 'home acceptance freezes the complete first-message history');
+    assert.equal(detail.turns[0].anchorMessageId, turn.messageId, 'durable home turn points at its accepted user message');
+    assert.equal(detail.turns[0].assistantMessageId, turn.assistantMessageId, 'durable home turn reserves the assistant message ID');
+    assert.equal(detail.turns[0].status, 'failed', 'home acceptance returning queued:false is not represented as queued');
+    assert.equal(detail.turns[0].startedAt, undefined, 'a home turn that never started has no startedAt');
     state.chats.unshift(summary);
     state.details.set(id, detail);
     state.homeDraft = {
       ...state.homeDraft, revision: state.homeDraft.revision + 1, text: '', attachments: [],
       lastAcceptance: { sourceRevision: revision, chatId: id, turn: clone(turn) },
     };
-    return { detail: clone(detail), turn, newlyAccepted: true, homeDraft: clone(state.homeDraft), queued: false };
+    return { detail: clone(detail), turn: clone(turn), newlyAccepted: true, homeDraft: clone(state.homeDraft), queued: false };
   };
   const resolveHomeDraftImport = (record) => record.resolve({ record: stageHomeDraftAttachment(record.name ?? 'picked-home.txt', record.size ?? 24), failures: [] });
   const resolveHomeDraftFilePicker = (record, name = 'picked-home.txt') => record.resolve({
@@ -526,6 +539,17 @@ async function runElectronHost() {
         return request.promise;
       }
       return clone(state.details.get(id));
+    }
+    if (group === 'chats' && method === 'copyMessage') {
+      const [id, messageId] = args;
+      state.copyMessageCalls.push({ id, messageId });
+      if (state.rejectNextCopyMessage) {
+        state.rejectNextCopyMessage = false;
+        throw new Error('Synthetic clipboard write failed');
+      }
+      const message = state.details.get(id)?.messages.find((item) => item.id === messageId && item.role === 'user');
+      if (!message) throw new Error('Synthetic copy accepts exact stored user messages only.');
+      return undefined;
     }
     if (group === 'chats' && method === 'create') {
       const [projectId] = args;
@@ -1792,6 +1816,9 @@ async function runElectronHost() {
     await capture('sidebar-toggle-expanded');
     passed('Rendered sidebar toggle animates, reverses, and clips only the collapsed divider line');
 
+    if (skipSidebarPointerCapture) {
+      console.log('SKIPPED (not counted): synthetic sidebar pointer-capture drag/pointercancel gate (--skip-sidebar-pointer-capture).');
+    } else {
     const dragWindowSize = window.getSize();
     const dragZoom = window.webContents.getZoomFactor();
     window.setSize(1424, 892);
@@ -1931,6 +1958,7 @@ async function runElectronHost() {
     window.setSize(dragWindowSize[0], dragWindowSize[1]);
     await sleep(350);
     passed('Synthetic captured pointer release persists width and pointercancel discards it');
+    }
 
     const debuggerWasAttached = window.webContents.debugger.isAttached();
     if (!debuggerWasAttached) window.webContents.debugger.attach('1.3');
@@ -2038,7 +2066,8 @@ async function runElectronHost() {
     assert.equal(await evaluate(`document.querySelector('.chat-history')?.textContent.includes('A stale') || document.querySelector('.chat-history')?.textContent.includes('B stale')`), false);
 
     window.webContents.send('audit:runtime', {
-      id: 'turn-a-completed', chatId: 'chat-a', status: 'completed', createdAt: timestamp, activity: [],
+      id: 'turn-a-completed', chatId: 'chat-a', status: 'completed', createdAt: timestamp,
+      startedAt: timestamp, endedAt: new Date(Date.parse(timestamp) + 900).toISOString(), activity: [],
     });
     await waitUntil('runtime completion detail read', () => (state.pendingGets.get('chat-a')?.length ?? 0) === 3);
     await clickChat('Chat B');
@@ -2056,59 +2085,116 @@ async function runElectronHost() {
     state.deferChatGets = false;
     passed('Rendered chat load and completed-turn reads ignore late A→B→A responses');
 
+    const runtimeUserAnchor = { id: 'chat-a-runtime-user', role: 'user', text: '  Synthetic question\nkept exactly.  ', createdAt: timestamp };
+    const otherChatUserAnchor = { id: 'chat-b-runtime-user', role: 'user', text: 'Запрос второго чата.', createdAt: timestamp };
+    state.details.get('chat-a').messages.push({
+      id: 'chat-a-pre-api-example', role: 'assistant', text: 'Исторический пример до появления источника ответа.', createdAt: timestamp,
+    });
+    state.details.get('chat-a').messages.push(runtimeUserAnchor);
+    state.details.get('chat-b').messages.push(otherChatUserAnchor);
+
     state.details.get('chat-a').artifacts = [
       { id: 'local-pdf', name: 'local.pdf', storedName: 'local.pdf', size: 1024, createdAt: timestamp, messageId: null },
       { id: 'local-xlsx', name: 'local.xlsx', storedName: 'local.xlsx', size: 2048, createdAt: timestamp, messageId: null },
       { id: 'local-md', name: 'local.md', storedName: 'local.md', size: 512, createdAt: timestamp, messageId: null },
     ];
+    await clickChat('Chat B');
+    await waitDom('Chat B loads the accepted user anchor before runtime activity', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'
+      && document.querySelector('[data-message-id="chat-b-runtime-user"]')?.textContent.includes('Запрос второго чата.')`);
+    await clickChat('Chat A');
+    await waitDom('Chat A reloads its accepted anchor and legacy attachments before runtime activity', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'
+      && document.querySelector('[data-message-id="chat-a-runtime-user"]')?.textContent.includes('Synthetic question')
+      && document.querySelector('.chat-files')?.textContent.includes('local.md')`);
     const importCountBeforeLocalAttachmentRender = state.importCalls.length;
     const queuedTurn = {
       id: 'turn-a-retryable', chatId: 'chat-a', status: 'queued', createdAt: timestamp, activity: [],
-      queueDurationMs: 850,
+      anchorMessageId: runtimeUserAnchor.id, assistantMessageId: 'assistant-turn-a-retryable', queueDurationMs: 850,
     };
     state.runtimeTurns.set('chat-a', [queuedTurn]);
     window.webContents.send('audit:runtime', queuedTurn);
-    await waitDom('queued runtime action', `document.querySelector('.runtime-turn-summary')?.textContent.includes('Ожидает')
+    await waitDom('queued runtime action stays beside its accepted user message', `document.querySelector('.turn-activity-summary')?.textContent.includes('В очереди')
       && document.querySelector('.runtime-cancel')?.textContent.includes('Убрать из очереди')`);
-    const runningTurn = { ...queuedTurn, status: 'running', draft: 'Текст поступает частями.', activeDurationMs: 900 };
+    const runningTurn = {
+      ...queuedTurn, status: 'running', startedAt: timestamp, draft: 'Текст поступает частями.', activeDurationMs: 900,
+    };
     state.runtimeTurns.set('chat-a', [runningTurn]);
     window.webContents.send('audit:runtime', runningTurn);
-    await waitDom('running partial draft and stop action', `document.querySelector('.runtime-turn-summary')?.textContent.includes('Выполняется')
-      && document.querySelector('.runtime-turn-draft')?.textContent.includes('Текст поступает частями')
+    await waitDom('running partial draft and stop action', `document.querySelector('.turn-activity-summary')?.textContent.includes('Выполняется')
+      && document.querySelector('.transcript-draft')?.textContent.includes('Текст поступает частями')
       && document.querySelector('.runtime-cancel')?.textContent === 'Остановить'`);
-    const otherChatQueuedTurn = { ...queuedTurn, id: 'turn-b-queued', chatId: 'chat-b' };
+    const otherChatQueuedTurn = { ...queuedTurn, id: 'turn-b-queued', chatId: 'chat-b', anchorMessageId: otherChatUserAnchor.id, assistantMessageId: 'assistant-turn-b-queued' };
     state.runtimeTurns.set('chat-b', [otherChatQueuedTurn]);
     await clickChat('Chat B');
     await waitDom('second chat shows its queued turn while the first chat is active', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'
-      && document.querySelector('.runtime-turn-summary')?.textContent.includes('Ожидает')
+      && document.querySelector('.turn-activity-summary')?.textContent.includes('В очереди')
       && document.querySelector('.runtime-cancel')?.textContent.includes('Убрать из очереди')`);
     await clickChat('Chat A');
     await waitDom('active chat retains its running turn after switching back', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'
-      && document.querySelector('.runtime-turn-summary')?.textContent.includes('Выполняется')`);
+      && document.querySelector('.turn-activity-summary')?.textContent.includes('Выполняется')`);
     await click('.runtime-cancel');
     await waitUntil('Stop invokes runtime cancel for the active chat turn', () => state.runtimeCancelCalls.length === 1);
     assert.deepEqual(state.runtimeCancelCalls[0], { chatId: 'chat-a', turnId: runningTurn.id });
+    state.details.get('chat-a').messages.push({ id: 'chat-a-cancel-user', role: 'user', text: 'Остановить этот запрос.', createdAt: timestamp });
     const failedTurn = {
       ...runningTurn, status: 'failed', error: 'Synthetic network failure', errorCategory: 'network', retryEligible: true,
       modelId: 'GigaChat-3-Ultra',
+      anchorMessageId: runtimeUserAnchor.id,
       draft: 'Частичный ответ остаётся незавершённым.', activeDurationMs: 4200,
+      endedAt: new Date(Date.parse(timestamp) + 4200).toISOString(),
     };
     state.runtimeTurns.set('chat-a', [failedTurn]);
     window.webContents.send('audit:runtime', failedTurn);
-    await waitDom('local attachment disclosure and collapsed failed timeline', `
+    await waitDom('local attachment disclosure and collapsed failed activity', `
       document.querySelector('.chat-files')?.textContent.includes('старое вложение, не отправлялось модели')
       && document.querySelector('.chat-files')?.textContent.includes('local.md')
       && document.querySelector('.chat-files')?.textContent.includes('Формат указан в API')
       && document.querySelector('.chat-files')?.textContent.includes('не подтверждён API')
-      && document.querySelector('.runtime-turn-details')?.open === false
-      && document.querySelector('.runtime-turn-summary')?.textContent.includes('Сеть')
+      && document.querySelector('.turn-activity-details')?.open === false
+      && document.querySelector('.turn-activity-summary')?.textContent.includes('Сеть')
       && document.querySelector('.runtime-retry')?.disabled
       && document.querySelector('.runtime-retry-hint')?.textContent.includes('Подключите API')`);
     assert.equal(state.retryCalls.length, 0, 'known-unavailable model registry must block renderer retry IPC');
-    await clickText('.runtime-turn-summary', 'Ошибка');
-    await waitDom('expanded failed timeline draft', `document.querySelector('.runtime-turn-details')?.open === true
-      && document.querySelector('.runtime-turn-draft')?.textContent.includes('незавершённый ответ')`);
+    await clickText('.turn-activity-summary', 'Не удалось завершить');
+    await waitDom('expanded failed timeline draft', `document.querySelector('.turn-activity-details')?.open === true
+      && document.querySelector('.turn-activity-error')?.textContent.includes('Synthetic network failure')
+      && document.querySelectorAll('.transcript-draft').length === 1
+      && document.querySelector('.transcript-draft')?.textContent.includes('Частичный ответ остаётся незавершённым.')
+      && document.querySelector('.transcript-draft')?.textContent.includes('Ответ не сохранён как готовое сообщение.')`);
     await capture('plan010-runtime-timeline-attachments');
+    const copyCallsBefore = state.copyMessageCalls.length;
+    await evaluate(`document.querySelector('[data-message-id="chat-a-runtime-user"] .transcript-copy').click()`);
+    await waitUntil('copy reaches the narrow stored-message IPC', () => state.copyMessageCalls.length === copyCallsBefore + 1);
+    assert.deepEqual(state.copyMessageCalls.at(-1), { id: 'chat-a', messageId: runtimeUserAnchor.id });
+    state.rejectNextCopyMessage = true;
+    await evaluate(`document.querySelector('[data-message-id="chat-a-runtime-user"] .transcript-copy').click()`);
+    await waitDom('clipboard failure stays visible beside its source message', `document.querySelector('[data-message-id="chat-a-runtime-user"] .transcript-copy-error')?.textContent.includes('Не удалось скопировать')`);
+    window.webContents.sendInputEvent({ type: 'mouseMove', x: 8, y: 8 });
+    await evaluate(`document.activeElement?.blur()`);
+    const copyFailureLayout = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const message = document.querySelector('[data-message-id="chat-a-runtime-user"]');
+      const meta = message?.querySelector('.transcript-message-meta');
+      const time = meta?.querySelector('time');
+      const copy = meta?.querySelector('.transcript-copy');
+      const error = meta?.querySelector('.transcript-copy-error');
+      const box = (element) => {
+        const rect = element?.getBoundingClientRect();
+        return rect ? { top: rect.top, width: rect.width } : null;
+      };
+      return {
+        hoverNone: matchMedia('(hover: none)').matches,
+        timeOpacity: time ? getComputedStyle(time).opacity : null,
+        copyOpacity: copy ? getComputedStyle(copy).opacity : null,
+        errorVisible: Boolean(error && getComputedStyle(error).display !== 'none' && getComputedStyle(error).visibility === 'visible' && getComputedStyle(error).opacity === '1'),
+        meta: box(meta), error: box(error), metaClientWidth: meta?.clientWidth, metaScrollWidth: meta?.scrollWidth,
+      };
+    })())`));
+    assert.equal(copyFailureLayout.errorVisible, true, 'copy error remains visible after hover and focus leave the message');
+    assert.ok(copyFailureLayout.error && copyFailureLayout.meta && copyFailureLayout.error.top >= copyFailureLayout.meta.top,
+      'copy error occupies its own metadata row');
+    assert.ok(copyFailureLayout.metaScrollWidth <= copyFailureLayout.metaClientWidth + 1,
+      'copy failure does not overflow the short user-message metadata row');
+    assert.equal(copyFailureLayout.timeOpacity, copyFailureLayout.hoverNone ? '1' : '0', 'timestamp visibility follows pointer/touch state');
+    assert.equal(copyFailureLayout.copyOpacity, copyFailureLayout.hoverNone ? '1' : '0', 'copy visibility follows pointer/touch state');
     state.keyStatus = { available: true, saved: true, usable: true };
     await clickText('.runtime-reconnect', 'Проверить подключение');
     await waitDom('connection status before retry', `document.querySelector('.connection-result')?.textContent.includes('Не подключено — запросы к модели недоступны')`);
@@ -2148,24 +2234,115 @@ async function runElectronHost() {
     await waitUntil('one retry IPC after a double click', () => state.retryCalls.length === 1);
     assert.deepEqual(state.retryCalls[0], { chatId: 'chat-a', turnId: failedTurn.id });
     assert.equal(state.appendCalls.length, appendCountBeforeRetry, 'retry must not append a second user record');
-    assert.equal(state.details.get('chat-a').messages.length, 1, 'synthetic renderer retry does not mutate chat history');
+    assert.equal(state.details.get('chat-a').messages.filter((message) => message.id === runtimeUserAnchor.id).length, 1,
+      'synthetic renderer retry keeps the original user message exactly once');
     assert.equal(state.importCalls.length, importCountBeforeLocalAttachmentRender, 'rendering stored files does not start a transfer or import');
     const settledFailure = { ...failedTurn, retryEligible: false };
     const completedRetry = {
-      id: 'turn-a-retry-completed', chatId: 'chat-a', status: 'completed', createdAt: timestamp,
+      id: 'turn-a-retry-completed', chatId: 'chat-a', anchorMessageId: runtimeUserAnchor.id,
+      assistantMessageId: failedTurn.assistantMessageId, status: 'completed', createdAt: new Date(Date.parse(timestamp) + 1000).toISOString(),
+      startedAt: new Date(Date.parse(timestamp) + 1100).toISOString(), endedAt: new Date(Date.parse(timestamp) + 3900).toISOString(),
       activity: [], queueDurationMs: 100, activeDurationMs: 2800,
     };
     const cancelledTurn = {
-      id: 'turn-a-cancelled', chatId: 'chat-a', status: 'cancelled', createdAt: timestamp,
+      id: 'turn-a-cancelled', chatId: 'chat-a', anchorMessageId: 'chat-a-cancel-user',
+      assistantMessageId: 'assistant-turn-a-cancelled', status: 'cancelled', createdAt: timestamp,
+      startedAt: timestamp, endedAt: new Date(Date.parse(timestamp) + 700).toISOString(),
       activity: [], errorCategory: 'cancel', draft: 'Остановленный черновик.', activeDurationMs: 700,
     };
+    state.details.get('chat-a').messages.push({
+      id: failedTurn.assistantMessageId, role: 'assistant', source: 'runtime', text: 'Ответ после повторного запуска.', createdAt: timestamp,
+    });
     state.runtimeTurns.set('chat-a', [settledFailure, completedRetry, cancelledTurn]);
     window.webContents.send('audit:runtime', settledFailure);
     window.webContents.send('audit:runtime', completedRetry);
     window.webContents.send('audit:runtime', cancelledTurn);
     await waitDom('completed and cancelled turns hide the old retry action', `document.querySelectorAll('.runtime-retry').length === 0
-      && [...document.querySelectorAll('.runtime-turn-summary')].some((summary) => summary.textContent.includes('Завершено'))
-      && [...document.querySelectorAll('.runtime-turn-summary')].some((summary) => summary.textContent.includes('Отменено'))`);
+      && [...document.querySelectorAll('.turn-activity-summary')].some((summary) => summary.textContent.includes('Выполнено за'))
+      && [...document.querySelectorAll('.turn-activity-summary')].some((summary) => summary.textContent.includes('Остановлено'))
+      && [...document.querySelectorAll('.transcript-message')].filter((message) => message.textContent.includes('Ответ после повторного запуска.')).length === 1
+      && document.querySelector('[data-message-id="chat-a-pre-api-example"] .transcript-example-label')?.textContent === 'Пример'
+      && !document.querySelector('[data-message-id="${failedTurn.assistantMessageId}"] .transcript-example-label')`);
+    assert.equal(await evaluate(`document.querySelector('[data-message-id="chat-a-pre-api-example"] .transcript-example-label')?.textContent`),
+      'Пример', 'legacy assistant text with no source keeps its example marker');
+    assert.equal(await evaluate(`document.querySelector('[data-message-id="${failedTurn.assistantMessageId}"] .transcript-example-label')`),
+      null, 'runtime assistant answers are not labeled as examples');
+    const retryActivityPosition = await evaluate(`(() => {
+      const activity = document.querySelector('[data-turn-id="turn-a-retry-completed"]');
+      const answer = document.querySelector('[data-message-id="${failedTurn.assistantMessageId}"]');
+      return Boolean(activity && answer && (activity.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING));
+    })()`);
+    assert.equal(retryActivityPosition, true, 'the successful retry activity appears immediately before its reserved answer');
+    await capture('stage4-linked-retry-transcript');
+
+    const transcriptOriginalSize = window.getSize();
+    const transcriptOriginalZoom = window.webContents.getZoomFactor();
+    const transcriptViewportCases = [
+      { width: 960, height: 720, zoom: 0.8, label: '960x720-80' },
+      { width: 560, height: 480, zoom: 1, label: '560x480' },
+      { width: 1520, height: 940, zoom: 1, label: 'wide' },
+      { width: 960, height: 720, zoom: 1.25, label: '960x720-125' },
+      { width: 960, height: 720, zoom: 1.5, label: '960x720-150' },
+    ];
+    const transcriptViewportMeasurements = [];
+    window.webContents.sendInputEvent({ type: 'mouseMove', x: 8, y: 8 });
+    for (const viewport of transcriptViewportCases) {
+      window.setSize(viewport.width, viewport.height);
+      window.webContents.setZoomFactor(viewport.zoom);
+      await sleep(320);
+      const measured = JSON.parse(await evaluate(`JSON.stringify((() => {
+        const chat = document.querySelector('.chat-view');
+        const history = document.querySelector('.chat-history');
+        const user = document.querySelector('[data-message-id="chat-a-runtime-user"]');
+        const bubble = user?.querySelector('.transcript-bubble');
+        const meta = user?.querySelector('.transcript-message-meta');
+        const assistant = document.querySelector('.transcript-message.message-assistant');
+        const box = (element) => {
+          if (!element) return null;
+          const rect = element.getBoundingClientRect();
+          return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width };
+        };
+        return {
+          chat: box(chat), history: box(history), historyClientWidth: history?.clientWidth, historyScrollWidth: history?.scrollWidth,
+          user: box(user), bubble: box(bubble), meta: box(meta), assistant: box(assistant),
+          userTextSelection: bubble ? getComputedStyle(bubble.querySelector('p')).userSelect : null,
+          hoverNone: matchMedia('(hover: none)').matches,
+          timeOpacity: user?.querySelector('.transcript-message-meta time') ? getComputedStyle(user.querySelector('.transcript-message-meta time')).opacity : null,
+          copyOpacity: user?.querySelector('.transcript-copy') ? getComputedStyle(user.querySelector('.transcript-copy')).opacity : null,
+        };
+      })())`));
+      assert.ok(measured.chat && measured.history && measured.user && measured.bubble && measured.meta && measured.assistant,
+        `${viewport.label}: all transcript regions are rendered`);
+      assert.ok(measured.historyScrollWidth <= measured.historyClientWidth + 1,
+        `${viewport.label}: transcript has no horizontal overflow`);
+      assert.ok(measured.user.left >= measured.chat.left - 1 && measured.user.right <= measured.chat.right + 1,
+        `${viewport.label}: user bubble stays inside the chat column`);
+      assert.ok(Math.abs(measured.user.right - measured.bubble.right) <= 1,
+        `${viewport.label}: short user bubble stays right-aligned inside its metadata row`);
+      assert.ok(measured.meta.top >= measured.bubble.bottom - 1,
+        `${viewport.label}: timestamp and copy controls stay below the user bubble`);
+      assert.ok(measured.assistant.width >= measured.history.width - 2,
+        `${viewport.label}: assistant answer uses the transcript width`);
+      assert.equal(measured.userTextSelection, 'text', `${viewport.label}: message text remains selectable`);
+      assert.equal(measured.timeOpacity, measured.hoverNone ? '1' : '0', `${viewport.label}: timestamp stays hidden at rest or remains available for touch`);
+      assert.equal(measured.copyOpacity, measured.hoverNone ? '1' : '0', `${viewport.label}: copy stays hidden at rest or remains available for touch`);
+      transcriptViewportMeasurements.push({ ...viewport, ...measured });
+      if (viewport.label === '960x720-80' || viewport.label === '560x480' || viewport.label === 'wide') {
+        await capture(`stage4-transcript-${viewport.label}`);
+      }
+    }
+    console.log(`Transcript viewport matrix ${JSON.stringify(transcriptViewportMeasurements.map(({ label, zoom, chat, historyScrollWidth, historyClientWidth, user, bubble }) => ({ label, zoom, chatWidth: chat.width, historyScrollWidth, historyClientWidth, userWidth: user.width, bubbleWidth: bubble.width })))}`);
+    await evaluate(`document.querySelector('[data-message-id="chat-a-runtime-user"] .transcript-copy').focus()`);
+    await waitDom('keyboard focus reveals timestamp and copy together', `(() => {
+      const message = document.querySelector('[data-message-id="chat-a-runtime-user"]');
+      const time = message?.querySelector('.transcript-message-meta time');
+      const copy = message?.querySelector('.transcript-copy');
+      return message?.matches(':focus-within') && Number(getComputedStyle(time).opacity) > 0 && Number(getComputedStyle(copy).opacity) > 0;
+    })()`);
+    await evaluate(`document.activeElement?.blur()`);
+    window.setSize(transcriptOriginalSize[0], transcriptOriginalSize[1]);
+    window.webContents.setZoomFactor(transcriptOriginalZoom);
+    await sleep(220);
 
     const registryReadsBeforePicker = state.modelRegistryCalls.filter((method) => method === 'getRegistry').length;
     await click('button[aria-label="Выбрать модель GigaChat"]');
@@ -2179,8 +2356,10 @@ async function runElectronHost() {
     const registryReadsBeforeBackgroundQuota = state.modelRegistryCalls.filter((method) => method === 'getRegistry').length;
     const refreshesBeforeBackgroundQuota = state.modelRegistryCalls.filter((method) => method === 'refresh').length;
     state.modelRegistry = { ...state.modelRegistry, exhaustedModelIds: ['GigaChat-3-Ultra'] };
+    state.details.get('chat-b').messages.push({ id: 'chat-b-quota-user', role: 'user', text: 'Запрос с исчерпанной квотой.', createdAt: timestamp });
     window.webContents.send('audit:runtime', {
-      id: 'turn-b-quota', chatId: 'chat-b', status: 'failed', createdAt: timestamp, activity: [],
+      id: 'turn-b-quota', chatId: 'chat-b', anchorMessageId: 'chat-b-quota-user', assistantMessageId: 'assistant-turn-b-quota', status: 'failed', createdAt: timestamp,
+      startedAt: timestamp, endedAt: new Date(Date.parse(timestamp) + 1000).toISOString(), activity: [],
       errorCategory: 'quota', error: 'Synthetic HTTP 402',
     });
     await waitUntil('background chat quota invalidates the shared model registry', () =>
@@ -2228,18 +2407,25 @@ async function runElectronHost() {
     await waitDom('chat returns after usage unknown check', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'`);
     passed('Rendered context, balance, and compaction remain unknown or unavailable without changing history');
     const toolTurnBase = {
-      id: 'turn-a-approved-tool', chatId: 'chat-a', createdAt: timestamp, activity: [
+      id: 'turn-a-approved-tool', chatId: 'chat-a', anchorMessageId: 'chat-a-tool-user', assistantMessageId: 'synthetic-tool-answer', createdAt: timestamp, activity: [
         { kind: 'provider', at: timestamp, activity: 'waiting-for-tool' },
         { kind: 'tool', at: timestamp, tool: 'read', phase: 'completed', durationMs: 28 },
       ],
     };
-    const toolTurn = { ...toolTurnBase, status: 'running', draft: 'Файл проверен и обновлён.' };
+    state.details.get('chat-a').messages.push({ id: 'chat-a-tool-user', role: 'user', text: 'Проверь файл и сообщи результат.', createdAt: timestamp });
+    await clickChat('Chat B');
+    await waitDom('Chat B remains readable before loading the tool-turn anchor', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'
+      && document.querySelector('.chat-history')?.textContent.includes('B baseline')`);
+    await clickChat('Chat A');
+    await waitDom('Chat A loads the accepted tool-turn anchor before its partial response', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'
+      && document.querySelector('[data-message-id="chat-a-tool-user"]')?.textContent.includes('Проверь файл и сообщи результат.')`);
+    const toolTurn = { ...toolTurnBase, status: 'running', startedAt: timestamp, draft: 'Файл проверен и обновлён.' };
     const turnsBeforeTool = state.runtimeTurns.get('chat-a') ?? [];
     state.runtimeTurns.set('chat-a', [...turnsBeforeTool, toolTurn]);
     window.webContents.send('audit:runtime', toolTurn);
-    await waitDom('partial answer delta appears before completion or history append', `document.querySelector('.runtime-activity-list')?.textContent.includes('Чтение файла: завершён')
-      && [...document.querySelectorAll('.runtime-turn-draft')].some((draft) => draft.textContent.includes('Файл проверен и обновлён'))
-      && !document.querySelector('.chat-history')?.textContent.includes('Файл проверен и обновлён')`);
+    await waitDom('partial answer delta appears before completion or history append', `document.querySelector('[data-turn-id="turn-a-approved-tool"] .turn-activity-list')?.textContent.includes('Чтение файла: завершён')
+      && [...document.querySelectorAll('.transcript-draft')].some((draft) => draft.textContent.includes('Файл проверен и обновлён'))
+      && !document.querySelector('[data-message-id="synthetic-tool-answer"]')`);
     window.webContents.send('audit:permission', {
       id: 'synthetic-write-approval', resource: 'project-files', action: 'write',
       target: 'C:\\audit\\project-a\\report.txt', reason: 'Synthetic renderer fixture approval.',
@@ -2250,19 +2436,25 @@ async function runElectronHost() {
     await clickText('.approval-dialog .primary-button', 'Разрешить');
     await waitUntil('approval response reaches the existing IPC contract', () => state.permissionResponses.some((item) => item.id === 'synthetic-write-approval' && item.allowed));
     const completedToolTurn = {
-      ...toolTurnBase, status: 'completed', activeDurationMs: 3400,
+      ...toolTurnBase, status: 'completed', startedAt: timestamp,
+      endedAt: new Date(Date.parse(timestamp) + 3400).toISOString(), activeDurationMs: 3400,
       activity: [
         { kind: 'tool', at: timestamp, tool: 'read', phase: 'completed', durationMs: 28 },
         { kind: 'tool', at: timestamp, tool: 'write', phase: 'completed', durationMs: 47 },
         { kind: 'provider', at: timestamp, activity: 'receiving' },
       ],
     };
-    state.details.get('chat-a').messages.push({ id: 'synthetic-tool-answer', role: 'assistant', source: 'runtime', text: 'Файл проверен и обновлён.', createdAt: timestamp });
+    state.details.get('chat-a').messages.push({ id: toolTurnBase.assistantMessageId, role: 'assistant', source: 'runtime', text: 'Файл проверен и обновлён.', createdAt: timestamp });
     state.runtimeTurns.set('chat-a', [...turnsBeforeTool, completedToolTurn]);
     window.webContents.send('audit:runtime', completedToolTurn);
-    await waitDom('completed injected tool timeline and answer render', `document.querySelector('.runtime-activity-list')?.textContent.includes('Запись файла: завершён')
-      && [...document.querySelectorAll('.chat-message')].filter((message) => message.textContent.includes('Файл проверен и обновлён')).length === 1
-      && ![...document.querySelectorAll('.runtime-turn-draft')].some((draft) => draft.textContent.includes('Файл проверен и обновлён'))`);
+    await waitDom('completed injected tool activity and reserved answer render once', `document.querySelector('[data-turn-id="turn-a-approved-tool"] .turn-activity-list')?.textContent.includes('Запись файла: завершён')
+      && [...document.querySelectorAll('.transcript-message')].filter((message) => message.textContent.includes('Файл проверен и обновлён')).length === 1
+      && ![...document.querySelectorAll('.transcript-draft')].some((draft) => draft.textContent.includes('Файл проверен и обновлён'))`);
+    assert.equal(await evaluate(`(() => {
+      const activity = document.querySelector('[data-turn-id="turn-a-approved-tool"]');
+      const answer = document.querySelector('[data-message-id="synthetic-tool-answer"]');
+      return Boolean(activity && answer && (activity.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING));
+    })()`), true, 'activity is above the exact assistant message reserved for that turn');
     assert.equal(state.details.get('chat-a').messages.filter((message) => message.text === 'Файл проверен и обновлён.').length, 1,
       'completed synthetic response must be stored once after its partial draft');
     passed('Renderer shows a partial delta before one final answer for synthetic tool activity; execution is covered by runtime/tool fixtures');
@@ -2272,10 +2464,42 @@ async function runElectronHost() {
     await waitDom('return to the current chat before switching chats', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'`);
     await clickChat('Chat B');
     await waitDom('timeline hidden after switching chats', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'
-      && document.querySelector('.runtime-timeline') === null`);
+      && document.querySelector('.turn-activity') === null`);
     await clickChat('Chat A');
-    await waitDom('timeline restored for original chat', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'
-      && document.querySelectorAll('.runtime-turn-summary').length === 4`);
+    const expectedChatATurnIds = [settledFailure.id, completedRetry.id, cancelledTurn.id, completedToolTurn.id].sort();
+    await waitDom('timeline restores the exact accepted turns for original chat', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'
+      && JSON.stringify([...document.querySelectorAll('.turn-activity')].map((activity) => activity.getAttribute('data-turn-id')).sort()) === ${JSON.stringify(JSON.stringify(expectedChatATurnIds))}`);
+    const restoredTimeline = JSON.parse(await evaluate(`JSON.stringify(((expected) => {
+      const activities = [...document.querySelectorAll('.turn-activity')];
+      return {
+        ids: activities.map((activity) => activity.getAttribute('data-turn-id')).sort(),
+        bindings: expected.map((turn) => {
+          const activity = document.querySelector('[data-turn-id="' + turn.turnId + '"]');
+          const anchor = document.querySelector('[data-message-id="' + turn.anchorMessageId + '"]');
+          const answer = turn.answerMessageId ? document.querySelector('[data-message-id="' + turn.answerMessageId + '"]') : null;
+          return {
+            turnId: turn.turnId,
+            activityCount: activities.filter((item) => item.getAttribute('data-turn-id') === turn.turnId).length,
+            anchorFound: Boolean(anchor),
+            answerFound: turn.answerMessageId ? Boolean(answer) : null,
+            answerAfterActivity: turn.answerMessageId && activity && answer
+              ? Boolean(activity.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING) : null,
+          };
+        }),
+      };
+    })(${JSON.stringify([
+      { turnId: settledFailure.id, anchorMessageId: runtimeUserAnchor.id, answerMessageId: null },
+      { turnId: completedRetry.id, anchorMessageId: runtimeUserAnchor.id, answerMessageId: completedRetry.assistantMessageId },
+      { turnId: cancelledTurn.id, anchorMessageId: 'chat-a-cancel-user', answerMessageId: null },
+      { turnId: completedToolTurn.id, anchorMessageId: toolTurnBase.anchorMessageId, answerMessageId: completedToolTurn.assistantMessageId },
+    ])}))`));
+    assert.deepEqual(restoredTimeline.ids, expectedChatATurnIds, `unexpected turn IDs after chat switch: ${JSON.stringify(restoredTimeline)}`);
+    assert.deepEqual(restoredTimeline.bindings, [
+      { turnId: settledFailure.id, activityCount: 1, anchorFound: true, answerFound: null, answerAfterActivity: null },
+      { turnId: completedRetry.id, activityCount: 1, anchorFound: true, answerFound: true, answerAfterActivity: true },
+      { turnId: cancelledTurn.id, activityCount: 1, anchorFound: true, answerFound: null, answerAfterActivity: null },
+      { turnId: completedToolTurn.id, activityCount: 1, anchorFound: true, answerFound: true, answerAfterActivity: true },
+    ], `orphaned or duplicated activity/answer binding: ${JSON.stringify(restoredTimeline)}`);
     passed('Rendered local attachments stay local; retry is explicit, collapsible, and adds no user message');
 
     const chatMessagesBeforeAttachmentPicker = state.details.get('chat-a').messages.length;
@@ -2293,8 +2517,13 @@ async function runElectronHost() {
     await waitDom('Send waits until existing-chat import completes', `document.querySelector('.send-button-wrap .send-button')?.disabled`);
     assert.equal(state.appendCalls.length, chatAppendsBeforeAttachmentPicker, 'opening a picker never appends a message');
     const pendingChatPicker = state.pendingChatDraftImports[chatPickerStart];
+    state.details.get('chat-a').messages.push({ id: 'chat-a-user-during-picker', role: 'user', text: 'Пока выбирался файл, пришёл новый запрос.', createdAt: timestamp });
     state.details.get('chat-a').messages.push({ id: 'chat-a-answer-during-picker', role: 'assistant', source: 'runtime', text: 'Ответ пришёл, пока выбирался файл.', createdAt: timestamp });
-    const pickerRefreshTurn = { id: 'turn-answer-during-attachment-picker', chatId: 'chat-a', status: 'completed', createdAt: timestamp, activity: [] };
+    const pickerRefreshTurn = {
+      id: 'turn-answer-during-attachment-picker', chatId: 'chat-a', anchorMessageId: 'chat-a-user-during-picker',
+      assistantMessageId: 'chat-a-answer-during-picker', status: 'completed', createdAt: timestamp,
+      startedAt: timestamp, endedAt: new Date(Date.parse(timestamp) + 1000).toISOString(), activity: [],
+    };
     state.runtimeTurns.set('chat-a', [...(state.runtimeTurns.get('chat-a') ?? []), pickerRefreshTurn]);
     window.webContents.send('audit:runtime', pickerRefreshTurn);
     await waitDom('new assistant message arrives while the picker is open', `document.querySelector('.chat-history')?.textContent.includes('Ответ пришёл, пока выбирался файл.')`);
@@ -2302,8 +2531,13 @@ async function runElectronHost() {
     await waitDom('late picker result merges only draft attachments into the current detail', `document.querySelector('.attachment-card strong')?.textContent === 'triangle.png'
       && document.querySelector('.chat-history')?.textContent.includes('Ответ пришёл, пока выбирался файл.')`);
     await waitDom('pending image thumbnail is rendered from the bounded preview bridge', `document.querySelector('.attachment-card .attachment-preview img')`);
-    assert.equal(state.details.get('chat-a').messages.length, chatMessagesBeforeAttachmentPicker + 1,
-      'the newer assistant message survives the attachment result');
+    assert.equal(state.details.get('chat-a').messages.length, chatMessagesBeforeAttachmentPicker + 2,
+      'the accepted user message and its assistant answer survive the attachment result');
+    assert.deepEqual(state.details.get('chat-a').messages.slice(chatMessagesBeforeAttachmentPicker)
+      .map(({ id, role, text }) => ({ id, role, text })), [
+      { id: 'chat-a-user-during-picker', role: 'user', text: 'Пока выбирался файл, пришёл новый запрос.' },
+      { id: 'chat-a-answer-during-picker', role: 'assistant', text: 'Ответ пришёл, пока выбирался файл.' },
+    ], 'late attachment staging preserves both exact messages in their accepted order');
     assert.equal(state.appendCalls.length, chatAppendsBeforeAttachmentPicker, 'staging stays local and does not send');
     assert.equal(await evaluate(`document.querySelector('.composer textarea')?.value`), 'Текст изменён, пока picker открыт',
       'late picker acknowledgement preserves text edited while it was open');
@@ -2678,7 +2912,8 @@ async function runElectronHost() {
     await waitDom('latest unconsumed Skill refreshed', `document.querySelector('.composer-skill-selection strong')?.textContent === 'Audit'`);
     updateSummary(profileChatId, { nextTurnPermissionProfile: null, nextTurnSkillId: null });
     window.webContents.send('audit:runtime', {
-      id: 'turn-terminal-after-consume', chatId: profileChatId, status: 'failed', createdAt: timestamp, activity: [],
+      id: 'turn-terminal-after-consume', chatId: profileChatId, status: 'failed', createdAt: timestamp,
+      startedAt: timestamp, endedAt: new Date(Date.parse(timestamp) + 1000).toISOString(), activity: [],
     });
     await waitDom('failed terminal event refreshes consumed profile', `document.querySelector('.composer-permission-menu > button')?.textContent.includes('Спросить')`);
     await waitDom('failed terminal event refreshes consumed Skill', `!document.querySelector('.composer-skill-selection')`);
@@ -2788,6 +3023,7 @@ async function runElectronHost() {
     state.deferHomeDraftSendResponse = true;
     const homeSendsBeforeAccept = state.homeDraftSendCalls.length;
     const appendsBeforeAccept = state.appendCalls.length;
+    const retriesBeforeHomeAccept = state.retryCalls.length;
     const acceptedClicks = await evaluate(`(() => { const button = document.querySelector('.send-button-wrap .send-button'); if (!button || button.disabled) return false; button.click(); button.click(); return true; })()`);
     assert.equal(acceptedClicks, true);
     await waitUntil('one atomic home Send after a double click', () => state.pendingHomeDraftSends.length === 1);
@@ -2804,17 +3040,33 @@ async function runElectronHost() {
       'pending file is attached to the explicit first user message');
     resolveHomeDraftSend(pendingHomeSend);
     await waitDom('accepted home draft opens its new chat', `document.querySelector('.chat-header-title')?.textContent === 'Home message with staged attachment'`);
+    const acceptedHomeTurn = pendingHomeSend.accepted.turn;
+    const durableHomeTurn = state.details.get(pendingHomeSend.accepted.detail.id)?.turns.find((turn) => turn.turnId === acceptedHomeTurn.turnId);
+    assert.equal(durableHomeTurn?.status, 'failed', 'queued:false home acceptance is durably terminal, not left queued');
+    assert.equal(durableHomeTurn?.startedAt, undefined, 'a turn rejected before runtime start has no start timestamp');
+    assert.ok(durableHomeTurn?.endedAt, 'the not-sent outcome is durably timestamped');
+    await waitDom('accepted but not queued home turn is rendered as not sent', `document.querySelector('[data-turn-id="${acceptedHomeTurn.turnId}"] .turn-activity-status')?.textContent === 'Не отправлено'
+      && document.querySelector('[data-turn-id="${acceptedHomeTurn.turnId}"] .turn-activity-error')?.textContent.includes('не поставлено в очередь')`);
+    const homeNotSentBinding = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const anchor = document.querySelector('[data-message-id="${acceptedHomeTurn.messageId}"]');
+      const activity = document.querySelector('[data-turn-id="${acceptedHomeTurn.turnId}"]');
+      return { anchor: anchor?.textContent, activityAfterAnchor: Boolean(anchor && activity && (anchor.compareDocumentPosition(activity) & Node.DOCUMENT_POSITION_FOLLOWING)) };
+    })())`));
+    assert.ok(homeNotSentBinding.anchor?.includes('Home message with staged attachment'));
+    assert.equal(homeNotSentBinding.activityAfterAnchor, true, 'not-sent status remains attached to its accepted user message');
     assert.equal(state.chats.length, homeChatCount + 1, 'only explicit Send creates one chat');
     assert.equal(state.createCalls.length, homeCreateCalls, 'home Send uses the atomic homeDraft contract, not chats.create');
     assert.equal(state.homeDraftSendCalls.length, homeSendsBeforeAccept + 1);
     assert.equal(state.appendCalls.length, appendsBeforeAccept, 'accepted first message is not appended twice');
+    assert.equal(state.retryCalls.length, retriesBeforeHomeAccept, 'a not-sent home turn is not automatically retried');
+    assert.equal(state.runtimeTurns.has(pendingHomeSend.accepted.detail.id), false, 'queued:false creates no runtime work item');
     assert.equal(state.details.get(pendingHomeSend.accepted.detail.id)?.messages.filter((message) => message.role === 'user').length, 1);
     assert.equal(state.homeDraft.text, '', 'accepted text clears from the persistent home draft');
     assert.equal(state.homeDraft.attachments.length, 0, 'accepted attachments leave the pending home tray');
     assert.equal(await evaluate(`document.querySelector('.notice')?.textContent.includes('сохранено локально')`), true,
       'offline acceptance is shown as local, not queued or sent');
     state.deferHomeDraftSendResponse = false;
-    passed('Home input and selections stay local until one explicit, durable Send; failure retains the draft and files');
+    passed('Home input stays local until explicit Send; queued:false is durably shown as not sent without runtime work');
 
     await clickText('.sidebar-actions button', 'Новый чат');
     await waitDom('home route after accepted Send', `document.querySelector('.home-view')`);
@@ -3862,6 +4114,138 @@ async function runElectronHost() {
     console.log(`Rendered browser workspace matrix ${JSON.stringify({ widths: browserWidthMatrix.map(({ target, zoom, workspaceWidth, innerWidth, full, chatTabCount, browserTabCount, scrollWidth, clientWidth }) => ({ target, zoom, workspaceWidth, innerWidth, full, chatTabCount, browserTabCount, scrollWidth, clientWidth })), oneTabGeometry, twentyTabGeometry, pinnedWidth, hiddenWidth })}`);
     passed('Renderer verifies main widths 1408/1200/880/879/560 at paired zooms, header alignment, and pinned/hidden/preview sidebar states');
 
+    const themeChat = state.details.get('chat-b');
+    const themeAnchor = { id: 'stage4-theme-user', role: 'user', text: 'йоу', createdAt: timestamp };
+    const themeAnswer = { id: 'stage4-theme-answer', role: 'assistant', source: 'runtime', text: 'Ответ остаётся на ширине чата.', createdAt: timestamp };
+    themeChat.messages.push(themeAnchor, themeAnswer);
+    const longUserTranscriptText = `Длинный русский запрос остаётся компактно выровненным справа и переносится по доступной ширине.\n\nURL: https://example.test/very/long/user/request?query=проверка&mode=responsive\n\nКод: const request = { chatId: "stage4-layout", includeHistory: true };`;
+    const longTranscriptText = `Длинное сообщение на русском сохраняет строки и переносится по доступной ширине.\n\nURL: https://example.test/very/long/path/for/a/transcript-layout-check?query=проверка&mode=responsive\n\nКод: const result = await client.request({ chatId: "stage4-layout", retry: false });`;
+    for (let index = 0; index < 28; index += 1) {
+      const role = index % 2 === 0 ? 'user' : 'assistant';
+      themeChat.messages.push({
+        id: `stage4-theme-history-${index + 1}`,
+        role,
+        ...(role === 'assistant' ? { source: 'runtime' } : {}),
+        text: index === 26 ? longUserTranscriptText : index === 27 ? longTranscriptText : `Сообщение ${index + 1} из длинного synthetic диалога.`,
+        createdAt: timestamp,
+      });
+    }
+    themeChat.turns.push({
+      turnId: 'stage4-theme-turn', anchorMessageId: themeAnchor.id, assistantMessageId: themeAnswer.id,
+      modelId: 'GigaChat-3-Ultra', status: 'completed', createdAt: timestamp, startedAt: timestamp, endedAt: timestamp,
+      queueDurationMs: 140, activeDurationMs: 2000, activity: [{ kind: 'provider', at: timestamp, activity: 'receiving' }],
+    });
+    const captureChatTranscriptTheme = async (name) => {
+      await waitDom(`${name} linked transcript is visible`, `document.querySelector('[data-message-id="stage4-theme-user"]')
+        && document.querySelector('[data-turn-id="stage4-theme-turn"]')
+        && document.querySelector('[data-message-id="stage4-theme-answer"]')`);
+      await evaluate(`document.activeElement?.blur()`);
+      await evaluate(`document.querySelector('[data-message-id="stage4-theme-user"]')?.scrollIntoView({ block: 'center' })`);
+      await movePointerTo('.chat-header-title');
+      const readShortBubbleState = async () => JSON.parse(await evaluate(`JSON.stringify((() => {
+        const history = document.querySelector('.chat-history');
+        const anchor = document.querySelector('[data-message-id="stage4-theme-user"]');
+        const bubble = anchor?.querySelector('.transcript-bubble');
+        const meta = anchor?.querySelector('.transcript-message-meta');
+        const time = meta?.querySelector('time');
+        const copy = meta?.querySelector('.transcript-copy');
+        const box = (element) => {
+          if (!element) return null;
+          const { left, right, top, bottom, width, height } = element.getBoundingClientRect();
+          return { left, right, top, bottom, width, height };
+        };
+        return {
+          history: box(history), anchor: box(anchor), bubble: box(bubble), meta: box(meta), time: box(time), copy: box(copy),
+          hoverNone: matchMedia('(hover: none)').matches,
+          timeOpacity: time ? getComputedStyle(time).opacity : null,
+          copyOpacity: copy ? getComputedStyle(copy).opacity : null,
+        };
+      })())`));
+      const assertCompactBubble = (metrics, label) => {
+        assert.ok(metrics.time && metrics.copy, `${name} ${label}: timestamp and copy controls are rendered`);
+        assert.ok(metrics.history?.width > 600, `${name} ${label}: the short-bubble check uses a wide transcript: ${JSON.stringify(metrics.history)}`);
+        assert.ok(metrics.bubble?.width < 120, `${name} ${label}: «йоу» stays an intrinsic bubble under 120px: ${JSON.stringify(metrics)}`);
+        assert.ok(Math.abs(metrics.anchor.right - metrics.history.right) <= 1,
+          `${name} ${label}: the compact user message is aligned to the transcript's right edge: ${JSON.stringify(metrics)}`);
+        assert.ok(Math.abs(metrics.bubble.right - metrics.anchor.right) <= 1,
+          `${name} ${label}: the bubble stays right-aligned within its message row: ${JSON.stringify(metrics)}`);
+        assert.ok(Math.abs((metrics.time.top + metrics.time.bottom) / 2 - (metrics.copy.top + metrics.copy.bottom) / 2) <= 1,
+          `${name} ${label}: time and copy share one centered control row: ${JSON.stringify(metrics)}`);
+        assert.ok(metrics.copy.left >= metrics.time.right - 1 && metrics.copy.left - metrics.time.right <= 12,
+          `${name} ${label}: copy sits adjacent to the timestamp: ${JSON.stringify(metrics)}`);
+      };
+      const assertReservedGeometry = (before, after, label) => {
+        for (const key of ['anchor', 'bubble', 'meta']) {
+          for (const coordinate of ['left', 'right', 'top', 'bottom', 'width', 'height']) {
+            assert.ok(Math.abs(before[key][coordinate] - after[key][coordinate]) <= 1,
+              `${name} ${label}: revealing metadata does not move ${key}.${coordinate}: before=${JSON.stringify(before[key])}, after=${JSON.stringify(after[key])}`);
+          }
+        }
+      };
+      const resting = await readShortBubbleState();
+      assertCompactBubble(resting, 'at rest');
+      assert.equal(resting.timeOpacity, resting.hoverNone ? '1' : '0', `${name}: the timestamp is quiet at rest unless touch rules keep it available`);
+      assert.equal(resting.copyOpacity, resting.hoverNone ? '1' : '0', `${name}: copy is quiet at rest unless touch rules keep it available`);
+      await evaluate(`document.querySelector('[data-message-id="stage4-theme-user"] .transcript-copy')?.focus()`);
+      await waitDom(`${name} keyboard focus reveals the compact message controls`, `(() => {
+        const message = document.querySelector('[data-message-id="stage4-theme-user"]');
+        const time = message?.querySelector('.transcript-message-meta time');
+        const copy = message?.querySelector('.transcript-copy');
+        return message?.matches(':focus-within') && Number(getComputedStyle(time).opacity) > 0 && Number(getComputedStyle(copy).opacity) > 0;
+      })()`);
+      const focused = await readShortBubbleState();
+      assertCompactBubble(focused, 'with keyboard focus');
+      assertReservedGeometry(resting, focused, 'keyboard focus');
+      await capture(`stage4-chat-transcript-${name}-short-yo`);
+      await evaluate(`document.activeElement?.blur()`);
+      if (!resting.hoverNone) {
+        await movePointerTo('[data-message-id="stage4-theme-user"] .transcript-bubble');
+        await waitDom(`${name} pointer hover reveals both compact message controls`, `(() => {
+          const message = document.querySelector('[data-message-id="stage4-theme-user"]');
+          const time = message?.querySelector('.transcript-message-meta time');
+          const copy = message?.querySelector('.transcript-copy');
+          return message?.matches(':hover') && Number(getComputedStyle(time).opacity) > 0 && Number(getComputedStyle(copy).opacity) > 0;
+        })()`);
+        const hovered = await readShortBubbleState();
+        assertCompactBubble(hovered, 'with pointer hover');
+        assertReservedGeometry(resting, hovered, 'pointer hover');
+      }
+      await movePointerTo('.chat-header-title');
+      await evaluate(`(() => { const area = document.querySelector('.view-area'); area.scrollTop = area.scrollHeight; })()`);
+      const sample = JSON.parse(await evaluate(`JSON.stringify((() => {
+        const history = document.querySelector('.chat-history');
+        const anchor = document.querySelector('[data-message-id="stage4-theme-user"]');
+        const bubble = anchor?.querySelector('.transcript-bubble');
+        const longUser = document.querySelector('[data-message-id="stage4-theme-history-27"]');
+        const longAssistant = document.querySelector('[data-message-id="stage4-theme-history-28"]');
+        const activity = document.querySelector('[data-turn-id="stage4-theme-turn"]');
+        const answer = document.querySelector('[data-message-id="stage4-theme-answer"]');
+        return {
+          messageCount: history?.querySelectorAll('.transcript-message').length ?? 0,
+          scrollWidth: history?.scrollWidth ?? 0,
+          clientWidth: history?.clientWidth ?? 0,
+          bubbleRight: bubble?.getBoundingClientRect().right ?? 0,
+          anchorRight: anchor?.getBoundingClientRect().right ?? 0,
+          longUserRole: longUser?.classList.contains('message-user') ?? false,
+          longUserText: longUser?.textContent ?? '',
+          longAssistantRole: longAssistant?.classList.contains('message-assistant') ?? false,
+          longAssistantText: longAssistant?.textContent ?? '',
+          answerAfterActivity: Boolean(activity && answer && (activity.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING)),
+          textSelectable: bubble ? getComputedStyle(bubble.querySelector('p')).userSelect === 'text' : false,
+        };
+      })())`));
+      assert.ok(sample.messageCount >= 30, `${name}: the transcript renders the full long history`);
+      assert.ok(sample.scrollWidth <= sample.clientWidth + 1, `${name}: long messages do not create horizontal overflow`);
+      assert.ok(Math.abs(sample.bubbleRight - sample.anchorRight) <= 1, `${name}: the short user bubble remains right-aligned`);
+      assert.equal(sample.longUserRole, true, `${name}: the long Russian/URL/code prompt is a user message`);
+      assert.ok(sample.longUserText.includes(longUserTranscriptText), `${name}: the long user prompt is preserved in full`);
+      assert.equal(sample.longAssistantRole, true, `${name}: the following long answer remains an assistant message`);
+      assert.ok(sample.longAssistantText.includes(longTranscriptText), `${name}: the long assistant answer is preserved in full`);
+      assert.equal(sample.answerAfterActivity, true, `${name}: linked activity remains before its answer`);
+      assert.equal(sample.textSelectable, true, `${name}: transcript text remains selectable`);
+      await capture(`stage4-chat-transcript-${name}`);
+    };
+
     const originalTheme = state.appSettings.theme;
     const themeCases = [
       { value: 'dark', label: 'Тёмная' },
@@ -3872,6 +4256,16 @@ async function runElectronHost() {
     ];
     const themeSamples = [];
     const browserWorkspaceThemeSamples = [];
+    await clickChat('Chat B');
+    await waitDom('Chat B is active before setting the transcript theme viewport', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'`);
+    await click('button[aria-label="Показать браузер"]');
+    await waitDom('browser opens to establish a measured wide theme viewport', `document.querySelector('.browser-workspace.browser-open')`);
+    const themeWideViewport = await setMainWorkspaceWidth(1200, 1);
+    assert.ok(themeWideViewport.workspaceWidth > 600, `the shared theme transcript uses the explicitly measured wide viewport: ${JSON.stringify(themeWideViewport)}`);
+    await click('button[aria-label="Скрыть браузер"]');
+    await waitDom('browser closes before the shared theme transcript matrix', `!document.querySelector('.browser-pane')`);
+    const themeChatWidth = Number(await evaluate(`document.querySelector('.chat-view')?.getBoundingClientRect().width ?? 0`));
+    assert.ok(themeChatWidth > 600, `the explicit wide workspace leaves Chat B over 600px for theme captures: ${themeChatWidth}`);
     await click('.profile-settings-button');
     await clickText('.settings-nav-item', 'Оформление');
     for (let index = 0; index < themeCases.length; index += 1) {
@@ -3919,6 +4313,7 @@ async function runElectronHost() {
       if (index < 4) {
         await click('button.window-action[aria-label="Назад"]');
         await waitDom(`${themeCase.label} returns to Chat B for actual workspace theme proof`, `document.querySelector('.chat-header-title')?.textContent === 'Chat B'`);
+      await captureChatTranscriptTheme(themeCase.value);
         if (await evaluate(`Boolean(document.querySelector('.notice'))`)) await click('button[aria-label="Закрыть уведомление"]');
         await waitDom(`${themeCase.label} transient notice is dismissed`, `!document.querySelector('.notice')`);
         await click('button[aria-label="Показать браузер"]');
@@ -3977,6 +4372,14 @@ async function runElectronHost() {
         await waitDom(`${themeCase.label} returns to settings for the next palette`, `document.querySelector('.settings-nav-item')`);
         await clickText('.settings-nav-item', 'Оформление');
       } else if (index < themeCases.length - 1) await clickText('.settings-nav-item', 'Оформление');
+      else {
+        await click('button.window-action[aria-label="Назад"]');
+        await waitDom('system theme returns to Chat B for transcript proof', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'`);
+        await captureChatTranscriptTheme(themeCase.value);
+        await click('.profile-settings-button');
+        await waitDom('system theme returns to settings after transcript proof', `document.querySelector('.settings-nav-item')`);
+        await clickText('.settings-nav-item', 'Оформление');
+      }
     }
     assert.ok(new Set(themeSamples.map((sample) => sample.popupBackground)).size >= 4,
       `Dark/Emerald/Light/Warm/System should render at least four resolved popup palettes: ${JSON.stringify(themeSamples.map((sample) => [sample.requested, sample.resolved, sample.popupBackground]))}`);
@@ -4100,7 +4503,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 const methods = {
   homeDraft: ['get','save','importFile','pickFiles','stageFiles','getAttachmentPreview','removeFile','send'],
   projects: ['list','create','pickFolder','instructionsBackupPath','update','remove','chooseFolder','openFolder','readInstructions','saveInstructions','saveInstructionsCopy'],
-  chats: ['list','get','create','update','appendLocalMessage','importFile','pickDraftFiles','stageDraftFiles','getDraftAttachmentPreview','getArtifactPreview','removeDraftFile','openArtifact','openFolder','remove'],
+  chats: ['list','get','create','update','appendLocalMessage','importFile','pickDraftFiles','stageDraftFiles','getDraftAttachmentPreview','getArtifactPreview','removeDraftFile','copyMessage','openArtifact','openFolder','remove'],
   runtime: ['getStatus','list','cancel','retry'],
   permissions: ['readConfig','saveConfig','respond'],
   skills: ['list','readSource','setEnabled','openFolder'],

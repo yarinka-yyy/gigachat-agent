@@ -2,11 +2,11 @@ import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { lstat, mkdir, mkdtemp, readFile, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, safeStorage, screen, session, shell, systemPreferences, Tray, WebContentsView, type IpcMainInvokeEvent, type MediaAccessPermissionRequest } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, safeStorage, screen, session, shell, systemPreferences, Tray, WebContentsView, type IpcMainInvokeEvent, type MediaAccessPermissionRequest } from 'electron';
 import { openStore, type LocalStore } from './store';
 import { COMPACTION_QUALITY_VERIFIED, COMPACTION_UNAVAILABLE_REASON, COMPACTION_TASK_INSTRUCTION, buildNextTurnContext, validateCompactSummary } from './context';
 import { createLocalTools, createPowerShellHelper, resolvePowerShellHelperPath } from './local-tools';
-import { createTurnRuntime, type PreparedCompactionContext, type TurnRuntime } from './runtime';
+import { createTurnRuntime, queueAcceptedTurnOrMarkNotSent, type PreparedCompactionContext, type TurnRuntime } from './runtime';
 import type { AcceptedTurnInput, AttachmentImportBatchResult, ChatArtifact, ChatPatch, CompactSnapshot, FolderOpener, HomeDraftAttachment, HookRunResult, ModelRegistrySnapshot, NotificationSettings, PreferredOpener, RuntimeAvailability, SettingsPatch, Theme, VoiceAvailability } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { requireModelId } from './models';
@@ -22,6 +22,7 @@ import { attachmentConnectionBlocker, attachmentContentType, attachmentSendBlock
 import { createOnboardingBrowser, type BrowserBounds } from './onboarding-browser';
 import { createEmbeddedBrowser } from './embedded-browser';
 import { createNumberedProjectFolder, prepareProjectFolders, removeEmptyCreatedFolder } from './project-folders';
+import { getCopyableUserMessageText } from './chat-transcript';
 import { createVoiceRuntime, VOICE_MAX_OUTPUT_BYTES, type VoiceRuntime } from './voice';
 import { prepareVoiceModelCache } from './voice-model-cache';
 import {
@@ -1255,18 +1256,22 @@ async function registerIpcHandlers(
       const connection = providerConnection.getConnectionStatus();
       const registry = providerConnection.getModelRegistry();
       const modelError = chatModelUnavailableReason(registry, accepted.turn.modelId);
-      if (connection.state === 'connected' && !modelError) {
-        try {
-          queued = runtime.enqueue(accepted.turn) !== null;
-          if (queued) queuedHomeTurns.add(accepted.turn.turnId);
-          else store.releaseTurnReservation(accepted.turn.turnId);
-        } catch (error) {
-          store.releaseTurnReservation(accepted.turn.turnId);
-          console.error('Accepted home turn was saved but could not be queued.', error);
-        }
-      } else store.releaseTurnReservation(accepted.turn.turnId);
+      const shouldQueue = connection.state === 'connected' && !modelError;
+      const reason = connection.state !== 'connected'
+        ? 'Сохранено локально, не отправлено. Подключитесь к GigaChat и отправьте сообщение ещё раз.'
+        : modelError
+          ? 'Сохранено локально, не отправлено. Выбранная модель сейчас недоступна; проверьте подключение и отправьте сообщение ещё раз.'
+          : 'Сохранено локально, не отправлено. Не удалось поставить ход в очередь; отправьте сообщение ещё раз.';
+      const result = await queueAcceptedTurnOrMarkNotSent({
+        shouldQueue,
+        enqueue: () => runtime.enqueue(accepted.turn),
+        markNotSent: () => store.markQueuedTurnNotSent(accepted.turn, reason),
+        releaseReservation: () => store.releaseTurnReservation(accepted.turn.turnId),
+      });
+      queued = result.queued;
+      if (result.queued) queuedHomeTurns.add(accepted.turn.turnId);
     }
-    return { ...accepted, homeDraft: await store.getHomeDraft(), queued };
+    return { ...accepted, detail: await store.getChat(accepted.turn.chatId), homeDraft: await store.getHomeDraft(), queued };
   });
   handle('chats:create', (projectId, kind) => withLocalFailureNotification(store, () => store.createChat(projectId, kind)));
   handle('chats:update', async (idInput, patchInput) => {
@@ -1304,13 +1309,16 @@ async function registerIpcHandlers(
       : undefined;
     const accepted = await withLocalFailureNotification(store, () =>
       store.acceptLocalMessage(chatId, text, randomUUID(), selectedAttachments.map((attachment) => attachment.id), expectedModelId, validateBeforeCommit));
-    try {
-      if (!runtime.enqueue(accepted.turn)) store.releaseTurnReservation(accepted.turn.turnId);
-      return accepted.detail;
-    } catch (error) {
-      store.releaseTurnReservation(accepted.turn.turnId);
-      throw error;
-    }
+    const result = await queueAcceptedTurnOrMarkNotSent({
+      shouldQueue: true,
+      enqueue: () => runtime.enqueue(accepted.turn),
+      markNotSent: () => store.markQueuedTurnNotSent(
+        accepted.turn,
+        'Сохранено локально, не отправлено. Не удалось поставить ход в очередь; подключитесь и отправьте сообщение ещё раз.',
+      ),
+      releaseReservation: () => store.releaseTurnReservation(accepted.turn.turnId),
+    });
+    return result.queued ? store.getChat(chatId) : result.persisted.detail;
   });
   handle('chats:pick-draft-files', async (idInput) => {
     const id = requireId(idInput);
@@ -1337,6 +1345,12 @@ async function registerIpcHandlers(
   });
   handle('chats:remove-draft-file', (idInput, attachmentId) =>
     withLocalFailureNotification(store, () => store.removeChatDraftFile(requireId(idInput), requireId(attachmentId))));
+  handle('chats:copy-message', async (idInput, messageIdInput) => {
+    const id = requireId(idInput);
+    const messageId = requireId(messageIdInput);
+    const detail = await store.getChat(id);
+    await clipboard.writeText(getCopyableUserMessageText(detail.messages, messageId));
+  });
   handle('chats:import-file', async (id, projectId) => {
     const options = { properties: ['openFile'] as Array<'openFile'> };
     const selected = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);

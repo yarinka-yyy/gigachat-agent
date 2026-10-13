@@ -93,6 +93,26 @@ export interface TurnRuntime {
   recordHookResult(result: HookRunResult): void;
 }
 
+export async function queueAcceptedTurnOrMarkNotSent<T>(input: {
+  shouldQueue: boolean;
+  enqueue(): string | null;
+  markNotSent(): Promise<T>;
+  releaseReservation(): void;
+}): Promise<{ queued: true } | { queued: false; persisted: T }> {
+  if (input.shouldQueue) {
+    try {
+      if (input.enqueue() !== null) return { queued: true };
+    } catch {
+      // Persist the accepted message as unsent; provider errors are deliberately not stored here.
+    }
+  }
+  try {
+    return { queued: false, persisted: await input.markNotSent() };
+  } finally {
+    input.releaseReservation();
+  }
+}
+
 interface RuntimeTurn extends RuntimeTurnSnapshot {
   input: AcceptedTurnInput;
   controller?: AbortController;
@@ -1290,7 +1310,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     }
   };
 
-  const enqueueAcceptedTurn = (input: AcceptedTurnInput): string => {
+  const enqueueAcceptedTurn = (input: AcceptedTurnInput, queuedAt?: string): string => {
     if (turns.has(input.turnId)) throw new Error('Повторный ID принятого хода.');
     const turn: RuntimeTurn = {
       id: input.turnId,
@@ -1298,7 +1318,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       anchorMessageId: input.messageId,
       assistantMessageId: input.assistantMessageId,
       status: 'queued',
-      createdAt: input.messages.find((message) => message.id === input.messageId)?.createdAt ?? new Date().toISOString(),
+      createdAt: queuedAt ?? input.messages.find((message) => message.id === input.messageId)?.createdAt ?? new Date().toISOString(),
       activity: [],
       cancelRequested: false,
       persistTail: Promise.resolve(),
@@ -1369,7 +1389,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         retryInput = requireAcceptedTurn({ ...turn.input, turnId: randomUUID() });
         await options.validateRetry?.(structuredClone(retryInput), structuredClone(turn.input));
         if (!canRetry(turn, true)) return null;
-        const retryId = enqueueAcceptedTurn(retryInput);
+        const retryId = enqueueAcceptedTurn(retryInput, new Date().toISOString());
         accepted = true;
         return retryId;
       } finally {

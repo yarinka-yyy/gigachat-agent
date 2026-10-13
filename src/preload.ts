@@ -110,6 +110,7 @@ const api: AppApi = {
     getArtifactPreview: (id, artifactId) => ipcRenderer.invoke('chats:artifact-preview', id, artifactId) as Promise<string | null>,
     removeDraftFile: (id, attachmentId) => ipcRenderer.invoke('chats:remove-draft-file', id, attachmentId) as Promise<ChatDetail>,
     importFile: (id, projectId) => ipcRenderer.invoke('chats:import-file', id, projectId) as Promise<ChatDetail | null>,
+    copyMessage: (id, messageId) => ipcRenderer.invoke('chats:copy-message', id, messageId) as Promise<void>,
     openArtifact: (id, artifactId) => ipcRenderer.invoke('chats:open-artifact', id, artifactId) as Promise<void>,
     openFolder: (id) => ipcRenderer.invoke('chats:open-folder', id) as Promise<void>,
     remove: (id) => ipcRenderer.invoke('chats:delete', id) as Promise<void>,

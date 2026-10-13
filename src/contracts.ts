@@ -651,6 +651,7 @@ export interface AppApi {
     getArtifactPreview(id: string, artifactId: string): Promise<string | null>;
     removeDraftFile(id: string, attachmentId: string): Promise<ChatDetail>;
     importFile(id: string | null, projectId?: string | null): Promise<ChatDetail | null>;
+    copyMessage(id: string, messageId: string): Promise<void>;
     openArtifact(id: string, artifactId: string): Promise<void>;
     openFolder(id: string): Promise<void>;
     remove(id: string): Promise<void>;
