@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rename, rm, stat, symlink, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { openStore as openStoreProduction, type StoreFaultStage, type StoreOpenOptions } from './store';
-import type { AcceptedTurnInput, CompactSnapshot, GigaChatProvider, HookDispatchInput, HookRunResult, InstructionCommitRequest, InstructionCommitResult, ProviderEvent, ProviderTurnRequest } from './contracts';
-import { COMPACTION_TASK_INSTRUCTION, buildNextTurnContext } from './context';
+import type { AcceptedTurnInput, ChatMessage, CompactSnapshot, GigaChatProvider, HookDispatchInput, HookRunResult, InstructionCommitRequest, InstructionCommitResult, ProviderEvent, ProviderTurnRequest } from './contracts';
+import { COMPACTION_TASK_INSTRUCTION, buildNextTurnContext, hashCompactionPrefix } from './context';
 import { instructionFileHash } from './instruction-documents';
 import { createTurnRuntime, type PreparedTurn } from './runtime';
 
@@ -26,6 +27,22 @@ const syntheticInstructionCommitter = async (request: InstructionCommitRequest):
 
 function openStore(directory: string, options: StoreOpenOptions = {}) {
   return openStoreProduction(directory, { instructionCommitter: syntheticInstructionCommitter, ...options });
+}
+
+function downgradeHomeSendJournalToSchema8(journal: Record<string, unknown>): void {
+  const legacyChat = journal.chat as Record<string, unknown>;
+  legacyChat.schemaVersion = 8;
+  delete legacyChat.draftAttachments;
+  for (const message of legacyChat.messages as Array<Record<string, unknown>>) delete message.attachmentIds;
+  for (const artifact of legacyChat.artifacts as Array<Record<string, unknown>>) delete artifact.sha256;
+  const removeTurnAttachmentIds = (turn: Record<string, unknown>): void => {
+    delete turn.attachmentIds;
+    for (const message of turn.messages as Array<Record<string, unknown>>) delete message.attachmentIds;
+  };
+  removeTurnAttachmentIds(journal.turn as Record<string, unknown>);
+  const nextDraft = journal.nextDraft as Record<string, unknown>;
+  const acceptance = nextDraft.lastAcceptance as Record<string, unknown>;
+  removeTurnAttachmentIds(acceptance.turn as Record<string, unknown>);
 }
 
 function deferred(): { promise: Promise<void>; resolve(): void } {
@@ -124,6 +141,7 @@ test('home draft and selected files survive reload without creating a chat', asy
   assert.equal(withFile.text, 'first line');
   assert.equal(withFile.attachments.length, 1);
   assert.equal(withFile.attachments[0]?.name, 'source.txt');
+  assert.deepEqual(await readFile(await store.getHomeDraftAttachmentPath(withFile.attachments[0]!.id)), Buffer.from('local bytes stay unchanged'));
   assert.deepEqual(await store.listChats(), [], 'typing, selections, and file choice stay out of Recents');
   assert.equal(await readFile(source, 'utf8'), 'local bytes stay unchanged');
 
@@ -133,6 +151,166 @@ test('home draft and selected files survive reload without creating a chat', asy
   const withoutFile = await restored.removeHomeDraftFile(withFile.attachments[0]!.id);
   assert.equal(withoutFile.attachments.length, 0);
   assert.equal(await readFile(source, 'utf8'), 'local bytes stay unchanged');
+});
+
+test('home send rejects a changed effective model before creating a chat or consuming staged files', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-home-model-cas-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = join(directory, 'notes.txt');
+  await writeFile(source, 'private fixture bytes', 'utf8');
+  const store = await openStore(directory);
+  const initial = await store.getHomeDraft();
+  const saved = await store.saveHomeDraft({ ...initial, revision: initial.revision + 1, text: 'Прочитай файл' });
+  const staged = await store.stageHomeDraftFile(source);
+  const expectedModel = staged.modelId ?? (await store.getSettings()).defaultModelId;
+  const changedModel = expectedModel === 'GigaChat-3-Ultra' ? 'GigaChat-2-Max' : 'GigaChat-3-Ultra';
+
+  await assert.rejects(store.acceptHomeDraft(staged.revision, 'wrong-home-model-turn', changedModel), /Модель изменилась/i);
+  assert.deepEqual(await store.listChats(), []);
+  assert.equal((await store.getHomeDraft()).revision, staged.revision);
+  assert.equal((await store.getHomeDraft()).attachments.length, 1);
+  assert.equal(saved.text, 'Прочитай файл');
+});
+
+test('home send keeps staged files when connection is lost before the durable send journal', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-home-attachment-connection-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = join(directory, 'notes.txt');
+  await writeFile(source, 'private fixture bytes', 'utf8');
+  let connected = true;
+  const store = await openStore(directory, { testFaults: { beforeHomeSendJournal: () => { connected = false; } } });
+  const initial = await store.getHomeDraft();
+  await store.saveHomeDraft({ ...initial, revision: initial.revision + 1, text: 'Прочитай файл' });
+  const staged = await store.stageHomeDraftFile(source);
+  const expectedModel = staged.modelId ?? (await store.getSettings()).defaultModelId;
+
+  await assert.rejects(store.acceptHomeDraft(staged.revision, 'home-connection-race', expectedModel, () => {
+    if (!connected) throw new Error('Соединение изменилось перед отправкой файлов.');
+  }), /Соединение изменилось/i);
+  assert.deepEqual(await store.listChats(), []);
+  assert.equal((await store.getHomeDraft()).text, 'Прочитай файл');
+  assert.deepEqual((await store.getHomeDraft()).attachments.map((item) => item.id), [staged.attachments[0]!.id]);
+});
+
+test('existing-chat attachment staging stays pending until one accepted message binds it', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-chat-staged-file-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = join(directory, 'image-fixture.png');
+  const originalBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jHfQAAAAASUVORK5CYII=', 'base64');
+  await writeFile(source, originalBytes);
+
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const attachments = store as typeof store & {
+    stageChatDraftFile(chatId: string, sourcePath: string): Promise<import('./contracts').ChatDetail>;
+    getChatDraftAttachmentPath(chatId: string, attachmentId: string): Promise<string>;
+    acceptLocalMessage(chatId: string, text: string, turnId: string, attachmentIds?: string[], expectedModelId?: unknown, validateBeforeCommit?: () => void): Promise<{ detail: import('./contracts').ChatDetail; turn: AcceptedTurnInput }>;
+  };
+
+  const staged = await attachments.stageChatDraftFile(chat.id, source);
+  assert.equal(staged.messages.length, 0);
+  assert.equal(staged.artifacts.length, 0, 'choosing a file does not make a sent artifact');
+  assert.equal(staged.draftAttachments.length, 1);
+  assert.deepEqual(await readFile(await attachments.getChatDraftAttachmentPath(chat.id, staged.draftAttachments[0]!.id)), originalBytes);
+  assert.equal(await readFile(source).then((bytes) => bytes.equals(originalBytes)), true, 'staging never changes the source');
+  assert.equal((await store.listChats()).length, 1, 'staging does not create another chat');
+
+  await assert.rejects(attachments.acceptLocalMessage(chat.id, 'Что на изображении?', 'chat-file-turn-wrong-model',
+    [staged.draftAttachments[0]!.id], '__changed-model__'), /Модель изменилась/i);
+  await assert.rejects(attachments.acceptLocalMessage(chat.id, 'Что на изображении?', 'chat-file-turn-disconnected',
+    [staged.draftAttachments[0]!.id], (await store.getSettings()).defaultModelId,
+    () => { throw new Error('Подключите GigaChat перед отправкой файлов.'); }), /Подключите GigaChat/i);
+  assert.equal((await store.getChat(chat.id)).messages.length, 0, 'failed model CAS keeps the file pending');
+  assert.equal((await store.getChat(chat.id)).draftAttachments.length, 1);
+  const settings = await store.getSettings();
+  const accepted = await attachments.acceptLocalMessage(chat.id, 'Что на изображении?', 'chat-file-turn',
+    [staged.draftAttachments[0]!.id], settings.defaultModelId);
+  const userMessage = accepted.detail.messages[accepted.detail.messages.length - 1]!;
+  assert.deepEqual(userMessage.attachmentIds, [staged.draftAttachments[0]!.id]);
+  assert.deepEqual(accepted.turn.attachmentIds, [staged.draftAttachments[0]!.id]);
+  assert.equal(accepted.detail.draftAttachments.length, 0);
+  const acceptedArtifact = accepted.detail.artifacts[accepted.detail.artifacts.length - 1];
+  assert.equal(acceptedArtifact?.id, staged.draftAttachments[0]?.id);
+  assert.equal(acceptedArtifact?.messageId, userMessage.id);
+  assert.equal(acceptedArtifact?.sha256, createHash('sha256').update(originalBytes).digest('hex'));
+
+  const restored = await openStore(directory);
+  const restoredChat = await restored.getChat(chat.id);
+  assert.deepEqual(restoredChat.messages[restoredChat.messages.length - 1]?.attachmentIds, [staged.draftAttachments[0]!.id]);
+  assert.equal(restoredChat.artifacts[restoredChat.artifacts.length - 1]?.messageId, userMessage.id);
+});
+
+test('rejects a renamed non-image during main-owned staging and leaves the source intact', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-chat-invalid-image-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = join(directory, 'renamed-executable.png');
+  const originalBytes = Buffer.from('MZ\0not an image');
+  await writeFile(source, originalBytes);
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const attachments = store as typeof store & {
+    stageChatDraftFile(chatId: string, sourcePath: string): Promise<import('./contracts').ChatDetail>;
+  };
+
+  await assert.rejects(attachments.stageChatDraftFile(chat.id, source), /формат|PNG|изображени/i);
+  assert.deepEqual(await readFile(source), originalBytes);
+  assert.deepEqual((await store.getChat(chat.id)).draftAttachments, []);
+  assert.deepEqual((await store.getChat(chat.id)).artifacts, []);
+});
+
+test('provider upload ledger keeps app-owned file references durable and account-scoped', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-provider-upload-ledger-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const ledger = store as typeof store & {
+    getProviderUploadEntries(scope: string): Promise<import('./contracts').ProviderUploadLedgerEntry[]>;
+    putProviderUploadEntry(value: import('./contracts').ProviderUploadLedgerEntry): Promise<import('./contracts').ProviderUploadLedgerEntry>;
+    removeProviderUploadEntry(scope: string, attachmentId: string, remoteFileId: string): Promise<void>;
+  };
+  const accountScope = 'a'.repeat(64);
+  const intent: import('./contracts').ProviderUploadLedgerEntry = {
+    accountScope,
+    attachmentId: 'attachment-local-one',
+    uploadFilename: 'gcagent_123e4567-e89b-42d3-a456-426614174000.txt',
+    name: 'source.txt', contentType: 'text/plain', kind: 'document', sizeBytes: 4,
+    sha256: createHash('sha256').update('data').digest('hex'), state: 'intent', remoteFileId: null,
+    createdAt: timestamp,
+  };
+
+  assert.deepEqual(await ledger.getProviderUploadEntries(accountScope), []);
+  assert.deepEqual(await ledger.putProviderUploadEntry(intent), intent);
+  assert.deepEqual(await ledger.getProviderUploadEntries('b'.repeat(64)), []);
+  assert.throws(() => ledger.putProviderUploadEntry({ ...intent, state: 'uploaded', remoteFileId: '../other-account-file' }));
+
+  const restored = await openStore(directory) as typeof ledger;
+  assert.deepEqual(await restored.getProviderUploadEntries(accountScope), [intent]);
+  const unknown = { ...intent, state: 'unknown' as const };
+  assert.deepEqual(await restored.putProviderUploadEntry(unknown), unknown);
+  const uploaded = { ...unknown, state: 'uploaded' as const, remoteFileId: 'provider-file_1' };
+  assert.deepEqual(await restored.putProviderUploadEntry(uploaded), uploaded);
+  const cleanup = { ...uploaded, state: 'cleanup-pending' as const };
+  await restored.putProviderUploadEntry(cleanup);
+  await assert.rejects(restored.removeProviderUploadEntry(accountScope, intent.attachmentId, 'different-file'));
+  assert.deepEqual(await restored.getProviderUploadEntries(accountScope), [cleanup]);
+  await restored.removeProviderUploadEntry(accountScope, intent.attachmentId, uploaded.remoteFileId);
+  assert.deepEqual(await restored.getProviderUploadEntries(accountScope), []);
+});
+
+test('files-only home send preserves an empty user message and binds files to the accepted turn', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-home-files-only-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = join(directory, 'instructions.txt');
+  await writeFile(source, 'Read this content exactly.');
+
+  const store = await openStore(directory);
+  const staged = await store.stageHomeDraftFile(source);
+  const accepted = await store.acceptHomeDraft(staged.revision, 'home-files-only-turn');
+  assert.equal(accepted.detail.messages[0]?.text, '');
+  assert.deepEqual(accepted.detail.messages[0]?.attachmentIds, [staged.attachments[0]!.id]);
+  assert.deepEqual(accepted.turn.attachmentIds, [staged.attachments[0]!.id]);
+  assert.equal(accepted.detail.title, 'Прикреплённые файлы');
+  assert.equal(accepted.detail.artifacts[0]?.messageId, accepted.detail.messages[0]?.id);
+  assert.equal((await store.getHomeDraft()).attachments.length, 0);
 });
 
 test('explicit home send creates one linked chat and returns the same frozen snapshot for a duplicate', async (t) => {
@@ -227,6 +405,153 @@ test('an interrupted home send journal replays the complete chat without queuein
   assert.equal((await recovered.getHomeDraft()).text, '');
   assert.equal((await recovered.getHomeDraft()).lastAcceptance?.turn.turnId, 'home-turn-recovery');
   assert.equal(await readFile(source, 'utf8'), 'recovery fixture');
+});
+
+test('schema 8 home-send journal recovers linked local files without inventing accepted-turn upload refs', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-home-send-v8-recovery-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = join(directory, 'legacy-local.txt');
+  await writeFile(source, 'local bytes from schema 8', 'utf8');
+  const store = await openStore(directory, {
+    testFaults: {
+      afterHomeSendStage: async (stage) => {
+        if (stage !== 'journal') return;
+        const journalPath = join(directory, 'home-send.journal.json');
+        const journal = JSON.parse(await readFile(journalPath, 'utf8')) as Record<string, unknown>;
+        downgradeHomeSendJournalToSchema8(journal);
+        await writeFile(journalPath, JSON.stringify(journal), 'utf8');
+        throw new Error('simulated interruption after legacy journal write');
+      },
+    },
+  });
+  await store.saveHomeDraft({
+    revision: 1, text: 'Read this local file', projectId: null,
+    permissionProfile: 'ask', skillId: null, modelId: 'GigaChat-3-Pro',
+  });
+  const staged = await store.stageHomeDraftFile(source);
+
+  await assert.rejects(store.acceptHomeDraft(staged.revision, 'legacy-home-turn'), /simulated interruption/);
+  const recovered = await openStore(directory);
+  const [summary] = await recovered.listChats();
+  assert.ok(summary);
+  const detail = await recovered.getChat(summary.id);
+  const accepted = (await recovered.getHomeDraft()).lastAcceptance;
+  assert.deepEqual(detail.messages[0]?.attachmentIds, [staged.attachments[0]!.id]);
+  assert.equal(detail.artifacts[0]?.messageId, detail.messages[0]?.id);
+  assert.equal(detail.artifacts[0]?.sha256, undefined, 'legacy artifact metadata remains intact');
+  assert.equal(accepted?.turn.attachmentIds, undefined, 'the old accepted turn is never upgraded into an upload request');
+  assert.equal(accepted?.turn.messages[0]?.attachmentIds, undefined);
+  assert.deepEqual(await readFile(await recovered.getArtifactPath(detail.id, staged.attachments[0]!.id)), Buffer.from('local bytes from schema 8'));
+  const savedChat = JSON.parse(await readFile(join(directory, 'chats', detail.id, 'chat.json'), 'utf8')) as Record<string, unknown>;
+  assert.equal(savedChat.schemaVersion, 9);
+});
+
+test('schema 8 compact snapshot validates against its original linked-file prefix then upgrades the hash', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-compact-v8-linked-file-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = join(directory, 'local.txt');
+  await writeFile(source, 'local attachment bytes', 'utf8');
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const pending = await store.stageChatDraftFile(chat.id, source);
+  const pendingId = pending.draftAttachments[0]!.id;
+  const accepted = await store.acceptLocalMessage(chat.id, 'Use the attached local file.', 'legacy-linked-file-turn', [pendingId]);
+  const chatPath = join(await store.getChatFolder(chat.id), 'chat.json');
+  const legacy = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown>;
+  const legacyMessages = structuredClone(legacy.messages) as Array<Record<string, unknown>>;
+  for (const message of legacyMessages) delete message.attachmentIds;
+  const oldHash = hashCompactionPrefix(legacyMessages as unknown as ChatMessage[], []);
+  legacy.schemaVersion = 8;
+  delete legacy.draftAttachments;
+  legacy.messages = legacyMessages;
+  for (const artifact of legacy.artifacts as Array<Record<string, unknown>>) delete artifact.sha256;
+  legacy.compactSnapshot = {
+    id: 'legacy-compact-snapshot', version: 1,
+    boundaryMessageId: accepted.turn.messageId, coveredThroughMessageId: accepted.turn.messageId,
+    coveredPrefixHash: oldHash, text: 'The local file was attached to the first message.',
+    modelId: 'GigaChat-3-Pro', provenance: 'fixture', createdAt: timestamp,
+  } satisfies CompactSnapshot;
+  await writeFile(chatPath, JSON.stringify(legacy), 'utf8');
+
+  const restored = await openStore(directory);
+  const detail = await restored.getChat(chat.id);
+  assert.deepEqual(detail.messages[0]?.attachmentIds, [pendingId]);
+  assert.notEqual(detail.compactSnapshot?.coveredPrefixHash, oldHash, 'migration rehashes only after verifying the authentic schema 8 prefix');
+  assert.equal(detail.compactSnapshot?.coveredPrefixHash, hashCompactionPrefix(detail.messages, []));
+  assert.equal(await readFile(await restored.getArtifactPath(chat.id, pendingId), 'utf8'), 'local attachment bytes');
+  const saved = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown>;
+  assert.equal(saved.schemaVersion, 9);
+  assert.deepEqual((saved.compactSnapshot as CompactSnapshot).coveredPrefixHash, detail.compactSnapshot?.coveredPrefixHash);
+});
+
+test('rejects tampered schema 8 attachment migrations without rewriting source bytes', async (t) => {
+  await t.test('a bad old compact-prefix hash leaves the schema 8 chat file unchanged', async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), 'gigachat-compact-v8-tamper-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const source = join(directory, 'local.txt');
+    await writeFile(source, 'preserve legacy bytes', 'utf8');
+    const store = await openStore(directory);
+    const chat = await store.createChat();
+    const staged = await store.stageChatDraftFile(chat.id, source);
+    const attachmentId = staged.draftAttachments[0]!.id;
+    const accepted = await store.acceptLocalMessage(chat.id, 'Keep the old attachment link.', 'legacy-hash-tamper', [attachmentId]);
+    const chatPath = join(await store.getChatFolder(chat.id), 'chat.json');
+    const legacy = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown>;
+    const messages = structuredClone(legacy.messages) as Array<Record<string, unknown>>;
+    for (const message of messages) delete message.attachmentIds;
+    legacy.schemaVersion = 8;
+    delete legacy.draftAttachments;
+    legacy.messages = messages;
+    for (const artifact of legacy.artifacts as Array<Record<string, unknown>>) delete artifact.sha256;
+    legacy.compactSnapshot = {
+      id: 'tampered-legacy-snapshot', version: 1,
+      boundaryMessageId: accepted.turn.messageId, coveredThroughMessageId: accepted.turn.messageId,
+      coveredPrefixHash: 'f'.repeat(64), text: 'Do not accept a changed prefix.',
+      modelId: 'GigaChat-3-Pro', provenance: 'fixture', createdAt: timestamp,
+    } satisfies CompactSnapshot;
+    const corruptedBytes = JSON.stringify(legacy);
+    await writeFile(chatPath, corruptedBytes, 'utf8');
+
+    const restored = await openStore(directory);
+    assert.deepEqual(await restored.listChats(), [], 'the invalid legacy chat is not exposed as migrated history');
+    assert.deepEqual(await readFile(chatPath, 'utf8'), corruptedBytes, 'failed validation leaves the source bytes untouched');
+  });
+
+  await t.test('a mismatched old accepted-turn message leaves the journal and draft bytes unchanged', async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), 'gigachat-home-send-v8-tamper-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const source = join(directory, 'local.txt');
+    await writeFile(source, 'preserve pending home bytes', 'utf8');
+    let corruptedJournal = '';
+    const store = await openStore(directory, {
+      testFaults: {
+        afterHomeSendStage: async (stage) => {
+          if (stage !== 'journal') return;
+          const journalPath = join(directory, 'home-send.journal.json');
+          const journal = JSON.parse(await readFile(journalPath, 'utf8')) as Record<string, unknown>;
+          downgradeHomeSendJournalToSchema8(journal);
+          const turn = journal.turn as Record<string, unknown>;
+          const turnMessages = turn.messages as Array<Record<string, unknown>>;
+          turnMessages[0]!.text = 'tampered accepted text';
+          corruptedJournal = JSON.stringify(journal);
+          await writeFile(journalPath, corruptedJournal, 'utf8');
+          throw new Error('simulated interruption after tampered legacy journal write');
+        },
+      },
+    });
+    const initial = await store.getHomeDraft();
+    await store.saveHomeDraft({ ...initial, revision: initial.revision + 1, text: 'Original accepted text' });
+    const staged = await store.stageHomeDraftFile(source);
+    const homeDraftPath = join(directory, 'home-draft.json');
+    const homeDraftBeforeRecovery = await readFile(homeDraftPath);
+
+    await assert.rejects(store.acceptHomeDraft(staged.revision, 'tampered-legacy-turn'), /tampered legacy journal/);
+    await assert.rejects(openStore(directory), /storage|home-send/i);
+    const journalPath = join(directory, 'home-send.journal.json');
+    assert.equal(await readFile(journalPath, 'utf8'), corruptedJournal, 'rejected journal bytes are preserved for recovery');
+    assert.deepEqual(await readFile(homeDraftPath), homeDraftBeforeRecovery, 'unsent text and staged-file links remain unchanged');
+    assert.deepEqual(await readFile(source), Buffer.from('preserve pending home bytes'));
+  });
 });
 
 test('home-send recovery preserves a different chat already stored under the journal ID', async (t) => {
@@ -753,7 +1078,7 @@ test('migrates v1 projects, chats, drafts, and theme without losing data', async
   const store = await openStore(directory);
   assert.deepEqual(await store.listProjects(), [{ ...project, workingFolder: null }]);
   assert.equal((await store.listChats())[0]?.id, chat.id);
-  assert.deepEqual(await store.getChat(chat.id), { ...chat, kind: 'text', nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [], toolReceipts: [], compactSnapshot: null });
+  assert.deepEqual(await store.getChat(chat.id), { ...chat, kind: 'text', nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [], draftAttachments: [], toolReceipts: [], compactSnapshot: null });
   assert.deepEqual(await store.getSettings(), {
     theme: 'emerald',
     sidebarTransparent: false,
@@ -774,7 +1099,7 @@ test('migrates v1 projects, chats, drafts, and theme without losing data', async
   assert.equal(JSON.parse(await readFile(join(directory, 'projects.json'), 'utf8')).schemaVersion, 2);
   assert.equal(JSON.parse(await readFile(join(directory, 'chats.json'), 'utf8')).schemaVersion, 1);
   assert.equal(await readFile(join(directory, 'chats.json.bak'), 'utf8'), await readFile(join(directory, 'chats.json'), 'utf8'));
-  assert.equal(JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')).schemaVersion, 8);
+  assert.equal(JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')).schemaVersion, 9);
   assert.equal(JSON.parse(await readFile(join(directory, 'settings.json'), 'utf8')).schemaVersion, 10);
   await store.deleteChat(chat.id);
   assert.deepEqual(await (await openStore(directory)).listChats(), []);
@@ -787,7 +1112,7 @@ test('migrates v2 chats with archive and draft without changing their UUIDs', as
     pinned: true, archived: true, createdAt: timestamp, updatedAt: timestamp, draft: 'Текст', kind: 'image' };
   await writeFile(join(directory, 'chats.json'), JSON.stringify({ schemaVersion: 2, chats: [chat] }));
   const store = await openStore(directory);
-  assert.deepEqual(await store.getChat(chat.id), { ...chat, nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [], toolReceipts: [], compactSnapshot: null });
+  assert.deepEqual(await store.getChat(chat.id), { ...chat, nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [], draftAttachments: [], toolReceipts: [], compactSnapshot: null });
   assert.equal((await store.listChats())[0]?.id, chat.id);
   assert.equal((await (await openStore(directory)).getChat(chat.id)).draft, 'Текст');
 });
@@ -832,7 +1157,7 @@ test('unfinished legacy migration preserves existing invalid chat details', asyn
         assert.deepEqual(restored.messages, kind === 'valid' ? detail.messages : []);
         if (validUnmarkedLegacyDetail) {
           const migratedDetail = JSON.parse(await readFile(detailPath, 'utf8')) as Record<string, unknown>;
-          assert.equal(migratedDetail.schemaVersion, 8);
+          assert.equal(migratedDetail.schemaVersion, 9);
           assert.equal(migratedDetail.compactSnapshot, null);
           assert.equal(migratedDetail.draft, 'newer draft');
         }
@@ -1110,9 +1435,34 @@ test('migrates existing chat detail schema 3 and preserves its draft', async (t)
   assert.equal((await restored.getChat(chat.id)).draft, 'Сохранённый черновик');
   assert.equal((await restored.getChat(chat.id)).nextTurnPermissionProfile, null);
   const migrated = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  assert.equal(migrated.schemaVersion, 8);
+  assert.equal(migrated.schemaVersion, 9);
   assert.equal(migrated.nextTurnPermissionProfile, null);
   assert.equal(migrated.nextTurnSkillId, null);
+});
+
+test('migrates schema 8 with an empty pending list and preserves legacy messageId-null artifacts', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-chat-detail-v8-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = join(directory, 'legacy-local.txt');
+  await writeFile(source, 'This was imported before staged attachments.');
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const imported = await store.importFile(chat.id, source);
+  assert.ok(imported);
+  const path = join(directory, 'chats', chat.id, 'chat.json');
+  const legacyBytes = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+  legacyBytes.schemaVersion = 8;
+  delete legacyBytes.draftAttachments;
+  await writeFile(path, JSON.stringify(legacyBytes));
+
+  const restored = await openStore(directory);
+  const detail = await restored.getChat(chat.id);
+  assert.deepEqual(detail.artifacts, imported.artifacts);
+  assert.equal(detail.artifacts[0]?.messageId, null);
+  assert.deepEqual(detail.draftAttachments, []);
+  const saved = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+  assert.equal(saved.schemaVersion, 9);
+  assert.deepEqual(saved.draftAttachments, []);
 });
 
 test('migrates chat detail schema 4 to 5 without changing history or artifacts', async (t) => {
@@ -1134,7 +1484,7 @@ test('migrates chat detail schema 4 to 5 without changing history or artifacts',
   assert.equal(detail.nextTurnSkillId, null);
   assert.equal(detail.draft, 'Черновик');
   assert.equal(detail.messages[0]?.text, 'Сохранённая история');
-  assert.equal(JSON.parse(await readFile(path, 'utf8')).schemaVersion, 8);
+  assert.equal(JSON.parse(await readFile(path, 'utf8')).schemaVersion, 9);
 });
 
 test('migrates previous settings and chat schemas with an empty model choice', async (t) => {
@@ -1156,7 +1506,7 @@ test('migrates previous settings and chat schemas with an empty model choice', a
   assert.equal((await restored.getChat(chat.id)).modelId, null);
   assert.equal((await restored.getSettings()).defaultModelId, null);
   assert.equal((await restored.getSettings()).microphoneConsent, 'unasked');
-  assert.equal(JSON.parse(await readFile(chatPath, 'utf8')).schemaVersion, 8);
+  assert.equal(JSON.parse(await readFile(chatPath, 'utf8')).schemaVersion, 9);
   assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).schemaVersion, 10);
 });
 

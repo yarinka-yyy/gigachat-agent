@@ -5,8 +5,10 @@ export interface ModelCapabilities {
   functionCalls: ModelCapabilityStatus;
   localRead: ModelCapabilityStatus;
   txt: ModelCapabilityStatus;
+  md: ModelCapabilityStatus;
   pdf: ModelCapabilityStatus;
   png: ModelCapabilityStatus;
+  jpeg: ModelCapabilityStatus;
   usage: ModelCapabilityStatus;
   evidence: {
     source: string;
@@ -20,8 +22,10 @@ const UNVERIFIED: ModelCapabilities = {
   functionCalls: 'unverified',
   localRead: 'unverified',
   txt: 'unverified',
+  md: 'unverified',
   pdf: 'unverified',
   png: 'unverified',
+  jpeg: 'unverified',
   usage: 'unverified',
   evidence: { source: 'no semantic API probe', verifiedAt: null, details: 'Capabilities remain unverified until a bounded real-model check.' },
 };
@@ -32,13 +36,15 @@ const MODEL_CAPABILITIES: Readonly<Record<string, Readonly<ModelCapabilities>>> 
     functionCalls: 'verified',
     localRead: 'verified',
     txt: 'verified',
+    md: 'verified',
     pdf: 'verified',
     png: 'verified',
+    jpeg: 'verified',
     usage: 'verified',
     evidence: {
-      source: 'installed-app real API spike in app/.qa/capability-spike/summary.md',
-      verifiedAt: '2026-10-12',
-      details: 'Semantic text answer, local read tool roundtrip, TXT/PDF/PNG markers, and usage receipt passed; XLSX is unavailable.',
+      source: 'app/.qa/capability-spike/summary.md; app/.qa/post-api-011/stage3-live-893676a7-ae44-4c80-b57c-d0db174e0140; app/.qa/post-api-011/stage3-supplemental-live-26aabefe-ce02-4c2e-8d55-2c0bb65b0196',
+      verifiedAt: '2026-10-13',
+      details: 'Semantic text answer, local read tool roundtrip, TXT/MD/PDF/PNG/JPEG markers, and usage receipt passed. Pairing multiple images remains unverified; XLSX is unavailable.',
     },
   },
   'GigaChat-2-Max': {

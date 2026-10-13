@@ -98,7 +98,7 @@ test('bounds the complete wire payload including all function schemas and counts
   const payload = JSON.parse(serialized.body) as { messages: Array<{ content: string }>; functions: unknown[]; function_call: string };
   assert.equal(serialized.wireBytes, Buffer.byteLength(serialized.body, 'utf8'));
   assert.ok(serialized.wireBytes <= MAX_PROVIDER_REQUEST_BYTES);
-  assert.equal(payload.functions.length, 6);
+  assert.equal(payload.functions.length, 7);
   assert.equal(payload.function_call, 'auto');
   assert.equal(serialized.textInputs.length, payload.messages.length);
 
@@ -108,6 +108,153 @@ test('bounds the complete wire payload including all function schemas and counts
   assert.equal(measured.textTokenCount, serialized.textInputs.length * 2);
   assert.equal(measured.textCountProvenance, 'verified');
   assert.equal(measured.provenance, 'unknown');
+});
+
+test('serializes one image per wire message with documents and get_file_content in the same request', () => {
+  const base = input([{
+    ...user('user-attachments', 'Сравни прикреплённые материалы.'),
+    attachmentIds: ['local-doc', 'local-image-one', 'local-image-two'],
+  }]);
+  const request = {
+    ...buildNextTurnContext(base).request,
+    attachments: [
+      { messageId: 'user-attachments', attachmentId: 'local-doc', fileId: 'remote-doc', name: 'notes.txt', contentType: 'text/plain', kind: 'document', sizeBytes: 5 },
+      { messageId: 'user-attachments', attachmentId: 'local-image-one', fileId: 'remote-image-one', name: 'one.png', contentType: 'image/png', kind: 'image', sizeBytes: 4 },
+      { messageId: 'user-attachments', attachmentId: 'local-image-two', fileId: 'remote-image-two', name: 'two.jpeg', contentType: 'image/jpeg', kind: 'image', sizeBytes: 6 },
+    ],
+  } as unknown as import('./contracts').ProviderTurnRequest;
+  const frozenLocalIds = [...request.messages[0]!.attachmentIds!];
+  const serialized = serializeProviderTurnRequest(request);
+  const body = JSON.parse(serialized.body) as {
+    messages: Array<{ role: string; content: string; attachments?: string[] }>;
+    functions: Array<{ name: string }>;
+    function_call: string;
+  };
+  const userMessages = body.messages.filter((message) => message.role === 'user');
+
+  assert.deepEqual(userMessages, [
+    { role: 'user', content: 'Сравни прикреплённые материалы.\n\nИзображение 1/2', attachments: ['remote-doc', 'remote-image-one'] },
+    { role: 'user', content: 'Сравни прикреплённые материалы.\n\nИзображение 2/2', attachments: ['remote-image-two'] },
+  ]);
+  assert.equal(body.function_call, 'auto');
+  assert.ok(body.functions.some((fn) => fn.name === 'get_file_content'));
+  assert.equal(userMessages.flatMap((message) => message.attachments ?? []).filter((id) => id.startsWith('remote-image')).length, 2);
+  assert.deepEqual(request.messages[0]!.attachmentIds, frozenLocalIds, 'wire file IDs never replace immutable local attachment IDs');
+
+  const oneImage = serializeProviderTurnRequest({
+    ...request,
+    messages: request.messages.map((message) => ({ ...message, attachmentIds: ['local-doc', 'local-image-one'] })),
+    attachments: request.attachments?.slice(0, 2),
+  } as unknown as import('./contracts').ProviderTurnRequest);
+  const oneImageUser = (JSON.parse(oneImage.body) as typeof body).messages.filter((message) => message.role === 'user');
+  assert.deepEqual(oneImageUser, [
+    { role: 'user', content: 'Сравни прикреплённые материалы.', attachments: ['remote-doc', 'remote-image-one'] },
+  ], 'single-image requests retain their original user text and wire shape');
+});
+
+test('adds an app-owned task only for a current empty-text user anchor with accepted files', () => {
+  const fileOnly = { ...user('files-only-anchor', ''), attachmentIds: ['local-file'] };
+  const context = buildNextTurnContext(input([fileOnly], { globalText: '', projectInstructions: [], selectedSkill: null }));
+  const userMessage = context.request.messages[0];
+  const taskLayer = context.request.system.find((layer) => layer.label === 'Задача текущего запроса');
+  const wire = JSON.parse(serializeProviderTurnRequest(context.request).body) as {
+    messages: Array<{ role: string; content: string }>;
+  };
+
+  assert.equal(userMessage?.text, '', 'the accepted chat history keeps its empty user text');
+  assert.deepEqual(userMessage?.attachmentIds, ['local-file']);
+  assert.equal(taskLayer?.source, 'runtime');
+  assert.equal(taskLayer?.text, 'Проанализируй приложенные файлы');
+  assert.equal(wire.messages.find((message) => message.role === 'user')?.content, '');
+
+  const ordinary = buildNextTurnContext(input([user('ordinary-empty-anchor', '')], {
+    globalText: '', projectInstructions: [], selectedSkill: null,
+  }));
+  assert.equal(ordinary.request.system.some((layer) => layer.label === 'Задача текущего запроса'), false,
+    'an empty text message without attachments does not gain a task');
+
+  const compacting = buildNextTurnContext(input([fileOnly], {
+    globalText: '', projectInstructions: [], selectedSkill: null,
+    taskInstruction: 'Сверни историю.', usageKind: 'compaction', functionCallMode: 'none',
+  }));
+  assert.equal(compacting.request.system.find((layer) => layer.label === 'Задача текущего запроса')?.text, 'Сверни историю.');
+});
+
+test('rejects unsupported image counts and media aggregate size before network serialization', () => {
+  const requestBase = buildNextTurnContext(input([user('too-many-images', 'Проверь')])).request;
+  const attachments = (count: number, sizeBytes: number) => Array.from({ length: count }, (_, index) => ({
+    messageId: 'too-many-images', attachmentId: `local-image-${index}`, fileId: `remote-image-${index}`,
+    name: `${index}.png`, contentType: 'image/png', kind: 'image', sizeBytes,
+  }));
+  const serializeWith = (items: ReturnType<typeof attachments>) => serializeProviderTurnRequest({
+    ...requestBase,
+    messages: requestBase.messages.map((message) => ({ ...message, attachmentIds: items.map((attachment) => attachment.attachmentId) })),
+    attachments: items,
+  } as unknown as import('./contracts').ProviderTurnRequest);
+
+  assert.throws(() => serializeWith(attachments(11, 1)), (error: unknown) => error instanceof GigaChatProviderError && error.category === 'context');
+  assert.ok(serializeWith(attachments(5, 15_000_000)), '75 MB of images is below the documented aggregate ceiling');
+  assert.throws(() => serializeWith(attachments(6, 15_000_000)), (error: unknown) => error instanceof GigaChatProviderError && error.category === 'context');
+  const mediaAt = (lastImageBytes: number) => [15_000_000, 15_000_000, 15_000_000, 15_000_000, 15_000_000, lastImageBytes]
+    .map((sizeBytes, index) => ({ ...attachments(1, sizeBytes)[0]!, attachmentId: `aggregate-local-${index}`, fileId: `aggregate-${index}` }));
+  assert.ok(serializeWith(mediaAt(4_900_000)), '75 MB remains valid with the serialized request overhead');
+  assert.throws(() => serializeWith(mediaAt(4_999_999)), (error: unknown) => error instanceof GigaChatProviderError && error.category === 'context');
+  assert.throws(() => serializeWith(mediaAt(5_000_000)), (error: unknown) => error instanceof GigaChatProviderError && error.category === 'context');
+  assert.ok(serializeWith([{ ...attachments(1, 1)[0]!, sizeBytes: 15_000_000 }]), 'the documented 15 MB image boundary is inclusive');
+  assert.throws(() => serializeWith([{ ...attachments(1, 1)[0]!, sizeBytes: 15_000_001 }]),
+    (error: unknown) => error instanceof GigaChatProviderError && error.category === 'context');
+});
+
+test('counts the serialized request bytes against the media aggregate boundary', () => {
+  const requestBase = buildNextTurnContext(input([user('media-with-prompt', 'p'.repeat(1_500_000))])).request;
+  const items = [15_000_000, 15_000_000, 15_000_000, 15_000_000, 15_000_000, 3_500_000]
+    .map((sizeBytes, index) => ({
+      messageId: 'media-with-prompt', attachmentId: `local-${index}`, fileId: `remote-${index}`,
+      name: `${index}.png`, contentType: 'image/png', kind: 'image' as const, sizeBytes,
+    }));
+  const request = {
+    ...requestBase,
+    messages: requestBase.messages.map((message) => ({ ...message, attachmentIds: items.map((item) => item.attachmentId) })),
+    attachments: items,
+  } as unknown as import('./contracts').ProviderTurnRequest;
+
+  assert.throws(() => serializeProviderTurnRequest(request),
+    (error: unknown) => error instanceof GigaChatProviderError && error.category === 'context');
+});
+
+test('does not apply the image-media aggregate limit to text documents', () => {
+  const requestBase = buildNextTurnContext(input([user('many-documents', 'Сравни документы')])).request;
+  const items = Array.from({ length: 4 }, (_, index) => ({
+    messageId: 'many-documents', attachmentId: `local-doc-${index}`, fileId: `remote-doc-${index}`,
+    name: `${index}.txt`, contentType: 'text/plain', kind: 'document' as const, sizeBytes: 25 * 1024 * 1024,
+  }));
+  const request = {
+    ...requestBase,
+    messages: requestBase.messages.map((message) => ({ ...message, attachmentIds: items.map((item) => item.attachmentId) })),
+    attachments: items,
+  } as unknown as import('./contracts').ProviderTurnRequest;
+
+  assert.ok(serializeProviderTurnRequest(request), 'document byte totals remain governed by local/document limits');
+});
+
+test('rejects attachment references that are duplicated, orphaned, or bound to an assistant message', () => {
+  const validUser = { ...user('bound-user'), attachmentIds: ['local-one'] };
+  const request = buildNextTurnContext(input([validUser])).request;
+  const reference = { messageId: 'bound-user', attachmentId: 'local-one', fileId: 'remote-one', name: 'one.png', contentType: 'image/png', kind: 'image', sizeBytes: 8 };
+  const withAttachments = (messages: ChatMessage[], attachments: unknown[]) => serializeProviderTurnRequest({
+    ...request, messages, attachments,
+  } as unknown as import('./contracts').ProviderTurnRequest);
+
+  assert.throws(() => withAttachments([validUser], [{ ...reference, messageId: 'missing-user' }]),
+    (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
+  assert.throws(() => withAttachments([assistant('assistant-target', 'answer')], [{ ...reference, messageId: 'assistant-target' }]),
+    (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
+  assert.throws(() => withAttachments([validUser], [reference, reference]),
+    (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
+  assert.throws(() => withAttachments([{ ...validUser, attachmentIds: ['different-id'] }], [reference]),
+    (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
+  assert.throws(() => withAttachments([validUser, { ...validUser }], [reference]),
+    (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
 });
 
 test('keeps a large selected Skill and an unknown model in the bounded wire request', () => {

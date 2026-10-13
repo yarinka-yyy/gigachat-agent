@@ -11,6 +11,7 @@ export const COMPACTION_TASK_INSTRUCTION = [
 ].join('\n');
 export const COMPACTION_UNAVAILABLE_REASON = 'Команда /compact выключена до проверки качества сводки на типовых диалогах. История чата не изменена.';
 export const COMPACTION_QUALITY_VERIFIED = false;
+const FILES_ONLY_TASK_INSTRUCTION = 'Проанализируй приложенные файлы';
 
 const MAX_COMPACT_SUMMARY_BYTES = 32 * 1024;
 
@@ -57,6 +58,7 @@ export function hashCompactionPrefix(
       createdAt: message.createdAt,
       ...(message.source === undefined ? {} : { source: message.source }),
       ...(message.functionsStateId === undefined ? {} : { functionsStateId: message.functionsStateId }),
+      ...(message.attachmentIds === undefined ? {} : { attachmentIds: message.attachmentIds }),
     })),
     protocolHistory: protocolHistory.map((exchange) => ({
       anchorMessageId: exchange.anchorMessageId,
@@ -110,7 +112,7 @@ function sizeBlocks(request: ProviderTurnRequest, functionSchemaBytes: number): 
       utf8Bytes: byteLength(JSON.stringify({ arguments: exchange.arguments, content: exchange.content, result: exchange.result })),
     });
   }
-  if (functionSchemaBytes > 0) blocks.push({ source: 'function-schema', label: 'Шесть разрешённых функций', utf8Bytes: functionSchemaBytes });
+  if (functionSchemaBytes > 0) blocks.push({ source: 'function-schema', label: 'Встроенная и шесть локальных функций', utf8Bytes: functionSchemaBytes });
   return blocks;
 }
 
@@ -128,8 +130,13 @@ export function buildNextTurnContext(input: NextTurnContextInput): NextTurnConte
       .filter((exchange) => !selected.coveredPrefix!.coveredAnchors.has(exchange.anchorMessageId))
       .map((exchange) => structuredClone(exchange));
   }
+  const currentAnchor = input.messages[input.messages.length - 1];
+  const shouldAddFilesOnlyTask = input.taskInstruction === undefined && input.usageKind !== 'compaction'
+    && input.functionCallMode !== 'none' && currentAnchor?.role === 'user' && currentAnchor.text === ''
+    && Array.isArray(currentAnchor.attachmentIds) && currentAnchor.attachmentIds.length > 0;
   const request = buildInstructionRequest({
     ...input,
+    ...(shouldAddFilesOnlyTask ? { taskInstruction: FILES_ONLY_TASK_INSTRUCTION } : {}),
     compactSnapshot: input.compactSnapshot ? { text: input.compactSnapshot.text } : null,
     messages: selected.messages,
     protocolHistory,

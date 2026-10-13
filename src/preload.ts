@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type {
   AppApi,
   AppInfo,
@@ -14,6 +14,7 @@ import type {
   HomeDraftRecord,
   HomeDraftInput,
   HomeDraftSendResult,
+  AttachmentImportBatchResult,
   FolderOpener,
   HookInspection,
   HookEvent,
@@ -38,6 +39,15 @@ import type {
 let closeFlush: (() => Promise<void>) | null = null;
 let closeFailureHandler: ((result: CloseFailure) => void) | null = null;
 let closeAttempt: Promise<CloseAttemptResult> | null = null;
+
+function droppedFilePaths(files: File[]): Array<{ path: string; name: string }> {
+  if (!Array.isArray(files) || files.length > 32) throw new Error('За один раз можно подготовить не более 32 файлов.');
+  return files.map((file) => {
+    let path = '';
+    try { path = webUtils.getPathForFile(file); } catch { /* Main reports this file as unavailable by name. */ }
+    return { path, name: typeof file.name === 'string' ? file.name.slice(0, 255) : '' };
+  });
+}
 
 const runCloseAttempt = (discardBrowserMetadata = false): Promise<CloseAttemptResult> => {
   if (closeAttempt) return closeAttempt;
@@ -68,6 +78,9 @@ const api: AppApi = {
     get: () => ipcRenderer.invoke('home-draft:get') as Promise<HomeDraftRecord>,
     save: (input: HomeDraftInput) => ipcRenderer.invoke('home-draft:save', input) as Promise<HomeDraftRecord>,
     importFile: () => ipcRenderer.invoke('home-draft:import-file') as Promise<HomeDraftRecord | null>,
+    pickFiles: () => ipcRenderer.invoke('home-draft:pick-files') as Promise<AttachmentImportBatchResult<HomeDraftRecord> | null>,
+    stageFiles: (files) => ipcRenderer.invoke('home-draft:stage-files', droppedFilePaths(files)) as Promise<AttachmentImportBatchResult<HomeDraftRecord>>,
+    getAttachmentPreview: (id) => ipcRenderer.invoke('home-draft:attachment-preview', id) as Promise<string | null>,
     removeFile: (id) => ipcRenderer.invoke('home-draft:remove-file', id) as Promise<HomeDraftRecord>,
     send: (expectedRevision) => ipcRenderer.invoke('home-draft:send', expectedRevision) as Promise<HomeDraftSendResult>,
   },
@@ -90,7 +103,12 @@ const api: AppApi = {
     create: (projectId = null, kind: ChatKind = 'text') =>
       ipcRenderer.invoke('chats:create', projectId, kind) as Promise<ChatSummary>,
     update: (id, patch) => ipcRenderer.invoke('chats:update', id, patch) as Promise<ChatSummary>,
-    appendLocalMessage: (id, text) => ipcRenderer.invoke('chats:append-local-message', id, text) as Promise<ChatDetail>,
+    appendLocalMessage: (id, text, attachmentIds = []) => ipcRenderer.invoke('chats:append-local-message', id, text, attachmentIds) as Promise<ChatDetail>,
+    pickDraftFiles: (id) => ipcRenderer.invoke('chats:pick-draft-files', id) as Promise<AttachmentImportBatchResult<ChatDetail> | null>,
+    stageDraftFiles: (id, files) => ipcRenderer.invoke('chats:stage-draft-files', id, droppedFilePaths(files)) as Promise<AttachmentImportBatchResult<ChatDetail>>,
+    getDraftAttachmentPreview: (id, attachmentId) => ipcRenderer.invoke('chats:draft-attachment-preview', id, attachmentId) as Promise<string | null>,
+    getArtifactPreview: (id, artifactId) => ipcRenderer.invoke('chats:artifact-preview', id, artifactId) as Promise<string | null>,
+    removeDraftFile: (id, attachmentId) => ipcRenderer.invoke('chats:remove-draft-file', id, attachmentId) as Promise<ChatDetail>,
     importFile: (id, projectId) => ipcRenderer.invoke('chats:import-file', id, projectId) as Promise<ChatDetail | null>,
     openArtifact: (id, artifactId) => ipcRenderer.invoke('chats:open-artifact', id, artifactId) as Promise<void>,
     openFolder: (id) => ipcRenderer.invoke('chats:open-folder', id) as Promise<void>,

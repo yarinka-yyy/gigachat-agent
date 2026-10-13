@@ -3,7 +3,7 @@ import { Buffer } from 'node:buffer';
 import { constants } from 'node:fs';
 import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { DEFAULT_NOTIFICATION_SETTINGS, type AcceptedTurnInput, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type CompactSnapshot, type CompactionPrefix, type HomeDraftAttachment, type HomeDraftInput, type HomeDraftRecord, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderProtocolExchange, type Settings, type SettingsPatch, type Theme, type UsageLedgerSummary, type UsageReceipt } from './contracts';
+import { DEFAULT_NOTIFICATION_SETTINGS, type AcceptedTurnInput, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type CompactSnapshot, type CompactionPrefix, type HomeDraftAttachment, type HomeDraftInput, type HomeDraftRecord, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderProtocolExchange, type ProviderUploadLedgerEntry, type Settings, type SettingsPatch, type Theme, type UsageLedgerSummary, type UsageReceipt } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { requireModelId } from './models';
 import { isSkillId } from './skills';
@@ -11,13 +11,14 @@ import { validateProjectFolder, validateProjectInstructionsPath } from './projec
 import { createInstructionDocument, instructionFileHash } from './instruction-documents';
 import { MAX_USAGE_RECEIPTS, mergeUsageReceipt, summarizeUsage, validateUsageReceipt } from './usage';
 import { hashCompactionPrefix, validateCompactSummary } from './context';
-import { LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES } from './attachment-policy';
+import { attachmentContentType, inspectLocalAttachmentContent, LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES } from './attachment-policy';
 
 type ProjectFile = { schemaVersion: 2; projects: Project[] };
 type LegacyChat = ChatSummary & { draft: string };
 type ChatFile = { schemaVersion: 2; chats: LegacyChat[] };
 type SettingsFile = { schemaVersion: 10; settings: Settings };
 type UsageFile = { schemaVersion: 1; receipts: UsageReceipt[] };
+type ProviderUploadFile = { schemaVersion: 1; entries: ProviderUploadLedgerEntry[] };
 type ProjectDeleteState = { projects: ProjectFile; chats: ChatDetail[]; instructionText: string | null };
 type ProjectDeleteJournal = {
   schemaVersion: 1;
@@ -55,6 +56,8 @@ export interface StoreOpenOptions {
 
 const MAX_INSTRUCTION_BYTES = 64 * 1024;
 const MAX_USAGE_LEDGER_BYTES = 32 * 1024 * 1024;
+const MAX_PROVIDER_UPLOAD_LEDGER_BYTES = 16 * 1024 * 1024;
+const MAX_PROVIDER_UPLOAD_ENTRIES = 10_000;
 const MAX_TOOL_RECEIPTS_PER_CHAT = 256;
 const MAX_TOOL_ARGUMENTS_BYTES = 1_900_000;
 const MAX_TOOL_RESULT_BYTES = 32 * 1024;
@@ -62,6 +65,8 @@ const MAX_HOME_DRAFT_BYTES = 1_000_000;
 const MAX_HOME_DRAFT_FILES = 32;
 const MAX_HOME_DRAFT_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_HOME_DRAFT_TOTAL_BYTES = 100 * 1024 * 1024;
+const MAX_CHAT_DRAFT_FILES = 32;
+const MAX_CHAT_DRAFT_TOTAL_BYTES = 100 * 1024 * 1024;
 const SIDE_EFFECT_TOOLS = new Set(['write', 'powershell', 'open']);
 const UNKNOWN_TOOL_RESULT = JSON.stringify({
   ok: false,
@@ -83,10 +88,14 @@ export interface LocalStore {
   deleteProject(id: unknown): Promise<void>;
   listChats(): Promise<ChatSummary[]>;
   getHomeDraft(): Promise<HomeDraftRecord>;
+  getHomeDraftAttachmentPath(attachmentId: unknown): Promise<string>;
   saveHomeDraft(input: unknown): Promise<HomeDraftRecord>;
   stageHomeDraftFile(sourcePath: string): Promise<HomeDraftRecord>;
   removeHomeDraftFile(id: unknown): Promise<HomeDraftRecord>;
-  acceptHomeDraft(expectedRevision: unknown, turnId: unknown): Promise<{ detail: ChatDetail; turn: AcceptedTurnInput; newlyAccepted: boolean }>;
+  stageChatDraftFile(chatId: unknown, sourcePath: string): Promise<ChatDetail>;
+  removeChatDraftFile(chatId: unknown, attachmentId: unknown): Promise<ChatDetail>;
+  getChatDraftAttachmentPath(chatId: unknown, attachmentId: unknown): Promise<string>;
+  acceptHomeDraft(expectedRevision: unknown, turnId: unknown, expectedModelId?: unknown, validateBeforeCommit?: () => void): Promise<{ detail: ChatDetail; turn: AcceptedTurnInput; newlyAccepted: boolean }>;
   getChat(id: unknown): Promise<ChatDetail>;
   getMessagesThrough(chatId: unknown, messageId: unknown): Promise<ChatMessage[]>;
   getToolProtocolThrough(chatId: unknown, messageId: unknown): Promise<ProviderProtocolExchange[]>;
@@ -96,7 +105,7 @@ export interface LocalStore {
   createChat(projectId?: unknown, kind?: unknown): Promise<ChatSummary>;
   updateChat(id: unknown, patch: unknown): Promise<ChatSummary>;
   appendLocalMessage(id: unknown, text: unknown): Promise<ChatDetail>;
-  acceptLocalMessage(id: unknown, text: unknown, turnId: unknown): Promise<{ detail: ChatDetail; turn: AcceptedTurnInput }>;
+  acceptLocalMessage(id: unknown, text: unknown, turnId: unknown, attachmentIds?: unknown, expectedModelId?: unknown, validateBeforeCommit?: () => void): Promise<{ detail: ChatDetail; turn: AcceptedTurnInput }>;
   acceptCompactionTurn(id: unknown, turnId: unknown): Promise<{ detail: ChatDetail; turn: AcceptedTurnInput }>;
   releaseTurnReservation(turnId: unknown): void;
   reserveRetryTurn(original: AcceptedTurnInput, retry: AcceptedTurnInput): Promise<void>;
@@ -113,6 +122,9 @@ export interface LocalStore {
   getLocalUsageStats(): Promise<LocalUsageStats>;
   recordUsageReceipt(receipt: unknown): Promise<void>;
   getUsageLedger(): Promise<UsageLedgerSummary>;
+  getProviderUploadEntries(accountScope: unknown): Promise<ProviderUploadLedgerEntry[]>;
+  putProviderUploadEntry(value: unknown): Promise<ProviderUploadLedgerEntry>;
+  removeProviderUploadEntry(accountScope: unknown, attachmentId: unknown, remoteFileId: unknown): Promise<void>;
   getStorageIssues(): Promise<string[]>;
   readGlobalInstructions(): Promise<string>;
   readGlobalInstructionDocument(): Promise<InstructionDocument>;
@@ -487,10 +499,11 @@ function validateCompactSnapshot(value: unknown, messages: readonly ChatMessage[
 }
 
 function validateChatDetail(value: unknown): Loaded<ChatDetail> {
-  if (!isRecord(value) || (value.schemaVersion !== 3 && value.schemaVersion !== 4 && value.schemaVersion !== 5 && value.schemaVersion !== 6 && value.schemaVersion !== 7 && value.schemaVersion !== 8)
+  if (!isRecord(value) || (value.schemaVersion !== 3 && value.schemaVersion !== 4 && value.schemaVersion !== 5 && value.schemaVersion !== 6 && value.schemaVersion !== 7 && value.schemaVersion !== 8 && value.schemaVersion !== 9)
     || !Array.isArray(value.messages) || !Array.isArray(value.artifacts)
     || (value.schemaVersion >= 7 && !Array.isArray(value.toolReceipts))
-    || (value.schemaVersion === 8 && !('compactSnapshot' in value))) {
+    || (value.schemaVersion >= 8 && !('compactSnapshot' in value))
+    || (value.schemaVersion === 9 && !Array.isArray(value.draftAttachments))) {
     throw new Error('Invalid chat detail.');
   }
   const version = value.schemaVersion;
@@ -499,6 +512,7 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
     if (!isRecord(entry) || (entry.role !== 'user' && entry.role !== 'assistant') || typeof entry.text !== 'string') {
       throw new Error('Invalid chat message.');
     }
+    if (version < 9 && entry.attachmentIds !== undefined) throw new Error('Invalid legacy chat message attachments.');
     if (entry.source !== undefined && entry.source !== 'runtime' && entry.source !== 'example') throw new Error('Invalid chat message source.');
     if (entry.functionsStateId !== undefined && (version < 7 || entry.role !== 'assistant' || typeof entry.functionsStateId !== 'string'
       || !entry.functionsStateId || entry.functionsStateId.length > 4096
@@ -506,10 +520,18 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
       || /[\u0000-\u001f\u007f]/.test(entry.functionsStateId))) {
       throw new Error('Invalid assistant function state.');
     }
+    const attachmentIds = entry.attachmentIds === undefined ? [] : entry.attachmentIds;
+    if (!Array.isArray(attachmentIds) || attachmentIds.length > MAX_CHAT_DRAFT_FILES
+      || attachmentIds.some((id) => typeof id !== 'string')
+      || new Set(attachmentIds).size !== attachmentIds.length
+      || (attachmentIds.length > 0 && entry.role !== 'user')) {
+      throw new Error('Invalid chat message attachments.');
+    }
     return {
       id: requireId(entry.id), role: entry.role, text: entry.text, createdAt: requireTimestamp(entry.createdAt),
       ...(entry.source === undefined ? {} : { source: entry.source }),
       ...(entry.functionsStateId === undefined ? {} : { functionsStateId: entry.functionsStateId }),
+      ...(attachmentIds.length ? { attachmentIds: attachmentIds.map(requireId) } : {}),
     };
   });
   const artifacts: ChatArtifact[] = value.artifacts.map((entry: unknown) => {
@@ -521,9 +543,28 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
     }
     return {
       id: requireId(entry.id), name: entry.name, storedName: entry.storedName, size: entry.size as number,
+      ...(entry.sha256 === undefined ? {} : { sha256: typeof entry.sha256 === 'string' && /^[a-f0-9]{64}$/.test(entry.sha256)
+        ? entry.sha256 : (() => { throw new Error('Invalid chat artifact hash.'); })() }),
       createdAt: requireTimestamp(entry.createdAt), messageId: entry.messageId === null ? null : requireId(entry.messageId),
     };
   });
+  const messagesBeforeAttachmentMigration = structuredClone(messages);
+  if (version < 9) {
+    for (const message of messages) {
+      if (message.role === 'user') {
+        const migratedIds = artifacts.filter((artifact) => artifact.messageId === message.id).map((artifact) => artifact.id);
+        if (migratedIds.length) message.attachmentIds = migratedIds;
+      }
+    }
+  }
+  const draftAttachmentValues: unknown[] = version >= 9 && Array.isArray(value.draftAttachments) ? value.draftAttachments : [];
+  const draftAttachments = draftAttachmentValues.map(validateHomeDraftAttachment);
+  if (draftAttachments.length > MAX_CHAT_DRAFT_FILES
+    || new Set(draftAttachments.map((attachment) => attachment.id)).size !== draftAttachments.length
+    || new Set(draftAttachments.map((attachment) => attachment.storedName)).size !== draftAttachments.length
+    || draftAttachments.reduce((total, attachment) => total + attachment.size, 0) > MAX_CHAT_DRAFT_TOTAL_BYTES) {
+    throw new Error('Duplicate or oversized chat draft attachments.');
+  }
   const toolReceipts: ChatToolReceipt[] = (version >= 7 && Array.isArray(value.toolReceipts) ? value.toolReceipts : []).map((entry: unknown) => {
     if (!isRecord(entry) || typeof entry.receiptId !== 'string' || !/^[a-f0-9]{64}$/.test(entry.receiptId)
       || typeof entry.anchorMessageId !== 'string' || typeof entry.name !== 'string' || !entry.name || entry.name.length > 128
@@ -566,6 +607,10 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
   if (new Set(messages.map((message) => message.id)).size !== messages.length
     || new Set(artifacts.map((artifact) => artifact.id)).size !== artifacts.length
     || artifacts.some((artifact) => artifact.messageId && !messages.some((message) => message.id === artifact.messageId))
+    || new Set([...draftAttachments.map((attachment) => attachment.id), ...artifacts.map((artifact) => artifact.id)]).size !== draftAttachments.length + artifacts.length
+    || new Set([...draftAttachments.map((attachment) => attachment.storedName), ...artifacts.map((artifact) => artifact.storedName)]).size !== draftAttachments.length + artifacts.length
+    || messages.some((message) => message.attachmentIds?.some((attachmentId) => !artifacts.some((artifact) => artifact.id === attachmentId && artifact.messageId === message.id)))
+    || artifacts.some((artifact) => artifact.messageId && !messages.find((message) => message.id === artifact.messageId)?.attachmentIds?.includes(artifact.id))
     || toolReceipts.length > MAX_TOOL_RECEIPTS_PER_CHAT
     || toolReceipts.some((receipt) => !messages.some((message) => message.id === receipt.anchorMessageId && message.role === 'user'))
     || new Set(toolReceipts.map((receipt) => `${receipt.receiptId}:${receipt.anchorMessageId}`)).size !== toolReceipts.length) {
@@ -579,20 +624,29 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
     if (!isSkillId(value.nextTurnSkillId)) throw new Error('Invalid next-turn Skill.');
     nextTurnSkillId = value.nextTurnSkillId;
   }
-  const compactSnapshot = version >= 8 ? validateCompactSnapshot(value.compactSnapshot, messages) : null;
+  let compactSnapshot = version >= 8 ? validateCompactSnapshot(value.compactSnapshot, messages) : null;
   if (compactSnapshot) {
-    const storedChat = { ...chat, messages, artifacts, toolReceipts, nextTurnPermissionProfile, nextTurnSkillId,
+    const storedChat = { ...chat, messages, artifacts, draftAttachments, toolReceipts, nextTurnPermissionProfile, nextTurnSkillId,
       modelId: version >= 6 && value.modelId !== null ? requireModelId(value.modelId) : null,
       compactSnapshot };
-    const prefix = buildCompactionPrefix(storedChat, compactSnapshot.boundaryMessageId, compactSnapshot.coveredThroughMessageId);
-    if (prefix.coveredThroughMessageId !== compactSnapshot.coveredThroughMessageId
-      || prefix.coveredPrefixHash !== compactSnapshot.coveredPrefixHash) throw new Error('Invalid compact prefix hash.');
+    if (version < 9) {
+      const legacyChat = { ...storedChat, messages: messagesBeforeAttachmentMigration };
+      const legacyPrefix = buildCompactionPrefix(legacyChat, compactSnapshot.boundaryMessageId, compactSnapshot.coveredThroughMessageId);
+      if (legacyPrefix.coveredThroughMessageId !== compactSnapshot.coveredThroughMessageId
+        || legacyPrefix.coveredPrefixHash !== compactSnapshot.coveredPrefixHash) throw new Error('Invalid legacy compact prefix hash.');
+      const migratedPrefix = buildCompactionPrefix(storedChat, compactSnapshot.boundaryMessageId, compactSnapshot.coveredThroughMessageId);
+      compactSnapshot = { ...compactSnapshot, coveredPrefixHash: migratedPrefix.coveredPrefixHash };
+    } else {
+      const prefix = buildCompactionPrefix(storedChat, compactSnapshot.boundaryMessageId, compactSnapshot.coveredThroughMessageId);
+      if (prefix.coveredThroughMessageId !== compactSnapshot.coveredThroughMessageId
+        || prefix.coveredPrefixHash !== compactSnapshot.coveredPrefixHash) throw new Error('Invalid compact prefix hash.');
+    }
   }
   return {
-    value: { ...chat, messages, artifacts, toolReceipts, nextTurnPermissionProfile, nextTurnSkillId,
+    value: { ...chat, messages, artifacts, draftAttachments, toolReceipts, nextTurnPermissionProfile, nextTurnSkillId,
       modelId: version >= 6 && value.modelId !== null ? requireModelId(value.modelId) : null,
       compactSnapshot },
-    needsWrite: version < 8,
+    needsWrite: version < 9,
   };
 }
 
@@ -604,7 +658,7 @@ function summary(chat: ChatDetail): ChatSummary {
 }
 
 function detailFile(chat: ChatDetail): Record<string, unknown> {
-  return { schemaVersion: 8, ...chat };
+  return { schemaVersion: 9, ...chat };
 }
 
 function validateHomeDraftAttachment(value: unknown): HomeDraftAttachment {
@@ -622,6 +676,82 @@ function validateHomeDraftAttachment(value: unknown): HomeDraftAttachment {
   };
 }
 
+function validateProviderUploadEntry(value: unknown): ProviderUploadLedgerEntry {
+  if (!isRecord(value) || typeof value.accountScope !== 'string' || !/^[a-f0-9]{64}$/.test(value.accountScope)
+    || typeof value.name !== 'string' || !value.name.trim() || value.name.length > 255
+    // eslint-disable-next-line no-control-regex -- Reject controls in persisted provider file metadata.
+    || /[\u0000-\u001f\u007f]/.test(value.name)
+    || typeof value.uploadFilename !== 'string'
+    || !/^gcagent_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(txt|md|pdf|png|jpe?g)$/i.test(value.uploadFilename)
+    || typeof value.contentType !== 'string' || (value.kind !== 'document' && value.kind !== 'image')
+    || !Number.isSafeInteger(value.sizeBytes) || (value.sizeBytes as number) < 1
+    || (value.sizeBytes as number) > LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES
+    || typeof value.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(value.sha256)
+    || (value.state !== 'intent' && value.state !== 'uploaded' && value.state !== 'unknown' && value.state !== 'cleanup-pending')
+    || (value.remoteFileId !== null && (typeof value.remoteFileId !== 'string' || !/^[A-Za-z0-9_-]{1,256}$/.test(value.remoteFileId)))) {
+    throw new Error('Некорректная запись загрузки файла.');
+  }
+  const expectedType = attachmentContentType(value.name);
+  const uploadExtension = value.uploadFilename.split('.').pop()?.toLowerCase();
+  const validExtensions = extensionsForContentType(value.contentType);
+  if (!expectedType || expectedType.kind !== value.kind || expectedType.contentType !== value.contentType
+    || value.state === 'intent' && value.remoteFileId !== null
+    || value.state === 'unknown' && value.remoteFileId !== null
+    || (value.state === 'uploaded' || value.state === 'cleanup-pending') && value.remoteFileId === null
+    || (value.kind === 'image' && (value.sizeBytes as number) > PROVIDER_IMAGE_LIMIT_BYTES)
+    || !validExtensions.includes(uploadExtension ?? '')) {
+    throw new Error('Запись загрузки не соответствует типу или состоянию файла.');
+  }
+  return {
+    accountScope: value.accountScope,
+    attachmentId: requireId(value.attachmentId),
+    uploadFilename: value.uploadFilename,
+    name: value.name,
+    contentType: value.contentType,
+    kind: value.kind,
+    sizeBytes: value.sizeBytes as number,
+    sha256: value.sha256,
+    state: value.state,
+    remoteFileId: value.remoteFileId as string | null,
+    createdAt: requireTimestamp(value.createdAt),
+  };
+}
+
+function extensionsForContentType(contentType: string): string[] {
+  switch (contentType) {
+    case 'text/plain': return ['txt', 'md'];
+    case 'application/pdf': return ['pdf'];
+    case 'image/png': return ['png'];
+    case 'image/jpeg': return ['jpg', 'jpeg'];
+    default: return [];
+  }
+}
+
+function parseProviderUploadFile(value: unknown): Loaded<ProviderUploadFile> {
+  if (!isRecord(value) || value.schemaVersion !== 1 || !Array.isArray(value.entries)
+    || value.entries.length > MAX_PROVIDER_UPLOAD_ENTRIES) throw new Error('Invalid provider upload ledger.');
+  const entries = value.entries.map(validateProviderUploadEntry);
+  if (new Set(entries.map((entry) => `${entry.accountScope}\0${entry.attachmentId}`)).size !== entries.length
+    || new Set(entries.map((entry) => `${entry.accountScope}\0${entry.uploadFilename}`)).size !== entries.length) {
+    throw new Error('Duplicate provider upload identity.');
+  }
+  return { value: { schemaVersion: 1, entries }, needsWrite: false };
+}
+
+async function loadProviderUploadLedger(filePath: string): Promise<Loaded<ProviderUploadFile>> {
+  let info;
+  try { info = await lstat(filePath); }
+  catch (error) {
+    if (isMissingFile(error)) return { value: { schemaVersion: 1, entries: [] }, needsWrite: true };
+    throw error;
+  }
+  if (!info.isFile() || info.size > MAX_PROVIDER_UPLOAD_LEDGER_BYTES) throw storageError(filePath);
+  const bytes = await readFile(filePath);
+  if (bytes.byteLength > MAX_PROVIDER_UPLOAD_LEDGER_BYTES) throw storageError(filePath);
+  try { return parseProviderUploadFile(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as unknown); }
+  catch { throw storageError(filePath); }
+}
+
 function validateAcceptedTurnRecord(value: unknown): AcceptedTurnInput {
   if (!isRecord(value) || !Array.isArray(value.messages) || !Number.isSafeInteger(value.historyBoundary)
     || (value.historyBoundary as number) < 1 || value.historyBoundary !== value.messages.length || !isRecord(value.reservation)) {
@@ -634,10 +764,16 @@ function validateAcceptedTurnRecord(value: unknown): AcceptedTurnInput {
       || (entry.functionsStateId !== undefined && (entry.role !== 'assistant' || typeof entry.functionsStateId !== 'string' || !entry.functionsStateId || entry.functionsStateId.length > 4096))) {
       throw new Error('Некорректное сообщение принятого хода.');
     }
+    const attachmentIds = entry.attachmentIds === undefined ? [] : entry.attachmentIds;
+    if (!Array.isArray(attachmentIds) || attachmentIds.length > MAX_CHAT_DRAFT_FILES
+      || attachmentIds.some((id) => typeof id !== 'string')
+      || new Set(attachmentIds).size !== attachmentIds.length
+      || (attachmentIds.length > 0 && entry.role !== 'user')) throw new Error('Некорректные вложения принятого сообщения.');
     return {
       id: requireId(entry.id), role: entry.role, text: entry.text, createdAt: requireTimestamp(entry.createdAt),
       ...(entry.source === undefined ? {} : { source: entry.source }),
       ...(entry.functionsStateId === undefined ? {} : { functionsStateId: entry.functionsStateId }),
+      ...(attachmentIds.length ? { attachmentIds: attachmentIds.map(requireId) } : {}),
     };
   });
   const ids = messages.map((message) => message.id);
@@ -648,10 +784,16 @@ function validateAcceptedTurnRecord(value: unknown): AcceptedTurnInput {
     if (!Number.isSafeInteger(input) || (input as number) < 0) throw new Error('Некорректная ревизия принятого хода.');
     return input as number;
   };
+  const attachmentIds = value.attachmentIds === undefined ? [] : value.attachmentIds;
+  if (!Array.isArray(attachmentIds) || attachmentIds.length > MAX_CHAT_DRAFT_FILES
+    || attachmentIds.some((id) => typeof id !== 'string') || new Set(attachmentIds).size !== attachmentIds.length) {
+    throw new Error('Некорректные вложения принятого хода.');
+  }
   const turn: AcceptedTurnInput = {
     turnId: requireId(value.turnId), chatId: requireId(value.chatId),
     projectId: value.projectId === null ? null : requireId(value.projectId), projectWorkingFolder,
     messageId: requireId(value.messageId), historyBoundary: value.historyBoundary as number, messages,
+    ...(attachmentIds.length ? { attachmentIds: attachmentIds.map(requireId) } : {}),
     permissionProfile: requirePermissionProfile(value.permissionProfile),
     modelId: value.modelId === null ? null : requireModelId(value.modelId),
     skillId: value.skillId === null ? null : (isSkillId(value.skillId) ? value.skillId : (() => { throw new Error('Некорректный Skill принятого хода.'); })()),
@@ -661,7 +803,11 @@ function validateAcceptedTurnRecord(value: unknown): AcceptedTurnInput {
     },
   };
   if (value.operation !== undefined) throw new Error('Домашний черновик не может принимать служебный ход.');
-  if (!messages.some((message) => message.id === turn.messageId && message.role === 'user')) throw new Error('В принятом ходе отсутствует исходный запрос.');
+  const sourceMessage = messages.find((message) => message.id === turn.messageId && message.role === 'user');
+  if (!sourceMessage) throw new Error('В принятом ходе отсутствует исходный запрос.');
+  if (value.attachmentIds !== undefined && JSON.stringify(turn.attachmentIds ?? []) !== JSON.stringify(sourceMessage.attachmentIds ?? [])) {
+    throw new Error('Вложения принятого сообщения не совпадают со снимком хода.');
+  }
   return turn;
 }
 
@@ -725,12 +871,25 @@ function validateHomeSendJournal(value: unknown): HomeSendJournal {
     || (value.sourceRevision as number) < 1 || !Array.isArray(value.attachments) || !isRecord(value.nextDraft)) {
     throw new Error('Некорректный журнал отправки домашнего черновика.');
   }
+  const rawChat = isRecord(value.chat) ? value.chat : null;
+  const legacySchema8 = rawChat?.schemaVersion === 8;
   const chat = validateChatDetail(value.chat).value;
   const turn = validateAcceptedTurnRecord(value.turn);
   const attachments = value.attachments.map(validateHomeDraftAttachment);
   const nextDraft = validateHomeDraftRecord(value.nextDraft);
   const acceptance = nextDraft.lastAcceptance;
   const userMessage = chat.messages[0];
+  const rawTurn = value.turn;
+  const rawAcceptance = isRecord(value.nextDraft.lastAcceptance) && isRecord(value.nextDraft.lastAcceptance.turn)
+    ? value.nextDraft.lastAcceptance.turn : null;
+  const containsLegacyAttachmentIds = (messages: unknown): boolean => Array.isArray(messages)
+    && messages.some((message) => isRecord(message) && Object.prototype.hasOwnProperty.call(message, 'attachmentIds'));
+  const hasOwnAttachmentIds = (record: Record<string, unknown>, key: string): boolean => Object.prototype.hasOwnProperty.call(record, key);
+  if (legacySchema8 && (rawChat === null || containsLegacyAttachmentIds(rawChat.messages)
+    || !isRecord(rawTurn) || hasOwnAttachmentIds(rawTurn, 'attachmentIds') || containsLegacyAttachmentIds(rawTurn.messages)
+    || !rawAcceptance || hasOwnAttachmentIds(rawAcceptance, 'attachmentIds') || containsLegacyAttachmentIds(rawAcceptance.messages))) {
+    throw new Error('Некорректное представление вложений в старом журнале отправки.');
+  }
   if (new Set(attachments.map((attachment) => attachment.id)).size !== attachments.length
     || new Set(attachments.map((attachment) => attachment.storedName)).size !== attachments.length
     || attachments.reduce((total, attachment) => total + attachment.size, 0) > MAX_HOME_DRAFT_TOTAL_BYTES) {
@@ -739,7 +898,15 @@ function validateHomeSendJournal(value: unknown): HomeSendJournal {
   if (!userMessage || userMessage.role !== 'user' || chat.messages.length !== 1
     || turn.chatId !== chat.id || turn.messageId !== userMessage.id || turn.projectId !== chat.projectId
     || turn.modelId !== chat.modelId || turn.historyBoundary !== chat.messages.length
-    || JSON.stringify(turn.messages) !== JSON.stringify(chat.messages)
+    || JSON.stringify(turn.messages) !== JSON.stringify(legacySchema8
+      ? chat.messages.map((message) => {
+        const legacyMessage = { ...message };
+        delete legacyMessage.attachmentIds;
+        return legacyMessage;
+      }) : chat.messages)
+    || (!legacySchema8 && JSON.stringify(turn.attachmentIds ?? []) !== JSON.stringify(attachments.map((attachment) => attachment.id)))
+    || JSON.stringify(userMessage.attachmentIds ?? []) !== JSON.stringify(attachments.map((attachment) => attachment.id))
+    || chat.draftAttachments.length !== 0
     || attachments.length !== chat.artifacts.length
     || attachments.some((attachment) => !chat.artifacts.some((artifact) => artifact.id === attachment.id
       && artifact.storedName === attachment.storedName && artifact.name === attachment.name
@@ -988,6 +1155,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
   const migrationMarker = join(storageRoot, 'chats.migrated');
   const settingsPath = join(storageRoot, 'settings.json');
   const usagePath = join(storageRoot, 'usage.json');
+  const providerUploadPath = join(storageRoot, 'provider-uploads.json');
   const homeDraftPath = join(storageRoot, 'home-draft.json');
   const homeDraftFilesDirectory = join(storageRoot, 'home-draft', 'files');
   const homeSendJournalPath = join(storageRoot, 'home-send.journal.json');
@@ -1372,6 +1540,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     assertOwnedPath(storageRoot, migrationMarker),
     assertOwnedPath(storageRoot, settingsPath),
     assertOwnedPath(storageRoot, usagePath),
+    assertOwnedPath(storageRoot, providerUploadPath),
     assertOwnedPath(storageRoot, homeDraftPath),
     assertOwnedPath(storageRoot, homeDraftFilesDirectory),
     assertOwnedPath(storageRoot, homeSendJournalPath),
@@ -1392,7 +1561,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
   }
 
   // Parse every existing file before creating or migrating any of them.
-  const [projectFile, settingsFile, usageFile, homeDraftFile] = await Promise.all([
+  const [projectFile, settingsFile, usageFile, homeDraftFile, providerUploadFile] = await Promise.all([
     loadVersioned<ProjectFile>(projectPath, { schemaVersion: 2, projects: [] }, parseProjectFile),
     loadVersioned<SettingsFile>(settingsPath, {
       schemaVersion: 10,
@@ -1416,6 +1585,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     }, parseSettingsFile),
     loadUsageLedger(usagePath),
     loadHomeDraftFile(homeDraftPath),
+    loadProviderUploadLedger(providerUploadPath),
   ]);
 
   await assertOwnedPath(storageRoot, migrationMarker);
@@ -1500,7 +1670,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     }
     for (const legacy of legacyChats) {
       if (existingChatDetails.has(legacy.id)) continue;
-      const detail: ChatDetail = { ...legacy, nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], toolReceipts: [], artifacts: [], compactSnapshot: null };
+      const detail: ChatDetail = { ...legacy, nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], toolReceipts: [], artifacts: [], draftAttachments: [], compactSnapshot: null };
       await writeOwnedAtomic(join(chatsDirectory, legacy.id, 'chat.json'), detailFile(detail));
       loadedChats.push(detail);
     }
@@ -1514,6 +1684,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
   if (projectFile.needsWrite) await writeOwnedAtomic(projectPath, projectFile.value);
   if (settingsFile.needsWrite) await writeOwnedAtomic(settingsPath, settingsFile.value);
   if (usageFile.needsWrite) await writeOwnedAtomic(usagePath, usageFile.value);
+  if (providerUploadFile.needsWrite) await writeOwnedAtomic(providerUploadPath, providerUploadFile.value);
   const initialHomeDraft = homeDraftFile.needsWrite
     ? { ...homeDraftFile.value, modelId: settingsFile.value.settings.defaultModelId }
     : homeDraftFile.value;
@@ -1523,6 +1694,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
   let chats = loadedChats;
   let settings = settingsFile.value.settings;
   let usageReceipts = usageFile.value.receipts;
+  let providerUploadEntries = providerUploadFile.value.entries;
   let homeDraft = initialHomeDraft;
   const selectionRevisions = new Map(chats.map((chat) => [chat.id, { permissionProfile: 0, skill: 0 }]));
   const turnReservations = new Map<string, {
@@ -1571,6 +1743,15 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     await writeOwnedAtomic(usagePath, value);
     usageReceipts = next;
   };
+  const saveProviderUploadEntries = async (next: ProviderUploadLedgerEntry[]): Promise<void> => {
+    if (next.length > MAX_PROVIDER_UPLOAD_ENTRIES) throw new Error('Лимит записей загрузки достигнут; история не сокращена.');
+    const value: ProviderUploadFile = { schemaVersion: 1, entries: next };
+    if (Buffer.byteLength(`${JSON.stringify(value, null, 2)}\n`, 'utf8') > MAX_PROVIDER_UPLOAD_LEDGER_BYTES) {
+      throw new Error('Журнал загрузок превысил безопасный размер; существующие записи сохранены.');
+    }
+    await writeOwnedAtomic(providerUploadPath, value);
+    providerUploadEntries = next;
+  };
   const chatFolder = (id: string): string => join(chatsDirectory, requireId(id));
   const saveChat = async (chat: ChatDetail, signal?: AbortSignal): Promise<void> => {
     await writeOwnedAtomic(join(chatFolder(chat.id), 'chat.json'), detailFile(chat), signal);
@@ -1604,7 +1785,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     const chat: ChatDetail = {
       id: randomUUID(), title: kind === 'image' ? 'Новое изображение' : 'Новый чат', projectId,
       pinned: false, archived: false, createdAt: now, updatedAt: now, draft: '', kind,
-      nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: settings.defaultModelId, messages: [], toolReceipts: [], artifacts: [],
+      nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: settings.defaultModelId, messages: [], toolReceipts: [], artifacts: [], draftAttachments: [],
       compactSnapshot: null,
     };
     await saveChat(chat);
@@ -1641,6 +1822,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       messageId,
       historyBoundary: messages.length,
       messages: structuredClone(messages),
+      ...(messages[boundaryIndex]?.attachmentIds?.length ? { attachmentIds: [...messages[boundaryIndex]!.attachmentIds!] } : {}),
       permissionProfile: profileReservation?.value ?? settings.defaultPermissionProfile,
       modelId: detail.modelId ?? settings.defaultModelId,
       skillId: skillReservation?.value ?? null,
@@ -1700,6 +1882,19 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
   return {
     listProjects: () => serialize(async () => projects.map((project) => ({ ...project }))),
     getHomeDraft: () => serialize(async () => structuredClone(homeDraft)),
+    getHomeDraftAttachmentPath: (attachmentIdInput) => serialize(async () => {
+      const attachment = homeDraft.attachments.find((item) => item.id === requireId(attachmentIdInput));
+      if (!attachment) throw new Error('Подготовленный файл не найден.');
+      const path = join(homeDraftFilesDirectory, attachment.storedName);
+      await assertOwnedPath(storageRoot, path);
+      const info = await lstat(path);
+      if (!info.isFile() || info.isSymbolicLink() || info.size !== attachment.size) {
+        throw new Error('Копия подготовленного файла недоступна или изменилась. Исходный файл сохранён.');
+      }
+      const copied = await hashFile(path);
+      if (copied.sha256 !== attachment.sha256) throw new Error('Целостность копии подготовленного файла не подтверждена.');
+      return path;
+    }),
     saveHomeDraft: (input) => serialize(async () => {
       const nextInput = homeDraftInput(input);
       if (nextInput.revision === homeDraft.revision) {
@@ -1726,6 +1921,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       if (!sourceInfo.isFile() || sourceInfo.isSymbolicLink() || sourceInfo.size > MAX_HOME_DRAFT_FILE_BYTES) {
         throw new Error('Выбранный файл недоступен или превышает лимит 25 МиБ.');
       }
+      inspectLocalAttachmentContent(basename(sourcePath), await readFile(sourcePath));
       const sourceRealPath = await realpath(sourcePath);
       if (!samePath(sourceRealPath, sourcePath)) throw new Error('Символические ссылки на файлы не поддерживаются.');
       if (homeDraft.attachments.reduce((total, attachment) => total + attachment.size, 0) + sourceInfo.size > MAX_HOME_DRAFT_TOTAL_BYTES) {
@@ -1771,7 +1967,79 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       await unlink(path).catch((error: unknown) => { if (!isMissingFile(error)) throw error; });
       return structuredClone(homeDraft);
     }),
-    acceptHomeDraft: (expectedRevisionInput, turnIdInput) => serialize(async () => {
+    stageChatDraftFile: (chatIdInput, sourcePath) => serialize(async () => {
+      const chat = findChat(chatIdInput);
+      if (typeof sourcePath !== 'string' || !sourcePath || sourcePath.includes('\0') || !isAbsolute(sourcePath)) {
+        throw new Error('Выберите доступный локальный файл.');
+      }
+      if (chat.draftAttachments.length >= MAX_CHAT_DRAFT_FILES) throw new Error('В черновик можно добавить не более 32 файлов.');
+      const sourceInfo = await lstat(sourcePath);
+      if (!sourceInfo.isFile() || sourceInfo.isSymbolicLink() || sourceInfo.size > MAX_HOME_DRAFT_FILE_BYTES) {
+        throw new Error('Выбранный файл недоступен или превышает локальный лимит 25 МиБ.');
+      }
+      const sourceRealPath = await realpath(sourcePath);
+      if (!samePath(sourceRealPath, sourcePath)) throw new Error('Символические ссылки на файлы не поддерживаются.');
+      if (chat.draftAttachments.reduce((total, attachment) => total + attachment.size, 0) + sourceInfo.size > MAX_CHAT_DRAFT_TOTAL_BYTES) {
+        throw new Error('Подготовленные файлы превышают локальный лимит 100 МиБ.');
+      }
+      const name = requireName(basename(sourcePath), 'Имя файла', 255);
+      inspectLocalAttachmentContent(name, await readFile(sourcePath));
+      const id = randomUUID();
+      const extension = extname(sourcePath).match(/^\.[A-Za-z0-9]{1,12}$/)?.[0].toLowerCase() ?? '';
+      const storedName = `${id}${extension}`;
+      const target = join(chatFolder(chat.id), 'files', storedName);
+      let copied = false;
+      try {
+        await assertOwnedPath(storageRoot, target);
+        await mkdir(dirname(target), { recursive: true });
+        await assertOwnedPath(storageRoot, target);
+        await copyFile(sourcePath, target, constants.COPYFILE_EXCL);
+        copied = true;
+        const sourceAfter = await lstat(sourcePath);
+        if (!sourceAfter.isFile() || sourceAfter.isSymbolicLink() || sourceAfter.size !== sourceInfo.size
+          || sourceAfter.mtimeMs !== sourceInfo.mtimeMs || !samePath(await realpath(sourcePath), sourceRealPath)) {
+          throw new Error('Исходный файл изменился во время подготовки; он не изменён.');
+        }
+        const copiedFile = await hashFile(target);
+        if (copiedFile.size !== sourceInfo.size) throw new Error('Копия файла изменилась при подготовке.');
+        const attachment: HomeDraftAttachment = {
+          id, name, storedName, size: copiedFile.size, sha256: copiedFile.sha256, createdAt: new Date().toISOString(),
+        };
+        const updated = validateChatDetail({ ...detailFile(chat), draftAttachments: [...chat.draftAttachments, attachment] }).value;
+        await saveChat({ ...updated, updatedAt: new Date().toISOString() });
+        return structuredClone(findChat(chat.id));
+      } catch (error) {
+        if (copied) await assertOwnedPath(storageRoot, target).then(() => unlink(target)).catch(() => undefined);
+        throw error;
+      }
+    }),
+    removeChatDraftFile: (chatIdInput, attachmentIdInput) => serialize(async () => {
+      const chat = findChat(chatIdInput);
+      const id = requireId(attachmentIdInput);
+      const attachment = chat.draftAttachments.find((item) => item.id === id);
+      if (!attachment) throw new Error('Подготовленный файл не найден.');
+      const updated = { ...chat, updatedAt: new Date().toISOString(), draftAttachments: chat.draftAttachments.filter((item) => item.id !== id) };
+      await saveChat(updated);
+      const path = join(chatFolder(chat.id), 'files', attachment.storedName);
+      await assertOwnedPath(storageRoot, path);
+      await unlink(path).catch((error: unknown) => { if (!isMissingFile(error)) throw error; });
+      return structuredClone(findChat(chat.id));
+    }),
+    getChatDraftAttachmentPath: (chatIdInput, attachmentIdInput) => serialize(async () => {
+      const chat = findChat(chatIdInput);
+      const attachment = chat.draftAttachments.find((item) => item.id === requireId(attachmentIdInput));
+      if (!attachment) throw new Error('Подготовленный файл не найден.');
+      const path = join(chatFolder(chat.id), 'files', attachment.storedName);
+      await assertOwnedPath(storageRoot, path);
+      const fileInfo = await lstat(path);
+      if (!fileInfo.isFile() || fileInfo.isSymbolicLink() || fileInfo.size !== attachment.size) {
+        throw new Error('Копия подготовленного файла недоступна или изменилась. Исходный файл сохранён.');
+      }
+      const copiedFile = await hashFile(path);
+      if (copiedFile.sha256 !== attachment.sha256) throw new Error('Целостность копии подготовленного файла не подтверждена.');
+      return path;
+    }),
+    acceptHomeDraft: (expectedRevisionInput, turnIdInput, expectedModelIdInput, validateBeforeCommit) => serialize(async () => {
       if (!Number.isSafeInteger(expectedRevisionInput) || (expectedRevisionInput as number) < 1) {
         throw new Error('Ревизия домашнего черновика некорректна.');
       }
@@ -1780,8 +2048,12 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         return { detail: structuredClone(findChat(homeDraft.lastAcceptance.chatId)), turn: structuredClone(homeDraft.lastAcceptance.turn), newlyAccepted: false };
       }
       if (expectedRevision !== homeDraft.revision) throw new Error('Черновик изменился перед отправкой; отправьте актуальную версию.');
+      const effectiveModelId = homeDraft.modelId ?? settings.defaultModelId;
+      if (expectedModelIdInput !== undefined && expectedModelIdInput !== effectiveModelId) {
+        throw new Error('Модель изменилась во время проверки файлов. Черновик сохранён; проверьте выбор и отправьте ещё раз.');
+      }
       const text = homeDraft.text.trim();
-      if (!text || text.length > 100_000) throw new Error('Введите сообщение перед отправкой.');
+      if ((!text && homeDraft.attachments.length === 0) || text.length > 100_000) throw new Error('Введите сообщение или прикрепите файл перед отправкой.');
       const project = homeDraft.projectId ? projects.find((item) => item.id === homeDraft.projectId && !item.archived) : null;
       if (homeDraft.projectId && !project) throw new Error('Выбранный проект недоступен.');
       if (homeDraft.skillId && skillForProject(homeDraft.skillId, homeDraft.projectId) !== homeDraft.skillId) {
@@ -1789,20 +2061,23 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       }
       const turnId = requireId(turnIdInput);
       const now = new Date().toISOString();
-      const message: ChatMessage = { id: randomUUID(), role: 'user', text, createdAt: now };
+      const message: ChatMessage = {
+        id: randomUUID(), role: 'user', text, createdAt: now,
+        ...(homeDraft.attachments.length ? { attachmentIds: homeDraft.attachments.map((attachment) => attachment.id) } : {}),
+      };
       const chatId = randomUUID();
       const chat: ChatDetail = {
         id: chatId,
-        title: requireName(text.split(/\r?\n/, 1)[0]?.slice(0, 60) ?? '', 'Название чата', 160),
+        title: text ? requireName(text.split(/\r?\n/, 1)[0]?.slice(0, 60) ?? '', 'Название чата', 160) : 'Прикреплённые файлы',
         projectId: homeDraft.projectId, pinned: false, archived: false, createdAt: now, updatedAt: now,
         draft: '', kind: 'text',
         nextTurnPermissionProfile: homeDraft.permissionProfile === settings.defaultPermissionProfile ? null : homeDraft.permissionProfile,
         nextTurnSkillId: homeDraft.skillId,
         modelId: homeDraft.modelId ?? settings.defaultModelId,
-        messages: [message], toolReceipts: [],
+        messages: [message], toolReceipts: [], draftAttachments: [],
         artifacts: homeDraft.attachments.map((attachment) => ({
           id: attachment.id, name: attachment.name, storedName: attachment.storedName,
-          size: attachment.size, createdAt: attachment.createdAt, messageId: message.id,
+          size: attachment.size, sha256: attachment.sha256, createdAt: attachment.createdAt, messageId: message.id,
         })),
         compactSnapshot: null,
       };
@@ -1823,6 +2098,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       }
       try {
         await testFaults?.beforeHomeSendJournal?.();
+        validateBeforeCommit?.();
         await writeOwnedAtomic(homeSendJournalPath, homeSendJournalFile(journal));
       } catch (error) {
         turnReservations.delete(turn.turnId);
@@ -2100,17 +2376,49 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       return summary(updated);
     }),
     appendLocalMessage: (id, textInput) => serialize(() => appendLocalMessage(id, textInput)),
-    acceptLocalMessage: (idInput, textInput, turnIdInput) => serialize(async () => {
+    acceptLocalMessage: (idInput, textInput, turnIdInput, attachmentIdsInput = [], expectedModelIdInput, validateBeforeCommit) => serialize(async () => {
       const turnId = requireId(turnIdInput);
       if (turnReservations.has(turnId)) throw new Error('Ход с таким идентификатором уже принят.');
       const before = findChat(idInput);
       if (before.projectId && !projects.some((item) => item.id === before.projectId)) {
         throw new Error('Проект чата больше недоступен.');
       }
-      const detail = await appendLocalMessage(idInput, textInput);
-      const message = detail.messages[detail.messages.length - 1];
-      if (!message || message.role !== 'user') throw new Error('Принятое сообщение отсутствует в истории чата.');
-      const turn = createAcceptedTurn(detail, turnId, message.id);
+      if (typeof textInput !== 'string' || textInput.length > 100_000) throw new Error('Сообщение не должно превышать 100 000 символов.');
+      if (!Array.isArray(attachmentIdsInput) || attachmentIdsInput.length > MAX_CHAT_DRAFT_FILES
+        || attachmentIdsInput.some((id) => typeof id !== 'string') || new Set(attachmentIdsInput).size !== attachmentIdsInput.length) {
+        throw new Error('Список подготовленных файлов изменился.');
+      }
+      const selectedIds = attachmentIdsInput.map(requireId);
+      const selectedAttachments = selectedIds.map((id) => {
+        const attachment = before.draftAttachments.find((item) => item.id === id);
+        if (!attachment) throw new Error('Подготовленный файл изменился перед отправкой.');
+        return attachment;
+      });
+      if (expectedModelIdInput !== undefined && expectedModelIdInput !== (before.modelId ?? settings.defaultModelId)) {
+        throw new Error('Модель изменилась во время проверки файлов. Черновик сохранён; проверьте выбор и отправьте ещё раз.');
+      }
+      const text = textInput.trim();
+      if (!text && selectedAttachments.length === 0) throw new Error('Введите сообщение или прикрепите файл перед отправкой.');
+      const now = new Date().toISOString();
+      const message: ChatMessage = {
+        id: randomUUID(), role: 'user', text, createdAt: now,
+        ...(selectedIds.length ? { attachmentIds: selectedIds } : {}),
+      };
+      const updated: ChatDetail = {
+        ...before, draft: '', updatedAt: now,
+        messages: [...before.messages, message],
+        draftAttachments: before.draftAttachments.filter((item) => !selectedIds.includes(item.id)),
+        artifacts: [...before.artifacts, ...selectedAttachments.map((attachment) => ({
+          id: attachment.id, name: attachment.name, storedName: attachment.storedName,
+          size: attachment.size, sha256: attachment.sha256, createdAt: attachment.createdAt, messageId: message.id,
+        }))],
+      };
+      validateBeforeCommit?.();
+      await saveChat(updated);
+      const detail = structuredClone(findChat(before.id));
+      const acceptedMessage = detail.messages[detail.messages.length - 1];
+      if (!acceptedMessage || acceptedMessage.role !== 'user') throw new Error('Принятое сообщение отсутствует в истории чата.');
+      const turn = createAcceptedTurn(detail, turnId, acceptedMessage.id);
       return { detail, turn };
     }),
     acceptCompactionTurn: (idInput, turnIdInput) => serialize(async () => {
@@ -2387,6 +2695,56 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       });
     },
     getUsageLedger: () => serialize(async () => structuredClone(summarizeUsage(usageReceipts))),
+    getProviderUploadEntries: (scopeInput) => serialize(async () => {
+      if (typeof scopeInput !== 'string' || !/^[a-f0-9]{64}$/.test(scopeInput)) throw new Error('Не удалось подтвердить область файлового аккаунта.');
+      return structuredClone(providerUploadEntries.filter((entry) => entry.accountScope === scopeInput));
+    }),
+    putProviderUploadEntry: (value) => {
+      const entry = validateProviderUploadEntry(value);
+      return serialize(async () => {
+        const index = providerUploadEntries.findIndex((row) => row.accountScope === entry.accountScope && row.attachmentId === entry.attachmentId);
+        const previous = index < 0 ? null : providerUploadEntries[index]!;
+        if (!previous) {
+          if (entry.state !== 'intent') throw new Error('Загрузка должна начинаться с сохранённого намерения.');
+        } else {
+          const sameIdentity = previous.accountScope === entry.accountScope && previous.attachmentId === entry.attachmentId
+            && previous.uploadFilename === entry.uploadFilename && previous.name === entry.name
+            && previous.contentType === entry.contentType && previous.kind === entry.kind
+            && previous.sizeBytes === entry.sizeBytes && previous.sha256 === entry.sha256
+            && previous.createdAt === entry.createdAt;
+          const stateCanAdvance = previous.state === 'intent'
+            ? entry.state === 'intent' || entry.state === 'uploaded' || entry.state === 'unknown'
+            : previous.state === 'unknown'
+              ? entry.state === 'unknown' || entry.state === 'uploaded'
+              : previous.state === 'uploaded'
+                ? entry.state === 'uploaded' || entry.state === 'cleanup-pending'
+                : entry.state === 'cleanup-pending';
+          if (!sameIdentity || !stateCanAdvance
+            || (previous.remoteFileId !== null && entry.remoteFileId !== previous.remoteFileId)) {
+            throw new Error('Состояние облачной копии изменилось; файл не будет переиспользован.');
+          }
+          if (sameJson(previous, entry)) return structuredClone(previous);
+        }
+        const next = [...providerUploadEntries];
+        if (index < 0) next.push(entry);
+        else next[index] = entry;
+        await saveProviderUploadEntries(next);
+        return structuredClone(entry);
+      });
+    },
+    removeProviderUploadEntry: (scopeInput, attachmentIdInput, remoteFileIdInput) => serialize(async () => {
+      if (typeof scopeInput !== 'string' || !/^[a-f0-9]{64}$/.test(scopeInput)) throw new Error('Не удалось подтвердить область файлового аккаунта.');
+      const attachmentId = requireId(attachmentIdInput);
+      if (typeof remoteFileIdInput !== 'string' || !/^[A-Za-z0-9_-]{1,256}$/.test(remoteFileIdInput)) {
+        throw new Error('Удаление облачной копии не подтверждено.');
+      }
+      const entry = providerUploadEntries.find((row) => row.accountScope === scopeInput && row.attachmentId === attachmentId);
+      if (!entry) return;
+      if (entry.state !== 'cleanup-pending' || entry.remoteFileId !== remoteFileIdInput) {
+        throw new Error('Удаляется только подтверждённая app-owned облачная копия.');
+      }
+      await saveProviderUploadEntries(providerUploadEntries.filter((row) => row !== entry));
+    }),
     getStorageIssues: () => serialize(async () => [...instructionIssues, ...storageIssues]),
     readGlobalInstructions: () => serialize(() => readOwnedInstructions(join(storageRoot, 'GIGACHAT.md'))),
     readGlobalInstructionDocument: () => serialize(async () =>

@@ -1,13 +1,13 @@
 import { execFile, spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { lstat, mkdir, mkdtemp, readFile, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, Notification, safeStorage, screen, session, shell, systemPreferences, Tray, WebContentsView, type IpcMainInvokeEvent, type MediaAccessPermissionRequest } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, safeStorage, screen, session, shell, systemPreferences, Tray, WebContentsView, type IpcMainInvokeEvent, type MediaAccessPermissionRequest } from 'electron';
 import { openStore, type LocalStore } from './store';
 import { COMPACTION_QUALITY_VERIFIED, COMPACTION_UNAVAILABLE_REASON, COMPACTION_TASK_INSTRUCTION, buildNextTurnContext, validateCompactSummary } from './context';
 import { createLocalTools, createPowerShellHelper, resolvePowerShellHelperPath } from './local-tools';
 import { createTurnRuntime, type PreparedCompactionContext, type TurnRuntime } from './runtime';
-import type { AcceptedTurnInput, ChatPatch, CompactSnapshot, FolderOpener, HookRunResult, ModelRegistrySnapshot, NotificationSettings, PreferredOpener, RuntimeAvailability, SettingsPatch, Theme, VoiceAvailability } from './contracts';
+import type { AcceptedTurnInput, AttachmentImportBatchResult, ChatArtifact, ChatPatch, CompactSnapshot, FolderOpener, HomeDraftAttachment, HookRunResult, ModelRegistrySnapshot, NotificationSettings, PreferredOpener, RuntimeAvailability, SettingsPatch, Theme, VoiceAvailability } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { requireModelId } from './models';
 import { chatModelUnavailableReason, isChatModelAvailable } from './model-catalog';
@@ -17,6 +17,8 @@ import { createSkillRegistry, isSkillId } from './skills';
 import { createHookApprovalGate, createHookDispatcher, createHookRegistry, transitionProjectHookContext, type HookApprovalRequestContext, type HookExecutionContext } from './hooks';
 import { createSecureStore } from './secure-store';
 import { createGigaChatProvider, createHttpsTransport, GIGACHAT_ROOT_CA_SHA256, GigaChatProviderError, type GigaChatProviderConnection, type ProviderTransport } from './gigachat-provider';
+import { prepareTurnAttachments } from './attachments';
+import { attachmentConnectionBlocker, attachmentContentType, attachmentSendBlocker, inspectLocalAttachmentContent, PROVIDER_IMAGE_LIMIT_BYTES } from './attachment-policy';
 import { createOnboardingBrowser, type BrowserBounds } from './onboarding-browser';
 import { createEmbeddedBrowser } from './embedded-browser';
 import { createNumberedProjectFolder, prepareProjectFolders, removeEmptyCreatedFolder } from './project-folders';
@@ -832,6 +834,11 @@ async function createMainRuntime(
       }
       return context.request;
     },
+    prepareProviderRequest: (turn, request, signal) => prepareTurnAttachments(turn, request, signal, {
+      store,
+      provider: providerConnection,
+      loadAuthorizationKey: () => secureStore.load(),
+    }),
     consumeTurn: (turn: AcceptedTurnInput, signal) => store.consumeTurnReservation(turn, signal),
     releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
     beginToolReceipt: (turn, receipt) => store.beginToolReceipt(turn.chatId, turn.messageId, receipt),
@@ -978,7 +985,7 @@ async function registerIpcHandlers(
   const { runtime, availability, providerConnection, voiceRuntime, voiceAvailability, skills, hooks } = mainRuntime;
   const nonCriticalChannels = new Set([
     'projects:list', 'projects:pick-folder', 'projects:open-folder', 'projects:read-instructions', 'projects:instructions-backup-path',
-    'chats:list', 'chats:get', 'chats:open-artifact', 'chats:open-folder',
+    'chats:list', 'chats:get', 'chats:open-artifact', 'chats:open-folder', 'chats:draft-attachment-preview', 'chats:artifact-preview',
     'runtime:list', 'runtime:status', 'permissions:read-config', 'permissions:respond',
     'voice:status', 'voice:cancel', 'skills:list', 'skills:read-source', 'skills:open-folder', 'hooks:list', 'hooks:inspect',
     'onboarding:key-status', 'onboarding:browser-status', 'onboarding:browser-open', 'onboarding:browser-close',
@@ -986,12 +993,12 @@ async function registerIpcHandlers(
     'models:get-registry', 'models:refresh',
     'onboarding:browser-back', 'onboarding:browser-reload', 'onboarding:browser-bounds',
     'browser:status', 'browser:bounds', 'runtime:cancel',
-    'settings:get', 'usage:local-stats', 'usage:get-ledger', 'settings:open-projects-folder', 'settings:list-openers', 'settings:app-info',
+    'home-draft:attachment-preview', 'settings:get', 'usage:local-stats', 'usage:get-ledger', 'settings:open-projects-folder', 'settings:list-openers', 'settings:app-info',
     'settings:get-auto-start', 'settings:read-instructions',
   ]);
   const readOnlyChannels = new Set([
     'projects:list', 'projects:read-instructions', 'projects:instructions-backup-path',
-    'chats:list', 'chats:get', 'home-draft:get', 'runtime:list', 'runtime:status', 'permissions:read-config',
+    'chats:list', 'chats:get', 'chats:draft-attachment-preview', 'chats:artifact-preview', 'home-draft:get', 'home-draft:attachment-preview', 'runtime:list', 'runtime:status', 'permissions:read-config',
     'voice:status', 'skills:list', 'skills:read-source', 'hooks:list', 'hooks:inspect', 'onboarding:key-status', 'onboarding:connection-status', 'models:get-registry',
     'onboarding:browser-status', 'browser:status', 'settings:get', 'usage:local-stats', 'usage:get-ledger',
     'settings:list-openers', 'settings:app-info', 'settings:get-auto-start', 'settings:read-instructions',
@@ -1014,6 +1021,97 @@ async function registerIpcHandlers(
         track: options.track,
       });
     });
+  };
+
+  const stageAttachmentPaths = async <T,>(
+    pathsInput: unknown,
+    load: () => Promise<T>,
+    stage: (path: string) => Promise<T>,
+  ): Promise<AttachmentImportBatchResult<T>> => {
+    if (!Array.isArray(pathsInput) || pathsInput.length > 32) {
+      throw new Error('За один раз можно подготовить не более 32 файлов.');
+    }
+    let record = await load();
+    const failures: AttachmentImportBatchResult<T>['failures'] = [];
+    for (const input of pathsInput) {
+      const path = typeof input === 'string'
+        ? input
+        : isRecord(input) && typeof input.path === 'string' ? input.path : '';
+      const rawName = typeof input === 'string' ? basename(input)
+        : isRecord(input) && typeof input.name === 'string' ? input.name : '';
+      // Strip control characters before exposing a filename in local UI results.
+      // eslint-disable-next-line no-control-regex -- filename control bytes are intentionally removed.
+      const name = rawName.replace(/[\\/]/g, '_').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 255) || 'Файл';
+      if (!path) {
+        failures.push({ name, reason: 'Путь файла не подтверждён.' });
+        continue;
+      }
+      try { record = await stage(path); }
+      catch (error) {
+        const reason = error instanceof Error ? error.message : 'Не удалось подготовить файл.';
+        failures.push({ name, reason: reason.replace(path, name) });
+      }
+    }
+    return { record, failures };
+  };
+  const assertAttachmentConnectionAvailable = (modelId: string | null): void => {
+    const blocker = attachmentConnectionBlocker(providerConnection.getConnectionStatus(), providerConnection.getModelRegistry(), modelId);
+    if (blocker) throw new Error(blocker);
+  };
+  const validateAttachmentSelection = async (
+    modelId: string | null,
+    text: string,
+    attachments: readonly HomeDraftAttachment[],
+    getPath: (id: string) => Promise<string>,
+  ): Promise<void> => {
+    if (attachments.length) assertAttachmentConnectionAvailable(modelId);
+    const blocker = attachmentSendBlocker(modelId, text, attachments);
+    if (blocker) throw new Error(blocker);
+    for (const attachment of attachments) await getPath(attachment.id);
+    if (attachments.length) assertAttachmentConnectionAvailable(modelId);
+  };
+  const getAttachmentPreview = async (
+    path: string,
+    attachment: Pick<HomeDraftAttachment, 'name' | 'size' | 'sha256'> | Pick<ChatArtifact, 'name' | 'size' | 'sha256'>,
+  ): Promise<string | null> => {
+    if (attachmentContentType(attachment.name)?.kind !== 'image'
+      || !Number.isSafeInteger(attachment.size) || attachment.size <= 0 || attachment.size > PROVIDER_IMAGE_LIMIT_BYTES) return null;
+    try {
+      const info = await lstat(path);
+      if (!info.isFile() || info.isSymbolicLink() || info.size !== attachment.size) return null;
+      const bytes = await readFile(path);
+      if (bytes.length !== attachment.size || (attachment.sha256
+        && createHash('sha256').update(bytes).digest('hex') !== attachment.sha256)) return null;
+      inspectLocalAttachmentContent(attachment.name, bytes);
+      const thumbnail = await nativeImage.createThumbnailFromPath(path, { width: 160, height: 120 });
+      if (thumbnail.isEmpty()) return null;
+      const { width, height } = thumbnail.getSize();
+      if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) return null;
+      const scale = Math.min(1, 160 / width, 120 / height);
+      const bounded = scale < 1
+        ? thumbnail.resize({ width: Math.max(1, Math.round(width * scale)), height: Math.max(1, Math.round(height * scale)) })
+        : thumbnail;
+      const preview = bounded.toDataURL();
+      return preview.startsWith('data:image/') && Buffer.byteLength(preview, 'utf8') <= 64 * 1024 ? preview : null;
+    } catch {
+      return null;
+    }
+  };
+  const selectChatDraftAttachments = (detail: Awaited<ReturnType<LocalStore['getChat']>>, value: unknown): HomeDraftAttachment[] => {
+    const ids = value === undefined ? [] : value;
+    if (!Array.isArray(ids) || ids.length > 32 || ids.some((id) => typeof id !== 'string')
+      || new Set(ids).size !== ids.length) throw new Error('Список подготовленных файлов изменился.');
+    return ids.map((id) => {
+      const attachment = detail.draftAttachments.find((item) => item.id === id);
+      if (!attachment) throw new Error('Подготовленный файл изменился перед отправкой.');
+      return attachment;
+    });
+  };
+
+  const pickAttachmentPaths = async (): Promise<string[] | null> => {
+    const options = { properties: ['openFile', 'multiSelections'] as Array<'openFile' | 'multiSelections'> };
+    const selected = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);
+    return selected.canceled ? null : selected.filePaths;
   };
 
   const refreshModelRegistry = async (): Promise<ModelRegistrySnapshot> => {
@@ -1110,6 +1208,11 @@ async function registerIpcHandlers(
   handle('chats:list', () => store.listChats());
   handle('chats:get', (id) => store.getChat(id));
   handle('home-draft:get', () => store.getHomeDraft());
+  handle('home-draft:attachment-preview', async (idInput) => {
+    const id = requireId(idInput);
+    const attachment = (await store.getHomeDraft()).attachments.find((item) => item.id === id);
+    return attachment ? getAttachmentPreview(await store.getHomeDraftAttachmentPath(id), attachment) : null;
+  });
   handle('home-draft:save', (input) => withLocalFailureNotification(store, () => store.saveHomeDraft(input)));
   handle('home-draft:import-file', async () => {
     const options = { properties: ['openFile'] as Array<'openFile'> };
@@ -1117,18 +1220,35 @@ async function registerIpcHandlers(
     if (selected.canceled || !selected.filePaths[0]) return null;
     return withLocalFailureNotification(store, () => store.stageHomeDraftFile(selected.filePaths[0]!));
   });
+  handle('home-draft:pick-files', async () => {
+    const paths = await pickAttachmentPaths();
+    if (!paths) return null;
+    return stageAttachmentPaths(paths, () => store.getHomeDraft(), (path) => store.stageHomeDraftFile(path));
+  });
+  handle('home-draft:stage-files', (paths) =>
+    stageAttachmentPaths(paths, () => store.getHomeDraft(), (path) => store.stageHomeDraftFile(path)));
   handle('home-draft:remove-file', (id) => withLocalFailureNotification(store, () => store.removeHomeDraftFile(id)));
   handle('home-draft:send', async (revision) => {
     const before = await store.getHomeDraft();
     const acceptedDuplicate = before.lastAcceptance?.sourceRevision === revision;
     if (before.revision !== revision && !acceptedDuplicate) throw new Error('Черновик изменился перед отправкой; проверьте последний текст.');
+    const settings = await store.getSettings();
+    const expectedModelId = before.modelId ?? settings.defaultModelId;
+    if (!acceptedDuplicate) {
+      await validateAttachmentSelection(expectedModelId, before.text, before.attachments,
+        (attachmentId) => store.getHomeDraftAttachmentPath(attachmentId));
+    }
     if (!acceptedDuplicate && before.skillId) {
       const selectedSkill = await skills.getEnabled(before.skillId);
       if (!selectedSkill || (selectedSkill.scope === 'project' && selectedSkill.projectId !== before.projectId)) {
         throw new Error('Выбранный Skill недоступен в этом проекте. Черновик сохранён.');
       }
     }
-    const accepted = await withLocalFailureNotification(store, () => store.acceptHomeDraft(revision, randomUUID()));
+    const validateBeforeCommit = !acceptedDuplicate && before.attachments.length
+      ? () => assertAttachmentConnectionAvailable(expectedModelId)
+      : undefined;
+    const accepted = await withLocalFailureNotification(store, () =>
+      store.acceptHomeDraft(revision, randomUUID(), expectedModelId, validateBeforeCommit));
     let queued = queuedHomeTurns.has(accepted.turn.turnId);
     if (accepted.newlyAccepted && !queued) {
       const connection = providerConnection.getConnectionStatus();
@@ -1170,8 +1290,19 @@ async function registerIpcHandlers(
     }
     return withLocalFailureNotification(store, () => store.updateChat(id, patch));
   });
-  handle('chats:append-local-message', async (id, text) => {
-    const accepted = await withLocalFailureNotification(store, () => store.acceptLocalMessage(id, text, randomUUID()));
+  handle('chats:append-local-message', async (id, text, attachmentIds) => {
+    const chatId = requireId(id);
+    const before = await store.getChat(chatId);
+    const selectedAttachments = selectChatDraftAttachments(before, attachmentIds);
+    const settings = await store.getSettings();
+    const expectedModelId = before.modelId ?? settings.defaultModelId;
+    await validateAttachmentSelection(expectedModelId, typeof text === 'string' ? text : '', selectedAttachments,
+      (attachmentId) => store.getChatDraftAttachmentPath(chatId, attachmentId));
+    const validateBeforeCommit = selectedAttachments.length
+      ? () => assertAttachmentConnectionAvailable(expectedModelId)
+      : undefined;
+    const accepted = await withLocalFailureNotification(store, () =>
+      store.acceptLocalMessage(chatId, text, randomUUID(), selectedAttachments.map((attachment) => attachment.id), expectedModelId, validateBeforeCommit));
     try {
       if (!runtime.enqueue(accepted.turn)) store.releaseTurnReservation(accepted.turn.turnId);
       return accepted.detail;
@@ -1180,6 +1311,31 @@ async function registerIpcHandlers(
       throw error;
     }
   });
+  handle('chats:pick-draft-files', async (idInput) => {
+    const id = requireId(idInput);
+    await store.getChat(id);
+    const paths = await pickAttachmentPaths();
+    if (!paths) return null;
+    return stageAttachmentPaths(paths, () => store.getChat(id), (path) => store.stageChatDraftFile(id, path));
+  });
+  handle('chats:stage-draft-files', (idInput, paths) => {
+    const id = requireId(idInput);
+    return stageAttachmentPaths(paths, () => store.getChat(id), (path) => store.stageChatDraftFile(id, path));
+  });
+  handle('chats:draft-attachment-preview', async (idInput, attachmentIdInput) => {
+    const id = requireId(idInput);
+    const attachmentId = requireId(attachmentIdInput);
+    const attachment = (await store.getChat(id)).draftAttachments.find((item) => item.id === attachmentId);
+    return attachment ? getAttachmentPreview(await store.getChatDraftAttachmentPath(id, attachmentId), attachment) : null;
+  });
+  handle('chats:artifact-preview', async (idInput, artifactIdInput) => {
+    const id = requireId(idInput);
+    const artifactId = requireId(artifactIdInput);
+    const artifact = (await store.getChat(id)).artifacts.find((item) => item.id === artifactId);
+    return artifact ? getAttachmentPreview(await store.getArtifactPath(id, artifactId), artifact) : null;
+  });
+  handle('chats:remove-draft-file', (idInput, attachmentId) =>
+    withLocalFailureNotification(store, () => store.removeChatDraftFile(requireId(idInput), requireId(attachmentId))));
   handle('chats:import-file', async (id, projectId) => {
     const options = { properties: ['openFile'] as Array<'openFile'> };
     const selected = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);

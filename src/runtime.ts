@@ -23,6 +23,7 @@ import { LocalToolError, type LocalToolEvent, type LocalTools } from './local-to
 import { HookDispatchAbortError } from './hooks';
 import { MAX_USAGE_COUNT, mergeUsageReceipt } from './usage';
 import { validateCompactSummary } from './context';
+import { MISSING_REMOTE_ATTACHMENT_MESSAGE, MissingRemoteAttachmentError } from './attachments';
 
 const MAX_ACTIVITY_PER_TURN = 50;
 const MAX_ASSISTANT_CHARS = 100_000;
@@ -62,6 +63,7 @@ export interface TurnRuntimeOptions {
   provider?: GigaChatProvider | null;
   tools: LocalTools;
   prepareTurn(turn: AcceptedTurnInput, signal: AbortSignal): Promise<ProviderTurnRequest | PreparedTurn>;
+  prepareProviderRequest?(turn: AcceptedTurnInput, request: ProviderTurnRequest, signal: AbortSignal): Promise<ProviderTurnRequest>;
   consumeTurn(turn: AcceptedTurnInput, signal: AbortSignal): Promise<void>;
   releaseTurn(turn: AcceptedTurnInput): void;
   appendAssistant(turn: AcceptedTurnInput, text: string, signal: AbortSignal, functionsStateId?: string): Promise<void>;
@@ -153,6 +155,7 @@ function runtimeErrorCategory(error: unknown, turnTimedOut = false): ProviderErr
     case 'UNEXPECTED_COMPACTION_FUNCTION':
     case 'RESPONSE_LIMIT': return 'context';
     case 'PROVIDER_STEP_TIMEOUT':
+    case 'ATTACHMENT_PREPARE_TIMEOUT':
     case 'PROVIDER_UNAVAILABLE': return 'network';
     case 'PROVIDER_PROTOCOL':
     case 'BAD_PROVIDER_EVENT':
@@ -210,10 +213,18 @@ function assertProviderEvent(value: unknown): asserts value is ProviderEvent {
   if (typeof value !== 'object' || value === null || !('type' in value)) throw new Error('BAD_PROVIDER_EVENT');
   const event = value as Record<string, unknown>;
   if (event.type === 'activity') {
-    if (!['connecting', 'receiving', 'waiting-for-tool', 'tool-started', 'tool-finished'].includes(String(event.activity))) {
+    if (!['connecting', 'receiving', 'waiting-for-tool', 'tool-started', 'tool-finished', 'function-progress'].includes(String(event.activity))) {
       throw new Error('BAD_PROVIDER_EVENT');
     }
     if (event.tool !== undefined && !['list', 'search', 'read', 'write', 'open', 'powershell'].includes(String(event.tool))) {
+      throw new Error('BAD_PROVIDER_EVENT');
+    }
+    if (event.activity === 'function-progress') {
+      if ((event.functionName !== 'get_file_content' && event.functionName !== 'text2image')
+        || typeof event.detail !== 'string' || event.detail.length > 1000
+        // eslint-disable-next-line no-control-regex -- Provider progress text is untrusted display metadata.
+        || /[\u0000-\u001f\u007f]/.test(event.detail)) throw new Error('BAD_PROVIDER_EVENT');
+    } else if (event.functionName !== undefined || event.detail !== undefined) {
       throw new Error('BAD_PROVIDER_EVENT');
     }
     return;
@@ -736,6 +747,18 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         if (rejected) throw new Error(rejected.reason ?? 'Проверка Hook остановила сжатие контекста.');
       } else await runHookEvent({ event: 'user-prompt-submitted', projectId: turn.input.projectId });
 
+      if (turn.input.operation !== 'compaction' && options.prepareProviderRequest) {
+        const attachmentPreparation = Promise.resolve().then(() =>
+          options.prepareProviderRequest!(turn.input, request, controller.signal));
+        request = await waitTracked(
+          attachmentPreparation,
+          prepareTimeoutMs,
+          'ATTACHMENT_PREPARE_TIMEOUT',
+          'Подготовка вложений не подтверждена; очередь приостановлена.',
+        );
+        if (controller.signal.aborted) throw abortError();
+      }
+
       let toolRounds = 0;
       let totalToolResultBytes = 0;
       for (;;) {
@@ -815,6 +838,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
             addActivity(turn, {
               kind: 'provider', at: new Date().toISOString(), activity: rawEvent.activity,
               ...(rawEvent.tool ? { tool: rawEvent.tool } : {}),
+              ...(rawEvent.functionName ? { functionName: rawEvent.functionName } : {}),
+              ...(rawEvent.detail ? { detail: rawEvent.detail } : {}),
             });
           } else if (rawEvent.type === 'usage') {
             await updateActiveUsage({
@@ -1093,6 +1118,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
                                   ? 'Не удалось сохранить usage; запрос не будет продолжен.'
                                   : terminalError instanceof Error && terminalError.message === 'TOOL_RECEIPT_STORE_UNAVAILABLE'
                                     ? 'Сохранение истории инструментов недоступно; действие не выполнено.'
+                                    : terminalError instanceof MissingRemoteAttachmentError
+                                      ? MISSING_REMOTE_ATTACHMENT_MESSAGE
                                     : 'Ход завершился ошибкой. Сообщение пользователя сохранено локально.';
         }
         publish(turn);

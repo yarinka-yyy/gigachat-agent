@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import type { AcceptedTurnInput, ChatToolReceipt, GigaChatProvider, HookDispatchInput, HookRunResult, ProviderEvent, ProviderTurnRequest, RuntimeTurnSnapshot, UsageReceipt } from './contracts';
 import type { LocalTools } from './local-tools';
@@ -6,6 +10,9 @@ import { LocalToolError } from './local-tools';
 import { HookDispatchAbortError } from './hooks';
 import { createTurnRuntime, type ToolReceiptInput, type ToolReceiptStart, type TurnRuntimeOptions } from './runtime';
 import { mergeUsageReceipt } from './usage';
+import { MISSING_REMOTE_ATTACHMENT_MESSAGE, prepareTurnAttachments } from './attachments';
+import { serializeProviderTurnRequest } from './gigachat-provider';
+import { openStore } from './store';
 
 const testTools = {} as LocalTools;
 
@@ -188,6 +195,33 @@ test('runs turns from two chats FIFO with one active adapter and appends only a 
   ]);
   assert.equal(runtime.list('chat-one')[0]?.status, 'completed');
   assert.equal(runtime.list('chat-two')[0]?.status, 'completed');
+});
+
+test('keeps provider built-in file progress in activity instead of answer text or local tool dispatch', async () => {
+  let localToolCalls = 0;
+  const saved: string[] = [];
+  const provider = makeProvider(async function* () {
+    yield { type: 'activity', activity: 'function-progress', functionName: 'get_file_content', detail: 'осталось 2 секунды' };
+    yield { type: 'text-delta', text: 'Прочитанное содержимое' };
+    yield { type: 'completed' };
+  });
+  const runtime = makeRuntime(provider, {
+    tools: { read: async () => { localToolCalls += 1; } } as unknown as LocalTools,
+    appendAssistant: async (_chatId, text) => { saved.push(text); },
+  });
+
+  runtime.enqueue(turnFor('file-progress-chat'));
+  await runtime.whenIdle();
+
+  const turn = runtime.list('file-progress-chat')[0]!;
+  assert.equal(turn.status, 'completed');
+  assert.equal(localToolCalls, 0);
+  assert.deepEqual(saved, ['Прочитанное содержимое']);
+  assert.deepEqual(turn.activity.filter((item) => item.kind === 'provider' && item.activity === 'function-progress')
+    .map((item) => item.kind === 'provider' ? { functionName: item.functionName, detail: item.detail } : null), [
+      { functionName: 'get_file_content', detail: 'осталось 2 секунды' },
+    ]);
+  assert.doesNotMatch(saved.join(' '), /осталось 2 секунды|get_file_content/);
 });
 
 test('holds FIFO through delayed compaction save and its single after hook', async () => {
@@ -1420,6 +1454,157 @@ test('continues GigaChat function rounds with fresh read results and saves the f
   assert.equal(JSON.parse(requests[3]?.protocolHistory?.[2]?.result ?? '{}').result.contents, 'after');
   assert.ok(requests.every((request) => request.modelId === accepted.modelId && request.permissionProfile === accepted.permissionProfile));
   assert.equal(savedStateId, 'state-final');
+});
+
+test('uploads only the accepted message attachments inside the FIFO turn and does not resend them on a text follow-up', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-runtime-attachment-fifo-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = join(directory, 'one-turn.txt');
+  await writeFile(source, 'synthetic local attachment bytes');
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Pro' });
+  const draft = await store.stageChatDraftFile(chat.id, source);
+  const localAttachmentId = draft.draftAttachments[0]!.id;
+  const first = await store.acceptLocalMessage(chat.id, 'Прочитай этот файл', 'turn-attachment-first', [localAttachmentId]);
+  const second = await store.acceptLocalMessage(chat.id, 'Продолжи без повторной отправки файла', 'turn-attachment-second');
+  const acceptedSnapshot = structuredClone(first.turn);
+
+  const uploadStarted = deferred();
+  const allowUpload = deferred();
+  const uploaded: string[] = [];
+  const requests: ProviderTurnRequest[] = [];
+  const provider = {
+    stream: async function* (request: ProviderTurnRequest): AsyncGenerator<ProviderEvent> {
+      requests.push(structuredClone(request));
+      yield { type: 'text-delta', text: 'Ответ' };
+      yield { type: 'completed' };
+    },
+    uploadFile: async (input: { filename: string; contentType: string; bytes: Uint8Array }, signal: AbortSignal) => {
+      uploadStarted.resolve();
+      await allowUpload.promise;
+      if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
+      uploaded.push(input.filename);
+      return { id: 'remote_attachment_one', filename: input.filename, bytes: input.bytes.byteLength, purpose: 'general' as const };
+    },
+    listFiles: async () => [],
+    deleteFile: async () => undefined,
+  } as unknown as import('./gigachat-provider').GigaChatProviderConnection;
+
+  const runtime = createTurnRuntime({
+    provider,
+    tools: testTools,
+    prepareTurn: async (turn, signal) => {
+      if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
+      await store.validateAcceptedTurn(turn);
+      return {
+        system: [],
+        messages: await store.getMessagesThrough(turn.chatId, turn.messageId),
+        permissionProfile: turn.permissionProfile,
+        modelId: turn.modelId,
+      };
+    },
+    prepareProviderRequest: (turn, request, signal) => prepareTurnAttachments(turn, request, signal, {
+      store,
+      provider,
+      loadAuthorizationKey: async () => 'synthetic-attachment-account-key',
+    }),
+    consumeTurn: (turn, signal) => store.consumeTurnReservation(turn, signal),
+    releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
+    appendAssistant: async (turn, text, signal, functionsStateId) => {
+      await store.appendAssistantMessageFromRuntime(turn.chatId, turn.messageId, text, signal, functionsStateId);
+    },
+    recordUsageReceipt: async () => undefined,
+  });
+
+  assert.ok(runtime.enqueue(first.turn));
+  await uploadStarted.promise;
+  assert.equal(requests.length, 0, 'provider stream waits until the durable upload receipt is ready');
+  assert.ok(runtime.enqueue(second.turn));
+  assert.equal(requests.length, 0, 'the next accepted turn stays behind the pending upload in the same FIFO');
+
+  allowUpload.resolve();
+  await runtime.whenIdle();
+
+  assert.deepEqual(first.turn, acceptedSnapshot, 'preparation leaves the accepted turn and local IDs immutable');
+  assert.equal(uploaded.length, 1);
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[0]?.attachments?.map((item) => ({ messageId: item.messageId, attachmentId: item.attachmentId, fileId: item.fileId })), [
+    { messageId: first.turn.messageId, attachmentId: localAttachmentId, fileId: 'remote_attachment_one' },
+  ]);
+  const firstWire = JSON.parse(serializeProviderTurnRequest(requests[0]!).body) as { messages: Array<Record<string, unknown>> };
+  assert.deepEqual(firstWire.messages.find((message) => message.role === 'user' && 'attachments' in message)?.attachments, ['remote_attachment_one']);
+  assert.deepEqual(requests[1]?.attachments, [], 'a text follow-up does not reload or resend the prior image/document');
+  const secondWire = JSON.parse(serializeProviderTurnRequest(requests[1]!).body) as { messages: Array<Record<string, unknown>> };
+  assert.equal(secondWire.messages.some((message) => 'attachments' in message), false);
+  const detail = await store.getChat(chat.id);
+  assert.deepEqual(detail.messages.find((message) => message.id === first.turn.messageId)?.attachmentIds, [localAttachmentId]);
+  assert.equal(detail.artifacts.find((artifact) => artifact.id === localAttachmentId)?.messageId, first.turn.messageId);
+});
+
+test('a missing prior remote upload asks to reattach and never silently uploads again', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-runtime-missing-upload-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = join(directory, 'local.txt');
+  await writeFile(source, 'previously accepted local bytes', 'utf8');
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Pro' });
+  const staged = await store.stageChatDraftFile(chat.id, source);
+  const attachmentId = staged.draftAttachments[0]!.id;
+  const accepted = await store.acceptLocalMessage(chat.id, 'Read the attached file.', 'turn-missing-upload', [attachmentId]);
+  const artifact = accepted.detail.artifacts.find((item) => item.id === attachmentId);
+  assert.ok(artifact?.sha256);
+  const authorizationKey = 'synthetic-attachment-account-key';
+  const accountScope = createHash('sha256').update(authorizationKey, 'utf8').digest('hex');
+  const uploadIntent = {
+    accountScope, attachmentId, uploadFilename: `gcagent_${attachmentId}.txt`,
+    name: artifact.name, contentType: 'text/plain', kind: 'document', sizeBytes: artifact.size,
+    sha256: artifact.sha256, state: 'intent' as const, remoteFileId: null, createdAt: new Date().toISOString(),
+  };
+  await store.putProviderUploadEntry(uploadIntent);
+  await store.putProviderUploadEntry({ ...uploadIntent, state: 'uploaded', remoteFileId: 'remote-file-no-longer-listed' });
+  let uploadCalls = 0;
+  let streamCalls = 0;
+  const provider = {
+    stream: async function* (): AsyncGenerator<ProviderEvent> {
+      streamCalls += 1;
+      yield { type: 'text-delta', text: 'unexpected' };
+      yield { type: 'completed' };
+    },
+    uploadFile: async () => { uploadCalls += 1; throw new Error('must not re-upload'); },
+    listFiles: async () => [],
+    deleteFile: async () => undefined,
+  } as unknown as import('./gigachat-provider').GigaChatProviderConnection;
+  const runtime = createTurnRuntime({
+    provider, tools: testTools,
+    prepareTurn: async (turn) => {
+      await store.validateAcceptedTurn(turn);
+      return {
+        system: [], messages: await store.getMessagesThrough(turn.chatId, turn.messageId),
+        permissionProfile: turn.permissionProfile, modelId: turn.modelId,
+      };
+    },
+    prepareProviderRequest: (turn, request, signal) => prepareTurnAttachments(turn, request, signal, {
+      store, provider, loadAuthorizationKey: async () => authorizationKey,
+    }),
+    consumeTurn: (turn, signal) => store.consumeTurnReservation(turn, signal),
+    releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
+    appendAssistant: async (turn, text, signal, functionsStateId) => {
+      await store.appendAssistantMessageFromRuntime(turn.chatId, turn.messageId, text, signal, functionsStateId);
+    },
+    recordUsageReceipt: async () => undefined,
+  });
+
+  runtime.enqueue(accepted.turn);
+  await runtime.whenIdle();
+
+  const result = runtime.list(chat.id)[0];
+  assert.equal(result?.status, 'failed');
+  assert.equal(result?.error, MISSING_REMOTE_ATTACHMENT_MESSAGE);
+  assert.equal(result?.errorCategory, 'storage');
+  assert.equal(uploadCalls, 0);
+  assert.equal(streamCalls, 0);
 });
 
 test('reports own-name prototype collisions as unknown functions without dispatching them', async () => {

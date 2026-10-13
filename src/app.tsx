@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
 import {
   Archive,
   ArrowLeft,
@@ -88,7 +88,7 @@ import type {
 } from './contracts';
 import type { PermissionProfile } from './permissions';
 import { unavailableModelRegistry } from './models';
-import { chatModelOptions, isChatModelAvailable, legacyModelUpgrade, modelFamilyForId, type ChatModelId, type ChatModelOption } from './model-catalog';
+import { chatModelOptions, chatModelUnavailableReason, isChatModelAvailable, legacyModelUpgrade, modelFamilyForId, type ChatModelId, type ChatModelOption } from './model-catalog';
 import gigaChatLogo from './assets/gigachat-logo.png';
 import { createInstructionAutosave, type SaveStatus } from './instruction-autosave';
 import { createRendererOperationTracker, retryUnavailableReason } from './renderer-operations';
@@ -99,7 +99,7 @@ import ContextRing from './components/ContextRing';
 import BrowserPanel from './components/BrowserPanel';
 import { createPreviewExitTimer, maxSidebarWidth as computeMaxSidebarWidth } from './sidebar-behavior';
 import { sidebarSections } from './sidebar-sections';
-import { evaluateAttachmentPolicy } from './attachment-policy';
+import { attachmentContentType, attachmentSendBlocker, evaluateAttachmentPolicy } from './attachment-policy';
 
 type Page = 'home' | 'chat' | 'settings' | 'onboarding' | 'images' | 'video' | 'podcasts' | 'archive' | 'profile';
 type Route = { page: Page; id?: string };
@@ -263,6 +263,40 @@ const APPROVAL_ACTION_LABELS = {
 function Icon({ name, className = '' }: { name: IconName; className?: string }) {
   const Component = ICONS[name];
   return <Component className={className ? `icon ${className}` : 'icon'} aria-hidden="true" focusable="false" strokeWidth={1.8} />;
+}
+
+function AttachmentThumbnail({ source, attachmentId, chatId, image }: {
+  source: 'home' | 'draft' | 'artifact'; attachmentId: string; chatId?: string; image: boolean;
+}) {
+  const [preview, setPreview] = useState<string | null>(null);
+  useEffect(() => {
+    let active = true;
+    if (!image) {
+      setPreview(null);
+      return () => { active = false; };
+    }
+    const request = source === 'home' ? window.gigaChat.homeDraft.getAttachmentPreview(attachmentId)
+      : source === 'draft' ? window.gigaChat.chats.getDraftAttachmentPreview(chatId ?? '', attachmentId)
+        : window.gigaChat.chats.getArtifactPreview(chatId ?? '', attachmentId);
+    void request.then((value) => {
+      if (active) setPreview(typeof value === 'string' && value.startsWith('data:image/') && value.length <= 64 * 1024 ? value : null);
+    }).catch(() => { if (active) setPreview(null); });
+    return () => { active = false; };
+  }, [attachmentId, chatId, image, source]);
+  return <span className={`attachment-preview${preview ? ' has-image' : ''}`} aria-hidden="true">
+    {preview ? <img src={preview} alt="" loading="lazy" decoding="async" />
+      : image ? <ImageIcon /> : <FileText />}
+  </span>;
+}
+
+function attachmentSizeLabel(size: number): string {
+  return size < 1024 ? `${size} Б` : `${Math.ceil(size / 1024)} КБ`;
+}
+
+function attachmentFormatLabel(name: string): string {
+  const fileName = name.split(/[\\/]/).pop() ?? name;
+  const extension = fileName.split('.').pop()?.toUpperCase();
+  return extension || 'Файл';
 }
 
 function ScrollingRowTitle({ value, pinned = false }: { value: string; pinned?: boolean }) {
@@ -705,6 +739,10 @@ function runtimeActivityLabel(activity: RuntimeActivity): string {
   if (activity.activity === 'connecting') return 'Подключение к GigaChat';
   if (activity.activity === 'receiving') return 'Получение ответа';
   if (activity.activity === 'waiting-for-tool') return 'Ожидание инструмента';
+  if (activity.activity === 'function-progress') {
+    const label = activity.functionName === 'get_file_content' ? 'Чтение вложения' : 'Обработка изображения';
+    return activity.detail ? `${label}: ${activity.detail}` : label;
+  }
   return activity.activity === 'tool-started' ? 'Запуск инструмента' : 'Инструмент завершён';
 }
 
@@ -780,6 +818,8 @@ export default function App() {
   const [draft, setDraft] = useState('');
   const [homeDraftRecord, setHomeDraftRecord] = useState<HomeDraftRecord | null>(null);
   const [homeDraftImporting, setHomeDraftImporting] = useState(false);
+  const [chatDraftImporting, setChatDraftImporting] = useState<Set<string>>(new Set());
+  const [attachmentDropActive, setAttachmentDropActive] = useState(false);
   const [homeDraftSaver] = useState(() => createHomeDraftSaveQueue<HomeDraftRecord>((snapshot) => {
     const { revision, text, projectId, permissionProfile, skillId, modelId } = snapshot;
     const input: HomeDraftInput = { revision, text, projectId, permissionProfile, skillId, modelId };
@@ -867,6 +907,7 @@ export default function App() {
   const homeDraftRef = useRef<HomeDraftRecord | null>(null);
   const homeDraftSaveGeneration = useRef(0);
   const homeDraftImportInFlight = useRef(false);
+  const chatDraftImportInFlight = useRef(new Set<string>());
   const sendInProgress = useRef(false);
   const retainedChatDrafts = useRef(new Map<string, { text: string; message: string }>());
   const chatDraftMutationRevision = useRef(new Map<string, number>());
@@ -1031,6 +1072,7 @@ export default function App() {
   ));
   const route = navigation.history[navigation.index] ?? { page: 'home' as const };
   const sendingOnCurrentRoute = sending && sendingRoute.current !== null && sameRoute(sendingRoute.current, route);
+  useEffect(() => { setAttachmentDropActive(false); }, [route.page, route.id]);
   useLayoutEffect(resizeComposer, [draft, route.page, route.id, compactLayout]);
   useEffect(() => {
     const panel = mainPanelRef.current;
@@ -1546,6 +1588,12 @@ export default function App() {
   const settingTitle = SETTINGS_SECTIONS.find((item) => item.id === settingsSection)?.label ?? 'Настройки';
   const activeHomeDraftRecord = route.page === 'home' ? homeDraftRecord : null;
   const homeDraftBusy = route.page === 'home' && homeDraftImporting;
+  const chatDraftBusy = route.page === 'chat' && Boolean(route.id)
+    && (chatDraftImporting.has(route.id!) || chatDraftImportInFlight.current.has(route.id!));
+  const composerAttachments = route.page === 'home'
+    ? activeHomeDraftRecord?.attachments ?? []
+    : route.page === 'chat' && chatDetail && chatDetail.id === route.id ? chatDetail.draftAttachments : [];
+  const composerCanSend = Boolean(draft.trim() || composerAttachments.length);
   const composerPermissionProfile = selectedChat && chatDetail?.id === selectedChat.id
     ? chatDetail.nextTurnPermissionProfile ?? (pendingPermissionChatIdRef.current === selectedChat.id ? pendingPermissionProfile : null) ?? settings.defaultPermissionProfile
     : activeHomeDraftRecord ? activeHomeDraftRecord.permissionProfile ?? settings.defaultPermissionProfile
@@ -1555,6 +1603,12 @@ export default function App() {
   const composerModelId = selectedChat && chatDetail?.id === selectedChat.id
     ? chatDetail.modelId ?? settings.defaultModelId
     : activeHomeDraftRecord?.modelId ?? settings.defaultModelId;
+  const composerAttachmentBlocker = composerAttachments.length
+    ? attachmentSendBlocker(composerModelId, draft, composerAttachments)
+      ?? (chatModelUnavailableReason(modelRegistry, composerModelId)
+        ? `Выбранная модель недоступна для нового запроса: ${chatModelUnavailableReason(modelRegistry, composerModelId)} Файлы останутся в черновике.`
+        : null)
+    : null;
   const availableChatModelOptions = chatModelOptions(modelRegistry);
   const composerModelAvailable = isChatModelAvailable(modelRegistry, composerModelId);
   const composerModelFamily = modelFamilyForId(composerModelId);
@@ -1824,16 +1878,21 @@ export default function App() {
   }
 
   async function submitMessageOperation(): Promise<void> {
-    const value = draftRef.current.trim();
-    if (!value || sending || sendInProgress.current || homeDraftImportInFlight.current) return;
     const sourceRoute = routeRef.current;
-    const sourceRouteGeneration = routeGeneration.current;
-    let sourceHomeDraft = sourceRoute.page === 'home' && homeDraftRef.current
+    const value = draftRef.current.trim();
+    const initialHomeDraft = sourceRoute.page === 'home' && homeDraftRef.current
       ? structuredClone(homeDraftRef.current) : null;
+    const initialChatAttachments = sourceRoute.page === 'chat' && chatDetail && chatDetail.id === sourceRoute.id
+      ? structuredClone(chatDetail.draftAttachments) : [];
+    if ((!value && !(initialHomeDraft?.attachments.length || initialChatAttachments.length))
+      || sending || sendInProgress.current || homeDraftImportInFlight.current
+      || (sourceRoute.page === 'chat' && Boolean(sourceRoute.id) && chatDraftImportInFlight.current.has(sourceRoute.id!))) return;
+    const sourceRouteGeneration = routeGeneration.current;
+    let sourceHomeDraft = initialHomeDraft;
     let sourceHomeDraftGeneration = homeDraftSaveGeneration.current;
     const sourceDefaultModelId = settingsRef.current.defaultModelId;
     const sourceDefaultPermissionProfile = settingsRef.current.defaultPermissionProfile;
-    if (isUnavailableCompactCommand(value)) {
+    if (value && !initialHomeDraft?.attachments.length && !initialChatAttachments.length && isUnavailableCompactCommand(value)) {
       const status = await window.gigaChat.runtime.getStatus().catch(() => null);
       showSuccess(status?.compactionUnavailableReason ?? 'Команда /compact пока недоступна; история чата не изменена.');
       return;
@@ -1910,7 +1969,7 @@ export default function App() {
       await acceptedDraftSave;
       await acceptedPermissionSave;
       await acceptedSkillSave;
-      const detail = await window.gigaChat.chats.appendLocalMessage(chatId, value);
+      const detail = await window.gigaChat.chats.appendLocalMessage(chatId, value, initialChatAttachments.map((attachment) => attachment.id));
       const stillCurrent = sourceRouteGeneration === routeGeneration.current
         && sourceDraftRevision === draftRevision.current
         && routeRef.current.page === 'chat' && routeRef.current.id === chatId;
@@ -1945,14 +2004,13 @@ export default function App() {
     }
   }
 
-  function attachFile(): Promise<void> {
-    return trackRendererOperation(() => attachFileOperation());
+  function attachFile(files?: File[]): Promise<void> {
+    return trackRendererOperation(() => attachFileOperation(files));
   }
 
-  async function attachFileOperation(): Promise<void> {
+  async function attachFileOperation(files?: File[]): Promise<void> {
     const sourceRoute = routeRef.current;
     const sourceRouteGeneration = routeGeneration.current;
-    const sourceProjectId = selectedProjectId || null;
     if (sourceRoute.page === 'home') {
       if (homeDraftImportInFlight.current) return;
       const sourceHomeDraftGeneration = homeDraftSaveGeneration.current;
@@ -1960,8 +2018,9 @@ export default function App() {
       setHomeDraftImporting(true);
       try {
         await homeDraftSaver.flush();
-        const imported = await window.gigaChat.homeDraft.importFile();
-        if (!imported) return;
+        const result = files ? await window.gigaChat.homeDraft.stageFiles(files) : await window.gigaChat.homeDraft.pickFiles();
+        if (!result) return;
+        const imported = result.record;
         await homeDraftSaver.synchronize(imported.revision);
         let nextHomeDraft = imported;
         const localHomeDraft = homeDraftRef.current;
@@ -1975,7 +2034,8 @@ export default function App() {
           draftRef.current = nextHomeDraft.text;
         }
         updateHomeDraftError('');
-        showSuccess('Файл подготовлен в черновике. Он попадёт в чат только после отправки сообщения.');
+        if (result.failures.length) setNotice(result.failures.map((failure) => `${failure.name}: ${failure.reason}`).join('\n'));
+        else showSuccess('Вложения подготовлены локально. Они попадут в запрос только после отправки.');
       } catch (error) {
         rendererOperations.current.reportFailure(error);
         setNotice(getErrorMessage(error));
@@ -1986,22 +2046,69 @@ export default function App() {
       return;
     }
     if (sourceRoute.page !== 'chat' || !sourceRoute.id) return;
+    const sourceChatId = sourceRoute.id;
+    if (chatDraftImportInFlight.current.has(sourceChatId)) return;
+    chatDraftImportInFlight.current.add(sourceChatId);
+    setChatDraftImporting(new Set(chatDraftImportInFlight.current));
     try {
-      const detail = await window.gigaChat.chats.importFile(sourceRoute.id, sourceProjectId);
-      if (!detail) return;
+      await draftSave.current.catch(() => undefined);
+      const result = files
+        ? await window.gigaChat.chats.stageDraftFiles(sourceChatId, files)
+        : await window.gigaChat.chats.pickDraftFiles(sourceChatId);
+      if (!result) return;
+      const detail = result.record;
       setChats(await window.gigaChat.chats.list());
       const currentRoute = routeRef.current;
-      if (currentRoute.page === 'chat' && currentRoute.id === detail.id) {
-        setChatDetail(detail);
-        showSuccess('Файл скопирован в чат.');
+      if (sourceRouteGeneration === routeGeneration.current && currentRoute.page === 'chat' && currentRoute.id === detail.id) {
+        setChatDetail((current) => current?.id === detail.id
+          ? { ...current, draftAttachments: detail.draftAttachments, draft: draftRef.current }
+          : current);
+        if (result.failures.length) setNotice(result.failures.map((failure) => `${failure.name}: ${failure.reason}`).join('\n'));
+        else showSuccess('Вложения подготовлены локально. Они попадут в запрос только после отправки.');
       }
     } catch (error) {
       rendererOperations.current.reportFailure(error);
       setNotice(getErrorMessage(error));
+    } finally {
+        chatDraftImportInFlight.current.delete(sourceChatId);
+        setChatDraftImporting(new Set(chatDraftImportInFlight.current));
     }
   }
 
-  async function removeHomeDraftFile(id: string): Promise<void> {
+  function removeChatDraftFile(id: string): Promise<void> {
+    return trackRendererOperation(() => removeChatDraftFileOperation(id));
+  }
+
+  async function removeChatDraftFileOperation(id: string): Promise<void> {
+    const sourceRoute = routeRef.current;
+    if (sourceRoute.page !== 'chat' || !sourceRoute.id || sending || chatDraftImportInFlight.current.has(sourceRoute.id)) return;
+    const sourceRouteGeneration = routeGeneration.current;
+    const sourceChatId = sourceRoute.id;
+    chatDraftImportInFlight.current.add(sourceChatId);
+    setChatDraftImporting(new Set(chatDraftImportInFlight.current));
+    try {
+      await draftSave.current.catch(() => undefined);
+      const detail = await window.gigaChat.chats.removeDraftFile(sourceChatId, id);
+      const currentRoute = routeRef.current;
+      if (sourceRouteGeneration === routeGeneration.current && currentRoute.page === 'chat' && currentRoute.id === detail.id) {
+        setChatDetail((current) => current?.id === detail.id
+          ? { ...current, draftAttachments: detail.draftAttachments, draft: draftRef.current }
+          : current);
+      }
+    } catch (error) {
+      rendererOperations.current.reportFailure(error);
+      setNotice(getErrorMessage(error));
+    } finally {
+        chatDraftImportInFlight.current.delete(sourceChatId);
+        setChatDraftImporting(new Set(chatDraftImportInFlight.current));
+    }
+  }
+
+  function removeHomeDraftFile(id: string): Promise<void> {
+    return trackRendererOperation(() => removeHomeDraftFileOperation(id));
+  }
+
+  async function removeHomeDraftFileOperation(id: string): Promise<void> {
     if (homeDraftImportInFlight.current || sending) return;
     const sourceRoute = routeRef.current;
     const sourceRouteGeneration = routeGeneration.current;
@@ -2025,6 +2132,7 @@ export default function App() {
       }
       updateHomeDraftError('');
     } catch (error) {
+      rendererOperations.current.reportFailure(error);
       setNotice(getErrorMessage(error));
     } finally {
       homeDraftImportInFlight.current = false;
@@ -3243,10 +3351,23 @@ export default function App() {
               <button type="button" className="secondary-button" onClick={() => saveChatDraft(selectedChat.id, draftRef.current)}>Повторить сохранение</button>
             </div>}
             {chatDetail?.id === selectedChat.id && chatLoadState.status === 'ready' && chatDetail.messages.length ? <div className="chat-history" aria-label="История сообщений">
-              {chatDetail.messages.map((message) => <article key={message.id} className={`chat-message message-${message.role}`}>
-                <span className="message-author">{message.role === 'user' ? 'Вы' : message.source === 'runtime' ? 'GigaChat' : 'GigaChat · пример'}</span>
-                <p>{message.text}</p>
-              </article>)}
+              {chatDetail.messages.map((message) => {
+                const linkedAttachments = (message.attachmentIds ?? []).map((id) =>
+                  chatDetail.artifacts.find((artifact) => artifact.id === id && artifact.messageId === message.id) ?? null);
+                return <article key={message.id} className={`chat-message message-${message.role}`}>
+                  <span className="message-author">{message.role === 'user' ? 'Вы' : message.source === 'runtime' ? 'GigaChat' : 'GigaChat · пример'}</span>
+                  <p>{message.text}</p>
+                  {linkedAttachments.length > 0 && <div className="message-attachments" aria-label="Вложения этого сообщения">
+                    {linkedAttachments.map((artifact, index) => artifact
+                      ? <button type="button" className="message-attachment" key={artifact.id}
+                        aria-label={`Открыть ${artifact.name}`} onClick={() => void window.gigaChat.chats.openArtifact(chatDetail.id, artifact.id).catch((error: unknown) => setNotice(getErrorMessage(error)))}>
+                        <AttachmentThumbnail source="artifact" chatId={chatDetail.id} attachmentId={artifact.id} image={attachmentContentType(artifact.name)?.kind === 'image'} />
+                        <span className="message-attachment-copy"><strong>{artifact.name}</strong><small>{attachmentFormatLabel(artifact.name)} · {attachmentSizeLabel(artifact.size)}</small></span>
+                      </button>
+                      : <span className="message-attachment attachment-missing" key={`${message.id}-missing-${index}`}>Файл недоступен</span>)}
+                  </div>}
+                </article>;
+              })}
             </div> : null}
             {runtimeTurns.length ? <section className="runtime-timeline" aria-label="Состояние локального хода">
               {runtimeTurns.map((turn) => {
@@ -3290,12 +3411,12 @@ export default function App() {
                 </article>;
               })}
             </section> : null}
-            {chatDetail?.artifacts.length ? <section className="chat-files" aria-label="Файлы чата">
-              <h2>Файлы чата</h2>
-              {chatDetail.artifacts.map((artifact) => {
+            {chatDetail?.artifacts.some((artifact) => artifact.messageId === null) ? <section className="chat-files" aria-label="Старые локальные файлы">
+              <h2>Старые локальные файлы</h2>
+              {chatDetail.artifacts.filter((artifact) => artifact.messageId === null).map((artifact) => {
                 const policy = evaluateAttachmentPolicy(artifact.name, artifact.size);
                 return <div className="chat-file" key={artifact.id}>
-                  <Icon name="file" /><span><strong>{artifact.name}</strong><small>{Math.ceil(artifact.size / 1024)} КБ · Локальный файл; модели не отправлен.</small>
+                  <Icon name="file" /><span><strong>{artifact.name}</strong><small>{Math.ceil(artifact.size / 1024)} КБ · старое вложение, не отправлялось модели.</small>
                     <small>{policy.format === 'documented' ? 'Формат указан в API; поддержка аккаунта и модели не проверена.' : 'Формат не подтверждён API; файл остаётся локальным.'}</small></span>
                   <button type="button" className="quiet-button" onClick={() => void window.gigaChat.chats.openArtifact(chatDetail.id, artifact.id).catch((error: unknown) => setNotice(getErrorMessage(error)))}>Открыть</button>
                   <button type="button" className="quiet-button" onClick={() => void window.gigaChat.chats.openFolder(chatDetail.id).catch((error: unknown) => setNotice(getErrorMessage(error)))}>Открыть папку чата</button>
@@ -3518,7 +3639,39 @@ export default function App() {
           }}
         />}
 
-        <main ref={mainPanelRef} className={route.page === 'settings' ? 'main-panel settings-panel' : 'main-panel'}>
+        <main ref={mainPanelRef} className={route.page === 'settings' ? 'main-panel settings-panel' : 'main-panel'}
+          onDragEnter={(event: ReactDragEvent<HTMLElement>) => {
+            const chatColumn = event.target instanceof Element ? event.target.closest('.chat-column') : null;
+            if (!chatColumn || !['home', 'chat'].includes(route.page) || !Array.from(event.dataTransfer.types).includes('Files')) return;
+            event.preventDefault();
+            setAttachmentDropActive(true);
+          }}
+          onDragOver={(event: ReactDragEvent<HTMLElement>) => {
+            const chatColumn = event.target instanceof Element ? event.target.closest('.chat-column') : null;
+            if (!chatColumn || !['home', 'chat'].includes(route.page) || !Array.from(event.dataTransfer.types).includes('Files')) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = 'copy';
+          }}
+          onDragLeave={(event: ReactDragEvent<HTMLElement>) => {
+            if (!attachmentDropActive) return;
+            const chatColumn = event.target instanceof Element ? event.target.closest('.chat-column') : null;
+            const nextChatColumn = event.relatedTarget instanceof Element ? event.relatedTarget.closest('.chat-column') : null;
+            if (chatColumn && nextChatColumn === chatColumn) return;
+            setAttachmentDropActive(false);
+          }}
+          onDrop={(event: ReactDragEvent<HTMLElement>) => {
+            const chatColumn = event.target instanceof Element ? event.target.closest('.chat-column') : null;
+            if (!chatColumn || !['home', 'chat'].includes(route.page) || !Array.from(event.dataTransfer.types).includes('Files')) return;
+            event.preventDefault();
+            setAttachmentDropActive(false);
+            const droppedFiles = Array.from(event.dataTransfer.files);
+            if (droppedFiles.length) void attachFile(droppedFiles);
+          }}
+          onKeyDown={(event: ReactKeyboardEvent<HTMLElement>) => {
+            if (event.key !== 'Escape' || !attachmentDropActive) return;
+            event.preventDefault();
+            setAttachmentDropActive(false);
+          }}>
           {(() => {
             const chatContent = <>
           <div className={route.page === 'home' ? 'view-area home-view' : route.page === 'settings' ? 'view-area settings-view' : route.page === 'onboarding' ? 'view-area onboarding-view' : 'view-area'}>{renderContent()}</div>
@@ -3575,15 +3728,21 @@ export default function App() {
                 <strong>Черновик пока не сохранён</strong><p>{homeDraftError} Введённый текст остаётся на экране.</p>
                 <button type="button" className="secondary-button" disabled={sendingOnCurrentRoute || homeDraftImporting} onClick={() => void retryHomeDraftSave()}>Повторить сохранение</button>
               </div>}
-              {route.page === 'home' && activeHomeDraftRecord?.attachments.length ? <section className="chat-files" aria-label="Подготовленные файлы">
-                <h2>Подготовленные файлы</h2>
-                {activeHomeDraftRecord.attachments.map((attachment) => <div className="chat-file" key={attachment.id}>
-                  <Icon name="file" /><span><strong>{attachment.name}</strong><small>{Math.ceil(attachment.size / 1024)} КБ · останется локально и не передаётся модели</small></span>
-                  <button type="button" className="quiet-button" aria-label={`Убрать ${attachment.name} из черновика`} title="Убрать из черновика"
-                    disabled={sendingOnCurrentRoute || homeDraftImporting} onClick={() => void removeHomeDraftFile(attachment.id)}>Убрать</button>
-                </div>)}
-              </section> : null}
               <div className="composer">
+                {composerAttachments.length > 0 && <section className="attachment-tray" aria-label="Подготовленные вложения">
+                  <div className="attachment-tray-heading"><strong>Вложения</strong><span>Локальные копии · проверка перед отправкой</span></div>
+                  <div className="attachment-tray-items">
+                    {composerAttachments.map((attachment) => <div className="attachment-card" key={attachment.id}>
+                      <AttachmentThumbnail source={route.page === 'home' ? 'home' : 'draft'} chatId={route.page === 'chat' ? route.id : undefined}
+                        attachmentId={attachment.id} image={attachmentContentType(attachment.name)?.kind === 'image'} />
+                      <span className="attachment-card-copy"><strong title={attachment.name}>{attachment.name}</strong><small>{attachmentFormatLabel(attachment.name)} · {attachmentSizeLabel(attachment.size)} · подготовлен локально</small></span>
+                      <button type="button" className="quiet-button" aria-label={`Убрать ${attachment.name}`} title="Убрать из черновика"
+                        disabled={sendingOnCurrentRoute || homeDraftBusy || chatDraftBusy}
+                        onClick={() => void (route.page === 'home' ? removeHomeDraftFile(attachment.id) : removeChatDraftFile(attachment.id))}>Убрать</button>
+                    </div>)}
+                  </div>
+                  {composerAttachmentBlocker && <p className="attachment-blocker" role="alert">{composerAttachmentBlocker}</p>}
+                </section>}
                 <label className="sr-only" htmlFor="chat-draft">Черновик сообщения</label>
                 <textarea
                   id="chat-draft"
@@ -3606,7 +3765,7 @@ export default function App() {
                 </div>}
                 <div className="composer-toolbar">
                   <div className="toolbar-leading">
-                  <button type="button" className="attach-button" disabled={sendingOnCurrentRoute || homeDraftBusy || !chatComposerReady || (route.page === 'home' && !homeDraftRecord)} aria-label="Прикрепить файл" title="Подготовить файл" onClick={() => void attachFile()}><Icon name="plus" /></button>
+                  <button type="button" className="attach-button" disabled={sendingOnCurrentRoute || homeDraftBusy || chatDraftBusy || !chatComposerReady || (route.page === 'home' && !homeDraftRecord)} aria-label="Прикрепить файл" title="Прикрепить файл" onClick={() => void attachFile()}><Icon name="plus" /></button>
                   <ActionMenu className="composer-permission-menu" placement="below-start" onVisibilityChange={trackNativeOverlay}
                     label={`Разрешения: ${AVAILABLE_PERMISSION_PROFILES.find((profile) => profile.id === composerPermissionProfile)?.name ?? 'Спросить'}`}
                     disabled={!canChangeComposerPermissionProfile || (sendingOnCurrentRoute && route.page === 'home') || homeDraftBusy || (route.page === 'home' && !homeDraftRecord)}
@@ -3669,12 +3828,13 @@ export default function App() {
                     onError={setNotice}
                     onSuccess={showSuccess}
                   />
-                  <span className="send-button-wrap" title={draft.trim() ? 'Сохранить сообщение и отправить его, если GigaChat подключён' : 'Введите сообщение'}><button type="button" className="send-button" disabled={!draft.trim() || sending || homeDraftBusy || !chatComposerReady || (route.page === 'home' && !homeDraftRecord)} aria-label="Отправить сообщение" onClick={() => void submitMessage()}><Icon name="send" /></button></span>
+                  <span className="send-button-wrap" title={composerCanSend ? 'Отправить текст и подготовленные вложения' : 'Введите сообщение или прикрепите файл'}><button type="button" className="send-button" disabled={!composerCanSend || Boolean(composerAttachmentBlocker) || sending || homeDraftBusy || chatDraftBusy || !chatComposerReady || (route.page === 'home' && !homeDraftRecord)} aria-label={draft.trim() ? 'Отправить сообщение' : 'Отправить вложения'} onClick={() => void submitMessage()}><Icon name="send" /></button></span>
                   </div>
                 </div>
               </div>
             </div>
           )}
+          {attachmentDropActive && ['home', 'chat'].includes(route.page) && <div className="attachment-drop-overlay" role="status" aria-live="polite"><span className="attachment-drop-hint">Отпустите, чтобы прикрепить</span></div>}
             </>;
             if (route.page === 'chat') return <BrowserPanel
               chatHeading={<>

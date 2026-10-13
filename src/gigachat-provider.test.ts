@@ -134,6 +134,190 @@ test('connect uses OAuth Basic/RqUID/scope, then discovers models without exposi
   assert.doesNotMatch(JSON.stringify(status), /synthetic-authorization-key|synthetic-access-token/);
 });
 
+test('uploads binary bytes as multipart without UTF-8 conversion and validates the returned file reference', async () => {
+  const requests: ProviderTransportRequest[] = [];
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => {
+      requests.push(request);
+      if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-3-Pro' }] });
+      return jsonResponse(200, {
+        object: 'file', id: 'remote-fixture-id', filename: 'gcagent_fixture.pdf', bytes: 8, purpose: 'general',
+      });
+    }),
+  });
+  assert.equal((await provider.connect()).state, 'connected');
+
+  const upload = provider as typeof provider & {
+    uploadFile(input: { filename: string; contentType: string; bytes: Uint8Array }, signal: AbortSignal): Promise<{ id: string; filename: string; bytes: number }>;
+  };
+  const fileBytes = Uint8Array.from([0x25, 0x50, 0x44, 0x46, 0x2d, 0x00, 0xff, 0xc3]);
+  const result = await upload.uploadFile({ filename: 'gcagent_fixture.pdf', contentType: 'application/pdf', bytes: fileBytes }, new AbortController().signal);
+
+  assert.deepEqual(result, { id: 'remote-fixture-id', filename: 'gcagent_fixture.pdf', bytes: fileBytes.byteLength, purpose: 'general' });
+  const request = requests[requests.length - 1]!;
+  assert.equal(request.url, `${GIGACHAT_API_BASE_URL}/files`);
+  assert.equal(request.method, 'POST');
+  assert.match(request.headers['Content-Type'] ?? '', /^multipart\/form-data; boundary=/);
+  const body = Buffer.from(request.body as Uint8Array);
+  assert.ok(body.includes(Buffer.from('purpose')));
+  assert.ok(body.includes(Buffer.from('general')));
+  assert.ok(body.includes(Buffer.from('gcagent_fixture.pdf')));
+  assert.ok(body.includes(Buffer.from(fileBytes)), 'all bytes, including invalid UTF-8 bytes, survive the multipart encoder');
+});
+
+test('rejects an upload HTTP 200 that does not identify the requested binary', async () => {
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => {
+      if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-3-Pro' }] });
+      return jsonResponse(200, { object: 'file', purpose: 'general', filename: 'other.txt', bytes: 4 });
+    }),
+  });
+  assert.equal((await provider.connect()).state, 'connected');
+  const upload = provider as typeof provider & {
+    uploadFile(input: { filename: string; contentType: string; bytes: Uint8Array }, signal: AbortSignal): Promise<unknown>;
+  };
+  await assert.rejects(upload.uploadFile({ filename: 'gcagent_expected.txt', contentType: 'text/plain', bytes: Buffer.from('data') }, new AbortController().signal),
+    (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
+});
+
+test('lists only general-purpose files and deletes an explicit provider file ID', async () => {
+  const requests: ProviderTransportRequest[] = [];
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => {
+      requests.push(request);
+      if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-3-Pro' }] });
+      if (request.url === `${GIGACHAT_API_BASE_URL}/files`) return jsonResponse(200, {
+        object: 'list', has_more: false, data: [
+          { object: 'file', id: 'owned-fixture-id', filename: 'gcagent_fixture.txt', bytes: 12, purpose: 'general' },
+          { object: 'file', id: 'unrelated-purpose-id', filename: 'other.png', bytes: 30, purpose: 'generated' },
+        ],
+      });
+      return jsonResponse(200, { id: 'owned-fixture-id', deleted: true });
+    }),
+  });
+  assert.equal((await provider.connect()).state, 'connected');
+
+  const signal = new AbortController().signal;
+  assert.deepEqual(await provider.listFiles(signal), [
+    { id: 'owned-fixture-id', filename: 'gcagent_fixture.txt', bytes: 12, purpose: 'general' },
+  ]);
+  await provider.deleteFile('owned-fixture-id', signal);
+  assert.equal(requests[requests.length - 2]?.url, `${GIGACHAT_API_BASE_URL}/files`);
+  const deletion = requests[requests.length - 1]!;
+  assert.equal(deletion.method, 'POST');
+  assert.equal(deletion.url, `${GIGACHAT_API_BASE_URL}/files/owned-fixture-id/delete`);
+  assert.equal(deletion.headers.Authorization, 'Bearer synthetic-token');
+});
+
+test('keeps a provider file deletion unconfirmed unless the bounded receipt matches the requested ID', async () => {
+  const receipts: unknown[] = [
+    { id: 'different-file-id', deleted: true },
+    { id: 'owned-fixture-id', deleted: false },
+    { id: 'owned-fixture-id', deleted: 'true' },
+  ];
+  for (const receipt of receipts) {
+    const provider = createGigaChatProvider({
+      loadAuthorizationKey: async () => 'synthetic-key',
+      now: () => FIXED_NOW,
+      transport: fakeTransport((request) => {
+        if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
+        if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-3-Pro' }] });
+        return jsonResponse(200, receipt);
+      }),
+    });
+    assert.equal((await provider.connect()).state, 'connected');
+    await assert.rejects(provider.deleteFile('owned-fixture-id', new AbortController().signal),
+      (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
+  }
+});
+
+test('rejects remote file IDs that are not one safe URL path segment', async () => {
+  let fileRequests = 0;
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => {
+      if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-3-Pro' }] });
+      fileRequests += 1;
+      return jsonResponse(200, { deleted: true });
+    }),
+  });
+  assert.equal((await provider.connect()).state, 'connected');
+
+  for (const id of ['.', '..', 'folder/file', 'file?query', 'file#fragment', 'file\u0000id', 'file\n']) {
+    await assert.rejects(provider.deleteFile(id, new AbortController().signal),
+      (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
+  }
+  assert.equal(fileRequests, 0);
+});
+
+test('cancels a response that becomes stale before authenticated response handling', async () => {
+  let responseCancelled = 0;
+  const response: ProviderTransportResponse = {
+    ...jsonResponse(200, {
+      object: 'file', id: 'late-file-id', filename: 'gcagent_late.txt', bytes: 4, purpose: 'general',
+    }),
+    cancel: () => { responseCancelled += 1; },
+  };
+  const transport: ProviderTransport = {
+    request: (request) => {
+      if (request.url === GIGACHAT_OAUTH_URL) return Promise.resolve(jsonResponse(200, token('synthetic-token')));
+      if (request.url.endsWith('/models')) return Promise.resolve(jsonResponse(200, { data: [{ id: 'GigaChat-3-Pro' }] }));
+      return {
+        then: (onFulfilled?: ((value: ProviderTransportResponse) => unknown) | null) => {
+          const result = onFulfilled?.(response);
+          provider.disconnect();
+          return Promise.resolve(result);
+        },
+      } as unknown as Promise<ProviderTransportResponse>;
+    },
+    close() {},
+  };
+  const provider = createGigaChatProvider({ loadAuthorizationKey: async () => 'synthetic-key', now: () => FIXED_NOW, transport });
+  assert.equal((await provider.connect()).state, 'connected');
+
+  await assert.rejects(provider.uploadFile({
+    filename: 'gcagent_late.txt', contentType: 'text/plain', bytes: Buffer.from('data'),
+  }, new AbortController().signal), (error: unknown) => error instanceof GigaChatProviderError && error.category === 'cancel');
+  assert.equal(responseCancelled, 1);
+});
+
+test('reports built-in file-reading progress as activity instead of assistant text', async () => {
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => {
+      if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-3-Pro' }] });
+      return eventStreamResponse([
+        Buffer.from(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: 'function_in_progress', name: 'get_file_content', content: 'осталось 00:02' }, finish_reason: null }] })}\n\n`),
+        Buffer.from(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: 'assistant', content: 'Документ изучен.' }, finish_reason: 'stop' }] })}\n\n`),
+        Buffer.from('data: [DONE]\n\n'),
+      ]);
+    }),
+  });
+  assert.equal((await provider.connect()).state, 'connected');
+  const events: ProviderEvent[] = [];
+  for await (const event of provider.stream({
+    system: [], messages: [{ id: 'user-file', role: 'user', text: 'Прочитай файл', createdAt: '2026-10-12T00:00:00.000Z' }],
+    permissionProfile: 'ask', modelId: 'GigaChat-3-Pro',
+  }, new AbortController().signal)) events.push(event);
+
+  assert.ok(events.some((event) => event.type === 'activity' && event.activity === 'function-progress'
+    && event.functionName === 'get_file_content' && event.detail === 'осталось 00:02'));
+  assert.deepEqual(events.filter((event) => event.type === 'text-delta').map((event) => event.text), ['Документ изучен.']);
+});
+
 test('discovers future model IDs without inventing model capabilities', async () => {
   const provider = createGigaChatProvider({
     loadAuthorizationKey: async () => 'synthetic-key',
@@ -400,7 +584,8 @@ test('streams GigaChat v1 SSE across split UTF-8, CRLF and multiline data frames
   assert.equal(completionRequests[0]?.method, 'POST');
   assert.equal(completionRequests[0]?.headers.Accept, 'text/event-stream');
   assert.equal(completionRequests[0]?.headers.Authorization, 'Bearer synthetic-token');
-  const requestBody = JSON.parse(completionRequests[0]?.body ?? '{}') as {
+  const completionBody = completionRequests[0]?.body;
+  const requestBody = JSON.parse(typeof completionBody === 'string' ? completionBody : Buffer.from(completionBody ?? []).toString('utf8')) as {
     model: string; messages: Array<Record<string, unknown>>; functions: Array<{ name: string }>; function_call: string; stream: boolean;
   };
   assert.equal(requestBody.model, 'GigaChat-3-Ultra');
@@ -414,7 +599,7 @@ test('streams GigaChat v1 SSE across split UTF-8, CRLF and multiline data frames
   ]);
   assert.equal(requestBody.stream, true);
   assert.equal(requestBody.function_call, 'auto');
-  assert.deepEqual(requestBody.functions.map((fn) => fn.name), ['list', 'search', 'read', 'write', 'open', 'powershell']);
+  assert.deepEqual(requestBody.functions.map((fn) => fn.name), ['list', 'search', 'read', 'write', 'open', 'powershell', 'get_file_content']);
   assert.equal(requestBody.messages.filter((message) => message.role === 'system').length, 1);
 });
 
@@ -1055,7 +1240,8 @@ test('uses the documented token-count REST array and rejects SDK-wrapper respons
   ]);
   const countRequest = requests[requests.length - 1]!;
   assert.equal(countRequest.url, `${GIGACHAT_API_BASE_URL}/tokens/count`);
-  assert.deepEqual(JSON.parse(countRequest.body ?? '{}'), { model: 'GigaChat-test-model', input: ['text-one', 'text-two'] });
+  assert.deepEqual(JSON.parse(typeof countRequest.body === 'string' ? countRequest.body : Buffer.from(countRequest.body ?? []).toString('utf8')),
+    { model: 'GigaChat-test-model', input: ['text-one', 'text-two'] });
   malformed = true;
   await assert.rejects(provider.countTokens('GigaChat-test-model', ['text-one', 'text-two'], signal),
     (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');

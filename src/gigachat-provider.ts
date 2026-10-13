@@ -3,9 +3,10 @@ import { randomUUID, X509Certificate } from 'node:crypto';
 import { type ClientRequest, type IncomingHttpHeaders, type IncomingMessage } from 'node:http';
 import { Agent, request as httpsRequest } from 'node:https';
 import * as tls from 'node:tls';
-import type { GigaChatProvider, ModelRegistrySnapshot, ProviderConnectionSnapshot, ProviderErrorCategory, ProviderEvent, ProviderProtocolExchange, ProviderTurnRequest, ProviderUsageValues } from './contracts';
+import type { GigaChatProvider, ModelRegistrySnapshot, ProviderAttachmentReference, ProviderConnectionSnapshot, ProviderErrorCategory, ProviderEvent, ProviderFileRecord, ProviderFileUploadInput, ProviderProtocolExchange, ProviderTurnRequest, ProviderUsageValues } from './contracts';
 import { discoveredModelRegistry, failedModelRegistry, isModelAvailable, requireModelId, unavailableModelRegistry, type GigaChatModelId } from './models';
 import { isChatModelAvailable } from './model-catalog';
+import { attachmentContentType, inspectLocalAttachmentContent, LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES, PROVIDER_MEDIA_LIMIT_BYTES, PROVIDER_REQUEST_LIMIT_BYTES } from './attachment-policy';
 
 export const GIGACHAT_API_BASE_URL = 'https://api.giga.chat/v1';
 export const GIGACHAT_OAUTH_URL = 'https://ngw.devices.sberbank.ru:9443/api/v2/oauth';
@@ -17,7 +18,7 @@ const MAX_TOKEN_CHARS = 16 * 1024;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_FUNCTION_ARGUMENT_BYTES = 1_900_000;
-export const MAX_PROVIDER_REQUEST_BYTES = 2 * 1024 * 1024;
+export const MAX_PROVIDER_REQUEST_BYTES = PROVIDER_REQUEST_LIMIT_BYTES;
 
 const GIGACHAT_FUNCTIONS: readonly Record<string, unknown>[] = [
   { name: 'list', description: 'Список файлов и папок по текущему профилю разрешений. Относительные пути считаются от рабочей папки; абсолютные пути вне неё доступны только при разрешении.', parameters: { type: 'object', properties: { path: { type: 'string', maxLength: 2048 } }, additionalProperties: false } },
@@ -28,11 +29,15 @@ const GIGACHAT_FUNCTIONS: readonly Record<string, unknown>[] = [
   { name: 'powershell', description: 'Выполнение PowerShell через существующий локальный helper и текущий профиль разрешений.', parameters: { type: 'object', properties: { script: { type: 'string', minLength: 1, maxLength: 16384 }, external_access: { type: 'boolean' } }, required: ['script'], additionalProperties: false } },
 ];
 
+const GIGACHAT_BUILTIN_FUNCTIONS: readonly Record<string, unknown>[] = [
+  { name: 'get_file_content' },
+];
+
 export interface ProviderTransportRequest {
   url: string;
   method: 'GET' | 'POST';
   headers: Record<string, string>;
-  body?: string;
+  body?: string | Uint8Array;
   signal: AbortSignal;
   streaming?: boolean;
 }
@@ -68,6 +73,13 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
     return `[${layer.label}]\n${layer.text}`;
   }).join('\n\n');
   const protocolHistory = validateProtocolHistory(request.protocolHistory ?? []);
+  const attachments = validateProviderAttachments(request.attachments === undefined ? [] : request.attachments, request.messages);
+  const attachmentsByMessage = new Map<string, ProviderAttachmentReference[]>();
+  for (const attachment of attachments) {
+    const rows = attachmentsByMessage.get(attachment.messageId) ?? [];
+    rows.push(attachment);
+    attachmentsByMessage.set(attachment.messageId, rows);
+  }
   const exchanges = new Map<string, ProviderProtocolExchange[]>();
   for (const exchange of protocolHistory) {
     const rows = exchanges.get(exchange.anchorMessageId) ?? [];
@@ -85,11 +97,34 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
       || !message.functionsStateId || message.functionsStateId.length > 4096
       // eslint-disable-next-line no-control-regex -- Reject control characters in provider protocol state IDs.
       || /[\u0000-\u001f\u007f]/.test(message.functionsStateId))) throw new GigaChatProviderError('protocol');
+    const messageAttachments = attachmentsByMessage.get(message.id) ?? [];
+    const imageCount = messageAttachments.filter((attachment) => attachment.kind === 'image').length;
+    const groups: Array<{ fileIds: string[]; imageIndex: number | null }> = [{ fileIds: [], imageIndex: null }];
+    let nextImageIndex = 0;
+    for (const attachment of messageAttachments) {
+      if (attachment.kind === 'image') {
+        if (nextImageIndex > 0) groups.push({ fileIds: [], imageIndex: null });
+        nextImageIndex += 1;
+        groups[groups.length - 1]!.imageIndex = nextImageIndex;
+      }
+      groups[groups.length - 1]!.fileIds.push(attachment.fileId);
+    }
+    const imageTask = message.text || request.system.find((layer) => layer.source === 'runtime'
+      && layer.label === 'Задача текущего запроса')?.text || '';
+    const wireContent = (group: typeof groups[number]): string => {
+      if (imageCount <= 1 || group.imageIndex === null) return message.text;
+      const label = `Изображение ${group.imageIndex}/${imageCount}`;
+      return imageTask ? `${imageTask}\n\n${label}` : label;
+    };
     messages.push({
       role: message.role,
-      content: message.text,
+      content: wireContent(groups[0]!),
+      ...(groups[0]!.fileIds.length ? { attachments: groups[0]!.fileIds } : {}),
       ...(message.role === 'assistant' && message.functionsStateId ? { functions_state_id: message.functionsStateId } : {}),
     });
+    for (const group of groups.slice(1)) {
+      messages.push({ role: 'user', content: wireContent(group), attachments: group.fileIds });
+    }
     if (message.role === 'user') {
       for (const exchange of exchanges.get(message.id) ?? []) {
         messages.push({
@@ -110,19 +145,97 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
     body = JSON.stringify({
       model: modelId,
       messages,
-      ...(functionsEnabled ? { functions: GIGACHAT_FUNCTIONS } : {}),
+      ...(functionsEnabled ? { functions: [...GIGACHAT_FUNCTIONS, ...GIGACHAT_BUILTIN_FUNCTIONS] } : {}),
       stream: true,
       function_call: functionsEnabled ? 'auto' : 'none',
     });
   } catch { throw new GigaChatProviderError('protocol'); }
   const wireBytes = Buffer.byteLength(body, 'utf8');
   if (wireBytes > MAX_PROVIDER_REQUEST_BYTES) throw new GigaChatProviderError('context');
+  const mediaBytes = attachments.reduce((total, attachment) => total + (attachment.kind === 'image' ? attachment.sizeBytes : 0), 0);
+  if (mediaBytes + wireBytes >= PROVIDER_MEDIA_LIMIT_BYTES) throw new GigaChatProviderError('context');
   return {
     body,
     wireBytes,
     textInputs: messages.flatMap((message) => typeof message.content === 'string' ? [message.content] : []),
-    functionSchemaBytes: functionsEnabled ? Buffer.byteLength(JSON.stringify(GIGACHAT_FUNCTIONS), 'utf8') : 0,
+    functionSchemaBytes: functionsEnabled ? Buffer.byteLength(JSON.stringify([...GIGACHAT_FUNCTIONS, ...GIGACHAT_BUILTIN_FUNCTIONS]), 'utf8') : 0,
   };
+}
+
+function validateProviderAttachments(value: unknown, messages: readonly ProviderTurnRequest['messages'][number][]): ProviderAttachmentReference[] {
+  if (!Array.isArray(value) || value.length > 32) throw new GigaChatProviderError('protocol');
+  const messageIds = new Set<string>();
+  for (const message of messages) {
+    if (!message || typeof message !== 'object' || typeof message.id !== 'string' || !message.id || message.id.length > 256) {
+      throw new GigaChatProviderError('protocol');
+    }
+    if (messageIds.has(message.id)) throw new GigaChatProviderError('protocol');
+    messageIds.add(message.id);
+  }
+  let imageCount = 0;
+  const remoteIds = new Set<string>();
+  const attachmentIds = new Set<string>();
+  const validated = value.map((item): ProviderAttachmentReference => {
+    const sizeBytes = isRecord(item) && typeof item.sizeBytes === 'number' ? item.sizeBytes : Number.NaN;
+    if (!isRecord(item) || typeof item.messageId !== 'string' || !item.messageId || item.messageId.length > 256
+      || typeof item.attachmentId !== 'string' || !item.attachmentId || item.attachmentId.length > 256
+      || !isSafeRemoteFileId(item.fileId)
+      || typeof item.name !== 'string' || item.name.length < 1 || item.name.length > 255
+      || item.name.includes('/') || item.name.includes('\\')
+      || typeof item.contentType !== 'string'
+      || (item.kind !== 'document' && item.kind !== 'image')
+      || !Number.isSafeInteger(sizeBytes) || sizeBytes < 0 || sizeBytes > LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES
+      // eslint-disable-next-line no-control-regex -- Reject control characters in local and remote attachment metadata.
+      || /[\u0000-\u001f\u007f]/.test(item.messageId) || /[\u0000-\u001f\u007f]/.test(item.attachmentId) || /[\u0000-\u001f\u007f]/.test(item.name)) {
+      throw new GigaChatProviderError('protocol');
+    }
+    if (remoteIds.has(item.fileId) || attachmentIds.has(item.attachmentId)) throw new GigaChatProviderError('protocol');
+    remoteIds.add(item.fileId);
+    attachmentIds.add(item.attachmentId);
+    const anchor = messages.find((message) => message.id === item.messageId);
+    if (!anchor || anchor.role !== 'user' || !Array.isArray(anchor.attachmentIds)
+      || !anchor.attachmentIds.includes(item.attachmentId)) throw new GigaChatProviderError('protocol');
+    const localType = attachmentContentType(item.name);
+    if (!localType || localType.kind !== item.kind || localType.contentType !== item.contentType) {
+      throw new GigaChatProviderError('protocol');
+    }
+    if (item.kind === 'image') {
+      if (sizeBytes > PROVIDER_IMAGE_LIMIT_BYTES) throw new GigaChatProviderError('context');
+      imageCount += 1;
+      if (imageCount > 10) throw new GigaChatProviderError('context');
+    }
+    return {
+      messageId: item.messageId,
+      attachmentId: item.attachmentId,
+      fileId: item.fileId,
+      name: item.name,
+      contentType: item.contentType,
+      kind: item.kind,
+      sizeBytes,
+    };
+  });
+  const byMessage = new Map<string, ProviderAttachmentReference[]>();
+  for (const attachment of validated) {
+    const rows = byMessage.get(attachment.messageId) ?? [];
+    rows.push(attachment);
+    byMessage.set(attachment.messageId, rows);
+  }
+  for (const message of messages) {
+    if (message.attachmentIds !== undefined && (!Array.isArray(message.attachmentIds)
+      || message.attachmentIds.length > 32 || new Set(message.attachmentIds).size !== message.attachmentIds.length
+      || message.attachmentIds.some((id) => typeof id !== 'string' || !id || id.length > 256))) {
+      throw new GigaChatProviderError('protocol');
+    }
+    const rows = byMessage.get(message.id) ?? [];
+    const attachedIds = message.attachmentIds ?? [];
+    let lastIndex = -1;
+    for (const row of rows) {
+      const index = attachedIds.indexOf(row.attachmentId);
+      if (index <= lastIndex) throw new GigaChatProviderError('protocol');
+      lastIndex = index;
+    }
+  }
+  return validated;
 }
 
 export interface GigaChatProviderConnection extends GigaChatProvider {
@@ -133,6 +246,9 @@ export interface GigaChatProviderConnection extends GigaChatProvider {
   disconnect(): ProviderConnectionSnapshot;
   invalidateSavedKey(): void;
   listModels(signal?: AbortSignal): Promise<string[]>;
+  uploadFile(input: ProviderFileUploadInput, signal: AbortSignal): Promise<ProviderFileRecord>;
+  listFiles(signal: AbortSignal): Promise<ProviderFileRecord[]>;
+  deleteFile(id: string, signal: AbortSignal): Promise<void>;
   countTokens(modelId: GigaChatModelId, input: readonly string[], signal: AbortSignal): Promise<ProviderTokenCount[]>;
 }
 
@@ -498,10 +614,143 @@ export function createGigaChatProvider(options: {
         throw statusError(response.statusCode);
       }
       const value = await readJsonResponse(response, signal);
-      assertCurrent(expectedGeneration, signal);
+      try { assertCurrent(expectedGeneration, signal); }
+      catch (error) {
+        response.cancel();
+        throw error;
+      }
       return parseModelIds(value);
     }
     throw new GigaChatProviderError('auth');
+  };
+
+  const requestWithAuthRetry = async (
+    createRequest: (token: string) => ProviderTransportRequest,
+    signal: AbortSignal,
+    expectedGeneration: number,
+  ): Promise<ProviderTransportResponse> => {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const access = await getAccessToken(signal, expectedGeneration);
+      assertCurrent(expectedGeneration, signal);
+      let response: ProviderTransportResponse;
+      try {
+        response = await awaitWithAbort(options.transport.request(createRequest(access.value)), signal, (lateResponse) => lateResponse.cancel());
+      } catch (error) {
+        throw transportError(error, signal);
+      }
+      try { assertCurrent(expectedGeneration, signal); }
+      catch (error) {
+        response.cancel();
+        throw error;
+      }
+      if (response.statusCode === 401 && attempt === 0) {
+        response.cancel();
+        if (accessToken?.value === access.value) accessToken = null;
+        continue;
+      }
+      return response;
+    }
+    throw new GigaChatProviderError('auth');
+  };
+
+  const uploadFile = async (input: ProviderFileUploadInput, signal: AbortSignal): Promise<ProviderFileRecord> => {
+    const operationGeneration = generation;
+    const operation = linkAbortSignals(sessionController.signal, signal);
+    const operationSignal = operation.controller.signal;
+    try {
+      if (connectionStatus.state !== 'connected' || !isSafeUploadInput(input)) throw new GigaChatProviderError('protocol');
+      assertCurrent(operationGeneration, operationSignal);
+      let boundary = `----GigaChat-${randomUUID()}`;
+      const fileBytes = Buffer.from(input.bytes);
+      while (fileBytes.includes(Buffer.from(boundary, 'ascii'))) boundary = `----GigaChat-${randomUUID()}`;
+      const filename = input.filename;
+      const body = Buffer.concat([
+        Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="purpose"\r\n\r\ngeneral\r\n`, 'utf8'),
+        Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: ${input.contentType}\r\n\r\n`, 'utf8'),
+        fileBytes,
+        Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'),
+      ]);
+      const response = await requestWithAuthRetry((tokenValue) => ({
+        url: `${GIGACHAT_API_BASE_URL}/files`,
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${tokenValue}`,
+          Accept: 'application/json',
+          'Content-Type': `multipart/form-data; boundary=${boundary}`,
+          'Content-Length': String(body.byteLength),
+        },
+        body,
+        signal: operationSignal,
+      }), operationSignal, operationGeneration);
+      if (response.statusCode !== 200) {
+        response.cancel();
+        throw statusError(response.statusCode);
+      }
+      const receipt = parseFileRecord(await readJsonResponse(response, operationSignal));
+      assertCurrent(operationGeneration, operationSignal);
+      if (!receipt || receipt.filename !== input.filename || receipt.bytes !== input.bytes.byteLength || receipt.purpose !== 'general') {
+        throw new GigaChatProviderError('protocol');
+      }
+      return receipt;
+    } catch (error) {
+      throw error instanceof GigaChatProviderError ? error : transportError(error, operationSignal);
+    } finally { operation.dispose(); }
+  };
+
+  const listFiles = async (signal: AbortSignal): Promise<ProviderFileRecord[]> => {
+    const operationGeneration = generation;
+    const operation = linkAbortSignals(sessionController.signal, signal);
+    const operationSignal = operation.controller.signal;
+    try {
+      if (connectionStatus.state !== 'connected') throw new GigaChatProviderError('auth');
+      const response = await requestWithAuthRetry((tokenValue) => ({
+        url: `${GIGACHAT_API_BASE_URL}/files`,
+        method: 'GET',
+        headers: { Authorization: `Bearer ${tokenValue}`, Accept: 'application/json' },
+        signal: operationSignal,
+      }), operationSignal, operationGeneration);
+      if (response.statusCode !== 200) {
+        response.cancel();
+        throw statusError(response.statusCode);
+      }
+      const value = await readJsonResponse(response, operationSignal);
+      assertCurrent(operationGeneration, operationSignal);
+      if (!isRecord(value) || !Array.isArray(value.data) || value.data.length > 10_000 || value.has_more === true) {
+        throw new GigaChatProviderError('protocol');
+      }
+      return value.data.map(parseFileRecord).filter((record): record is ProviderFileRecord => record !== null);
+    } catch (error) {
+      throw error instanceof GigaChatProviderError ? error : transportError(error, operationSignal);
+    } finally { operation.dispose(); }
+  };
+
+  const deleteFile = async (id: string, signal: AbortSignal): Promise<void> => {
+    const operationGeneration = generation;
+    const operation = linkAbortSignals(sessionController.signal, signal);
+    const operationSignal = operation.controller.signal;
+    try {
+      if (connectionStatus.state !== 'connected' || !isSafeRemoteFileId(id)) throw new GigaChatProviderError('protocol');
+      const response = await requestWithAuthRetry((tokenValue) => ({
+        url: `${GIGACHAT_API_BASE_URL}/files/${encodeURIComponent(id)}/delete`,
+        method: 'POST',
+        headers: { Authorization: `Bearer ${tokenValue}`, Accept: 'application/json' },
+        signal: operationSignal,
+      }), operationSignal, operationGeneration);
+      if (response.statusCode !== 200) {
+        response.cancel();
+        throw statusError(response.statusCode);
+      }
+      const receipt = await readJsonResponse(response, operationSignal);
+      assertCurrent(operationGeneration, operationSignal);
+      if (!isRecord(receipt) || receipt.id !== id || receipt.deleted !== true
+        || ('access_policy' in receipt && (typeof receipt.access_policy !== 'string' || receipt.access_policy.length > 64
+          // eslint-disable-next-line no-control-regex -- Provider deletion metadata is untrusted.
+          || /[\u0000-\u001f\u007f]/.test(receipt.access_policy)))) {
+        throw new GigaChatProviderError('protocol');
+      }
+    } catch (error) {
+      throw error instanceof GigaChatProviderError ? error : transportError(error, operationSignal);
+    } finally { operation.dispose(); }
   };
 
   const connect = async (): Promise<ProviderConnectionSnapshot> => {
@@ -619,6 +868,15 @@ export function createGigaChatProvider(options: {
         const usage = parseProviderUsage(payload);
         if (usage) yield { type: 'usage', ...usage };
         const chunk = parseCompletionChunk(payload);
+        if (chunk.functionProgress) {
+          yield {
+            type: 'activity',
+            activity: 'function-progress',
+            functionName: chunk.functionProgress.name,
+            detail: chunk.functionProgress.detail,
+          };
+          continue;
+        }
         if (chunk.finishReason === 'function_call') {
           if (chunk.errorCategory) throw new GigaChatProviderError(chunk.errorCategory);
           if (!chunk.functionCall) throw new GigaChatProviderError('protocol');
@@ -658,6 +916,9 @@ export function createGigaChatProvider(options: {
     disconnect: () => { reset(); return getStatus(); },
     invalidateSavedKey: () => { reset(); },
     stream,
+    uploadFile,
+    listFiles,
+    deleteFile,
     listModels: async (signal) => {
       const discoveryGeneration = ++modelRegistryGeneration;
       const operationGeneration = generation;
@@ -760,6 +1021,37 @@ async function readJsonResponse(response: ProviderTransportResponse, signal: Abo
   } finally {
     signal.removeEventListener('abort', cancelOnAbort);
   }
+}
+
+function isSafeUploadInput(value: ProviderFileUploadInput): boolean {
+  if (!value || typeof value !== 'object' || typeof value.filename !== 'string' || value.filename.length > 160
+    || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value.filename) || typeof value.contentType !== 'string'
+    || !(value.bytes instanceof Uint8Array) || value.bytes.byteLength < 1
+    || value.bytes.byteLength > LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES) return false;
+  const expected = attachmentContentType(value.filename);
+  if (!expected || expected.contentType !== value.contentType) return false;
+  try {
+    const content = inspectLocalAttachmentContent(value.filename, value.bytes);
+    if (!content || content.contentType !== value.contentType || content.kind !== expected.kind) return false;
+  } catch { return false; }
+  return expected.kind !== 'image' || value.bytes.byteLength <= PROVIDER_IMAGE_LIMIT_BYTES;
+}
+
+function parseFileRecord(value: unknown): ProviderFileRecord | null {
+  if (!isRecord(value) || !isSafeRemoteFileId(value.id) || typeof value.filename !== 'string'
+    || value.filename.length < 1 || value.filename.length > 255
+    || !Number.isSafeInteger(value.bytes) || (value.bytes as number) < 0
+    || typeof value.purpose !== 'string' || value.purpose.length < 1 || value.purpose.length > 64
+    // eslint-disable-next-line no-control-regex -- File metadata comes from an untrusted provider response.
+    || /[\u0000-\u001f\u007f]/.test(value.filename) || /[\u0000-\u001f\u007f]/.test(value.purpose)) {
+    throw new GigaChatProviderError('protocol');
+  }
+  if (value.purpose !== 'general') return null;
+  return { id: value.id, filename: value.filename, bytes: value.bytes as number, purpose: 'general' };
+}
+
+function isSafeRemoteFileId(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{1,256}$/.test(value);
 }
 
 function parseTokenCounts(value: unknown, expectedLength: number): ProviderTokenCount[] {
@@ -893,6 +1185,7 @@ function parseCompletionChunk(parsed: unknown): {
   content: string | null;
   functionsStateId: string | null;
   finishReason: 'stop' | 'function_call' | null;
+  functionProgress?: { name: 'get_file_content' | 'text2image'; detail: string };
   functionCall?: { name: string; arguments: Record<string, unknown>; content: string | null; functionsStateId: string | null; terminalReason: 'function_call' };
   errorCategory?: ProviderErrorCategory;
 } {
@@ -905,6 +1198,10 @@ function parseCompletionChunk(parsed: unknown): {
     throw new GigaChatProviderError('protocol');
   }
   let errorCategory: ProviderErrorCategory | undefined;
+  const role = choice.delta.role;
+  if (role !== undefined && role !== 'assistant' && role !== 'function_in_progress') {
+    throw new GigaChatProviderError('protocol');
+  }
   const finishReason = choice.finish_reason;
   let terminal: 'stop' | 'function_call' | null = null;
   if (finishReason !== undefined && finishReason !== null) {
@@ -923,6 +1220,17 @@ function parseCompletionChunk(parsed: unknown): {
     // eslint-disable-next-line no-control-regex -- Reject control characters in provider protocol state IDs.
     || /[\u0000-\u001f\u007f]/.test(rawStateId))) throw new GigaChatProviderError('protocol');
   const functionsStateId = typeof rawStateId === 'string' ? rawStateId : null;
+  let functionProgress: { name: 'get_file_content' | 'text2image'; detail: string } | undefined;
+  if (role === 'function_in_progress') {
+    const name = choice.delta.name;
+    if ((name !== 'get_file_content' && name !== 'text2image') || typeof content !== 'string'
+      || content.length > 1000 || terminal !== null || 'function_call' in choice.delta) {
+      throw new GigaChatProviderError('protocol');
+    }
+    functionProgress = { name, detail: content };
+  } else if ('name' in choice.delta) {
+    throw new GigaChatProviderError('protocol');
+  }
   let functionCall: ReturnType<typeof parseProviderFunctionCall> | undefined;
   if ('function_call' in choice.delta) {
     if (terminal !== 'function_call') throw new GigaChatProviderError('protocol');
@@ -932,6 +1240,7 @@ function parseCompletionChunk(parsed: unknown): {
     content: typeof content === 'string' ? content : null,
     functionsStateId,
     finishReason: terminal,
+    ...(functionProgress ? { functionProgress } : {}),
     ...(functionCall ? { functionCall } : {}),
     ...(errorCategory ? { errorCategory } : {}),
   };

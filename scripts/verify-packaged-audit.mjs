@@ -9,6 +9,7 @@ import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 const require = createRequire(import.meta.url);
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_RENDERER_HOST_LOG_BYTES = 512 * 1024;
+const SYNTHETIC_IMAGE_PREVIEW = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jHfQAAAAASUVORK5CYII=';
 
 function captureBounded(state, chunk) {
   if (state.bytes >= MAX_RENDERER_HOST_LOG_BYTES) {
@@ -180,7 +181,7 @@ async function runElectronHost() {
   const makeChat = (id, title, projectId = null) => ({ id, title, projectId, pinned: false, archived: false, createdAt: timestamp, updatedAt: timestamp, kind: 'text' });
   const makeDetail = (summary, text, draft = '') => ({
     ...summary, draft, nextTurnPermissionProfile: null, modelId: null, nextTurnSkillId: null,
-    messages: [{ id: `${summary.id}-message`, role: 'assistant', text, createdAt: timestamp }], artifacts: [],
+    messages: [{ id: `${summary.id}-message`, role: 'assistant', text, createdAt: timestamp }], artifacts: [], draftAttachments: [],
   });
   const makeBrowserTab = (id, title, url) => ({ id, title, url, canGoBack: false, canGoForward: false, loading: false, error: null });
   const projects = [
@@ -206,6 +207,10 @@ async function runElectronHost() {
     deferHomeDraftGet: true, pendingHomeDraftGets: [],
     deferHomeDraftSaves: false, pendingHomeDraftSaves: [], homeDraftSaveCalls: [], rejectNextHomeDraftSave: false,
     deferHomeDraftImports: false, pendingHomeDraftImports: [], homeDraftImportCalls: 0,
+    homeDraftStageCalls: [], chatDraftStageCalls: [], attachmentPreviewCalls: [], chatDraftAttachmentSequence: 0,
+    nextHomePickedFile: null, nextChatPickedFile: null,
+    deferChatDraftImports: false, pendingChatDraftImports: [],
+    deferChatDraftRemovals: false, pendingChatDraftRemovals: [],
     deferHomeDraftSendResponse: false, pendingHomeDraftSends: [], homeDraftSendCalls: [], rejectNextHomeDraftSend: false,
     homeDraftAttachmentSequence: 0, homeDraftAcceptanceSequence: 0,
     runtimeTurns: new Map(), retryCalls: [], runtimeCancelCalls: [],
@@ -272,17 +277,27 @@ async function runElectronHost() {
     try { record.resolve(applyHomeDraftSave(record.input)); }
     catch (error) { record.reject(error); }
   };
-  const stageHomeDraftAttachment = () => {
+  const stageHomeDraftAttachment = (name, size = 24) => {
     const index = ++state.homeDraftAttachmentSequence;
     const attachment = {
-      id: `home-file-${index}`, name: `prepared-${index}.txt`, storedName: `home-file-${index}.txt`,
-      size: 24, sha256: 'a'.repeat(64), createdAt: timestamp,
+      id: `home-file-${index}`, name: name || `prepared-${index}.txt`, storedName: `home-file-${index}.txt`,
+      size, sha256: 'a'.repeat(64), createdAt: timestamp,
     };
     state.homeDraft = {
       ...state.homeDraft, revision: state.homeDraft.revision + 1,
       attachments: [...state.homeDraft.attachments, attachment],
     };
     return clone(state.homeDraft);
+  };
+  const stageChatDraftAttachment = (chatId, name, size = 24) => {
+    const detail = state.details.get(chatId);
+    if (!detail) throw new Error(`Synthetic chat not found: ${chatId}`);
+    const index = ++state.chatDraftAttachmentSequence;
+    detail.draftAttachments.push({
+      id: `chat-file-${index}`, name: name || `prepared-chat-${index}.txt`, storedName: `chat-file-${index}.txt`,
+      size, sha256: 'b'.repeat(64), createdAt: timestamp,
+    });
+    return clone(detail);
   };
   const acceptHomeDraft = (revision) => {
     state.homeDraftSendCalls.push(revision);
@@ -295,18 +310,19 @@ async function runElectronHost() {
     }
     if (revision !== state.homeDraft.revision) throw new Error('Synthetic home draft changed before Send');
     const text = state.homeDraft.text.trim();
-    if (!text) throw new Error('Synthetic empty home draft');
+    if (!text && state.homeDraft.attachments.length === 0) throw new Error('Synthetic empty home draft');
     const index = ++state.homeDraftAcceptanceSequence;
     const id = `home-chat-${index}`;
-    const message = { id: `home-message-${index}`, role: 'user', text, createdAt: timestamp };
-    const summary = makeChat(id, text.split(/\r?\n/, 1)[0].slice(0, 60), state.homeDraft.projectId);
+    const message = { id: `home-message-${index}`, role: 'user', text, createdAt: timestamp,
+      ...(state.homeDraft.attachments.length ? { attachmentIds: state.homeDraft.attachments.map((attachment) => attachment.id) } : {}) };
+    const summary = makeChat(id, text ? text.split(/\r?\n/, 1)[0].slice(0, 60) : 'Прикреплённые файлы', state.homeDraft.projectId);
     const permissionProfile = state.homeDraft.permissionProfile ?? state.appSettings.defaultPermissionProfile;
     const detail = {
       ...summary, draft: '', nextTurnPermissionProfile: permissionProfile === state.appSettings.defaultPermissionProfile ? null : permissionProfile,
       modelId: state.homeDraft.modelId ?? state.appSettings.defaultModelId, nextTurnSkillId: state.homeDraft.skillId,
-      messages: [message], toolReceipts: [], artifacts: state.homeDraft.attachments.map((attachment) => ({
+      messages: [message], toolReceipts: [], draftAttachments: [], artifacts: state.homeDraft.attachments.map((attachment) => ({
         id: attachment.id, name: attachment.name, storedName: attachment.storedName, size: attachment.size,
-        createdAt: attachment.createdAt, messageId: message.id,
+        sha256: attachment.sha256, createdAt: attachment.createdAt, messageId: message.id,
       })), compactSnapshot: null,
     };
     const turn = {
@@ -323,7 +339,13 @@ async function runElectronHost() {
     };
     return { detail: clone(detail), turn, newlyAccepted: true, homeDraft: clone(state.homeDraft), queued: false };
   };
-  const resolveHomeDraftImport = (record) => record.resolve(stageHomeDraftAttachment());
+  const resolveHomeDraftImport = (record) => record.resolve({ record: stageHomeDraftAttachment(record.name ?? 'picked-home.txt', record.size ?? 24), failures: [] });
+  const resolveHomeDraftFilePicker = (record, name = 'picked-home.txt') => record.resolve({
+    record: stageHomeDraftAttachment(name), failures: [],
+  });
+  const resolveChatDraftFilePicker = (record, chatId, name = record.name ?? 'picked-chat.txt') => record.request.resolve({
+    record: stageChatDraftAttachment(chatId, name, record.size ?? 24), failures: [],
+  });
   const resolveHomeDraftSend = (record) => record.resolve(clone(record.accepted));
   const updateSummary = (id, patch) => {
     const summary = state.chats.find((item) => item.id === id);
@@ -414,6 +436,26 @@ async function runElectronHost() {
       const request = deferred();
       state.pendingHomeDraftImports.push(request);
       return request.promise;
+    }
+    if (group === 'homeDraft' && method === 'pickFiles') {
+      state.homeDraftImportCalls += 1;
+      const nextFile = state.nextHomePickedFile ?? { name: 'picked-home.txt', size: 24 };
+      state.nextHomePickedFile = null;
+      if (!state.deferHomeDraftImports) return { record: stageHomeDraftAttachment(nextFile.name, nextFile.size), failures: [] };
+      const request = deferred();
+      state.pendingHomeDraftImports.push({ ...request, name: nextFile.name, size: nextFile.size });
+      return request.promise;
+    }
+    if (group === 'homeDraft' && method === 'stageFiles') {
+      const inputs = Array.isArray(args[0]) ? args[0] : [];
+      state.homeDraftStageCalls.push(inputs.map((input) => ({ name: input?.name ?? '', size: input?.size ?? 24 })));
+      let record = clone(state.homeDraft);
+      for (const input of inputs) record = stageHomeDraftAttachment(typeof input?.name === 'string' ? input.name : 'dropped-home.txt', Number.isSafeInteger(input?.size) ? input.size : 24);
+      return { record, failures: [] };
+    }
+    if (group === 'homeDraft' && method === 'getAttachmentPreview') {
+      state.attachmentPreviewCalls.push({ group, id: args[0] });
+      return state.homeDraft.attachments.some((attachment) => attachment.id === args[0]) ? SYNTHETIC_IMAGE_PREVIEW : null;
     }
     if (group === 'homeDraft' && method === 'removeFile') {
       const id = args[0];
@@ -526,11 +568,59 @@ async function runElectronHost() {
       state.pendingImports.push({ id, request });
       return request.promise;
     }
+    if (group === 'chats' && method === 'pickDraftFiles') {
+      const [chatId] = args;
+      const nextFile = state.nextChatPickedFile ?? { name: 'picked-chat.txt', size: 24 };
+      state.nextChatPickedFile = null;
+      if (!state.deferChatDraftImports) return { record: stageChatDraftAttachment(chatId, nextFile.name, nextFile.size), failures: [] };
+      const request = deferred();
+      state.pendingChatDraftImports.push({ chatId, request, name: nextFile.name, size: nextFile.size });
+      return request.promise;
+    }
+    if (group === 'chats' && method === 'stageDraftFiles') {
+      const [chatId, inputs] = args;
+      const files = Array.isArray(inputs) ? inputs : [];
+      state.chatDraftStageCalls.push({ chatId, files: files.map((input) => ({ name: input?.name ?? '', size: input?.size ?? 24 })) });
+      let detail = clone(state.details.get(chatId));
+      for (const input of files) detail = stageChatDraftAttachment(chatId, typeof input?.name === 'string' ? input.name : 'dropped-chat.txt', Number.isSafeInteger(input?.size) ? input.size : 24);
+      return { record: detail, failures: [] };
+    }
+    if (group === 'chats' && method === 'getDraftAttachmentPreview') {
+      const [chatId, attachmentId] = args;
+      state.attachmentPreviewCalls.push({ group, chatId, attachmentId });
+      return state.details.get(chatId)?.draftAttachments.some((attachment) => attachment.id === attachmentId) ? SYNTHETIC_IMAGE_PREVIEW : null;
+    }
+    if (group === 'chats' && method === 'getArtifactPreview') {
+      const [chatId, artifactId] = args;
+      state.attachmentPreviewCalls.push({ group, chatId, artifactId });
+      return state.details.get(chatId)?.artifacts.some((artifact) => artifact.id === artifactId) ? SYNTHETIC_IMAGE_PREVIEW : null;
+    }
+    if (group === 'chats' && method === 'removeDraftFile') {
+      const [chatId, attachmentId] = args;
+      const remove = () => {
+        const detail = state.details.get(chatId);
+        if (!detail?.draftAttachments.some((attachment) => attachment.id === attachmentId)) throw new Error('Synthetic chat draft file not found');
+        detail.draftAttachments = detail.draftAttachments.filter((attachment) => attachment.id !== attachmentId);
+        return clone(detail);
+      };
+      if (!state.deferChatDraftRemovals) return remove();
+      const request = deferred();
+      state.pendingChatDraftRemovals.push({ chatId, attachmentId, resolve: () => {
+        try { request.resolve(remove()); }
+        catch (error) { request.reject(error); }
+      } });
+      return request.promise;
+    }
     if (group === 'chats' && method === 'appendLocalMessage') {
-      const [id, text] = args;
+      const [id, text, attachmentIds = []] = args;
       const detail = state.details.get(id);
-      state.appendCalls.push({ id, text, nextTurnSkillId: detail.nextTurnSkillId, nextTurnPermissionProfile: detail.nextTurnPermissionProfile });
-      detail.messages.push({ id: `${id}-${detail.messages.length}`, role: 'user', text, createdAt: timestamp });
+      const selectedAttachments = detail.draftAttachments.filter((attachment) => attachmentIds.includes(attachment.id));
+      state.appendCalls.push({ id, text, attachmentIds: clone(attachmentIds), nextTurnSkillId: detail.nextTurnSkillId, nextTurnPermissionProfile: detail.nextTurnPermissionProfile });
+      const messageId = `${id}-${detail.messages.length}`;
+      detail.messages.push({ id: messageId, role: 'user', text, createdAt: timestamp,
+        ...(attachmentIds.length ? { attachmentIds: clone(attachmentIds) } : {}) });
+      detail.artifacts.push(...selectedAttachments.map((attachment) => ({ ...clone(attachment), messageId })));
+      detail.draftAttachments = detail.draftAttachments.filter((attachment) => !attachmentIds.includes(attachment.id));
       detail.draft = '';
       updateSummary(id, { draft: '' });
       return clone(detail);
@@ -2006,7 +2096,7 @@ async function runElectronHost() {
     state.runtimeTurns.set('chat-a', [failedTurn]);
     window.webContents.send('audit:runtime', failedTurn);
     await waitDom('local attachment disclosure and collapsed failed timeline', `
-      document.querySelector('.chat-files')?.textContent.includes('Локальный файл; модели не отправлен')
+      document.querySelector('.chat-files')?.textContent.includes('старое вложение, не отправлялось модели')
       && document.querySelector('.chat-files')?.textContent.includes('local.md')
       && document.querySelector('.chat-files')?.textContent.includes('Формат указан в API')
       && document.querySelector('.chat-files')?.textContent.includes('не подтверждён API')
@@ -2188,6 +2278,186 @@ async function runElectronHost() {
       && document.querySelectorAll('.runtime-turn-summary').length === 4`);
     passed('Rendered local attachments stay local; retry is explicit, collapsible, and adds no user message');
 
+    const chatMessagesBeforeAttachmentPicker = state.details.get('chat-a').messages.length;
+    const chatAppendsBeforeAttachmentPicker = state.appendCalls.length;
+    await fillTextarea(draftSelector, 'Текст сохраняется во время выбора файла');
+    await waitUntil('existing-chat text is saved before the picker test', () => state.details.get('chat-a')?.draft === 'Текст сохраняется во время выбора файла');
+    state.deferChatDraftImports = true;
+    state.nextChatPickedFile = { name: 'triangle.png', size: 96 };
+    const chatPickerStart = state.pendingChatDraftImports.length;
+    const pickerDoubleClick = await evaluate(`(() => { const button = document.querySelector('button[aria-label="Прикрепить файл"]'); if (!button) return false; button.click(); button.click(); return true; })()`);
+    assert.equal(pickerDoubleClick, true);
+    await waitUntil('one existing-chat file picker despite a same-tick double click', () => state.pendingChatDraftImports.length === chatPickerStart + 1);
+    await fillTextarea(draftSelector, 'Текст изменён, пока picker открыт');
+    await waitUntil('editing remains available while existing-chat picker waits', () => state.details.get('chat-a')?.draft === 'Текст изменён, пока picker открыт');
+    await waitDom('Send waits until existing-chat import completes', `document.querySelector('.send-button-wrap .send-button')?.disabled`);
+    assert.equal(state.appendCalls.length, chatAppendsBeforeAttachmentPicker, 'opening a picker never appends a message');
+    const pendingChatPicker = state.pendingChatDraftImports[chatPickerStart];
+    state.details.get('chat-a').messages.push({ id: 'chat-a-answer-during-picker', role: 'assistant', source: 'runtime', text: 'Ответ пришёл, пока выбирался файл.', createdAt: timestamp });
+    const pickerRefreshTurn = { id: 'turn-answer-during-attachment-picker', chatId: 'chat-a', status: 'completed', createdAt: timestamp, activity: [] };
+    state.runtimeTurns.set('chat-a', [...(state.runtimeTurns.get('chat-a') ?? []), pickerRefreshTurn]);
+    window.webContents.send('audit:runtime', pickerRefreshTurn);
+    await waitDom('new assistant message arrives while the picker is open', `document.querySelector('.chat-history')?.textContent.includes('Ответ пришёл, пока выбирался файл.')`);
+    resolveChatDraftFilePicker(pendingChatPicker, 'chat-a', pendingChatPicker.name);
+    await waitDom('late picker result merges only draft attachments into the current detail', `document.querySelector('.attachment-card strong')?.textContent === 'triangle.png'
+      && document.querySelector('.chat-history')?.textContent.includes('Ответ пришёл, пока выбирался файл.')`);
+    await waitDom('pending image thumbnail is rendered from the bounded preview bridge', `document.querySelector('.attachment-card .attachment-preview img')`);
+    assert.equal(state.details.get('chat-a').messages.length, chatMessagesBeforeAttachmentPicker + 1,
+      'the newer assistant message survives the attachment result');
+    assert.equal(state.appendCalls.length, chatAppendsBeforeAttachmentPicker, 'staging stays local and does not send');
+    assert.equal(await evaluate(`document.querySelector('.composer textarea')?.value`), 'Текст изменён, пока picker открыт',
+      'late picker acknowledgement preserves text edited while it was open');
+    await capture('stage3-existing-chat-pending-image');
+    state.deferChatDraftImports = false;
+
+    await click('.profile-settings-button');
+    await clickText('.settings-nav-item', 'Подключение API');
+    await waitDom('synthetic session is connected before resetting the exhausted pool', `[...document.querySelectorAll('.connection-setup button')].some((button) => button.textContent.includes('Отключить'))`);
+    await clickText('.connection-setup button', 'Отключить');
+    await waitUntil('explicit disconnect clears the synthetic connection', () => state.connectionStatus.state === 'not-configured');
+    await waitDom('Connect action is rendered after explicit disconnect', `[...document.querySelectorAll('.connection-setup button')].some((button) => button.textContent.includes('Проверить подключение') && !button.disabled)`);
+    await clickText('.connection-setup button', 'Проверить подключение');
+    await waitUntil('explicit reconnect starts a fresh allowance session', () => state.connectionStatus.state === 'connected'
+      && !state.modelRegistry.exhaustedModelIds?.includes('GigaChat-3-Ultra'));
+    await waitDom('connected state and disconnect action render before model navigation', `document.querySelector('.connection-result[data-state="connected"]')
+      && [...document.querySelectorAll('.connection-setup button')].some((button) => button.textContent.includes('Отключить'))`);
+    await clickText('.settings-nav-item', 'Модели и лимиты');
+    await clickText('.connection-card button', 'Обновить список');
+    await waitDom('fresh model registry is loaded after explicit reconnect', `document.querySelector('.connection-card .status-pill')?.textContent.includes('Список загружен')`);
+    assert.deepEqual(state.modelRegistry.exhaustedModelIds, [], 'the selected Ultra pool is fresh only after explicit reconnect');
+    await click('button.window-action[aria-label="Назад"]');
+    await waitDom('chat A returns with its pending image after reconnect', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'
+      && document.querySelector('.attachment-card strong')?.textContent === 'triangle.png'`);
+    assert.equal(await evaluate(`document.querySelector('.send-button-wrap .send-button')?.disabled`), false,
+      'verified Ultra image capability is usable only after the authoritative reconnect/registry refresh');
+
+    await fillTextarea(draftSelector, '');
+    await waitUntil('files-only Send begins with an empty user text', () => state.details.get('chat-a')?.draft === '');
+    await click('.send-button-wrap .send-button');
+    await waitUntil('files-only Send appends one user message with its local attachment ID', () => state.appendCalls.length === chatAppendsBeforeAttachmentPicker + 1);
+    const acceptedChatAttachment = state.appendCalls.at(-1);
+    assert.equal(acceptedChatAttachment.id, 'chat-a');
+    assert.equal(acceptedChatAttachment.text, '', 'files-only Send keeps user-visible message text empty');
+    assert.equal(acceptedChatAttachment.attachmentIds.length, 1, 'one exact staged local ID is accepted');
+    await waitDom('sent image is shown on its linked user message', `document.querySelector('.message-attachments .attachment-preview img')
+      && document.querySelector('.message-attachments')?.closest('.message-user')?.textContent.includes('triangle.png')`);
+    assert.equal(state.details.get('chat-a').messages.filter((message) => message.role === 'user').at(-1)?.attachmentIds?.[0], acceptedChatAttachment.attachmentIds[0]);
+    assert.equal(state.details.get('chat-a').artifacts.find((item) => item.id === acceptedChatAttachment.attachmentIds[0])?.messageId,
+      state.details.get('chat-a').messages.filter((message) => message.role === 'user').at(-1)?.id,
+      'the accepted file stays associated with this user message');
+    await capture('stage3-existing-chat-sent-image');
+
+    window.setSize(1520, 940);
+    await waitDom('wide workspace is ready for chat-column drop proof', `document.querySelector('.browser-workspace')?.getBoundingClientRect().width >= 880`);
+    await click('button[aria-label="Показать браузер"]');
+    await waitDom('browser pane mounts before selecting split presentation', `document.querySelector('.browser-pane')`);
+    await evaluate(`(() => {
+      const toggle = document.querySelector('.workspace-expand-toggle');
+      if (toggle?.getAttribute('aria-pressed') === 'true') toggle.click();
+    })()`);
+    await waitDom('browser opens beside the visible chat column', `document.querySelector('.browser-pane')
+      && !document.querySelector('.browser-workspace')?.classList.contains('is-full')
+      && document.querySelector('.chat-column')?.getBoundingClientRect().width > 0
+      && document.querySelector('.chat-column')?.getBoundingClientRect().height > 0`);
+    await evaluate(`(() => {
+      const pane = document.querySelector('.browser-pane');
+      const dataTransfer = new DataTransfer();
+      dataTransfer.items.add(new File(['image'], 'drop.png', { type: 'image/png' }));
+      pane?.dispatchEvent(new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer }));
+    })()`);
+    await sleep(80);
+    assert.equal(await evaluate(`Boolean(document.querySelector('.attachment-drop-overlay'))`), false,
+      'dragging over the embedded browser never tints or targets it');
+    const chatDropStart = state.chatDraftStageCalls.length;
+    await evaluate(`(() => {
+      const column = document.querySelector('.chat-column');
+      const dataTransfer = new DataTransfer();
+      dataTransfer.items.add(new File(['image'], 'dropped.png', { type: 'image/png' }));
+      column?.querySelector('.composer')?.dispatchEvent(new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer }));
+    })()`);
+    await waitDom('drop hint covers the complete chat column only', `document.querySelector('.attachment-drop-overlay')`);
+    const dropBounds = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const column = document.querySelector('.chat-column')?.getBoundingClientRect();
+      const overlay = document.querySelector('.attachment-drop-overlay')?.getBoundingClientRect();
+      const pane = document.querySelector('.browser-pane')?.getBoundingClientRect();
+      const overlayElement = document.querySelector('.attachment-drop-overlay');
+      const style = overlayElement ? getComputedStyle(overlayElement) : null;
+      return column && overlay && pane && overlayElement && style ? {
+        left: Math.abs(column.left - overlay.left), top: Math.abs(column.top - overlay.top),
+        width: Math.abs(column.width - overlay.width), height: Math.abs(column.height - overlay.height),
+        chatWidth: column.width, chatHeight: column.height, paneWidth: pane.width, paneHeight: pane.height,
+        overlayWidth: overlay.width, overlayHeight: overlay.height,
+        display: style.display, visibility: style.visibility, opacity: Number(style.opacity),
+        rendered: overlayElement.getClientRects().length > 0,
+        overlapsBrowser: overlay.left < pane.right && overlay.right > pane.left && overlay.top < pane.bottom && overlay.bottom > pane.top,
+      } : null;
+    })())`));
+    assert.ok(dropBounds && [dropBounds.left, dropBounds.top, dropBounds.width, dropBounds.height].every((value) => value <= 1),
+      'drop tint covers the full chat column including its composer');
+    assert.ok(dropBounds.chatWidth > 0 && dropBounds.chatHeight > 0 && dropBounds.paneWidth > 0 && dropBounds.paneHeight > 0,
+      `chat and browser targets are both visible: ${JSON.stringify(dropBounds)}`);
+    assert.ok(dropBounds.rendered && dropBounds.display !== 'none' && dropBounds.visibility === 'visible' && dropBounds.opacity > 0,
+      `drop overlay is actually rendered: ${JSON.stringify(dropBounds)}`);
+    assert.equal(dropBounds.overlapsBrowser, false, 'visible drop tint stays outside the visible browser pane');
+    assert.equal(await evaluate(`document.querySelector('.browser-pane')?.contains(document.querySelector('.attachment-drop-overlay'))`), false,
+      'drop overlay is not rendered inside the browser pane');
+    await capture('stage3-chat-column-drop-overlay');
+    await evaluate(`document.querySelector('.composer textarea')?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
+    await waitDom('Escape dismisses the drop overlay', `!document.querySelector('.attachment-drop-overlay')`);
+    await evaluate(`(() => {
+      const column = document.querySelector('.chat-column');
+      const dataTransfer = new DataTransfer();
+      dataTransfer.items.add(new File(['image'], 'dropped.png', { type: 'image/png' }));
+      column?.querySelector('.composer')?.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer }));
+    })()`);
+    await waitUntil('OS-style drop reaches the same local chat staging bridge', () => state.chatDraftStageCalls.length === chatDropStart + 1);
+    await waitDom('dropped file appears in the composer tray', `document.querySelector('.attachment-card strong')?.textContent === 'dropped.png'`);
+    assert.equal(state.appendCalls.length, chatAppendsBeforeAttachmentPicker + 1, 'drag-and-drop does not send or create a second message');
+    const droppedId = state.details.get('chat-a').draftAttachments.find((item) => item.name === 'dropped.png')?.id;
+    assert.ok(droppedId);
+    await fillTextarea(draftSelector, 'Черновик и история сохраняются при удалении файла');
+    await waitUntil('existing-chat draft is saved before the close/removal race', () =>
+      state.details.get('chat-a')?.draft === 'Черновик и история сохраняются при удалении файла');
+    const messagesBeforeDeferredRemoval = clone(state.details.get('chat-a').messages);
+    const removeCallsBeforeClose = state.pendingChatDraftRemovals.length;
+    const closeReadyBeforeRemoval = state.closeReadyCalls;
+    const closeReturnsBeforeRemoval = state.closeReturnCalls;
+    state.deferChatDraftRemovals = true;
+    await clickText('.attachment-card button', 'Убрать');
+    await waitUntil('chat draft removal waits in the main boundary', () => state.pendingChatDraftRemovals.length === removeCallsBeforeClose + 1);
+    const closeDuringAttachmentRemoval = evaluate('window.gigaChat.auditRequestClose()');
+    await waitDom('close stays pending while a chat attachment removal is active', `document.querySelector('.close-pending-dialog')?.open === true`);
+    await sleep(80);
+    assert.equal(state.closeReadyCalls, closeReadyBeforeRemoval, 'close must drain the tracked removal before main close-ready');
+    assert.deepEqual(state.details.get('chat-a').messages, messagesBeforeDeferredRemoval, 'history remains intact during removal');
+    assert.equal(state.details.get('chat-a').draft, 'Черновик и история сохраняются при удалении файла', 'draft remains saved during removal');
+    state.pendingChatDraftRemovals[removeCallsBeforeClose].resolve();
+    await waitUntil('main close-ready follows the settled attachment removal', () => state.closeReadyCalls === closeReadyBeforeRemoval + 1);
+    assert.equal((await closeDuringAttachmentRemoval).status, 'failed');
+    await waitDom('close returns to work after the staged file is removed', `document.querySelector('.close-error-dialog')?.open === true`);
+    await clickText('.close-error-dialog button', 'Вернуться к работе');
+    await waitUntil('renderer resumes after tracked attachment removal close', async () => state.closeReturnCalls === closeReturnsBeforeRemoval + 1
+      && !(await evaluate(`document.querySelector('.close-error-dialog')?.open`)));
+    state.deferChatDraftRemovals = false;
+    await waitDom('removing a staged drop keeps the sent attachment intact', `!document.querySelector('.attachment-card strong')
+      && document.querySelector('.message-attachments')?.textContent.includes('triangle.png')`);
+    assert.deepEqual(state.details.get('chat-a').messages, messagesBeforeDeferredRemoval, 'removing a pending file does not change saved history');
+    assert.equal(state.details.get('chat-a').draft, 'Черновик и история сохраняются при удалении файла', 'removing a pending file preserves the saved chat draft');
+    assert.equal(state.details.get('chat-a').artifacts.some((item) => item.id === acceptedChatAttachment.attachmentIds[0]), true,
+      'removing a later pending file does not remove a sent artifact');
+    await click('button[aria-label="Скрыть браузер"]');
+    await waitDom('split browser closes after attachment drop proof', `!document.querySelector('.browser-pane')`);
+    state.nextChatPickedFile = { name: 'empty-chat.txt', size: 0 };
+    const emptyChatAppendCount = state.appendCalls.length;
+    await click('button[aria-label="Прикрепить файл"]');
+    await waitDom('empty existing-chat file remains staged and blocks Send', `document.querySelector('.attachment-blocker')?.textContent.includes('пуст')
+      && document.querySelector('.send-button-wrap .send-button')?.disabled`);
+    assert.equal(state.details.get('chat-a').draftAttachments.at(-1)?.size, 0);
+    assert.equal(state.appendCalls.length, emptyChatAppendCount, 'empty existing-chat attachment is rejected before append');
+    await clickText('.attachment-card button', 'Убрать');
+    await waitDom('empty existing-chat file can be removed without a history write', `!document.querySelector('.attachment-card')`);
+    passed('Existing-chat picker/drop stay local, preserve newer history, and link the sent image to one files-only message');
+
     state.rejectNextGet = 'chat-b';
     await clickChat('Chat B');
     await waitDom('chat load error and retry', `document.querySelector('.chat-view [role="alert"] button')?.textContent.includes('Повторить')`);
@@ -2226,19 +2496,33 @@ async function runElectronHost() {
     assert.equal(state.details.get('chat-a').draft, 'x', 'retry must persist the newest x after the preceding y save and failed x save');
     passed('Rendered x→y→x draft failure retains the latest text for retry');
 
-    state.deferImports = true;
+    const chatAHistoryBeforeLatePicker = clone(state.details.get('chat-a').messages);
+    const chatAArtifactsBeforeLatePicker = clone(state.details.get('chat-a').artifacts);
+    const chatAImportCallsBeforeLatePicker = state.importCalls.length;
+    const chatAAppendCallsBeforeLatePicker = state.appendCalls.length;
+    state.deferChatDraftImports = true;
+    state.nextChatPickedFile = { name: 'late-picked-a.txt', size: 40 };
+    const lateChatPickerStart = state.pendingChatDraftImports.length;
     await click('button[aria-label="Прикрепить файл"]');
-    await waitUntil('A file import', () => state.pendingImports.length === 1);
+    await waitUntil('A pending file picker', () => state.pendingChatDraftImports.length === lateChatPickerStart + 1);
     await clickChat('Chat B');
     await waitDom('chat B after navigation', `document.querySelector('.chat-header-title')?.textContent === 'Chat B' && document.querySelector('.chat-history')?.textContent.includes('B baseline')`);
-    const importedA = clone(makeDetail(chats.find((item) => item.id === 'chat-a'), 'Imported only into A'));
-    state.details.set('chat-a', importedA);
-    state.pendingImports[0].request.resolve(importedA);
+    const lateChatPicker = state.pendingChatDraftImports[lateChatPickerStart];
+    resolveChatDraftFilePicker(lateChatPicker, 'chat-a', lateChatPicker.name);
     await sleep(140);
     assert.equal(await evaluate(`document.querySelector('.chat-header-title')?.textContent`), 'Chat B');
-    assert.equal(await evaluate(`document.querySelector('.chat-history')?.textContent.includes('Imported only into A')`), false);
-    state.deferImports = false;
-    passed('Rendered late import updates its source chat without replacing the active chat');
+    assert.equal(await evaluate(`document.querySelector('.chat-history')?.textContent.includes('late-picked-a.txt')`), false);
+    assert.deepEqual(state.details.get('chat-a').messages, chatAHistoryBeforeLatePicker, 'late picker result creates no message in its source chat');
+    assert.deepEqual(state.details.get('chat-a').artifacts, chatAArtifactsBeforeLatePicker, 'late picker result does not create a legacy message artifact');
+    assert.equal(state.details.get('chat-a').draftAttachments.some((item) => item.name === 'late-picked-a.txt'), true,
+      'late picker result remains a local pending attachment on its source chat');
+    assert.equal(state.importCalls.length, chatAImportCallsBeforeLatePicker, 'pending picker does not invoke legacy chat import');
+    assert.equal(state.appendCalls.length, chatAAppendCallsBeforeLatePicker, 'pending picker does not append or send a message');
+    state.deferChatDraftImports = false;
+    await clickChat('Chat A');
+    await waitDom('A late picker file restored with its draft', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'
+      && document.querySelector('.attachment-card strong')?.textContent === 'late-picked-a.txt'`);
+    passed('Rendered late picker stages only a local A draft file without replacing B or creating a message');
 
     await clickChat('Chat A');
     await waitDom('chat A ready for accepted Skill test', `document.querySelector('.chat-header-title')?.textContent === 'Chat A' && !document.querySelector('.composer textarea')?.disabled`);
@@ -2536,6 +2820,17 @@ async function runElectronHost() {
     await waitDom('home route after accepted Send', `document.querySelector('.home-view')`);
     assert.equal(await evaluate(`document.querySelector('.composer textarea')?.value`), '',
       'a new home draft shows its own saved text, not the previous chat composer');
+    state.nextHomePickedFile = { name: 'empty.txt', size: 0 };
+    const emptyHomeSendCount = state.homeDraftSendCalls.length;
+    const emptyHomeChatCount = state.chats.length;
+    await click('button[aria-label="Прикрепить файл"]');
+    await waitDom('empty home file remains pending with a clear blocker', `document.querySelector('.attachment-blocker')?.textContent.includes('пуст')
+      && document.querySelector('.send-button-wrap .send-button')?.disabled`);
+    assert.equal(state.homeDraft.attachments.at(-1)?.size, 0);
+    assert.equal(state.homeDraftSendCalls.length, emptyHomeSendCount, 'empty home attachment is rejected before acceptance');
+    assert.equal(state.chats.length, emptyHomeChatCount, 'empty home attachment cannot create an empty chat');
+    await clickText('.attachment-card button', 'Убрать');
+    await waitDom('empty home file can be removed without changing the home route', `!document.querySelector('.attachment-card') && document.querySelector('.home-view')`);
     await fillTextarea(draftSelector, 'Accepted A before a late home edit');
     await waitUntil('source A persisted before Send', () => state.homeDraft.text === 'Accepted A before a late home edit');
     state.deferHomeDraftSendResponse = true;
@@ -3803,9 +4098,9 @@ async function runElectronHost() {
 const fakePreloadSource = String.raw`
 const { contextBridge, ipcRenderer } = require('electron');
 const methods = {
-  homeDraft: ['get','save','importFile','removeFile','send'],
+  homeDraft: ['get','save','importFile','pickFiles','stageFiles','getAttachmentPreview','removeFile','send'],
   projects: ['list','create','pickFolder','instructionsBackupPath','update','remove','chooseFolder','openFolder','readInstructions','saveInstructions','saveInstructionsCopy'],
-  chats: ['list','get','create','update','appendLocalMessage','importFile','openArtifact','openFolder','remove'],
+  chats: ['list','get','create','update','appendLocalMessage','importFile','pickDraftFiles','stageDraftFiles','getDraftAttachmentPreview','getArtifactPreview','removeDraftFile','openArtifact','openFolder','remove'],
   runtime: ['getStatus','list','cancel','retry'],
   permissions: ['readConfig','saveConfig','respond'],
   skills: ['list','readSource','setEnabled','openFolder'],
@@ -3821,6 +4116,8 @@ const api = {};
 for (const [group, names] of Object.entries(methods)) {
   api[group] = Object.fromEntries(names.map((name) => [name, (...args) => ipcRenderer.invoke('audit:api', group, name, args)]));
 }
+api.homeDraft.stageFiles = (files) => ipcRenderer.invoke('audit:api', 'homeDraft', 'stageFiles', [Array.from(files, (file) => ({ name: file.name, size: file.size }))]);
+api.chats.stageDraftFiles = (id, files) => ipcRenderer.invoke('audit:api', 'chats', 'stageDraftFiles', [id, Array.from(files, (file) => ({ name: file.name, size: file.size }))]);
 for (const [group, channel] of [['runtime','audit:runtime'],['permissions','audit:permission'],['onboarding','audit:onboarding'],['browser','audit:browser']]) {
   const method = group === 'runtime' ? 'onUpdate' : group === 'permissions' ? 'onRequest' : group === 'onboarding' ? 'onBrowserStatus' : 'onStatus';
   api[group][method] = (listener) => {

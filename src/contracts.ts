@@ -60,6 +60,7 @@ export interface ChatMessage {
   createdAt: string;
   source?: 'runtime' | 'example';
   functionsStateId?: string;
+  attachmentIds?: string[];
 }
 
 export interface CompactSnapshot {
@@ -133,10 +134,21 @@ export interface ProviderTurnRequest {
   system: InstructionLayer[];
   messages: ChatMessage[];
   protocolHistory?: ProviderProtocolExchange[];
+  attachments?: ProviderAttachmentReference[];
   permissionProfile: PermissionProfile;
   modelId: GigaChatModelId | null;
   usageKind?: UsageRequestKind;
   functionCallMode?: 'auto' | 'none';
+}
+
+export interface ProviderAttachmentReference {
+  messageId: string;
+  attachmentId: string;
+  fileId: string;
+  name: string;
+  contentType: string;
+  kind: 'document' | 'image';
+  sizeBytes: number;
 }
 
 export type UsageRequestKind = 'chat' | 'tool-continuation' | 'compaction';
@@ -245,6 +257,7 @@ export interface AcceptedTurnInput {
   messageId: string;
   historyBoundary: number;
   messages: ChatMessage[];
+  attachmentIds?: string[];
   permissionProfile: PermissionProfile;
   modelId: GigaChatModelId | null;
   skillId: string | null;
@@ -257,7 +270,7 @@ export interface AcceptedTurnInput {
 export type ProviderToolName = 'list' | 'search' | 'read' | 'write' | 'open' | 'powershell';
 
 export type ProviderEvent =
-  | { type: 'activity'; activity: 'connecting' | 'receiving' | 'waiting-for-tool' | 'tool-started' | 'tool-finished'; tool?: ProviderToolName }
+  | { type: 'activity'; activity: 'connecting' | 'receiving' | 'waiting-for-tool' | 'tool-started' | 'tool-finished' | 'function-progress'; tool?: ProviderToolName; functionName?: 'get_file_content' | 'text2image'; detail?: string }
   | ({ type: 'usage' } & ProviderUsageValues)
   | { type: 'text-delta'; text: string }
   | { type: 'function-call'; functionCall: ProviderFunctionCall }
@@ -268,10 +281,37 @@ export interface GigaChatProvider {
   stream(request: ProviderTurnRequest, signal: AbortSignal): AsyncIterable<ProviderEvent>;
 }
 
+export interface ProviderFileRecord {
+  id: string;
+  filename: string;
+  bytes: number;
+  purpose: 'general';
+}
+
+export interface ProviderFileUploadInput {
+  filename: string;
+  contentType: string;
+  bytes: Uint8Array;
+}
+
+export interface ProviderUploadLedgerEntry {
+  accountScope: string;
+  attachmentId: string;
+  uploadFilename: string;
+  name: string;
+  contentType: string;
+  kind: 'document' | 'image';
+  sizeBytes: number;
+  sha256: string;
+  state: 'intent' | 'uploaded' | 'unknown' | 'cleanup-pending';
+  remoteFileId: string | null;
+  createdAt: string;
+}
+
 export type RuntimeTurnStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
 
 export type RuntimeActivity =
-  | { kind: 'provider'; at: string; activity: Extract<ProviderEvent, { type: 'activity' }>['activity']; tool?: ProviderToolName }
+  | { kind: 'provider'; at: string; activity: Extract<ProviderEvent, { type: 'activity' }>['activity']; tool?: ProviderToolName; functionName?: 'get_file_content' | 'text2image'; detail?: string }
   | { kind: 'tool'; at: string; tool: ProviderToolName; phase: 'started' | 'completed' | 'failed' | 'cancelled'; durationMs?: number }
   | { kind: 'hook'; at: string; hookId: string; hookName: string; event: HookEvent; status: HookRunResult['status']; reason?: string };
 
@@ -320,6 +360,7 @@ export interface ChatArtifact {
   name: string;
   storedName: string;
   size: number;
+  sha256?: string;
   createdAt: string;
   messageId: string | null;
 }
@@ -361,6 +402,16 @@ export interface HomeDraftSendResult {
   newlyAccepted: boolean;
 }
 
+export interface AttachmentImportFailure {
+  name: string;
+  reason: string;
+}
+
+export interface AttachmentImportBatchResult<T> {
+  record: T;
+  failures: AttachmentImportFailure[];
+}
+
 export interface ChatDetail extends ChatSummary {
   draft: string;
   nextTurnPermissionProfile: PermissionProfile | null;
@@ -369,6 +420,7 @@ export interface ChatDetail extends ChatSummary {
   messages: ChatMessage[];
   toolReceipts: ChatToolReceipt[];
   artifacts: ChatArtifact[];
+  draftAttachments: HomeDraftAttachment[];
   compactSnapshot: CompactSnapshot | null;
 }
 
@@ -546,6 +598,9 @@ export interface AppApi {
     get(): Promise<HomeDraftRecord>;
     save(input: HomeDraftInput): Promise<HomeDraftRecord>;
     importFile(): Promise<HomeDraftRecord | null>;
+    pickFiles(): Promise<AttachmentImportBatchResult<HomeDraftRecord> | null>;
+    stageFiles(files: File[]): Promise<AttachmentImportBatchResult<HomeDraftRecord>>;
+    getAttachmentPreview(id: string): Promise<string | null>;
     removeFile(id: string): Promise<HomeDraftRecord>;
     send(expectedRevision: number): Promise<HomeDraftSendResult>;
   };
@@ -567,7 +622,12 @@ export interface AppApi {
     get(id: string): Promise<ChatDetail>;
     create(projectId?: string | null, kind?: ChatKind): Promise<ChatSummary>;
     update(id: string, patch: ChatPatch): Promise<ChatSummary>;
-    appendLocalMessage(id: string, text: string): Promise<ChatDetail>;
+    appendLocalMessage(id: string, text: string, attachmentIds?: string[]): Promise<ChatDetail>;
+    pickDraftFiles(id: string): Promise<AttachmentImportBatchResult<ChatDetail> | null>;
+    stageDraftFiles(id: string, files: File[]): Promise<AttachmentImportBatchResult<ChatDetail>>;
+    getDraftAttachmentPreview(id: string, attachmentId: string): Promise<string | null>;
+    getArtifactPreview(id: string, artifactId: string): Promise<string | null>;
+    removeDraftFile(id: string, attachmentId: string): Promise<ChatDetail>;
     importFile(id: string | null, projectId?: string | null): Promise<ChatDetail | null>;
     openArtifact(id: string, artifactId: string): Promise<void>;
     openFolder(id: string): Promise<void>;

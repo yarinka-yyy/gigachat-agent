@@ -79,6 +79,18 @@ test('chat enforcement requires an exact listed current ID and verified basic ca
   assert.match(chatModelUnavailableReason(failedModelRegistry('network'), 'GigaChat-3-Ultra') ?? '', /подтвердить актуальный список/);
 });
 
+test('keeps document and JPEG capability evidence separate and per-model', () => {
+  const ultra = getModelCapabilities('GigaChat-3-Ultra');
+  assert.equal(ultra.md, 'verified', 'the real Ultra probe semantically read the Markdown text/plain fixture');
+  assert.equal(ultra.jpeg, 'verified', 'the supplemental real Ultra probe identified the JPEG fixture');
+  for (const modelId of ['GigaChat-2-Max', 'GigaChat-3-Pro', 'GigaChat-3-Lightning']) {
+    const capabilities = getModelCapabilities(modelId);
+    assert.equal(capabilities.md, 'unverified', `${modelId} has no separate Markdown proof`);
+    assert.equal(capabilities.jpeg, 'unverified', `${modelId} has no separate JPEG proof`);
+  }
+  assert.equal('multipleImages' in ultra, false, 'a single-image proof does not establish grouped multi-image capability');
+});
+
 test('quota exhaustion affects only the reported model while independent models and raw discovery remain intact', () => {
   const rawIds = ['GigaChat-3-Ultra', 'GigaChat-2-Max', 'GigaChat-3-Pro'];
   const registry = { ...discoveredModelRegistry(rawIds), exhaustedModelIds: ['GigaChat-3-Ultra'] };
