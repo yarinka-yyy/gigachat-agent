@@ -27,6 +27,7 @@ function turnFor(chatId: string, text = chatId): AcceptedTurnInput {
   const message = { id: `message-${turnId}`, role: 'user' as const, text, createdAt: '2026-09-27T00:00:00.000Z' };
   return {
     turnId, chatId, projectId: null, projectWorkingFolder: null, messageId: message.id,
+    assistantMessageId: `assistant-${turnId}`,
     historyBoundary: 1, messages: [message], modelId: 'GigaChat-2-Pro', permissionProfile: 'ask', skillId: null,
     reservation: { permissionProfileRevision: null, skillRevision: null },
   };
@@ -36,6 +37,7 @@ function compactionTurnFor(chatId: string): AcceptedTurnInput {
   const turn = turnFor(chatId, 'Сожми историю');
   return {
     ...turn,
+    assistantMessageId: null,
     operation: 'compaction',
     compactBoundaryMessageId: turn.messageId,
     compactExpectedSnapshotId: null,
@@ -52,7 +54,7 @@ function requestFor(turn: AcceptedTurnInput): ProviderTurnRequest {
 }
 
 function makeRuntime(provider: GigaChatProvider | null, options: {
-  appendAssistant?: (chatId: string, text: string, signal: AbortSignal, functionsStateId?: string) => Promise<void>;
+  appendAssistant?: (chatId: string, text: string, signal: AbortSignal, functionsStateId?: string, acceptedTurn?: AcceptedTurnInput, terminalTurn?: RuntimeTurnSnapshot) => Promise<void>;
   tools?: LocalTools;
   beginToolReceipt?: TurnRuntimeOptions['beginToolReceipt'];
   completeToolReceipt?: TurnRuntimeOptions['completeToolReceipt'];
@@ -72,7 +74,7 @@ function makeRuntime(provider: GigaChatProvider | null, options: {
     consumeTurn: async () => undefined,
     releaseTurn: options.releaseTurn ?? (() => undefined),
     appendAssistant: options.appendAssistant
-      ? async (turn, text, signal, functionsStateId) => options.appendAssistant?.(turn.chatId, text, signal, functionsStateId)
+      ? async (turn, text, signal, functionsStateId, terminalTurn) => options.appendAssistant?.(turn.chatId, text, signal, functionsStateId, turn, terminalTurn)
       : async () => undefined,
     recordUsageReceipt: options.recordUsageReceipt ?? (async (receipt) => {
       const index = usageReceipts.findIndex((item) => item.localRequestId === receipt.localRequestId);
@@ -158,6 +160,111 @@ function functionCall(name: string, args: Record<string, unknown>, functionsStat
   };
 }
 
+test('runtime keeps the FIFO turn running until assistant and completed turn persist atomically', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-runtime-turn-commit-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Pro' });
+  const first = await store.acceptLocalMessage(chat.id, 'first accepted request', 'turn-commit-first');
+  const second = await store.acceptLocalMessage(chat.id, 'second accepted request', 'turn-commit-second');
+  const finalSaveStarted = deferred();
+  const allowFirstSave = deferred();
+  let providerStarts = 0;
+  const provider = makeProvider(async function* () {
+    providerStarts += 1;
+    yield { type: 'text-delta', text: `answer-${providerStarts}` };
+    yield { type: 'completed' };
+  });
+  const runtime = createTurnRuntime({
+    provider, tools: testTools,
+    prepareTurn: async (turn) => requestFor(turn),
+    consumeTurn: async () => undefined,
+    releaseTurn: () => undefined,
+    persistTurnRecord: (turn) => store.updateRuntimeTurn(turn),
+    appendAssistant: async (turn, text, signal, functionsStateId, terminalTurn) => {
+      if (turn.turnId === first.turn.turnId) {
+        finalSaveStarted.resolve();
+        await allowFirstSave.promise;
+      }
+      await store.appendAssistantMessageFromRuntime(turn, text, terminalTurn, signal, functionsStateId);
+    },
+    recordUsageReceipt: async () => undefined,
+  });
+
+  assert.ok(runtime.enqueue(first.turn));
+  assert.ok(runtime.enqueue(second.turn));
+  await finalSaveStarted.promise;
+
+  assert.equal(runtime.list().find((turn) => turn.id === first.turn.turnId)?.status, 'running');
+  assert.equal(runtime.list().find((turn) => turn.id === second.turn.turnId)?.status, 'queued');
+  assert.equal(providerStarts, 1, 'the next provider request waits for the first durable final save');
+  const pendingDetail = await store.getChat(chat.id);
+  assert.equal(pendingDetail.messages.some((message) => message.role === 'assistant'), false);
+  assert.equal(pendingDetail.turns.find((turn) => turn.turnId === first.turn.turnId)?.status, 'running');
+
+  allowFirstSave.resolve();
+  await runtime.whenIdle();
+
+  const detail = await (await openStore(directory)).getChat(chat.id);
+  assert.equal(providerStarts, 2);
+  assert.deepEqual(detail.messages.map((message) => [message.role, message.text]), [
+    ['user', 'first accepted request'], ['assistant', 'answer-1'],
+    ['user', 'second accepted request'], ['assistant', 'answer-2'],
+  ]);
+  assert.deepEqual(detail.turns.map((turn) => [turn.turnId, turn.anchorMessageId, turn.assistantMessageId, turn.status]), [
+    [first.turn.turnId, first.turn.messageId, first.turn.assistantMessageId, 'completed'],
+    [second.turn.turnId, second.turn.messageId, second.turn.assistantMessageId, 'completed'],
+  ]);
+});
+
+test('persists scoped Hook activity IDs and multiline provider progress through runtime and store reload', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-runtime-scoped-hook-record-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const project = await store.createProject('Scoped Hook record', directory);
+  const chat = await store.createChat(project.id);
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Pro' });
+  const accepted = await store.acceptLocalMessage(chat.id, 'Read the document safely.', 'turn-scoped-hooks');
+  const progress = 'Страница 1:\nчитаю\tготово';
+  const provider = makeProvider(async function* () {
+    yield { type: 'activity', activity: 'function-progress', functionName: 'get_file_content', detail: progress };
+    yield { type: 'text-delta', text: 'Содержимое прочитано.' };
+    yield { type: 'completed' };
+  });
+  const runtime = createTurnRuntime({
+    provider, tools: testTools,
+    prepareTurn: async (turn) => requestFor(turn),
+    consumeTurn: (turn, signal) => store.consumeTurnReservation(turn, signal),
+    releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
+    persistTurnRecord: (turn) => store.updateRuntimeTurn(turn),
+    appendAssistant: async (turn, text, signal, functionsStateId, terminalTurn) => {
+      await store.appendAssistantMessageFromRuntime(turn, text, terminalTurn, signal, functionsStateId);
+    },
+    recordUsageReceipt: async () => undefined,
+    runHooks: async (_turn, input) => input.event === 'user-prompt-submitted' ? [
+      { hookId: 'global/guard', hookName: 'Guard', event: input.event, status: 'completed' },
+      { hookId: `project/${project.id}/audit`, hookName: 'Audit', event: input.event, status: 'completed' },
+      { hookId: 'skill/global/reader/guard', hookName: 'Global Skill guard', event: input.event, status: 'completed' },
+      { hookId: `skill/project/${project.id}/reader/audit`, hookName: 'Project Skill audit', event: input.event, status: 'completed' },
+    ] : [],
+  });
+
+  runtime.enqueue(accepted.turn);
+  await runtime.whenIdle();
+
+  const restored = await (await openStore(directory)).getChat(chat.id);
+  const record = restored.turns.find((turn) => turn.turnId === accepted.turn.turnId);
+  assert.equal(record?.status, 'completed');
+  assert.deepEqual(record?.activity.filter((item) => item.kind === 'hook').map((item) => item.kind === 'hook' ? item.hookId : ''), [
+    'global/guard', `project/${project.id}/audit`, 'skill/global/reader/guard', `skill/project/${project.id}/reader/audit`,
+  ]);
+  assert.equal(record?.activity.find((item) => item.kind === 'provider' && item.activity === 'function-progress')?.kind, 'provider');
+  const savedProgress = record?.activity.find((item) => item.kind === 'provider' && item.activity === 'function-progress');
+  assert.equal(savedProgress?.kind === 'provider' ? savedProgress.detail : undefined, progress);
+  assert.equal(restored.messages.find((message) => message.id === accepted.turn.assistantMessageId)?.text, 'Содержимое прочитано.');
+});
+
 async function waitUntil(predicate: () => boolean): Promise<void> {
   const deadline = Date.now() + 2000;
   while (!predicate()) {
@@ -201,7 +308,7 @@ test('keeps provider built-in file progress in activity instead of answer text o
   let localToolCalls = 0;
   const saved: string[] = [];
   const provider = makeProvider(async function* () {
-    yield { type: 'activity', activity: 'function-progress', functionName: 'get_file_content', detail: 'осталось 2 секунды' };
+    yield { type: 'activity', activity: 'function-progress', functionName: 'get_file_content', detail: 'Осталось:\n2 секунды\tпроверяем' };
     yield { type: 'text-delta', text: 'Прочитанное содержимое' };
     yield { type: 'completed' };
   });
@@ -219,9 +326,9 @@ test('keeps provider built-in file progress in activity instead of answer text o
   assert.deepEqual(saved, ['Прочитанное содержимое']);
   assert.deepEqual(turn.activity.filter((item) => item.kind === 'provider' && item.activity === 'function-progress')
     .map((item) => item.kind === 'provider' ? { functionName: item.functionName, detail: item.detail } : null), [
-      { functionName: 'get_file_content', detail: 'осталось 2 секунды' },
+      { functionName: 'get_file_content', detail: 'Осталось:\n2 секунды\tпроверяем' },
     ]);
-  assert.doesNotMatch(saved.join(' '), /осталось 2 секунды|get_file_content/);
+  assert.doesNotMatch(saved.join(' '), /Осталось:|2 секунды|get_file_content/);
 });
 
 test('holds FIFO through delayed compaction save and its single after hook', async () => {
@@ -975,6 +1082,54 @@ test('cancels a queued turn without starting it', async () => {
   assert.deepEqual(consumed, ['chat-one']);
 });
 
+test('keeps FIFO blocked when persisting a queued cancellation fails', async () => {
+  const firstGate = deferred();
+  let cancelledSaveStarted = false;
+  let rejectCancelledSave!: (error: Error) => void;
+  const cancelledSave = new Promise<void>((_resolve, reject) => { rejectCancelledSave = reject; });
+  const started: string[] = [];
+  let cancelledTurnId = '';
+  const provider = makeProvider(async function* (request) {
+    const chatId = request.messages[0]?.text ?? '';
+    started.push(chatId);
+    if (chatId === 'chat-one') await firstGate.promise;
+    yield { type: 'text-delta', text: 'Готово' };
+    yield { type: 'completed' };
+  });
+  const runtime = createTurnRuntime({
+    provider,
+    tools: testTools,
+    prepareTurn: async (turn) => requestFor(turn),
+    consumeTurn: async () => undefined,
+    releaseTurn: () => undefined,
+    appendAssistant: async () => undefined,
+    recordUsageReceipt: async () => undefined,
+    persistTurnRecord: async (turn) => {
+      if (turn.id === cancelledTurnId && turn.status === 'cancelled') {
+        cancelledSaveStarted = true;
+        await cancelledSave;
+      }
+    },
+  });
+  runtime.enqueue(turnFor('chat-one'));
+  cancelledTurnId = runtime.enqueue(turnFor('chat-two'))!;
+  runtime.enqueue(turnFor('chat-three'));
+  await waitUntil(() => started.length === 1);
+  assert.equal(runtime.cancel(cancelledTurnId), true);
+  await waitUntil(() => cancelledSaveStarted);
+  const idle = assert.rejects(runtime.whenIdle(), /остановка хода не подтверждена/i);
+
+  firstGate.resolve();
+  await waitUntil(() => runtime.list('chat-one')[0]?.status === 'completed');
+  assert.deepEqual(started, ['chat-one']);
+
+  rejectCancelledSave(new Error('synthetic queued cancellation save failure'));
+  await waitUntil(() => runtime.list('chat-two')[0]?.status === 'failed');
+  await idle;
+  assert.equal(runtime.list('chat-two')[0]?.errorCategory, 'storage');
+  assert.deepEqual(started, ['chat-one']);
+});
+
 test('cancels an active turn, waits for it to stop, then starts the next turn', async () => {
   const firstStarted = deferred();
   const started: string[] = [];
@@ -1511,8 +1666,9 @@ test('uploads only the accepted message attachments inside the FIFO turn and doe
     }),
     consumeTurn: (turn, signal) => store.consumeTurnReservation(turn, signal),
     releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
-    appendAssistant: async (turn, text, signal, functionsStateId) => {
-      await store.appendAssistantMessageFromRuntime(turn.chatId, turn.messageId, text, signal, functionsStateId);
+    persistTurnRecord: (turn) => store.updateRuntimeTurn(turn),
+    appendAssistant: async (turn, text, signal, functionsStateId, terminalTurn) => {
+      await store.appendAssistantMessageFromRuntime(turn, text, terminalTurn, signal, functionsStateId);
     },
     recordUsageReceipt: async () => undefined,
   });
@@ -1590,8 +1746,9 @@ test('a missing prior remote upload asks to reattach and never silently uploads 
     }),
     consumeTurn: (turn, signal) => store.consumeTurnReservation(turn, signal),
     releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
-    appendAssistant: async (turn, text, signal, functionsStateId) => {
-      await store.appendAssistantMessageFromRuntime(turn.chatId, turn.messageId, text, signal, functionsStateId);
+    persistTurnRecord: (turn) => store.updateRuntimeTurn(turn),
+    appendAssistant: async (turn, text, signal, functionsStateId, terminalTurn) => {
+      await store.appendAssistantMessageFromRuntime(turn, text, terminalTurn, signal, functionsStateId);
     },
     recordUsageReceipt: async () => undefined,
   });

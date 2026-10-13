@@ -32,6 +32,7 @@ function fixture(chatId = 'chat-one', hasAttachment = true, originalName = 'note
   } as unknown as ChatDetail;
   const turn: AcceptedTurnInput = {
     turnId: 'turn-one', chatId, projectId: null, projectWorkingFolder: null, messageId: 'message-one',
+    assistantMessageId: 'assistant-one',
     historyBoundary: 1, messages: structuredClone(detail.messages), ...(hasAttachment ? { attachmentIds: [attachmentId] } : {}),
     permissionProfile: 'ask', modelId: 'GigaChat-3-Pro', skillId: null,
     reservation: { permissionProfileRevision: null, skillRevision: null },
@@ -211,7 +212,7 @@ test('cleans up a lost upload acknowledgment after the chat is removed and prese
   const message = { id: 'later-message', role: 'user' as const, text: 'Continue', createdAt: at };
   const cleanupTurn: AcceptedTurnInput = {
     turnId: 'later-turn', chatId: 'later-chat', projectId: null, projectWorkingFolder: null,
-    messageId: message.id, historyBoundary: 1, messages: [message], permissionProfile: 'ask',
+    messageId: message.id, assistantMessageId: 'later-assistant', historyBoundary: 1, messages: [message], permissionProfile: 'ask',
     modelId: 'GigaChat-3-Pro', skillId: null,
     reservation: { permissionProfileRevision: null, skillRevision: null },
   };
@@ -326,7 +327,7 @@ test('leaves an ambiguous orphan upload durably unknown instead of deleting a ca
   const message = { id: 'later-message', role: 'user' as const, text: 'Continue', createdAt: at };
   const cleanupTurn: AcceptedTurnInput = {
     turnId: 'later-turn', chatId: 'later-chat', projectId: null, projectWorkingFolder: null,
-    messageId: message.id, historyBoundary: 1, messages: [message], permissionProfile: 'ask',
+    messageId: message.id, assistantMessageId: 'later-assistant', historyBoundary: 1, messages: [message], permissionProfile: 'ask',
     modelId: 'GigaChat-3-Pro', skillId: null,
     reservation: { permissionProfileRevision: null, skillRevision: null },
   };

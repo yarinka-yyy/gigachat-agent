@@ -829,6 +829,7 @@ test('runs GigaChat read and approved write through the actual native helper in 
   runtime.enqueue({
     turnId: 'turn-helper', chatId: 'chat-helper', projectId: fixture.project.id,
     projectWorkingFolder: fixture.projectFolder, messageId: 'message-helper', historyBoundary: 1,
+    assistantMessageId: 'assistant-turn-helper',
     messages: [{ id: 'message-helper', role: 'user', text: 'Прочитай и запиши файл', createdAt: '2026-09-27T00:00:00.000Z' }],
     modelId: 'GigaChat-2-Pro', permissionProfile: 'custom', skillId: null,
     reservation: { permissionProfileRevision: null, skillRevision: null },

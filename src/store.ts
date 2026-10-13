@@ -3,7 +3,7 @@ import { Buffer } from 'node:buffer';
 import { constants } from 'node:fs';
 import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { DEFAULT_NOTIFICATION_SETTINGS, type AcceptedTurnInput, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type CompactSnapshot, type CompactionPrefix, type HomeDraftAttachment, type HomeDraftInput, type HomeDraftRecord, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderProtocolExchange, type ProviderUploadLedgerEntry, type Settings, type SettingsPatch, type Theme, type UsageLedgerSummary, type UsageReceipt } from './contracts';
+import { DEFAULT_NOTIFICATION_SETTINGS, PROVIDER_ERROR_CATEGORIES, type AcceptedTurnInput, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type ChatTurnRecord, type CompactSnapshot, type CompactionPrefix, type HomeDraftAttachment, type HomeDraftInput, type HomeDraftRecord, type HookEvent, type HookRunResult, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderErrorCategory, type ProviderProtocolExchange, type ProviderToolName, type ProviderUploadLedgerEntry, type RuntimeActivity, type RuntimeTurnSnapshot, type Settings, type SettingsPatch, type Theme, type UsageLedgerSummary, type UsageReceipt } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { requireModelId } from './models';
 import { isSkillId } from './skills';
@@ -59,6 +59,8 @@ const MAX_USAGE_LEDGER_BYTES = 32 * 1024 * 1024;
 const MAX_PROVIDER_UPLOAD_LEDGER_BYTES = 16 * 1024 * 1024;
 const MAX_PROVIDER_UPLOAD_ENTRIES = 10_000;
 const MAX_TOOL_RECEIPTS_PER_CHAT = 256;
+const MAX_TURN_ACTIVITY_PER_TURN = 50;
+const MAX_TURN_RECORDS_PER_CHAT = 50_000;
 const MAX_TOOL_ARGUMENTS_BYTES = 1_900_000;
 const MAX_TOOL_RESULT_BYTES = 32 * 1024;
 const MAX_HOME_DRAFT_BYTES = 1_000_000;
@@ -111,8 +113,9 @@ export interface LocalStore {
   reserveRetryTurn(original: AcceptedTurnInput, retry: AcceptedTurnInput): Promise<void>;
   consumeTurnReservation(turn: AcceptedTurnInput, signal?: AbortSignal): Promise<void>;
   validateAcceptedTurn(turn: AcceptedTurnInput): Promise<void>;
-  appendAssistantMessageFromRuntime(id: unknown, messageId: unknown, text: unknown, signal?: AbortSignal, functionsStateId?: unknown): Promise<ChatDetail>;
-  commitCompactSnapshot(id: unknown, snapshot: CompactSnapshot, expectedSnapshotId: string | null, signal?: AbortSignal): Promise<ChatDetail>;
+  updateRuntimeTurn(turn: RuntimeTurnSnapshot): Promise<void>;
+  appendAssistantMessageFromRuntime(turn: AcceptedTurnInput, text: unknown, terminalTurn: RuntimeTurnSnapshot, signal?: AbortSignal, functionsStateId?: unknown): Promise<ChatDetail>;
+  commitCompactSnapshot(id: unknown, snapshot: CompactSnapshot, expectedSnapshotId: string | null, signal?: AbortSignal, terminalTurn?: RuntimeTurnSnapshot): Promise<ChatDetail>;
   importFile(id: unknown, sourcePath: string, projectId?: unknown): Promise<ChatDetail>;
   getArtifactPath(id: unknown, artifactId: unknown): Promise<string>;
   getChatFolder(id: unknown): Promise<string>;
@@ -498,12 +501,158 @@ function validateCompactSnapshot(value: unknown, messages: readonly ChatMessage[
   };
 }
 
+const CHAT_TURN_STATUSES = ['queued', 'running', 'completed', 'failed', 'cancelled', 'interrupted'] as const;
+const CHAT_TURN_PROVIDER_EVENTS = ['connecting', 'receiving', 'waiting-for-tool', 'tool-started', 'tool-finished', 'function-progress'] as const;
+const CHAT_TURN_TOOL_NAMES = ['list', 'search', 'read', 'write', 'open', 'powershell'] as const;
+const CHAT_TURN_HOOK_EVENTS = ['session-start', 'project-start', 'user-prompt-submitted', 'before-tool', 'after-tool', 'permission-request', 'before-compaction', 'after-compaction', 'interrupt', 'stop', 'session-end', 'project-end'] as const;
+const CHAT_TURN_HOOK_STATUSES = ['completed', 'blocked', 'failed', 'skipped', 'cancelled'] as const;
+const MAX_TURN_DURATION_MS = 366 * 24 * 60 * 60 * 1000;
+
+function validateRuntimeActivity(value: unknown): RuntimeActivity {
+  if (!isRecord(value) || typeof value.kind !== 'string') throw new Error('Некорректная запись активности хода.');
+  if (value.kind === 'provider') {
+    if (!(CHAT_TURN_PROVIDER_EVENTS as readonly unknown[]).includes(value.activity)
+      || (value.tool !== undefined && !(CHAT_TURN_TOOL_NAMES as readonly unknown[]).includes(value.tool))
+      || (value.functionName !== undefined && value.functionName !== 'get_file_content' && value.functionName !== 'text2image')
+      || (value.detail !== undefined && (typeof value.detail !== 'string' || value.detail.length > 1000
+        // eslint-disable-next-line no-control-regex -- Allow line breaks/tabs but reject other control characters in persisted provider activity.
+        || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value.detail)))) {
+      throw new Error('Некорректная запись активности провайдера.');
+    }
+    if (value.activity === 'function-progress' && (typeof value.functionName !== 'string' || typeof value.detail !== 'string')) {
+      throw new Error('В записи активности отсутствуют данные функции.');
+    }
+    if (value.activity !== 'function-progress' && (value.functionName !== undefined || value.detail !== undefined)) {
+      throw new Error('Данные функции не привязаны к событию активности.');
+    }
+    return {
+      kind: 'provider', at: requireTimestamp(value.at),
+      activity: value.activity as Extract<RuntimeActivity, { kind: 'provider' }>['activity'],
+      ...(value.tool === undefined ? {} : { tool: value.tool as ProviderToolName }),
+      ...(value.functionName === undefined ? {} : { functionName: value.functionName as 'get_file_content' | 'text2image' }),
+      ...(value.detail === undefined ? {} : { detail: value.detail as string }),
+    } as RuntimeActivity;
+  }
+  if (value.kind === 'tool') {
+    if (!(CHAT_TURN_TOOL_NAMES as readonly unknown[]).includes(value.tool)
+      || !['started', 'completed', 'failed', 'cancelled'].includes(String(value.phase))
+      || (value.durationMs !== undefined && (!Number.isSafeInteger(value.durationMs) || (value.durationMs as number) < 0 || (value.durationMs as number) > MAX_TURN_DURATION_MS))) {
+      throw new Error('Некорректная запись локального инструмента.');
+    }
+    return {
+      kind: 'tool', at: requireTimestamp(value.at), tool: value.tool as 'list' | 'search' | 'read' | 'write' | 'open' | 'powershell',
+      phase: value.phase as 'started' | 'completed' | 'failed' | 'cancelled',
+      ...(value.durationMs === undefined ? {} : { durationMs: value.durationMs as number }),
+    };
+  }
+  if (value.kind === 'hook') {
+    if (!(CHAT_TURN_HOOK_EVENTS as readonly unknown[]).includes(value.event)
+      || !(CHAT_TURN_HOOK_STATUSES as readonly unknown[]).includes(value.status)
+      || typeof value.hookName !== 'string' || !value.hookName.trim() || value.hookName.length > 120
+      || (value.reason !== undefined && (typeof value.reason !== 'string' || value.reason.length > 500))) {
+      throw new Error('Некорректная запись Hook.');
+    }
+    return {
+      kind: 'hook', at: requireTimestamp(value.at), hookId: requireScopedHookId(value.hookId), hookName: value.hookName,
+      event: value.event as HookEvent, status: value.status as HookRunResult['status'],
+      ...(value.reason === undefined ? {} : { reason: value.reason as string }),
+    } as RuntimeActivity;
+  }
+  throw new Error('Неизвестный вид активности хода.');
+}
+
+function requireScopedHookId(value: unknown): string {
+  if (typeof value !== 'string' || !value.trim() || value.length > 512
+    // eslint-disable-next-line no-control-regex -- Hook IDs are opaque scoped registry identifiers; controls are never valid.
+    || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error('Некорректный идентификатор Hook.');
+  }
+  return value;
+}
+
+function validateChatTurnRecord(value: unknown): ChatTurnRecord {
+  if (!isRecord(value) || !(CHAT_TURN_STATUSES as readonly unknown[]).includes(value.status)
+    || (value.operation !== undefined && value.operation !== 'compaction')
+    || (value.modelId !== null && value.modelId !== undefined && typeof value.modelId !== 'string')
+    || !Array.isArray(value.activity) || value.activity.length > MAX_TURN_ACTIVITY_PER_TURN
+    || (value.startedAt !== undefined && !Number.isFinite(Date.parse(String(value.startedAt))))
+    || (value.endedAt !== undefined && !Number.isFinite(Date.parse(String(value.endedAt))))
+    || (value.queueDurationMs !== undefined && (!Number.isSafeInteger(value.queueDurationMs) || (value.queueDurationMs as number) < 0 || (value.queueDurationMs as number) > MAX_TURN_DURATION_MS))
+    || (value.activeDurationMs !== undefined && (!Number.isSafeInteger(value.activeDurationMs) || (value.activeDurationMs as number) < 0 || (value.activeDurationMs as number) > MAX_TURN_DURATION_MS))
+    || (value.error !== undefined && (typeof value.error !== 'string' || value.error.length > 1000))
+    || (value.errorCategory !== undefined && !(PROVIDER_ERROR_CATEGORIES as readonly unknown[]).includes(value.errorCategory))) {
+    throw new Error('Некорректная запись хода чата.');
+  }
+  const operation = value.operation as 'compaction' | undefined;
+  const assistantMessageId = value.assistantMessageId === null ? null : requireId(value.assistantMessageId);
+  if ((operation === 'compaction') !== (assistantMessageId === null)
+    || (value.status !== 'queued' && value.status !== 'running' && value.endedAt === undefined)) {
+    throw new Error('Идентификаторы или время завершения хода не согласованы.');
+  }
+  return {
+    turnId: requireId(value.turnId),
+    anchorMessageId: requireId(value.anchorMessageId),
+    assistantMessageId,
+    modelId: value.modelId === null || value.modelId === undefined ? null : requireModelId(value.modelId),
+    ...(operation ? { operation } : {}),
+    status: value.status as ChatTurnRecord['status'],
+    createdAt: requireTimestamp(value.createdAt),
+    ...(value.startedAt === undefined ? {} : { startedAt: requireTimestamp(value.startedAt) }),
+    ...(value.endedAt === undefined ? {} : { endedAt: requireTimestamp(value.endedAt) }),
+    ...(value.queueDurationMs === undefined ? {} : { queueDurationMs: value.queueDurationMs as number }),
+    ...(value.activeDurationMs === undefined ? {} : { activeDurationMs: value.activeDurationMs as number }),
+    activity: value.activity.map(validateRuntimeActivity),
+    ...(value.error === undefined ? {} : { error: value.error as string }),
+    ...(value.errorCategory === undefined ? {} : { errorCategory: value.errorCategory as ProviderErrorCategory }),
+  };
+}
+
+function assistantMessageIdForLegacyTurn(turnId: string): string {
+  return `legacy-assistant-${createHash('sha256').update(turnId).digest('hex').slice(0, 32)}`;
+}
+
+function recordForAcceptedTurn(turn: AcceptedTurnInput): ChatTurnRecord {
+  const anchor = turn.messages.find((message) => message.id === turn.messageId && message.role === 'user');
+  if (!anchor) throw new Error('Принятый ход не содержит исходное сообщение.');
+  return {
+    turnId: turn.turnId,
+    anchorMessageId: turn.messageId,
+    assistantMessageId: turn.assistantMessageId,
+    modelId: turn.modelId,
+    ...(turn.operation ? { operation: turn.operation } : {}),
+    status: 'queued',
+    createdAt: anchor.createdAt,
+    activity: [],
+  };
+}
+
+function recordFromRuntimeTurn(turn: RuntimeTurnSnapshot): ChatTurnRecord {
+  return validateChatTurnRecord({
+    turnId: turn.id,
+    anchorMessageId: turn.anchorMessageId,
+    assistantMessageId: turn.assistantMessageId,
+    modelId: turn.modelId ?? null,
+    ...(turn.operation ? { operation: turn.operation } : {}),
+    status: turn.status,
+    createdAt: turn.createdAt,
+    ...(turn.startedAt === undefined ? {} : { startedAt: turn.startedAt }),
+    ...(turn.endedAt === undefined ? {} : { endedAt: turn.endedAt }),
+    ...(turn.queueDurationMs === undefined ? {} : { queueDurationMs: turn.queueDurationMs }),
+    ...(turn.activeDurationMs === undefined ? {} : { activeDurationMs: turn.activeDurationMs }),
+    activity: turn.activity,
+    ...(turn.error === undefined ? {} : { error: turn.error }),
+    ...(turn.errorCategory === undefined ? {} : { errorCategory: turn.errorCategory }),
+  });
+}
+
 function validateChatDetail(value: unknown): Loaded<ChatDetail> {
-  if (!isRecord(value) || (value.schemaVersion !== 3 && value.schemaVersion !== 4 && value.schemaVersion !== 5 && value.schemaVersion !== 6 && value.schemaVersion !== 7 && value.schemaVersion !== 8 && value.schemaVersion !== 9)
+  if (!isRecord(value) || (value.schemaVersion !== 3 && value.schemaVersion !== 4 && value.schemaVersion !== 5 && value.schemaVersion !== 6 && value.schemaVersion !== 7 && value.schemaVersion !== 8 && value.schemaVersion !== 9 && value.schemaVersion !== 10)
     || !Array.isArray(value.messages) || !Array.isArray(value.artifacts)
     || (value.schemaVersion >= 7 && !Array.isArray(value.toolReceipts))
     || (value.schemaVersion >= 8 && !('compactSnapshot' in value))
-    || (value.schemaVersion === 9 && !Array.isArray(value.draftAttachments))) {
+    || (value.schemaVersion >= 9 && !Array.isArray(value.draftAttachments))
+    || (value.schemaVersion === 10 && !Array.isArray(value.turns))
+    || (value.schemaVersion < 10 && value.turns !== undefined)) {
     throw new Error('Invalid chat detail.');
   }
   const version = value.schemaVersion;
@@ -604,6 +753,7 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
       createdAt: requireTimestamp(entry.createdAt),
     };
   });
+  const turns = (version >= 10 ? value.turns as unknown[] : []).map(validateChatTurnRecord);
   if (new Set(messages.map((message) => message.id)).size !== messages.length
     || new Set(artifacts.map((artifact) => artifact.id)).size !== artifacts.length
     || artifacts.some((artifact) => artifact.messageId && !messages.some((message) => message.id === artifact.messageId))
@@ -613,7 +763,13 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
     || artifacts.some((artifact) => artifact.messageId && !messages.find((message) => message.id === artifact.messageId)?.attachmentIds?.includes(artifact.id))
     || toolReceipts.length > MAX_TOOL_RECEIPTS_PER_CHAT
     || toolReceipts.some((receipt) => !messages.some((message) => message.id === receipt.anchorMessageId && message.role === 'user'))
-    || new Set(toolReceipts.map((receipt) => `${receipt.receiptId}:${receipt.anchorMessageId}`)).size !== toolReceipts.length) {
+    || new Set(toolReceipts.map((receipt) => `${receipt.receiptId}:${receipt.anchorMessageId}`)).size !== toolReceipts.length
+    || turns.length > MAX_TURN_RECORDS_PER_CHAT
+    || new Set(turns.map((turn) => turn.turnId)).size !== turns.length
+    || turns.some((turn) => !messages.some((message) => message.id === turn.anchorMessageId && message.role === 'user')
+      || turn.assistantMessageId !== null && messages.some((message) => message.id === turn.assistantMessageId && message.role !== 'assistant')
+      || turn.status === 'completed' && turn.operation !== 'compaction'
+        && !messages.some((message) => message.id === turn.assistantMessageId && message.role === 'assistant'))) {
     throw new Error('Duplicate or unbound chat resource.');
   }
   const nextTurnPermissionProfile = version === 3
@@ -626,7 +782,7 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
   }
   let compactSnapshot = version >= 8 ? validateCompactSnapshot(value.compactSnapshot, messages) : null;
   if (compactSnapshot) {
-    const storedChat = { ...chat, messages, artifacts, draftAttachments, toolReceipts, nextTurnPermissionProfile, nextTurnSkillId,
+    const storedChat = { ...chat, messages, artifacts, draftAttachments, toolReceipts, turns, nextTurnPermissionProfile, nextTurnSkillId,
       modelId: version >= 6 && value.modelId !== null ? requireModelId(value.modelId) : null,
       compactSnapshot };
     if (version < 9) {
@@ -643,10 +799,10 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
     }
   }
   return {
-    value: { ...chat, messages, artifacts, draftAttachments, toolReceipts, nextTurnPermissionProfile, nextTurnSkillId,
+    value: { ...chat, messages, artifacts, draftAttachments, toolReceipts, turns, nextTurnPermissionProfile, nextTurnSkillId,
       modelId: version >= 6 && value.modelId !== null ? requireModelId(value.modelId) : null,
       compactSnapshot },
-    needsWrite: version < 9,
+    needsWrite: version < 10,
   };
 }
 
@@ -658,7 +814,7 @@ function summary(chat: ChatDetail): ChatSummary {
 }
 
 function detailFile(chat: ChatDetail): Record<string, unknown> {
-  return { schemaVersion: 9, ...chat };
+  return { schemaVersion: 10, ...chat };
 }
 
 function validateHomeDraftAttachment(value: unknown): HomeDraftAttachment {
@@ -752,7 +908,7 @@ async function loadProviderUploadLedger(filePath: string): Promise<Loaded<Provid
   catch { throw storageError(filePath); }
 }
 
-function validateAcceptedTurnRecord(value: unknown): AcceptedTurnInput {
+function validateAcceptedTurnRecord(value: unknown, allowLegacyAssistantId = true): AcceptedTurnInput {
   if (!isRecord(value) || !Array.isArray(value.messages) || !Number.isSafeInteger(value.historyBoundary)
     || (value.historyBoundary as number) < 1 || value.historyBoundary !== value.messages.length || !isRecord(value.reservation)) {
     throw new Error('Некорректный принятый ход домашнего черновика.');
@@ -778,6 +934,11 @@ function validateAcceptedTurnRecord(value: unknown): AcceptedTurnInput {
   });
   const ids = messages.map((message) => message.id);
   if (new Set(ids).size !== ids.length) throw new Error('Повтор сообщения в принятом ходе.');
+  const turnId = requireId(value.turnId);
+  const legacyAssistantId = value.assistantMessageId === undefined;
+  if (legacyAssistantId && !allowLegacyAssistantId) throw new Error('В принятом ходе отсутствует зарезервированный ответ.');
+  const assistantMessageId = legacyAssistantId ? assistantMessageIdForLegacyTurn(turnId)
+    : value.assistantMessageId === null ? null : requireId(value.assistantMessageId);
   const projectWorkingFolder = value.projectWorkingFolder === null ? null : requireFolderPath(value.projectWorkingFolder, 'Рабочая папка принятого хода');
   const revision = (input: unknown): number | null => {
     if (input === null) return null;
@@ -790,9 +951,9 @@ function validateAcceptedTurnRecord(value: unknown): AcceptedTurnInput {
     throw new Error('Некорректные вложения принятого хода.');
   }
   const turn: AcceptedTurnInput = {
-    turnId: requireId(value.turnId), chatId: requireId(value.chatId),
+    turnId, chatId: requireId(value.chatId),
     projectId: value.projectId === null ? null : requireId(value.projectId), projectWorkingFolder,
-    messageId: requireId(value.messageId), historyBoundary: value.historyBoundary as number, messages,
+    messageId: requireId(value.messageId), assistantMessageId, historyBoundary: value.historyBoundary as number, messages,
     ...(attachmentIds.length ? { attachmentIds: attachmentIds.map(requireId) } : {}),
     permissionProfile: requirePermissionProfile(value.permissionProfile),
     modelId: value.modelId === null ? null : requireModelId(value.modelId),
@@ -805,6 +966,7 @@ function validateAcceptedTurnRecord(value: unknown): AcceptedTurnInput {
   if (value.operation !== undefined) throw new Error('Домашний черновик не может принимать служебный ход.');
   const sourceMessage = messages.find((message) => message.id === turn.messageId && message.role === 'user');
   if (!sourceMessage) throw new Error('В принятом ходе отсутствует исходный запрос.');
+  if (assistantMessageId === null || ids.includes(assistantMessageId)) throw new Error('Зарезервированный ответ принятого хода повреждён.');
   if (value.attachmentIds !== undefined && JSON.stringify(turn.attachmentIds ?? []) !== JSON.stringify(sourceMessage.attachmentIds ?? [])) {
     throw new Error('Вложения принятого сообщения не совпадают со снимком хода.');
   }
@@ -847,7 +1009,9 @@ function validateHomeDraftRecord(value: unknown): HomeDraftRecord {
 }
 
 function parseHomeDraftFile(value: unknown): Loaded<HomeDraftRecord> {
-  return { value: validateHomeDraftRecord(value), needsWrite: false };
+  const legacyAcceptance = isRecord(value) && isRecord(value.lastAcceptance)
+    && isRecord(value.lastAcceptance.turn) && !Object.prototype.hasOwnProperty.call(value.lastAcceptance.turn, 'assistantMessageId');
+  return { value: validateHomeDraftRecord(value), needsWrite: legacyAcceptance };
 }
 
 async function loadHomeDraftFile(filePath: string): Promise<Loaded<HomeDraftRecord>> {
@@ -873,8 +1037,9 @@ function validateHomeSendJournal(value: unknown): HomeSendJournal {
   }
   const rawChat = isRecord(value.chat) ? value.chat : null;
   const legacySchema8 = rawChat?.schemaVersion === 8;
-  const chat = validateChatDetail(value.chat).value;
-  const turn = validateAcceptedTurnRecord(value.turn);
+  const legacySchema9 = rawChat?.schemaVersion === 9;
+  let chat = validateChatDetail(value.chat).value;
+  const turn = validateAcceptedTurnRecord(value.turn, legacySchema8 || legacySchema9);
   const attachments = value.attachments.map(validateHomeDraftAttachment);
   const nextDraft = validateHomeDraftRecord(value.nextDraft);
   const acceptance = nextDraft.lastAcceptance;
@@ -889,6 +1054,12 @@ function validateHomeSendJournal(value: unknown): HomeSendJournal {
     || !isRecord(rawTurn) || hasOwnAttachmentIds(rawTurn, 'attachmentIds') || containsLegacyAttachmentIds(rawTurn.messages)
     || !rawAcceptance || hasOwnAttachmentIds(rawAcceptance, 'attachmentIds') || containsLegacyAttachmentIds(rawAcceptance.messages))) {
     throw new Error('Некорректное представление вложений в старом журнале отправки.');
+  }
+  if ((!legacySchema8 && !legacySchema9 && (!isRecord(rawTurn) || !Object.prototype.hasOwnProperty.call(rawTurn, 'assistantMessageId')
+      || !rawAcceptance || !Object.prototype.hasOwnProperty.call(rawAcceptance, 'assistantMessageId')))
+    || (legacySchema8 || legacySchema9) && (!isRecord(rawTurn) || Object.prototype.hasOwnProperty.call(rawTurn, 'assistantMessageId')
+      || !rawAcceptance || Object.prototype.hasOwnProperty.call(rawAcceptance, 'assistantMessageId'))) {
+    throw new Error('Представление зарезервированного ответа в журнале отправки повреждено.');
   }
   if (new Set(attachments.map((attachment) => attachment.id)).size !== attachments.length
     || new Set(attachments.map((attachment) => attachment.storedName)).size !== attachments.length
@@ -918,6 +1089,15 @@ function validateHomeSendJournal(value: unknown): HomeSendJournal {
     || JSON.stringify(acceptance.turn) !== JSON.stringify(turn)) {
     throw new Error('Связи журнала отправки домашнего черновика повреждены.');
   }
+  const storedTurn = chat.turns.find((item) => item.turnId === turn.turnId);
+  if (legacySchema8 || legacySchema9) {
+    if (chat.turns.length !== 0) throw new Error('Старый журнал отправки неожиданно содержит записи ходов.');
+    chat = { ...chat, turns: [recordForAcceptedTurn(turn)] };
+  } else if (!storedTurn || storedTurn.anchorMessageId !== turn.messageId
+    || storedTurn.assistantMessageId !== turn.assistantMessageId || storedTurn.status !== 'queued') {
+    throw new Error('Связь принятого хода с записью чата повреждена.');
+  }
+  if (acceptance && (legacySchema8 || legacySchema9)) acceptance.turn = structuredClone(turn);
   return {
     schemaVersion: 1, operationId: requireId(value.operationId), sourceRevision: value.sourceRevision as number,
     chat, turn, attachments, nextDraft,
@@ -1631,8 +1811,14 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     try {
       const detail = validateChatDetail(JSON.parse(contents) as unknown);
       if (detail.value.id !== entry.name) throw new Error('Chat ID mismatch.');
-      loadedChats.push(detail.value);
-      if (detail.needsWrite) chatsNeedingMigration.push(detail.value);
+      const recoveryAt = new Date().toISOString();
+      const turns = detail.value.turns.map((turn) => turn.status === 'queued' || turn.status === 'running'
+        ? { ...turn, status: 'interrupted' as const, endedAt: recoveryAt, error: turn.error ?? 'Приложение завершилось до сохранения ответа.' }
+        : turn);
+      const recoveredChat = turns.some((turn, index) => turn !== detail.value.turns[index])
+        ? { ...detail.value, turns } : detail.value;
+      loadedChats.push(recoveredChat);
+      if (detail.needsWrite || recoveredChat !== detail.value) chatsNeedingMigration.push(recoveredChat);
     } catch {
       storageIssues.push(`Чат ${entry.name} недоступен: файл истории повреждён; каталог сохранён.`);
     }
@@ -1670,7 +1856,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     }
     for (const legacy of legacyChats) {
       if (existingChatDetails.has(legacy.id)) continue;
-      const detail: ChatDetail = { ...legacy, nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], toolReceipts: [], artifacts: [], draftAttachments: [], compactSnapshot: null };
+      const detail: ChatDetail = { ...legacy, nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], turns: [], toolReceipts: [], artifacts: [], draftAttachments: [], compactSnapshot: null };
       await writeOwnedAtomic(join(chatsDirectory, legacy.id, 'chat.json'), detailFile(detail));
       loadedChats.push(detail);
     }
@@ -1778,6 +1964,9 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       throw new Error('Рабочая папка проекта изменилась после принятия хода; запрос остановлен.');
     }
     if (!turn.projectId && turn.projectWorkingFolder !== null) throw new Error('Привязка папки хода повреждена.');
+    if (!chat.messages.some((message) => message.id === turn.messageId && message.role === 'user')) {
+      throw new Error('Исходное сообщение принятого хода отсутствует.');
+    }
     return chat;
   };
   const createStoredChat = async (projectId: string | null, kind: ChatKind): Promise<ChatDetail> => {
@@ -1785,7 +1974,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     const chat: ChatDetail = {
       id: randomUUID(), title: kind === 'image' ? 'Новое изображение' : 'Новый чат', projectId,
       pinned: false, archived: false, createdAt: now, updatedAt: now, draft: '', kind,
-      nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: settings.defaultModelId, messages: [], toolReceipts: [], artifacts: [], draftAttachments: [],
+      nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: settings.defaultModelId, messages: [], turns: [], toolReceipts: [], artifacts: [], draftAttachments: [],
       compactSnapshot: null,
     };
     await saveChat(chat);
@@ -1810,16 +1999,16 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     const skillReservation = detail.nextTurnSkillId !== null && !skillAlreadyReserved
       ? { value: detail.nextTurnSkillId, revision: revisions.skill }
       : null;
-    turnReservations.set(turnId, { chatId: detail.id, permissionProfile: profileReservation, skill: skillReservation });
     const boundaryIndex = detail.messages.findIndex((message) => message.id === messageId && message.role === 'user');
     if (boundaryIndex < 0) throw new Error('Принятое сообщение отсутствует в истории чата.');
     const messages = operation === 'compaction' ? detail.messages.slice(0, boundaryIndex + 1) : detail.messages;
-    return {
+    const turn: AcceptedTurnInput = {
       turnId,
       chatId: detail.id,
       projectId: detail.projectId,
       projectWorkingFolder: project?.workingFolder ?? null,
       messageId,
+      assistantMessageId: operation === 'compaction' ? null : randomUUID(),
       historyBoundary: messages.length,
       messages: structuredClone(messages),
       ...(messages[boundaryIndex]?.attachmentIds?.length ? { attachmentIds: [...messages[boundaryIndex]!.attachmentIds!] } : {}),
@@ -1836,6 +2025,8 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         compactExpectedSnapshotId: detail.compactSnapshot?.id ?? null,
       } : {}),
     };
+    turnReservations.set(turnId, { chatId: detail.id, permissionProfile: profileReservation, skill: skillReservation });
+    return turn;
   };
   const appendLocalMessage = async (idInput: unknown, textInput: unknown): Promise<ChatDetail> => {
     const chat = findChat(idInput);
@@ -2066,7 +2257,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         ...(homeDraft.attachments.length ? { attachmentIds: homeDraft.attachments.map((attachment) => attachment.id) } : {}),
       };
       const chatId = randomUUID();
-      const chat: ChatDetail = {
+      const baseChat: ChatDetail = {
         id: chatId,
         title: text ? requireName(text.split(/\r?\n/, 1)[0]?.slice(0, 60) ?? '', 'Название чата', 160) : 'Прикреплённые файлы',
         projectId: homeDraft.projectId, pinned: false, archived: false, createdAt: now, updatedAt: now,
@@ -2074,14 +2265,15 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         nextTurnPermissionProfile: homeDraft.permissionProfile === settings.defaultPermissionProfile ? null : homeDraft.permissionProfile,
         nextTurnSkillId: homeDraft.skillId,
         modelId: homeDraft.modelId ?? settings.defaultModelId,
-        messages: [message], toolReceipts: [], draftAttachments: [],
+        messages: [message], turns: [], toolReceipts: [], draftAttachments: [],
         artifacts: homeDraft.attachments.map((attachment) => ({
           id: attachment.id, name: attachment.name, storedName: attachment.storedName,
           size: attachment.size, sha256: attachment.sha256, createdAt: attachment.createdAt, messageId: message.id,
         })),
         compactSnapshot: null,
       };
-      const turn = createAcceptedTurn(chat, turnId, message.id);
+      const turn = createAcceptedTurn(baseChat, turnId, message.id);
+      const chat: ChatDetail = { ...baseChat, turns: [recordForAcceptedTurn(turn)] };
       const nextDraft: HomeDraftRecord = {
         ...homeDraft, revision: homeDraft.revision + 1, text: '', attachments: [],
         lastAcceptance: { sourceRevision: expectedRevision, chatId, turn: structuredClone(turn) },
@@ -2413,12 +2605,14 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
           size: attachment.size, sha256: attachment.sha256, createdAt: attachment.createdAt, messageId: message.id,
         }))],
       };
-      validateBeforeCommit?.();
-      await saveChat(updated);
-      const detail = structuredClone(findChat(before.id));
-      const acceptedMessage = detail.messages[detail.messages.length - 1];
+      const acceptedMessage = updated.messages[updated.messages.length - 1];
       if (!acceptedMessage || acceptedMessage.role !== 'user') throw new Error('Принятое сообщение отсутствует в истории чата.');
-      const turn = createAcceptedTurn(detail, turnId, acceptedMessage.id);
+      validateBeforeCommit?.();
+      const turn = createAcceptedTurn(updated, turnId, acceptedMessage.id);
+      const acceptedChat = { ...updated, turns: [...updated.turns, recordForAcceptedTurn(turn)] };
+      try { await saveChat(acceptedChat); }
+      catch (error) { turnReservations.delete(turnId); throw error; }
+      const detail = structuredClone(findChat(before.id));
       return { detail, turn };
     }),
     acceptCompactionTurn: (idInput, turnIdInput) => serialize(async () => {
@@ -2431,7 +2625,10 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         throw new Error('Проект чата больше недоступен.');
       }
       const turn = createAcceptedTurn(detail, turnId, lastUserMessage.id, 'compaction');
-      return { detail: structuredClone(detail), turn };
+      const accepted = { ...detail, updatedAt: new Date().toISOString(), turns: [...detail.turns, recordForAcceptedTurn(turn)] };
+      try { await saveChat(accepted); }
+      catch (error) { turnReservations.delete(turnId); throw error; }
+      return { detail: structuredClone(findChat(detail.id)), turn };
     }),
     releaseTurnReservation: (turnIdInput) => {
       if (typeof turnIdInput === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(turnIdInput)) turnReservations.delete(turnIdInput);
@@ -2520,10 +2717,62 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       if (signal?.aborted) throw createAbortError();
       turnReservations.delete(turn.turnId);
     }),
-    appendAssistantMessageFromRuntime: (id, messageIdInput, textInput, signal, functionsStateIdInput) => serialize(async () => {
+    updateRuntimeTurn: (turnInput) => serialize(async () => {
+      const snapshot = structuredClone(turnInput);
+      const record = recordFromRuntimeTurn(snapshot);
+      const chat = findChat(snapshot.chatId);
+      if (!chat.messages.some((message) => message.id === record.anchorMessageId && message.role === 'user')) {
+        throw new Error('Исходное сообщение хода отсутствует в чате.');
+      }
+      const existingIndex = chat.turns.findIndex((item) => item.turnId === record.turnId);
+      const existing = existingIndex >= 0 ? chat.turns[existingIndex] : null;
+      if (existing) {
+        if (existing.anchorMessageId !== record.anchorMessageId || existing.assistantMessageId !== record.assistantMessageId
+          || existing.modelId !== record.modelId || existing.operation !== record.operation) {
+          throw new Error('Запись runtime не совпадает с принятым ходом.');
+        }
+        if (existing.status === 'completed') {
+          const sameCompletion = record.status === 'completed' && record.createdAt === existing.createdAt
+            && record.startedAt === existing.startedAt && record.endedAt === existing.endedAt
+            && record.activeDurationMs === existing.activeDurationMs
+            && JSON.stringify(record.activity.slice(0, existing.activity.length)) === JSON.stringify(existing.activity);
+          if (!sameCompletion) throw new Error('Устаревшее обновление завершённого хода.');
+          if (JSON.stringify(record) === JSON.stringify(existing)) return;
+          record.createdAt = existing.createdAt;
+        } else if (existing.status === 'failed' || existing.status === 'cancelled' || existing.status === 'interrupted') {
+          if (JSON.stringify({ ...record, createdAt: existing.createdAt }) === JSON.stringify(existing)) return;
+          throw new Error('Устаревшее обновление записи завершённого хода.');
+        }
+        if (existing.status !== 'completed') {
+          if (record.status === 'completed') throw new Error('Завершение хода должно атомарно сохраняться вместе с ответом.');
+          if (record.status === 'queued' && existing.status === 'running') throw new Error('Запись хода не может вернуться в очередь.');
+          record.createdAt = existing.createdAt;
+        }
+      } else {
+        if (record.status !== 'queued' || chat.turns.length >= MAX_TURN_RECORDS_PER_CHAT) {
+          throw new Error('Нельзя восстановить отсутствующую запись уже начатого хода.');
+        }
+        if (record.assistantMessageId && chat.messages.some((message) => message.id === record.assistantMessageId)) {
+          throw new Error('Зарезервированный ответ уже занят другим сообщением.');
+        }
+      }
+      const turns = [...chat.turns];
+      if (existingIndex >= 0) turns[existingIndex] = record;
+      else turns.push(record);
+      await saveChat({ ...chat, turns, updatedAt: new Date().toISOString() });
+    }),
+    appendAssistantMessageFromRuntime: (turnInput, textInput, terminalTurnInput, signal, functionsStateIdInput) => serialize(async () => {
       if (signal?.aborted) throw createAbortError();
-      const chat = findChat(id);
-      const messageId = requireId(messageIdInput);
+      const acceptedTurn = structuredClone(turnInput);
+      validateAcceptedTurnBinding(acceptedTurn);
+      const terminalTurn = recordFromRuntimeTurn(terminalTurnInput);
+      if (terminalTurnInput.chatId !== acceptedTurn.chatId || acceptedTurn.operation || acceptedTurn.assistantMessageId === null || terminalTurn.status !== 'completed'
+        || terminalTurn.operation || terminalTurn.turnId !== acceptedTurn.turnId || terminalTurn.anchorMessageId !== acceptedTurn.messageId
+        || terminalTurn.assistantMessageId !== acceptedTurn.assistantMessageId || terminalTurn.modelId !== acceptedTurn.modelId) {
+        throw new Error('Завершённый ответ не совпадает с зарезервированным ходом.');
+      }
+      const chat = findChat(acceptedTurn.chatId);
+      const messageId = requireId(acceptedTurn.messageId);
       const anchor = chat.messages.findIndex((message) => message.id === messageId && message.role === 'user');
       if (anchor < 0) throw new Error('Ответ не привязан к принятому сообщению чата.');
       if (typeof textInput !== 'string' || !textInput.trim() || textInput.length > 100_000) {
@@ -2535,18 +2784,41 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         || /[\u0000-\u001f\u007f]/.test(functionsStateIdInput))) {
         throw new Error('Некорректное состояние ответа GigaChat.');
       }
-      const now = new Date().toISOString();
+      const now = terminalTurn.endedAt ?? new Date().toISOString();
+      const currentTurnIndex = chat.turns.findIndex((item) => item.turnId === acceptedTurn.turnId);
+      const currentTurn = currentTurnIndex >= 0 ? chat.turns[currentTurnIndex] : null;
+      if (currentTurn && (currentTurn.anchorMessageId !== terminalTurn.anchorMessageId
+        || currentTurn.assistantMessageId !== terminalTurn.assistantMessageId || currentTurn.modelId !== terminalTurn.modelId
+        || currentTurn.operation || currentTurn.status === 'interrupted')) {
+        throw new Error('Запись ответа не совпадает с историей хода.');
+      }
+      const existingMessage = chat.messages.find((message) => message.id === acceptedTurn.assistantMessageId);
+      if (existingMessage) {
+        const savedTurn = currentTurn;
+        if (existingMessage.role === 'assistant' && existingMessage.source === 'runtime'
+          && existingMessage.text === textInput.trim()
+          && existingMessage.functionsStateId === functionsStateIdInput
+          && savedTurn?.status === 'completed') return structuredClone(chat);
+        throw new Error('Зарезервированный ответ уже сохранён с другими данными.');
+      }
+      if (currentTurn && ['failed', 'cancelled', 'interrupted'].includes(currentTurn.status)) {
+        throw new Error('Завершённый ход уже был остановлен.');
+      }
       const message: ChatMessage = {
-        id: randomUUID(), role: 'assistant', source: 'runtime', text: textInput.trim(), createdAt: now,
+        id: acceptedTurn.assistantMessageId, role: 'assistant', source: 'runtime', text: textInput.trim(), createdAt: now,
         ...(functionsStateIdInput === undefined ? {} : { functionsStateId: functionsStateIdInput }),
       };
       const messages = [...chat.messages];
       messages.splice(anchor + 1, 0, message);
-      const updated = { ...chat, updatedAt: now, messages };
+      const completedRecord = { ...terminalTurn, createdAt: currentTurn?.createdAt ?? terminalTurn.createdAt };
+      const turns = [...chat.turns];
+      if (currentTurnIndex >= 0) turns[currentTurnIndex] = completedRecord;
+      else turns.push(completedRecord);
+      const updated = { ...chat, updatedAt: now, messages, turns };
       await saveChat(updated, signal);
       return structuredClone(updated);
     }),
-    commitCompactSnapshot: (idInput, snapshotInput, expectedSnapshotIdInput, signal) => serialize(async () => {
+    commitCompactSnapshot: (idInput, snapshotInput, expectedSnapshotIdInput, signal, terminalTurnInput) => serialize(async () => {
       if (signal?.aborted) throw createAbortError();
       const chat = findChat(idInput);
       if (expectedSnapshotIdInput !== null && typeof expectedSnapshotIdInput !== 'string') {
@@ -2563,9 +2835,29 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         : -1;
       const nextBoundaryIndex = chat.messages.findIndex((message) => message.id === snapshot.boundaryMessageId);
       if (nextBoundaryIndex < previousBoundaryIndex) throw new Error('Сводка не может откатывать уже покрытую историю.');
+      let turns = chat.turns;
+      if (terminalTurnInput) {
+        const terminalTurn = recordFromRuntimeTurn(terminalTurnInput);
+        if (terminalTurnInput.chatId !== chat.id || terminalTurn.status !== 'completed' || terminalTurn.operation !== 'compaction'
+          || terminalTurn.assistantMessageId !== null || terminalTurn.anchorMessageId !== snapshot.boundaryMessageId
+          || terminalTurn.modelId !== snapshot.modelId || terminalTurn.turnId === '') {
+          throw new Error('Завершённая сводка не совпадает с принятым ходом.');
+        }
+        const index = chat.turns.findIndex((item) => item.turnId === terminalTurn.turnId);
+        const existing = index < 0 ? null : chat.turns[index]!;
+        if (existing && (existing.operation !== 'compaction' || existing.anchorMessageId !== terminalTurn.anchorMessageId
+          || existing.assistantMessageId !== null || existing.modelId !== terminalTurn.modelId
+          || ['failed', 'cancelled', 'interrupted'].includes(existing.status))) {
+          throw new Error('Запись сводки не совпадает с историей хода.');
+        }
+        turns = [...chat.turns];
+        const completed = { ...terminalTurn, createdAt: existing?.createdAt ?? terminalTurn.createdAt };
+        if (index < 0) turns.push(completed);
+        else turns[index] = completed;
+      }
       await testFaults?.beforeCompactSnapshotCommit?.();
       if (signal?.aborted) throw createAbortError();
-      const updated = { ...chat, compactSnapshot: snapshot, updatedAt: new Date().toISOString() };
+      const updated = { ...chat, compactSnapshot: snapshot, turns, updatedAt: new Date().toISOString() };
       await saveChat(updated, signal);
       return structuredClone(updated);
     }),

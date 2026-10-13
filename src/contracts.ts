@@ -255,6 +255,7 @@ export interface AcceptedTurnInput {
   projectId: string | null;
   projectWorkingFolder: string | null;
   messageId: string;
+  assistantMessageId: string | null;
   historyBoundary: number;
   messages: ChatMessage[];
   attachmentIds?: string[];
@@ -318,6 +319,9 @@ export type RuntimeActivity =
 export interface RuntimeTurnSnapshot {
   id: string;
   chatId: string;
+  anchorMessageId: string;
+  assistantMessageId: string | null;
+  operation?: 'compaction';
   modelId?: GigaChatModelId | null;
   status: RuntimeTurnStatus;
   createdAt: string;
@@ -330,6 +334,23 @@ export interface RuntimeTurnSnapshot {
   error?: string;
   errorCategory?: ProviderErrorCategory;
   retryEligible?: boolean;
+}
+
+export interface ChatTurnRecord {
+  turnId: string;
+  anchorMessageId: string;
+  assistantMessageId: string | null;
+  modelId: GigaChatModelId | null;
+  operation?: 'compaction';
+  status: RuntimeTurnStatus | 'interrupted';
+  createdAt: string;
+  startedAt?: string;
+  endedAt?: string;
+  queueDurationMs?: number;
+  activeDurationMs?: number;
+  activity: RuntimeActivity[];
+  error?: string;
+  errorCategory?: ProviderErrorCategory;
 }
 
 export interface RuntimeAvailability {
@@ -418,6 +439,7 @@ export interface ChatDetail extends ChatSummary {
   modelId: GigaChatModelId | null;
   nextTurnSkillId: string | null;
   messages: ChatMessage[];
+  turns: ChatTurnRecord[];
   toolReceipts: ChatToolReceipt[];
   artifacts: ChatArtifact[];
   draftAttachments: HomeDraftAttachment[];

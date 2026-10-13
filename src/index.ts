@@ -841,12 +841,13 @@ async function createMainRuntime(
     }),
     consumeTurn: (turn: AcceptedTurnInput, signal) => store.consumeTurnReservation(turn, signal),
     releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
+    persistTurnRecord: (turn) => store.updateRuntimeTurn(turn),
     beginToolReceipt: (turn, receipt) => store.beginToolReceipt(turn.chatId, turn.messageId, receipt),
     completeToolReceipt: (turn, receiptId, status, result) => store.completeToolReceipt(turn.chatId, turn.messageId, receiptId, status, result),
-    appendAssistant: async (turn, text, signal, functionsStateId) => {
-      await store.appendAssistantMessageFromRuntime(turn.chatId, turn.messageId, text, signal, functionsStateId);
+    appendAssistant: async (turn, text, signal, functionsStateId, terminalTurn) => {
+      await store.appendAssistantMessageFromRuntime(turn, text, terminalTurn, signal, functionsStateId);
     },
-    appendCompaction: async (turn, text, signal, context: PreparedCompactionContext) => {
+    appendCompaction: async (turn, text, signal, context: PreparedCompactionContext, terminalTurn) => {
       const snapshot: CompactSnapshot = {
         id: randomUUID(),
         version: 1,
@@ -858,7 +859,7 @@ async function createMainRuntime(
         provenance: context.provenance,
         createdAt: new Date().toISOString(),
       };
-      await store.commitCompactSnapshot(turn.chatId, snapshot, context.expectedSnapshotId, signal);
+      await store.commitCompactSnapshot(turn.chatId, snapshot, context.expectedSnapshotId, signal, terminalTurn);
     },
     compactionEnabled: COMPACTION_QUALITY_VERIFIED,
     recordUsageReceipt: (receipt) => store.recordUsageReceipt(receipt),

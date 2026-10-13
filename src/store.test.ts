@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { openStore as openStoreProduction, type StoreFaultStage, type StoreOpenOptions } from './store';
-import type { AcceptedTurnInput, ChatMessage, CompactSnapshot, GigaChatProvider, HookDispatchInput, HookRunResult, InstructionCommitRequest, InstructionCommitResult, ProviderEvent, ProviderTurnRequest } from './contracts';
+import type { AcceptedTurnInput, ChatMessage, CompactSnapshot, GigaChatProvider, HookDispatchInput, HookRunResult, InstructionCommitRequest, InstructionCommitResult, ProviderEvent, ProviderTurnRequest, RuntimeTurnSnapshot } from './contracts';
 import { COMPACTION_TASK_INSTRUCTION, buildNextTurnContext, hashCompactionPrefix } from './context';
 import { instructionFileHash } from './instruction-documents';
 import { createTurnRuntime, type PreparedTurn } from './runtime';
@@ -29,14 +29,36 @@ function openStore(directory: string, options: StoreOpenOptions = {}) {
   return openStoreProduction(directory, { instructionCommitter: syntheticInstructionCommitter, ...options });
 }
 
+async function appendAcceptedAnswer(store: Awaited<ReturnType<typeof openStore>>, turn: AcceptedTurnInput, text: string): Promise<void> {
+  const detail = await store.getChat(turn.chatId);
+  const accepted = detail.turns.find((item) => item.turnId === turn.turnId);
+  assert.ok(accepted);
+  const completed: RuntimeTurnSnapshot = {
+    id: turn.turnId, chatId: turn.chatId, anchorMessageId: turn.messageId,
+    assistantMessageId: turn.assistantMessageId, modelId: turn.modelId, status: 'completed',
+    createdAt: accepted.createdAt, endedAt: timestamp, activity: [],
+  };
+  await store.appendAssistantMessageFromRuntime(turn, text, completed);
+}
+
+function completedCompactionTurn(turn: AcceptedTurnInput, createdAt: string): RuntimeTurnSnapshot {
+  return {
+    id: turn.turnId, chatId: turn.chatId, anchorMessageId: turn.messageId,
+    assistantMessageId: null, operation: 'compaction', modelId: turn.modelId, status: 'completed',
+    createdAt, endedAt: timestamp, activity: [],
+  };
+}
+
 function downgradeHomeSendJournalToSchema8(journal: Record<string, unknown>): void {
   const legacyChat = journal.chat as Record<string, unknown>;
   legacyChat.schemaVersion = 8;
+  delete legacyChat.turns;
   delete legacyChat.draftAttachments;
   for (const message of legacyChat.messages as Array<Record<string, unknown>>) delete message.attachmentIds;
   for (const artifact of legacyChat.artifacts as Array<Record<string, unknown>>) delete artifact.sha256;
   const removeTurnAttachmentIds = (turn: Record<string, unknown>): void => {
     delete turn.attachmentIds;
+    delete turn.assistantMessageId;
     for (const message of turn.messages as Array<Record<string, unknown>>) delete message.attachmentIds;
   };
   removeTurnAttachmentIds(journal.turn as Record<string, unknown>);
@@ -443,7 +465,7 @@ test('schema 8 home-send journal recovers linked local files without inventing a
   assert.equal(accepted?.turn.messages[0]?.attachmentIds, undefined);
   assert.deepEqual(await readFile(await recovered.getArtifactPath(detail.id, staged.attachments[0]!.id)), Buffer.from('local bytes from schema 8'));
   const savedChat = JSON.parse(await readFile(join(directory, 'chats', detail.id, 'chat.json'), 'utf8')) as Record<string, unknown>;
-  assert.equal(savedChat.schemaVersion, 9);
+  assert.equal(savedChat.schemaVersion, 10);
 });
 
 test('schema 8 compact snapshot validates against its original linked-file prefix then upgrades the hash', async (t) => {
@@ -463,6 +485,7 @@ test('schema 8 compact snapshot validates against its original linked-file prefi
   const oldHash = hashCompactionPrefix(legacyMessages as unknown as ChatMessage[], []);
   legacy.schemaVersion = 8;
   delete legacy.draftAttachments;
+  delete legacy.turns;
   legacy.messages = legacyMessages;
   for (const artifact of legacy.artifacts as Array<Record<string, unknown>>) delete artifact.sha256;
   legacy.compactSnapshot = {
@@ -480,7 +503,7 @@ test('schema 8 compact snapshot validates against its original linked-file prefi
   assert.equal(detail.compactSnapshot?.coveredPrefixHash, hashCompactionPrefix(detail.messages, []));
   assert.equal(await readFile(await restored.getArtifactPath(chat.id, pendingId), 'utf8'), 'local attachment bytes');
   const saved = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown>;
-  assert.equal(saved.schemaVersion, 9);
+  assert.equal(saved.schemaVersion, 10);
   assert.deepEqual((saved.compactSnapshot as CompactSnapshot).coveredPrefixHash, detail.compactSnapshot?.coveredPrefixHash);
 });
 
@@ -501,6 +524,7 @@ test('rejects tampered schema 8 attachment migrations without rewriting source b
     for (const message of messages) delete message.attachmentIds;
     legacy.schemaVersion = 8;
     delete legacy.draftAttachments;
+    delete legacy.turns;
     legacy.messages = messages;
     for (const artifact of legacy.artifacts as Array<Record<string, unknown>>) delete artifact.sha256;
     legacy.compactSnapshot = {
@@ -563,7 +587,7 @@ test('home-send recovery preserves a different chat already stored under the jou
       afterHomeSendStage: async (stage) => {
         if (stage !== 'journal' || !conflictTemplate) return;
         const journal = JSON.parse(await readFile(join(directory, 'home-send.journal.json'), 'utf8')) as { chat: { id: string } };
-        const conflict = { schemaVersion: 8, ...conflictTemplate, id: journal.chat.id, title: 'Existing unrelated chat' };
+        const conflict = { schemaVersion: 10, ...conflictTemplate, id: journal.chat.id, title: 'Existing unrelated chat' };
         const chatFolder = join(directory, 'chats', journal.chat.id);
         await mkdir(chatFolder, { recursive: true });
         await writeFile(join(chatFolder, 'chat.json'), JSON.stringify(conflict), 'utf8');
@@ -630,7 +654,7 @@ test('changing the next model preserves accepted turns, messages, and historical
     conflictedFields: [],
   };
   await store.recordUsageReceipt(receipt);
-  await store.appendAssistantMessageFromRuntime(chat.id, accepted.turn.messageId, 'Сохранённый ответ');
+  await appendAcceptedAnswer(store, accepted.turn, 'Сохранённый ответ');
   const messagesBeforeChange = (await store.getChat(chat.id)).messages;
 
   await store.updateChat(chat.id, { modelId: 'GigaChat-3-Pro' });
@@ -724,7 +748,8 @@ test('inserts a queued reply after its user anchor and assembles only history th
 
   assert.deepEqual(second.turn.messages.map((message) => message.text), ['user1', 'user2']);
   assert.deepEqual(third.turn.messages.map((message) => message.text), ['user1', 'user2', 'user3']);
-  const updated = await store.appendAssistantMessageFromRuntime(chat.id, first.turn.messageId, 'answer1');
+  await appendAcceptedAnswer(store, first.turn, 'answer1');
+  const updated = await store.getChat(chat.id);
   assert.deepEqual(updated.messages.map((message) => message.text), ['user1', 'answer1', 'user2', 'user3']);
   assert.equal(updated.messages[1]?.source, 'runtime');
   assert.deepEqual((await store.getMessagesThrough(chat.id, second.turn.messageId)).map((message) => message.text), [
@@ -745,12 +770,12 @@ test('compaction captures the fixed queued prefix, keeps tool pairing, and persi
     receiptId, name: 'read', arguments: { path: 'src/example.ts' }, content: null, functionsStateId: 'state-user1',
   });
   await store.completeToolReceipt(chat.id, first.turn.messageId, receiptId, 'completed', JSON.stringify({ ok: true, text: 'tool result' }));
-  await store.appendAssistantMessageFromRuntime(chat.id, first.turn.messageId, 'answer1');
+  await appendAcceptedAnswer(store, first.turn, 'answer1');
 
   const second = await store.acceptLocalMessage(chat.id, 'user2', 'turn-compact-user2');
   const compact = await store.acceptCompactionTurn(chat.id, 'turn-compact');
   assert.equal(compact.turn.messageId, second.turn.messageId);
-  await store.appendAssistantMessageFromRuntime(chat.id, second.turn.messageId, 'answer2');
+  await appendAcceptedAnswer(store, second.turn, 'answer2');
   await store.acceptLocalMessage(chat.id, 'user3', 'turn-compact-user3');
 
   const prefix = await store.getCompactionPrefix(chat.id, compact.turn.messageId);
@@ -774,7 +799,8 @@ test('compaction captures the fixed queued prefix, keeps tool pairing, and persi
     text: 'Сохранены user1, tool result, answer1 и user2.', modelId: 'GigaChat-2-Pro',
     provenance: 'fixture', createdAt: timestamp,
   };
-  await store.commitCompactSnapshot(chat.id, snapshot, compact.turn.compactExpectedSnapshotId ?? null);
+  await store.commitCompactSnapshot(chat.id, snapshot, compact.turn.compactExpectedSnapshotId ?? null, undefined,
+    completedCompactionTurn(compact.turn, (await store.getChat(chat.id)).turns.find((turn) => turn.turnId === compact.turn.turnId)!.createdAt));
   const beforeReload = await store.getChat(chat.id);
   assert.deepEqual(beforeReload.messages.map((message) => message.text), ['user1', 'answer1', 'user2', 'answer2', 'user3']);
   assert.deepEqual(beforeReload.compactSnapshot, snapshot);
@@ -928,16 +954,17 @@ test('runs queued turns through the real context builder and store compaction, t
     },
     consumeTurn: (turn, signal) => store.consumeTurnReservation(turn, signal),
     releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
-    appendAssistant: async (turn, text, signal) => {
-      await store.appendAssistantMessageFromRuntime(turn.chatId, turn.messageId, text, signal);
+    persistTurnRecord: (turn) => store.updateRuntimeTurn(turn),
+    appendAssistant: async (turn, text, signal, _functionsStateId, terminalTurn) => {
+      await store.appendAssistantMessageFromRuntime(turn, text, terminalTurn, signal);
     },
-    appendCompaction: async (turn, text, signal, context) => {
+    appendCompaction: async (turn, text, signal, context, terminalTurn) => {
       const snapshot: CompactSnapshot = {
         id: `snapshot-${turn.turnId}`, version: 1, boundaryMessageId: context.boundaryMessageId,
         coveredThroughMessageId: context.coveredThroughMessageId, coveredPrefixHash: context.coveredPrefixHash,
         text, modelId: turn.modelId!, provenance: context.provenance, createdAt: new Date().toISOString(),
       };
-      await store.commitCompactSnapshot(turn.chatId, snapshot, context.expectedSnapshotId, signal);
+      await store.commitCompactSnapshot(turn.chatId, snapshot, context.expectedSnapshotId, signal, terminalTurn);
     },
     compactionEnabled: true,
     beginToolReceipt: (turn, receipt) => store.beginToolReceipt(turn.chatId, turn.messageId, receipt),
@@ -945,7 +972,7 @@ test('runs queued turns through the real context builder and store compaction, t
     recordUsageReceipt: (receipt) => store.recordUsageReceipt(receipt),
     runHooks: async (_turn, input: HookDispatchInput): Promise<HookRunResult[]> => {
       hookEvents.push(input.event);
-      return [{ hookId: `fixture-${input.event}`, hookName: 'Fixture', event: input.event, status: 'completed' }];
+      return [{ hookId: `global/fixture-${input.event}`, hookName: 'Fixture', event: input.event, status: 'completed' }];
     },
   });
 
@@ -984,6 +1011,9 @@ test('runs queued turns through the real context builder and store compaction, t
 
   const reloaded = await openStore(directory);
   const savedChat = await reloaded.getChat(chat.id);
+  const savedCompactionTurn = savedChat.turns.find((turn) => turn.turnId === compact.turn.turnId);
+  assert.equal(savedCompactionTurn?.status, 'completed');
+  assert.ok(savedCompactionTurn?.activity.some((activity) => activity.kind === 'hook' && activity.event === 'after-compaction'));
   const afterRestart = await reloaded.acceptLocalMessage(chat.id, 'После перезапуска', 'turn-after-restart');
   const futureMessages = await reloaded.getMessagesThrough(chat.id, afterRestart.turn.messageId);
   const futureProtocols = await reloaded.getToolProtocolThrough(chat.id, afterRestart.turn.messageId);
@@ -1031,8 +1061,9 @@ test('queued fake provider turns see prior replies but never later accepted prom
     }),
     consumeTurn: (turn, signal) => store.consumeTurnReservation(turn, signal),
     releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
-    appendAssistant: async (turn, text, signal) => {
-      await store.appendAssistantMessageFromRuntime(turn.chatId, turn.messageId, text, signal);
+    persistTurnRecord: (turn) => store.updateRuntimeTurn(turn),
+    appendAssistant: async (turn, text, signal, _functionsStateId, terminalTurn) => {
+      await store.appendAssistantMessageFromRuntime(turn, text, terminalTurn, signal);
     },
     recordUsageReceipt: (receipt) => store.recordUsageReceipt(receipt),
   });
@@ -1078,7 +1109,7 @@ test('migrates v1 projects, chats, drafts, and theme without losing data', async
   const store = await openStore(directory);
   assert.deepEqual(await store.listProjects(), [{ ...project, workingFolder: null }]);
   assert.equal((await store.listChats())[0]?.id, chat.id);
-  assert.deepEqual(await store.getChat(chat.id), { ...chat, kind: 'text', nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [], draftAttachments: [], toolReceipts: [], compactSnapshot: null });
+  assert.deepEqual(await store.getChat(chat.id), { ...chat, kind: 'text', nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [], draftAttachments: [], toolReceipts: [], turns: [], compactSnapshot: null });
   assert.deepEqual(await store.getSettings(), {
     theme: 'emerald',
     sidebarTransparent: false,
@@ -1099,7 +1130,7 @@ test('migrates v1 projects, chats, drafts, and theme without losing data', async
   assert.equal(JSON.parse(await readFile(join(directory, 'projects.json'), 'utf8')).schemaVersion, 2);
   assert.equal(JSON.parse(await readFile(join(directory, 'chats.json'), 'utf8')).schemaVersion, 1);
   assert.equal(await readFile(join(directory, 'chats.json.bak'), 'utf8'), await readFile(join(directory, 'chats.json'), 'utf8'));
-  assert.equal(JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')).schemaVersion, 9);
+  assert.equal(JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')).schemaVersion, 10);
   assert.equal(JSON.parse(await readFile(join(directory, 'settings.json'), 'utf8')).schemaVersion, 10);
   await store.deleteChat(chat.id);
   assert.deepEqual(await (await openStore(directory)).listChats(), []);
@@ -1112,7 +1143,7 @@ test('migrates v2 chats with archive and draft without changing their UUIDs', as
     pinned: true, archived: true, createdAt: timestamp, updatedAt: timestamp, draft: 'Текст', kind: 'image' };
   await writeFile(join(directory, 'chats.json'), JSON.stringify({ schemaVersion: 2, chats: [chat] }));
   const store = await openStore(directory);
-  assert.deepEqual(await store.getChat(chat.id), { ...chat, nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [], draftAttachments: [], toolReceipts: [], compactSnapshot: null });
+  assert.deepEqual(await store.getChat(chat.id), { ...chat, nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], artifacts: [], draftAttachments: [], toolReceipts: [], turns: [], compactSnapshot: null });
   assert.equal((await store.listChats())[0]?.id, chat.id);
   assert.equal((await (await openStore(directory)).getChat(chat.id)).draft, 'Текст');
 });
@@ -1157,7 +1188,7 @@ test('unfinished legacy migration preserves existing invalid chat details', asyn
         assert.deepEqual(restored.messages, kind === 'valid' ? detail.messages : []);
         if (validUnmarkedLegacyDetail) {
           const migratedDetail = JSON.parse(await readFile(detailPath, 'utf8')) as Record<string, unknown>;
-          assert.equal(migratedDetail.schemaVersion, 9);
+          assert.equal(migratedDetail.schemaVersion, 10);
           assert.equal(migratedDetail.compactSnapshot, null);
           assert.equal(migratedDetail.draft, 'newer draft');
         }
@@ -1376,14 +1407,118 @@ test('trusted runtime assistant append preserves draft and final provider state 
   const store = await openStore(directory);
   const chat = await store.createChat();
   const accepted = await store.acceptLocalMessage(chat.id, 'Запрос пользователя', 'turn-runtime-assistant');
+  assert.ok(accepted.turn.assistantMessageId, 'acceptance reserves the assistant message ID before runtime starts');
+  const queued = await store.getChat(chat.id);
+  assert.equal(queued.turns[0]?.turnId, accepted.turn.turnId);
+  assert.equal(queued.turns[0]?.anchorMessageId, accepted.turn.messageId);
+  assert.equal(queued.turns[0]?.assistantMessageId, accepted.turn.assistantMessageId);
+  assert.equal(queued.turns[0]?.status, 'queued');
   await store.updateChat(chat.id, { draft: 'Черновик остаётся' });
-  const detail = await store.appendAssistantMessageFromRuntime(chat.id, accepted.turn.messageId, 'Ответ провайдера', undefined, 'state-final');
+  const completed = {
+    id: accepted.turn.turnId, chatId: chat.id, anchorMessageId: accepted.turn.messageId,
+    assistantMessageId: accepted.turn.assistantMessageId!, modelId: accepted.turn.modelId,
+    status: 'completed' as const, createdAt: queued.turns[0]!.createdAt,
+    startedAt: timestamp, endedAt: timestamp, activeDurationMs: 1250, activity: [],
+  };
+  const detail = await store.appendAssistantMessageFromRuntime(accepted.turn, 'Ответ провайдера', completed, undefined, 'state-final');
   assert.equal(detail.messages[1]?.role, 'assistant');
+  assert.equal(detail.messages[1]?.id, accepted.turn.assistantMessageId);
   assert.equal(detail.messages[1]?.source, 'runtime');
   assert.equal(detail.messages[1]?.text, 'Ответ провайдера');
   assert.equal(detail.messages[1]?.functionsStateId, 'state-final');
+  assert.equal(detail.turns[0]?.status, 'completed');
+  assert.equal(detail.turns[0]?.activeDurationMs, 1250);
   assert.equal(detail.draft, 'Черновик остаётся');
-  assert.deepEqual((await (await openStore(directory)).getChat(chat.id)).messages, detail.messages);
+  const repeatedAck = await store.appendAssistantMessageFromRuntime(accepted.turn, 'Ответ провайдера', completed, undefined, 'state-final');
+  assert.deepEqual(repeatedAck.messages, detail.messages, 'the same durable ACK does not create a second assistant message');
+  await assert.rejects(
+    store.appendAssistantMessageFromRuntime(accepted.turn, 'Другой ответ', completed),
+    /уже сохранён с другими данными/,
+  );
+  const restored = await (await openStore(directory)).getChat(chat.id);
+  assert.deepEqual(restored.messages, detail.messages);
+  assert.deepEqual(restored.turns, detail.turns);
+});
+
+test('schema 9 compact metadata survives turn-record migration without invented history', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-chat-v9-compact-migration-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const accepted = await store.acceptLocalMessage(chat.id, 'Keep this compact prefix.', 'turn-v9-compact');
+  const current = await store.getChat(chat.id);
+  const prefix = await store.getCompactionPrefix(chat.id, accepted.turn.messageId);
+  const snapshot: CompactSnapshot = {
+    id: 'schema-nine-compact', version: 1, boundaryMessageId: accepted.turn.messageId,
+    coveredThroughMessageId: prefix.coveredThroughMessageId, coveredPrefixHash: prefix.coveredPrefixHash,
+    text: 'The original request is covered.', modelId: 'GigaChat-3-Pro',
+    provenance: 'fixture', createdAt: timestamp,
+  };
+  await store.commitCompactSnapshot(chat.id, snapshot, null);
+  const path = join(directory, 'chats', chat.id, 'chat.json');
+  const legacy = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+  legacy.schemaVersion = 9;
+  delete legacy.turns;
+  await writeFile(path, JSON.stringify(legacy), 'utf8');
+
+  const restored = await openStore(directory);
+  const migrated = await restored.getChat(chat.id);
+  assert.deepEqual(migrated.messages, current.messages);
+  assert.deepEqual(migrated.compactSnapshot, snapshot);
+  assert.deepEqual(migrated.turns, [], 'schema 9 history has no reliable turn metadata to invent');
+  const saved = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+  assert.equal(saved.schemaVersion, 10);
+  assert.deepEqual(saved.compactSnapshot, snapshot);
+});
+
+test('schema 9 home-send journal recovers a stable interrupted turn without replaying it', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-home-v9-journal-turn-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = join(directory, 'schema-nine.txt');
+  await writeFile(source, 'preserved local source', 'utf8');
+  const store = await openStore(directory, {
+    testFaults: {
+      afterHomeSendStage: async (stage) => {
+        if (stage !== 'journal') return;
+        const journalPath = join(directory, 'home-send.journal.json');
+        const journal = JSON.parse(await readFile(journalPath, 'utf8')) as Record<string, unknown>;
+        const chat = journal.chat as Record<string, unknown>;
+        chat.schemaVersion = 9;
+        delete chat.turns;
+        delete (journal.turn as Record<string, unknown>).assistantMessageId;
+        const nextDraft = journal.nextDraft as Record<string, unknown>;
+        const acceptance = nextDraft.lastAcceptance as Record<string, unknown>;
+        delete (acceptance.turn as Record<string, unknown>).assistantMessageId;
+        await writeFile(journalPath, JSON.stringify(journal), 'utf8');
+        throw new Error('simulated schema 9 journal interruption');
+      },
+    },
+  });
+  await store.saveHomeDraft({
+    revision: 1, text: 'Restore the accepted request.', projectId: null,
+    permissionProfile: 'ask', skillId: null, modelId: 'GigaChat-3-Pro',
+  });
+  const staged = await store.stageHomeDraftFile(source);
+  await assert.rejects(store.acceptHomeDraft(staged.revision, 'home-schema-nine-turn'), /simulated schema 9 journal interruption/);
+
+  const recovered = await openStore(directory);
+  const [summary] = await recovered.listChats();
+  assert.ok(summary);
+  const detail = await recovered.getChat(summary.id);
+  const accepted = (await recovered.getHomeDraft()).lastAcceptance;
+  assert.equal(detail.messages.length, 1);
+  assert.equal(detail.messages[0]?.text, 'Restore the accepted request.');
+  assert.equal(detail.messages[0]?.attachmentIds?.[0], staged.attachments[0]?.id);
+  assert.equal(detail.turns.length, 1);
+  assert.equal(detail.turns[0]?.turnId, 'home-schema-nine-turn');
+  assert.equal(detail.turns[0]?.anchorMessageId, detail.messages[0]?.id);
+  assert.equal(detail.turns[0]?.status, 'interrupted');
+  assert.ok(detail.turns[0]?.assistantMessageId);
+  assert.equal(detail.turns[0]?.assistantMessageId, accepted?.turn.assistantMessageId);
+  assert.equal(detail.messages.some((message) => message.role === 'assistant'), false);
+  assert.deepEqual(accepted?.turn.messages.map((message) => message.id), [detail.messages[0]?.id]);
+  assert.equal(await readFile(source, 'utf8'), 'preserved local source');
+  assert.equal((JSON.parse(await readFile(join(directory, 'chats', detail.id, 'chat.json'), 'utf8')) as Record<string, unknown>).schemaVersion, 10);
 });
 
 test('persists each provider pairing while reusing a completed side effect for a new state ID', async (t) => {
@@ -1428,6 +1563,7 @@ test('migrates existing chat detail schema 3 and preserves its draft', async (t)
   const path = join(directory, 'chats', chat.id, 'chat.json');
   const oldDetail = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
   oldDetail.schemaVersion = 3;
+  delete oldDetail.turns;
   delete oldDetail.nextTurnPermissionProfile;
   await writeFile(path, JSON.stringify(oldDetail));
 
@@ -1435,7 +1571,7 @@ test('migrates existing chat detail schema 3 and preserves its draft', async (t)
   assert.equal((await restored.getChat(chat.id)).draft, 'Сохранённый черновик');
   assert.equal((await restored.getChat(chat.id)).nextTurnPermissionProfile, null);
   const migrated = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  assert.equal(migrated.schemaVersion, 9);
+  assert.equal(migrated.schemaVersion, 10);
   assert.equal(migrated.nextTurnPermissionProfile, null);
   assert.equal(migrated.nextTurnSkillId, null);
 });
@@ -1453,6 +1589,7 @@ test('migrates schema 8 with an empty pending list and preserves legacy messageI
   const legacyBytes = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
   legacyBytes.schemaVersion = 8;
   delete legacyBytes.draftAttachments;
+  delete legacyBytes.turns;
   await writeFile(path, JSON.stringify(legacyBytes));
 
   const restored = await openStore(directory);
@@ -1461,7 +1598,7 @@ test('migrates schema 8 with an empty pending list and preserves legacy messageI
   assert.equal(detail.artifacts[0]?.messageId, null);
   assert.deepEqual(detail.draftAttachments, []);
   const saved = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  assert.equal(saved.schemaVersion, 9);
+  assert.equal(saved.schemaVersion, 10);
   assert.deepEqual(saved.draftAttachments, []);
 });
 
@@ -1475,6 +1612,7 @@ test('migrates chat detail schema 4 to 5 without changing history or artifacts',
   const path = join(directory, 'chats', chat.id, 'chat.json');
   const oldDetail = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
   oldDetail.schemaVersion = 4;
+  delete oldDetail.turns;
   delete oldDetail.nextTurnSkillId;
   await writeFile(path, JSON.stringify(oldDetail));
 
@@ -1484,7 +1622,7 @@ test('migrates chat detail schema 4 to 5 without changing history or artifacts',
   assert.equal(detail.nextTurnSkillId, null);
   assert.equal(detail.draft, 'Черновик');
   assert.equal(detail.messages[0]?.text, 'Сохранённая история');
-  assert.equal(JSON.parse(await readFile(path, 'utf8')).schemaVersion, 9);
+  assert.equal(JSON.parse(await readFile(path, 'utf8')).schemaVersion, 10);
 });
 
 test('migrates previous settings and chat schemas with an empty model choice', async (t) => {
@@ -1497,6 +1635,7 @@ test('migrates previous settings and chat schemas with an empty model choice', a
   const oldChat = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown>;
   const oldSettings = JSON.parse(await readFile(settingsPath, 'utf8')) as { schemaVersion: number; settings: Record<string, unknown> };
   oldChat.schemaVersion = 5;
+  delete oldChat.turns;
   delete oldChat.modelId;
   oldSettings.schemaVersion = 6;
   delete oldSettings.settings.defaultModelId;
@@ -1506,7 +1645,7 @@ test('migrates previous settings and chat schemas with an empty model choice', a
   assert.equal((await restored.getChat(chat.id)).modelId, null);
   assert.equal((await restored.getSettings()).defaultModelId, null);
   assert.equal((await restored.getSettings()).microphoneConsent, 'unasked');
-  assert.equal(JSON.parse(await readFile(chatPath, 'utf8')).schemaVersion, 9);
+  assert.equal(JSON.parse(await readFile(chatPath, 'utf8')).schemaVersion, 10);
   assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).schemaVersion, 10);
 });
 

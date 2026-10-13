@@ -66,8 +66,9 @@ export interface TurnRuntimeOptions {
   prepareProviderRequest?(turn: AcceptedTurnInput, request: ProviderTurnRequest, signal: AbortSignal): Promise<ProviderTurnRequest>;
   consumeTurn(turn: AcceptedTurnInput, signal: AbortSignal): Promise<void>;
   releaseTurn(turn: AcceptedTurnInput): void;
-  appendAssistant(turn: AcceptedTurnInput, text: string, signal: AbortSignal, functionsStateId?: string): Promise<void>;
-  appendCompaction?(turn: AcceptedTurnInput, text: string, signal: AbortSignal, context: PreparedCompactionContext): Promise<void>;
+  persistTurnRecord?(turn: RuntimeTurnSnapshot): Promise<void>;
+  appendAssistant(turn: AcceptedTurnInput, text: string, signal: AbortSignal, functionsStateId: string | undefined, terminalTurn: RuntimeTurnSnapshot): Promise<void>;
+  appendCompaction?(turn: AcceptedTurnInput, text: string, signal: AbortSignal, context: PreparedCompactionContext, terminalTurn: RuntimeTurnSnapshot): Promise<void>;
   compactionEnabled?: boolean;
   recordUsageReceipt(receipt: UsageReceipt): Promise<void>;
   beginToolReceipt?(turn: AcceptedTurnInput, receipt: ToolReceiptInput): Promise<ToolReceiptStart>;
@@ -96,6 +97,9 @@ interface RuntimeTurn extends RuntimeTurnSnapshot {
   input: AcceptedTurnInput;
   controller?: AbortController;
   cancelRequested: boolean;
+  persistTail: Promise<void>;
+  persistError?: unknown;
+  pendingTerminal?: RuntimeTurnSnapshot;
 }
 
 interface StopState {
@@ -105,6 +109,7 @@ interface StopState {
   waiters: Set<() => void>;
   pendingOperation: boolean;
   pendingOutcome: { status: 'completed' | 'failed' | 'cancelled'; error?: string; errorCategory?: ProviderErrorCategory } | null;
+  terminalRecordSaved?: boolean;
 }
 
 interface IdleWaiter {
@@ -123,6 +128,9 @@ function copyTurn(turn: RuntimeTurn): RuntimeTurnSnapshot {
   return {
     id: turn.id,
     chatId: turn.chatId,
+    anchorMessageId: turn.input.messageId,
+    assistantMessageId: turn.input.assistantMessageId,
+    ...(turn.input.operation ? { operation: turn.input.operation } : {}),
     modelId: turn.input.modelId,
     status: turn.status,
     createdAt: turn.createdAt,
@@ -162,6 +170,8 @@ function runtimeErrorCategory(error: unknown, turnTimedOut = false): ProviderErr
     case 'INCOMPLETE_PROVIDER_RESPONSE': return 'protocol';
     case 'TURN_CONSUME_TIMEOUT':
     case 'TOOL_INTENT_SAVE_TIMEOUT':
+    case 'TURN_RECORD_SAVE_TIMEOUT':
+    case 'TURN_RECORD_SAVE_FAILED':
     case 'USAGE_RECEIPT_SAVE_TIMEOUT':
     case 'USAGE_RECEIPT_SAVE_FAILED':
     case 'USAGE_RECEIPT_WRITE_FAILED':
@@ -199,6 +209,7 @@ function requireAcceptedTurn(value: unknown): AcceptedTurnInput {
     || (turn.projectId !== null && typeof turn.projectId !== 'string')
     || (turn.projectWorkingFolder !== null && typeof turn.projectWorkingFolder !== 'string')
     || (turn.operation !== undefined && turn.operation !== 'compaction')
+    || (turn.operation === 'compaction' ? turn.assistantMessageId !== null : typeof turn.assistantMessageId !== 'string')
     || (turn.operation === 'compaction' && (typeof turn.compactBoundaryMessageId !== 'string'
       || turn.compactBoundaryMessageId !== turn.messageId
       || !(turn.compactExpectedSnapshotId === null || typeof turn.compactExpectedSnapshotId === 'string')))
@@ -223,7 +234,7 @@ function assertProviderEvent(value: unknown): asserts value is ProviderEvent {
       if ((event.functionName !== 'get_file_content' && event.functionName !== 'text2image')
         || typeof event.detail !== 'string' || event.detail.length > 1000
         // eslint-disable-next-line no-control-regex -- Provider progress text is untrusted display metadata.
-        || /[\u0000-\u001f\u007f]/.test(event.detail)) throw new Error('BAD_PROVIDER_EVENT');
+        || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(event.detail)) throw new Error('BAD_PROVIDER_EVENT');
     } else if (event.functionName !== undefined || event.detail !== undefined) {
       throw new Error('BAD_PROVIDER_EVENT');
     }
@@ -386,9 +397,11 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
   const toolOwners = new Map<string, string>();
   const latestTurnByAnchor = new Map<string, string>();
   const retryingAnchors = new Set<string>();
+  const pendingPersistenceWaiters = new Set<() => void>();
   let activeTurn: RuntimeTurn | null = null;
   let draining = false;
   let blockedTurnId: string | null = null;
+  let pendingPersistenceCount = 0;
   const idleWaiters: IdleWaiter[] = [];
   const prepareTimeoutMs = options.timeouts?.prepareMs ?? DEFAULT_PREPARE_TIMEOUT_MS;
   const nextTimeoutMs = options.timeouts?.nextMs ?? DEFAULT_NEXT_TIMEOUT_MS;
@@ -404,6 +417,31 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       try { listener(snapshot); } catch { /* Runtime state must survive observer failures. */ }
     }
   };
+
+  const scheduleTurnRecord = (turn: RuntimeTurn, snapshotInput?: RuntimeTurnSnapshot): Promise<void> => {
+    if (!options.persistTurnRecord) return Promise.resolve();
+    const snapshot = snapshotInput ? structuredClone(snapshotInput) : copyTurn(turn);
+    const writing = turn.persistTail.then(async () => {
+      if (turn.persistError !== undefined) throw turn.persistError;
+      try { await options.persistTurnRecord!(snapshot); }
+      catch (error) { throw Object.assign(new Error('TURN_RECORD_SAVE_FAILED'), { category: 'storage' as const, cause: error }); }
+    });
+    turn.persistTail = writing.catch((error: unknown) => { turn.persistError ??= error; });
+    pendingPersistenceCount += 1;
+    void writing.then(() => undefined, () => undefined).then(() => {
+      pendingPersistenceCount -= 1;
+      if (pendingPersistenceCount === 0) {
+        for (const resolve of pendingPersistenceWaiters) resolve();
+        pendingPersistenceWaiters.clear();
+      }
+      finishIdleWaiters();
+    });
+    return writing;
+  };
+
+  const waitForPendingPersistence = (): Promise<void> => pendingPersistenceCount === 0
+    ? Promise.resolve()
+    : new Promise((resolve) => pendingPersistenceWaiters.add(resolve));
 
   const anchorKey = (turn: AcceptedTurnInput): string => `${turn.chatId}\0${turn.messageId}`;
   const canRetry = (turn: RuntimeTurn, ignoreRetryLock = false): boolean => {
@@ -427,9 +465,13 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     for (const turn of turns.values()) updateRetryEligibility(turn);
   };
 
-  const addActivity = (turn: RuntimeTurn, activity: RuntimeActivity): void => {
+  const addActivity = (turn: RuntimeTurn, activity: RuntimeActivity, persistAs?: RuntimeTurnSnapshot): void => {
     if (turn.activity.length >= MAX_ACTIVITY_PER_TURN) turn.activity.shift();
     turn.activity.push(activity);
+    const snapshot = persistAs
+      ? { ...structuredClone(persistAs), activity: structuredClone(turn.activity) }
+      : undefined;
+    void scheduleTurnRecord(turn, snapshot).catch(() => undefined);
     publish(turn);
   };
 
@@ -446,8 +488,9 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     const turn = turns.get(turnId);
     if (turn && state.pendingOutcome) {
       turn.status = state.pendingOutcome.status;
-      turn.endedAt = new Date().toISOString();
-      if (turn.startedAt) turn.activeDurationMs = Math.max(0, Date.now() - Date.parse(turn.startedAt));
+      turn.endedAt = turn.pendingTerminal?.endedAt ?? new Date().toISOString();
+      if (turn.pendingTerminal?.activeDurationMs !== undefined) turn.activeDurationMs = turn.pendingTerminal.activeDurationMs;
+      else if (turn.startedAt) turn.activeDurationMs = Math.max(0, Date.now() - Date.parse(turn.startedAt));
       if (state.pendingOutcome.status === 'completed') delete turn.draft;
       if (state.pendingOutcome.error) turn.error = state.pendingOutcome.error;
       else delete turn.error;
@@ -455,7 +498,32 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       else if (state.pendingOutcome.status === 'cancelled') turn.errorCategory = 'cancel';
       else delete turn.errorCategory;
       turn.controller = undefined;
+      if (state.pendingOutcome.status === 'completed' && turn.pendingTerminal) {
+        turn.endedAt = turn.pendingTerminal.endedAt;
+        turn.activeDurationMs = turn.pendingTerminal.activeDurationMs;
+        delete turn.error;
+        delete turn.errorCategory;
+      }
+      delete turn.pendingTerminal;
       publish(turn);
+      if (state.pendingOutcome.status !== 'completed' && options.persistTurnRecord && !state.terminalRecordSaved) {
+        state.pendingOperation = true;
+        const savingTerminal = scheduleTurnRecord(turn);
+        void savingTerminal.then(() => {
+          state.terminalRecordSaved = true;
+          state.pendingOperation = false;
+          maybeUnblock(turnId);
+        }, () => {
+          state.pendingOperation = false;
+          blockedTurnId = turnId;
+          turn.errorCategory = 'storage';
+          turn.error = 'Состояние остановленного хода не сохранено; очередь приостановлена.';
+          publish(turn);
+          refreshRetryEligibility();
+          finishIdleWaiters();
+        });
+        return;
+      }
     }
     stopStates.delete(turnId);
     blockedTurnId = null;
@@ -471,7 +539,22 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       return;
     }
     if (draining || activeTurn || queue.some((turn) => turn.status === 'queued')) return;
+    if (pendingPersistenceCount > 0) return;
     for (const waiter of idleWaiters.splice(0)) waiter.resolve();
+  };
+
+  const persistQueuedCancellation = (turn: RuntimeTurn): void => {
+    void scheduleTurnRecord(turn).then(() => {
+      finishIdleWaiters();
+    }, () => {
+      turn.status = 'failed';
+      turn.errorCategory = 'storage';
+      turn.error = 'Состояние отменённого хода не сохранено; очередь приостановлена.';
+      if (!blockedTurnId) blockedTurnId = turn.id;
+      publish(turn);
+      refreshRetryEligibility();
+      finishIdleWaiters();
+    });
   };
 
   const waitForTools = async (state: StopState): Promise<boolean> => {
@@ -562,10 +645,11 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     delete turn.errorCategory;
     turn.error = 'Не удалось подтвердить остановку потока или локального инструмента; очередь приостановлена.';
     turn.endedAt = new Date().toISOString();
+    const state = stopStates.get(turn.id);
+    if (state) state.pendingOutcome = { status: 'failed', error: turn.error };
     publish(turn);
     refreshRetryEligibility();
     finishIdleWaiters();
-    const state = stopStates.get(turn.id);
     if (state) {
       state.streamStop?.then(() => { notifyStopWaiters(state); maybeUnblock(turn.id); });
       if (stopConfirmed(state)) maybeUnblock(turn.id);
@@ -584,6 +668,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     delete turn.retryEligible;
     turn.startedAt = new Date().toISOString();
     turn.queueDurationMs = Math.max(0, Date.now() - Date.parse(turn.createdAt));
+    void scheduleTurnRecord(turn).catch(() => undefined);
     publish(turn);
     const started = Date.now();
     let iterator: AsyncIterator<ProviderEvent> | null = null;
@@ -638,6 +723,19 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         throw timedOut ? new Error(timeoutMessage) : error;
       }
     };
+    const flushTurnPersistence = async (signal = controller.signal): Promise<void> => {
+      if (!options.persistTurnRecord) return;
+      const pending = turn.persistTail.then(() => {
+        if (turn.persistError !== undefined) throw turn.persistError;
+      });
+      await waitTracked(
+        pending,
+        operationTimeoutMs,
+        'TURN_RECORD_SAVE_TIMEOUT',
+        'Сохранение состояния хода ожидается; очередь приостановлена.',
+        signal,
+      );
+    };
     const saveUsageReceipt = async (receipt: UsageReceipt): Promise<void> => {
       try { await options.recordUsageReceipt(receipt); }
       catch (error) {
@@ -684,6 +782,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       input: HookDispatchInput,
       signal = controller.signal,
       acceptedTurn = turn.input,
+      persistAs?: RuntimeTurnSnapshot,
     ): Promise<HookRunResult[]> => {
       let results: HookRunResult[];
       try {
@@ -694,8 +793,9 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
             addActivity(turn, {
               kind: 'hook', at: new Date().toISOString(), hookId: result.hookId, hookName: result.hookName,
               event: result.event, status: result.status, ...(result.reason ? { reason: result.reason } : {}),
-            });
+            }, persistAs);
           }
+          await flushTurnPersistence(signal);
         }
         throw error;
       }
@@ -703,8 +803,9 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         addActivity(turn, {
           kind: 'hook', at: new Date().toISOString(), hookId: result.hookId, hookName: result.hookName,
           event: result.event, status: result.status, ...(result.reason ? { reason: result.reason } : {}),
-        });
+        }, persistAs);
       }
+      await flushTurnPersistence(signal);
       if (signal.aborted) throw abortError();
       return results;
     };
@@ -728,6 +829,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       }
     };
     try {
+      await flushTurnPersistence();
       if (!options.provider) throw new Error('PROVIDER_UNAVAILABLE');
       if (!turn.input.modelId) throw new Error('MODEL_NOT_SELECTED');
       const preparation = Promise.resolve().then(() => options.prepareTurn(turn.input, controller.signal));
@@ -762,6 +864,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       let toolRounds = 0;
       let totalToolResultBytes = 0;
       for (;;) {
+        await flushTurnPersistence();
         if (controller.signal.aborted) throw abortError();
         if (stopState.pendingToolIds.size || stopState.pendingOperation) throw new Error('TOOL_STOP_STATE');
         stopState.streamConfirmed = true;
@@ -864,6 +967,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
             completed = true;
             if (rawEvent.functionsStateId) completedFunctionsStateId = rawEvent.functionsStateId;
           }
+          await flushTurnPersistence();
         }
 
         if (controller.signal.aborted) throw abortError();
@@ -884,6 +988,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
             kind: 'provider', at: new Date().toISOString(), activity: 'waiting-for-tool',
             ...(isProviderToolName(functionCall.name) ? { tool: functionCall.name } : {}),
           });
+          await flushTurnPersistence();
           if (!options.beginToolReceipt || !options.completeToolReceipt) {
             throw Object.assign(new Error('TOOL_RECEIPT_STORE_UNAVAILABLE'), { category: 'tool' });
           }
@@ -1015,15 +1120,26 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         await finishActiveUsage('completed');
         stopHooksRan = true;
         await runHookEvent({ event: 'stop', projectId: turn.input.projectId }, new AbortController().signal).catch(() => undefined);
+        await flushTurnPersistence();
         flushDraft();
+        const terminalTurn = copyTurn({
+          ...turn,
+          status: 'completed',
+          endedAt: new Date().toISOString(),
+          activeDurationMs: Math.max(0, Date.now() - started),
+          draft: undefined,
+          error: undefined,
+          errorCategory: undefined,
+          retryEligible: undefined,
+        });
         const appendOperation = turn.input.operation === 'compaction'
           ? options.appendCompaction && compactionContext
-            ? options.appendCompaction(turn.input, validateCompactSummary(answer), controller.signal, compactionContext)
+            ? options.appendCompaction(turn.input, validateCompactSummary(answer), controller.signal, compactionContext, terminalTurn)
               .then(async () => {
-                await runHookEvent({ event: 'after-compaction', projectId: turn.input.projectId }, new AbortController().signal).catch(() => undefined);
+                await runHookEvent({ event: 'after-compaction', projectId: turn.input.projectId }, new AbortController().signal, turn.input, terminalTurn).catch(() => undefined);
               })
             : Promise.reject(new Error('COMPACTION_SAVE_UNAVAILABLE'))
-          : options.appendAssistant(turn.input, answer, controller.signal, completedFunctionsStateId);
+          : options.appendAssistant(turn.input, answer, controller.signal, completedFunctionsStateId, terminalTurn);
         const appending = appendOperation.catch((error: unknown) => {
           if (isAbortError(error)) throw error;
           throw Object.assign(new Error('ASSISTANT_SAVE_FAILED'), { category: 'storage' as const });
@@ -1036,6 +1152,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         );
         const appended = await bounded(appending.then(() => true), operationTimeoutMs);
         if (appended === STOP_TIMEOUT) {
+          turn.pendingTerminal = terminalTurn;
           holdForPendingOperation(turn, stopState, appendOutcome, 'Подтверждение сохранения ответа ожидается; очередь приостановлена.');
           return;
         }
@@ -1044,8 +1161,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         delete turn.error;
         delete turn.errorCategory;
         delete turn.retryEligible;
-        turn.endedAt = new Date().toISOString();
-        turn.activeDurationMs = Math.max(0, Date.now() - started);
+        turn.endedAt = terminalTurn.endedAt;
+        turn.activeDurationMs = terminalTurn.activeDurationMs;
         publish(turn);
         break;
       }
@@ -1123,6 +1240,19 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
                                     : 'Ход завершился ошибкой. Сообщение пользователя сохранено локально.';
         }
         publish(turn);
+        if (options.persistTurnRecord) {
+          try { await scheduleTurnRecord(turn); }
+          catch {
+            blockedTurnId = turn.id;
+            turn.status = 'failed';
+            turn.errorCategory = 'storage';
+            turn.error = 'Состояние остановленного хода не сохранено; очередь приостановлена.';
+            publish(turn);
+            refreshRetryEligibility();
+            finishIdleWaiters();
+            return;
+          }
+        }
       }
     } finally {
       clearTimeout(turnTimer);
@@ -1142,6 +1272,10 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     draining = true;
     try {
       while (queue.length && !blockedTurnId) {
+        if (pendingPersistenceCount > 0) {
+          await waitForPendingPersistence();
+          continue;
+        }
         const turn = queue.shift();
         if (!turn || turn.status !== 'queued') continue;
         activeTurn = turn;
@@ -1161,15 +1295,19 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     const turn: RuntimeTurn = {
       id: input.turnId,
       chatId: input.chatId,
+      anchorMessageId: input.messageId,
+      assistantMessageId: input.assistantMessageId,
       status: 'queued',
-      createdAt: new Date().toISOString(),
+      createdAt: input.messages.find((message) => message.id === input.messageId)?.createdAt ?? new Date().toISOString(),
       activity: [],
       cancelRequested: false,
+      persistTail: Promise.resolve(),
       input,
     };
     turns.set(turn.id, turn);
     if (input.operation !== 'compaction') latestTurnByAnchor.set(anchorKey(input), turn.id);
     queue.push(turn);
+    void scheduleTurnRecord(turn).catch(() => undefined);
     publish(turn);
     void drain();
     return turn.id;
@@ -1206,6 +1344,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         turn.endedAt = new Date().toISOString();
         turn.queueDurationMs = Math.max(0, Date.now() - Date.parse(turn.createdAt));
         options.releaseTurn(turn.input);
+        persistQueuedCancellation(turn);
         publish(turn);
         updateRetryEligibility(turn);
         finishIdleWaiters();
@@ -1249,6 +1388,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           turn.endedAt = new Date().toISOString();
           turn.queueDurationMs = Math.max(0, Date.now() - Date.parse(turn.createdAt));
           options.releaseTurn(turn.input);
+          persistQueuedCancellation(turn);
           publish(turn);
           updateRetryEligibility(turn);
         }
@@ -1256,13 +1396,13 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       activeTurn?.controller?.abort();
       await new Promise<void>((resolve, reject) => {
         if (blockedTurnId) reject(new Error('Очередь приостановлена: остановка хода не подтверждена.'));
-        else if (!draining && !activeTurn && !queue.some((turn) => turn.status === 'queued')) resolve();
+        else if (!draining && !activeTurn && !queue.some((turn) => turn.status === 'queued') && pendingPersistenceCount === 0) resolve();
         else idleWaiters.push({ resolve, reject });
       });
     },
     whenIdle: () => new Promise<void>((resolve, reject) => {
       if (blockedTurnId) reject(new Error('Очередь приостановлена: остановка хода не подтверждена.'));
-      else if (!draining && !activeTurn && !queue.some((turn) => turn.status === 'queued')) resolve();
+      else if (!draining && !activeTurn && !queue.some((turn) => turn.status === 'queued') && pendingPersistenceCount === 0) resolve();
       else idleWaiters.push({ resolve, reject });
     }),
     onUpdate: (listener) => {
