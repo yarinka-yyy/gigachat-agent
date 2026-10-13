@@ -214,9 +214,50 @@ export interface UsageProfileDay {
   byFamily: UsageAggregate[];
 }
 
+export type BalanceFamilyId = 'ultra' | 'max' | 'pro' | 'lite';
+
+export interface ProviderBalanceFamily {
+  family: BalanceFamilyId;
+  state: 'known' | 'missing' | 'ambiguous';
+  value?: number;
+}
+
+export interface ProviderBalanceObservation {
+  observedAt: string;
+  unknownUsageCount: number;
+  families: ProviderBalanceFamily[];
+}
+
+export interface UsageBalanceFamilyView {
+  family: BalanceFamilyId;
+  state: 'known' | 'missing' | 'ambiguous' | 'unknown' | 'expired';
+  snapshotRemainingTokens: number | null;
+  usedSinceSnapshot: number;
+  estimatedRemainingTokens: number | null;
+  unknownRequests: number;
+  conflictedRequests: number;
+}
+
+export interface UsageBalanceView {
+  state: 'unknown' | 'available' | 'expired';
+  source: 'api' | 'studio' | null;
+  observedAt: string | null;
+  expiresAt: string | null;
+  unknownUsageCount: number | null;
+  isEstimate: boolean;
+  incomplete: boolean;
+  families: UsageBalanceFamilyView[];
+}
+
+export interface StudioBalanceAnchorInput {
+  remainingTokens: Record<BalanceFamilyId, number>;
+  expiresAt: string;
+}
+
 export interface UsageProfileView {
   generatedAt: string;
   timeZone: string;
+  balance: UsageBalanceView;
   total: UsageAggregate;
   byFamily: UsageAggregate[];
   byModel: UsageAggregate[];
@@ -791,6 +832,8 @@ export interface AppApi {
     getLocalStats(): Promise<LocalUsageStats>;
     getLedger(): Promise<UsageLedgerSummary>;
     getProfileView(): Promise<UsageProfileView>;
+    refreshBalance(): Promise<UsageProfileView>;
+    saveStudioBalanceAnchor(input: StudioBalanceAnchorInput): Promise<UsageProfileView>;
   };
   onCloseRequested(flush: () => Promise<void>, onFailure: (result: CloseFailure) => void): () => void;
   retryClose(discardBrowserMetadata?: boolean): Promise<CloseAttemptResult>;

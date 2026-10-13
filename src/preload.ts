@@ -213,6 +213,8 @@ const api: AppApi = {
     getLocalStats: () => ipcRenderer.invoke('usage:local-stats') as Promise<LocalUsageStats>,
     getLedger: () => ipcRenderer.invoke('usage:get-ledger') as Promise<UsageLedgerSummary>,
     getProfileView: () => ipcRenderer.invoke('usage:get-profile-view') as Promise<UsageProfileView>,
+    refreshBalance: () => ipcRenderer.invoke('usage:refresh-balance') as Promise<UsageProfileView>,
+    saveStudioBalanceAnchor: (input) => ipcRenderer.invoke('usage:save-studio-balance-anchor', input) as Promise<UsageProfileView>,
   },
   onCloseRequested: (flush, onFailure) => {
     closeFlush = flush;

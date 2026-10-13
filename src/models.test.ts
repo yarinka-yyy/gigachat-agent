@@ -8,6 +8,7 @@ import {
   unavailableModelRegistry,
 } from './models';
 import {
+  billingFamilyForUsageLabel,
   CHAT_MODEL_FAMILIES,
   chatModelUnavailableReason,
   chatModelOptions,
@@ -57,6 +58,19 @@ test('chat catalogue is the four named current families while raw discovery stay
   assert.notEqual(chatModelOptions(registry)[0]?.poolEvidence, CHAT_MODEL_FAMILIES[0]?.poolEvidence);
   const chatCatalogIds: string[] = chatModelOptions(registry).map(({ displayName, currentId }) => `${displayName}:${currentId}`);
   assert.equal(chatCatalogIds.some((entry) => entry.includes('Embeddings') || entry.includes('GigaChat-2-Pro')), false);
+});
+
+test('balance billing labels match only exact current, legacy, display, and observed Ultra aliases', () => {
+  for (const family of CHAT_MODEL_FAMILIES) {
+    for (const label of [family.currentId, family.displayName, ...family.legacyIds,
+      ...('billingAliases' in family ? family.billingAliases : [])]) {
+      assert.equal(billingFamilyForUsageLabel(label)?.family, family.family);
+    }
+  }
+  assert.equal(billingFamilyForUsageLabel('GigaChat-Ultra')?.family, 'ultra');
+  for (const label of ['GigaChat3Ultra', 'GigaChat3-Ultra', 'Embeddings', 'my-GigaChat-Ultra', 'GigaChat Ultra v2', '']) {
+    assert.equal(billingFamilyForUsageLabel(label), null);
+  }
 });
 
 test('chat enforcement requires an exact listed current ID and verified basic capability', () => {

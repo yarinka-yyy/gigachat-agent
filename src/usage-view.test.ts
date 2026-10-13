@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { UsageProfileInput } from './usage-view';
-import { buildUsageProfileView } from './usage-view';
-import type { ChatToolReceipt, UsageProfileView, UsageReceipt } from './contracts';
+import type { UsageBalanceAnchorViewInput, UsageProfileInput } from './usage-view';
+import { buildUsageProfileView, createBalanceScopeGuard } from './usage-view';
+import type { ChatToolReceipt, ProviderBalanceFamily, UsageProfileView, UsageReceipt } from './contracts';
 
 const NOW = '2026-10-13T12:00:00.000Z';
 
@@ -35,6 +35,21 @@ function profile(overrides: Partial<UsageProfileInput> = {}): UsageProfileView {
     installedSkillCount: 0,
     ...overrides,
   });
+}
+
+const completeBalanceFamilies: ProviderBalanceFamily[] = [
+  { family: 'ultra', state: 'known', value: 1_000 },
+  { family: 'max', state: 'known', value: 1_000 },
+  { family: 'pro', state: 'known', value: 1_000 },
+  { family: 'lite', state: 'known', value: 1_000 },
+];
+
+function balanceAnchor(overrides: Partial<UsageBalanceAnchorViewInput> = {}): UsageBalanceAnchorViewInput {
+  return {
+    source: 'api', observedAt: '2026-10-13T10:00:00.000Z', expiresAt: null,
+    unknownUsageCount: 0, families: completeBalanceFamilies, baselineReceiptCount: 0,
+    baselineMatches: true, ...overrides,
+  };
 }
 
 function aggregate(view: UsageProfileView, key: string) {
@@ -226,4 +241,139 @@ test('returns empty and uncertain metrics explicitly instead of inventing chat, 
   assert.equal(view.total.totalTokens.knownTokens, 0);
   assert.equal(view.total.totalTokens.unknownRequests, 1);
   assert.equal(view.localActivity.streakDays, 1, 'a recorded API request is an activity day even when its token total is unknown');
+});
+
+test('balance anchor includes historical pending requests and subtracts only later known usage', () => {
+  const view = profile({
+    receipts: [
+      receipt(1, {
+        modelId: 'GigaChat-3-Pro', providerRequestId: 'historical-pending',
+        createdAt: '2026-10-13T09:00:00.000Z', status: 'pending',
+        promptTokens: null, completionTokens: null, totalTokens: null,
+      }),
+      receipt(2, { createdAt: '2026-10-13T11:00:00.000Z', totalTokens: 37 }),
+      receipt(3, {
+        modelId: 'GigaChat-3-Ultra', createdAt: '2026-10-13T11:30:00.000Z',
+        status: 'failed', promptTokens: null, completionTokens: null, totalTokens: null,
+      }),
+    ],
+    balanceAnchor: balanceAnchor({ baselineReceiptCount: 1 }),
+  });
+
+  assert.equal(view.balance.state, 'available');
+  assert.equal(view.balance.incomplete, true, 'unknown post-anchor usage remains visibly partial');
+  const pro = view.balance.families.find((family) => family.family === 'pro');
+  assert.equal(pro?.usedSinceSnapshot, 37);
+  assert.equal(pro?.estimatedRemainingTokens, 963);
+  const ultra = view.balance.families.find((family) => family.family === 'ultra');
+  assert.equal(ultra?.unknownRequests, 1);
+  assert.equal(ultra?.estimatedRemainingTokens, null, 'unknown expense is never treated as zero');
+});
+
+test('unknown post-anchor billing families make every family estimate unknown', () => {
+  for (const totalTokens of [37, null]) {
+    const view = profile({
+      receipts: [receipt(1, {
+        modelId: 'GigaChat-3-Unmapped', createdAt: '2026-10-13T11:00:00.000Z',
+        totalTokens,
+      })],
+      balanceAnchor: balanceAnchor(),
+    });
+
+    assert.equal(view.balance.state, 'available');
+    assert.equal(view.balance.incomplete, true);
+    assert.equal(view.balance.families.length, 4);
+    assert.ok(view.balance.families.every((family) => family.estimatedRemainingTokens === null),
+      'unknown model billing cannot be assumed to leave all known pools unchanged');
+  }
+});
+
+test('does not subtract a compatible provider duplicate that arrives after the anchor', () => {
+  const shared = {
+    providerRequestId: 'already-counted', createdAt: '2026-10-13T09:30:00.000Z', totalTokens: 40,
+  };
+  const view = profile({
+    receipts: [receipt(1, shared), receipt(2, shared)],
+    balanceAnchor: balanceAnchor({ baselineReceiptCount: 1 }),
+  });
+  const pro = view.balance.families.find((family) => family.family === 'pro');
+
+  assert.equal(pro?.usedSinceSnapshot, 0);
+  assert.equal(pro?.estimatedRemainingTokens, 1_000);
+  assert.equal(pro?.conflictedRequests, 0);
+  assert.equal(view.balance.incomplete, false);
+});
+
+test('invalidates an anchor when a baseline receipt changes after calibration', () => {
+  const changedAfterAnchor = receipt(1, {
+    providerRequestId: 'settled-after-anchor', createdAt: '2026-10-13T09:00:00.000Z',
+    status: 'completed', promptTokens: 20, completionTokens: 5, totalTokens: 25,
+  });
+  const view = profile({
+    receipts: [changedAfterAnchor],
+    balanceAnchor: balanceAnchor({ baselineReceiptCount: 1, baselineMatches: false }),
+  });
+  const pro = view.balance.families.find((family) => family.family === 'pro');
+
+  assert.equal(view.balance.incomplete, true);
+  assert.equal(pro?.estimatedRemainingTokens, null, 'changed baseline cannot silently produce an exact estimate');
+});
+
+test('marks a request crossing the observed balance timestamp as uncertain', () => {
+  const view = profile({
+    receipts: [receipt(1, { createdAt: '2026-10-13T09:59:00.000Z', totalTokens: 50 })],
+    balanceAnchor: balanceAnchor({ observedAt: '2026-10-13T10:00:00.000Z' }),
+  });
+  const pro = view.balance.families.find((family) => family.family === 'pro');
+
+  assert.equal(view.balance.incomplete, true);
+  assert.equal(pro?.usedSinceSnapshot, 0);
+  assert.equal(pro?.estimatedRemainingTokens, null);
+});
+
+test('expires a manual anchor without renewing it from the current date', () => {
+  const view = profile({
+    balanceAnchor: balanceAnchor({ source: 'studio', expiresAt: '2026-10-12' }),
+  });
+  assert.equal(view.balance.state, 'expired');
+  assert.equal(view.balance.families.find((family) => family.family === 'pro')?.snapshotRemainingTokens, null);
+  assert.equal(view.balance.families.find((family) => family.family === 'pro')?.estimatedRemainingTokens, null);
+});
+
+test('connection and model refresh operations cannot cross a pending key save', async () => {
+  const guard = createBalanceScopeGuard();
+  let connectCalls = 0;
+  const finishKeySave = guard.beginTransition();
+
+  await assert.rejects(guard.runStable(async () => {
+    connectCalls += 1;
+    return 'connected';
+  }), /смена ключа/);
+  assert.equal(connectCalls, 0, 'a new connection cannot start with the key being replaced');
+
+  finishKeySave();
+  let finishConnect: ((value: string) => void) | undefined;
+  const connecting = guard.runStable(() => new Promise<string>((resolve) => { finishConnect = resolve; }));
+  const finishSecondKeySave = guard.beginTransition();
+  finishConnect?.('connected');
+  await assert.rejects(connecting, /изменился/,
+    'a connection completing across a key-save transition is not accepted');
+  finishSecondKeySave();
+});
+
+test('balance scope transitions invalidate in-flight reads and keep overlapping key changes blocked', () => {
+  const guard = createBalanceScopeGuard();
+  const originalGeneration = guard.getGeneration();
+  const finishFirst = guard.beginTransition();
+  const secondGeneration = guard.getGeneration();
+  const finishSecond = guard.beginTransition();
+
+  assert.equal(guard.isCurrent(originalGeneration), false);
+  assert.equal(guard.isTransitioning(), true);
+  finishFirst();
+  assert.equal(guard.isCurrent(secondGeneration), false, 'an unfinished key save keeps profile reads unscoped');
+  finishSecond();
+  finishSecond();
+  assert.equal(guard.isTransitioning(), false);
+  assert.equal(guard.isCurrent(guard.getGeneration()), true);
 });

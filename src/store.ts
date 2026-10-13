@@ -3,14 +3,14 @@ import { Buffer } from 'node:buffer';
 import { constants } from 'node:fs';
 import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { DEFAULT_NOTIFICATION_SETTINGS, PROVIDER_ERROR_CATEGORIES, type AcceptedTurnInput, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type ChatTurnRecord, type CompactSnapshot, type CompactionPrefix, type HomeDraftAttachment, type HomeDraftInput, type HomeDraftRecord, type HookEvent, type HookRunResult, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderErrorCategory, type ProviderProtocolExchange, type ProviderToolName, type ProviderUploadLedgerEntry, type RuntimeActivity, type RuntimeTurnSnapshot, type Settings, type SettingsPatch, type Theme, type UsageLedgerSummary, type UsageProfileView, type UsageReceipt } from './contracts';
+import { DEFAULT_NOTIFICATION_SETTINGS, PROVIDER_ERROR_CATEGORIES, type AcceptedTurnInput, type BalanceFamilyId, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type ChatTurnRecord, type CompactSnapshot, type CompactionPrefix, type HomeDraftAttachment, type HomeDraftInput, type HomeDraftRecord, type HookEvent, type HookRunResult, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderBalanceFamily, type ProviderBalanceObservation, type ProviderErrorCategory, type ProviderProtocolExchange, type ProviderToolName, type ProviderUploadLedgerEntry, type RuntimeActivity, type RuntimeTurnSnapshot, type Settings, type SettingsPatch, type StudioBalanceAnchorInput, type Theme, type UsageLedgerSummary, type UsageProfileView, type UsageReceipt } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { requireModelId } from './models';
 import { isSkillId } from './skills';
 import { validateProjectFolder, validateProjectInstructionsPath } from './project-paths';
 import { createInstructionDocument, instructionFileHash } from './instruction-documents';
 import { MAX_USAGE_RECEIPTS, mergeUsageReceipt, summarizeUsage, validateUsageReceipt } from './usage';
-import { buildUsageProfileView } from './usage-view';
+import { buildUsageProfileView, type UsageBalanceAnchorViewInput } from './usage-view';
 import { hashCompactionPrefix, validateCompactSummary } from './context';
 import { attachmentContentType, inspectLocalAttachmentContent, LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES } from './attachment-policy';
 
@@ -19,6 +19,11 @@ type LegacyChat = ChatSummary & { draft: string };
 type ChatFile = { schemaVersion: 2; chats: LegacyChat[] };
 type SettingsFile = { schemaVersion: 10; settings: Settings };
 type UsageFile = { schemaVersion: 1; receipts: UsageReceipt[] };
+type ProfileBalanceAnchor = Omit<UsageBalanceAnchorViewInput, 'baselineMatches'> & {
+  accountScope: string;
+  baselineReceiptDigest: string;
+};
+type ProfileBalanceFile = { schemaVersion: 1; anchors: ProfileBalanceAnchor[] };
 type ProviderUploadFile = { schemaVersion: 1; entries: ProviderUploadLedgerEntry[] };
 type ProjectDeleteState = { projects: ProjectFile; chats: ChatDetail[]; instructionText: string | null };
 type ProjectDeleteJournal = {
@@ -49,6 +54,20 @@ export interface StoreTestFaults {
 
 export type InstructionCommitter = (request: InstructionCommitRequest) => Promise<InstructionCommitResult>;
 
+export interface UsageReceiptBaseline {
+  receiptCount: number;
+  digest: string;
+}
+
+function validateUsageReceiptBaseline(value: unknown): UsageReceiptBaseline {
+  if (!isRecord(value) || !Number.isSafeInteger(value.receiptCount) || (value.receiptCount as number) < 0
+    || (value.receiptCount as number) > MAX_USAGE_RECEIPTS
+    || typeof value.digest !== 'string' || !/^[a-f0-9]{64}$/.test(value.digest)) {
+    throw new Error('Сверка баланса не содержит допустимую границу истории usage.');
+  }
+  return { receiptCount: value.receiptCount as number, digest: value.digest };
+}
+
 export interface StoreOpenOptions {
   documentsDirectory?: string | null;
   testFaults?: StoreTestFaults;
@@ -57,6 +76,9 @@ export interface StoreOpenOptions {
 
 const MAX_INSTRUCTION_BYTES = 64 * 1024;
 const MAX_USAGE_LEDGER_BYTES = 32 * 1024 * 1024;
+const MAX_PROFILE_BALANCE_BYTES = 64 * 1024;
+const MAX_PROFILE_BALANCE_ANCHORS = 16;
+const BALANCE_FAMILIES = ['ultra', 'max', 'pro', 'lite'] as const;
 const MAX_PROVIDER_UPLOAD_LEDGER_BYTES = 16 * 1024 * 1024;
 const MAX_PROVIDER_UPLOAD_ENTRIES = 10_000;
 const MAX_TOOL_RECEIPTS_PER_CHAT = 256;
@@ -125,7 +147,11 @@ export interface LocalStore {
   getSettings(): Promise<Settings>;
   updateSettings(patch: unknown): Promise<Settings>;
   getLocalUsageStats(): Promise<LocalUsageStats>;
-  getUsageProfileView(installedSkillCount: number | null): Promise<UsageProfileView>;
+  getUsageProfileView(installedSkillCount: number | null, accountScope?: string | null): Promise<UsageProfileView>;
+  getUsageReceiptBaseline(): Promise<UsageReceiptBaseline>;
+  saveProviderBalanceAnchor(accountScope: unknown, observation: unknown, expectedBaseline: unknown): Promise<void>;
+  saveStudioBalanceAnchor(accountScope: unknown, input: unknown, expectedBaseline: unknown): Promise<void>;
+  invalidateUsageBalanceAnchors(): Promise<void>;
   recordUsageReceipt(receipt: unknown): Promise<void>;
   getUsageLedger(): Promise<UsageLedgerSummary>;
   getProviderUploadEntries(accountScope: unknown): Promise<ProviderUploadLedgerEntry[]>;
@@ -440,6 +466,20 @@ async function loadUsageLedger(filePath: string): Promise<Loaded<UsageFile>> {
   catch { throw storageError(filePath); }
 }
 
+async function loadProfileBalanceFile(filePath: string): Promise<Loaded<ProfileBalanceFile>> {
+  let info;
+  try { info = await lstat(filePath); }
+  catch (error) {
+    if (isMissingFile(error)) return { value: { schemaVersion: 1, anchors: [] }, needsWrite: true };
+    throw error;
+  }
+  if (!info.isFile() || info.size > MAX_PROFILE_BALANCE_BYTES) throw storageError(filePath);
+  const bytes = await readFile(filePath);
+  if (bytes.byteLength > MAX_PROFILE_BALANCE_BYTES) throw storageError(filePath);
+  try { return parseProfileBalanceFile(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as unknown); }
+  catch { throw storageError(filePath); }
+}
+
 function parseProjectFile(value: unknown): Loaded<ProjectFile> {
   if (!isRecord(value)) throw new Error('Invalid projects file.');
   if (value.schemaVersion === 1) {
@@ -462,6 +502,118 @@ function parseUsageFile(value: unknown): Loaded<UsageFile> {
     throw new Error('Duplicate usage request.');
   }
   return { value: { schemaVersion: 1, receipts }, needsWrite: false };
+}
+
+function requireAccountScope(value: unknown): string {
+  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value)) {
+    throw new Error('Не удалось подтвердить область аккаунта для сверки.');
+  }
+  return value;
+}
+
+function requireBalanceDate(value: unknown): string | null {
+  if (value === null) return null;
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)
+    || !Number.isFinite(Date.parse(`${value}T00:00:00.000Z`))
+    || new Date(`${value}T00:00:00.000Z`).toISOString().slice(0, 10) !== value) {
+    throw new Error('Укажите корректную дату окончания сверки.');
+  }
+  return value;
+}
+
+function validateBalanceFamilies(value: unknown): ProviderBalanceFamily[] {
+  if (!Array.isArray(value) || value.length !== BALANCE_FAMILIES.length) {
+    throw new Error('Некорректный состав семейств остатка.');
+  }
+  const families = value.map((entry): ProviderBalanceFamily => {
+    if (!isRecord(entry) || !(BALANCE_FAMILIES as readonly unknown[]).includes(entry.family)
+      || (entry.state !== 'known' && entry.state !== 'missing' && entry.state !== 'ambiguous')) {
+      throw new Error('Некорректная строка остатка.');
+    }
+    if (entry.state === 'known') {
+      if (!Number.isSafeInteger(entry.value) || (entry.value as number) < 0) throw new Error('Некорректное значение остатка.');
+      return { family: entry.family as BalanceFamilyId, state: 'known', value: entry.value as number };
+    }
+    if ('value' in entry) throw new Error('Неизвестное семейство не может содержать выдуманный остаток.');
+    return { family: entry.family as BalanceFamilyId, state: entry.state };
+  });
+  if (new Set(families.map((entry) => entry.family)).size !== BALANCE_FAMILIES.length) {
+    throw new Error('Повторяется семейство остатка.');
+  }
+  return BALANCE_FAMILIES.map((family) => families.find((entry) => entry.family === family)!);
+}
+
+function validateProfileBalanceAnchor(value: unknown): ProfileBalanceAnchor {
+  if (!isRecord(value) || (value.source !== 'api' && value.source !== 'studio')
+    || (value.unknownUsageCount !== null && (!Number.isSafeInteger(value.unknownUsageCount)
+      || (value.unknownUsageCount as number) < 0 || (value.unknownUsageCount as number) > 128))
+    || !Number.isSafeInteger(value.baselineReceiptCount) || (value.baselineReceiptCount as number) < 0
+    || (value.baselineReceiptCount as number) > MAX_USAGE_RECEIPTS
+    || typeof value.baselineReceiptDigest !== 'string' || !/^[a-f0-9]{64}$/.test(value.baselineReceiptDigest)) {
+    throw new Error('Некорректная запись сверки баланса.');
+  }
+  const observedAt = requireTimestamp(value.observedAt);
+  if (new Date(observedAt).toISOString() !== observedAt) throw new Error('Некорректное время сверки.');
+  const expiresAt = requireBalanceDate(value.expiresAt);
+  if (value.source === 'studio' && (expiresAt === null || value.unknownUsageCount !== 0
+    || validateBalanceFamilies(value.families).some((family) => family.state !== 'known'))) {
+    throw new Error('Ручная сверка должна содержать все четыре наблюдённых остатка и срок.');
+  }
+  return {
+    accountScope: requireAccountScope(value.accountScope),
+    source: value.source,
+    observedAt,
+    expiresAt,
+    unknownUsageCount: value.unknownUsageCount as number | null,
+    families: validateBalanceFamilies(value.families),
+    baselineReceiptCount: value.baselineReceiptCount as number,
+    baselineReceiptDigest: value.baselineReceiptDigest,
+  };
+}
+
+function parseProfileBalanceFile(value: unknown): Loaded<ProfileBalanceFile> {
+  if (!isRecord(value) || value.schemaVersion !== 1 || !Array.isArray(value.anchors)
+    || value.anchors.length > MAX_PROFILE_BALANCE_ANCHORS) throw new Error('Invalid profile balance file.');
+  const anchors = value.anchors.map(validateProfileBalanceAnchor);
+  if (new Set(anchors.map((anchor) => anchor.accountScope)).size !== anchors.length) {
+    throw new Error('Duplicate profile balance account scope.');
+  }
+  return { value: { schemaVersion: 1, anchors }, needsWrite: false };
+}
+
+function validateProviderBalanceObservation(value: unknown): ProviderBalanceObservation {
+  if (!isRecord(value) || !Number.isSafeInteger(value.unknownUsageCount)
+    || (value.unknownUsageCount as number) < 0 || (value.unknownUsageCount as number) > 128) {
+    throw new Error('Ответ API баланса имеет неизвестную структуру.');
+  }
+  const observedAt = requireTimestamp(value.observedAt);
+  if (new Date(observedAt).toISOString() !== observedAt) throw new Error('Некорректное время ответа API баланса.');
+  return {
+    observedAt,
+    unknownUsageCount: value.unknownUsageCount as number,
+    families: validateBalanceFamilies(value.families),
+  };
+}
+
+function validateStudioBalanceInput(value: unknown): StudioBalanceAnchorInput {
+  if (!isRecord(value) || !isRecord(value.remainingTokens)
+    || Object.keys(value).sort().join('|') !== 'expiresAt|remainingTokens'
+    || Object.keys(value.remainingTokens).sort().join('|') !== [...BALANCE_FAMILIES].sort().join('|')) {
+    throw new Error('Укажите наблюдённый остаток и срок для каждого семейства.');
+  }
+  const remainingTokens = {} as Record<BalanceFamilyId, number>;
+  for (const family of BALANCE_FAMILIES) {
+    const amount = value.remainingTokens[family];
+    if (!Number.isSafeInteger(amount) || (amount as number) < 0) throw new Error('Остаток должен быть целым неотрицательным числом.');
+    remainingTokens[family] = amount as number;
+  }
+  const expiresAt = requireBalanceDate(value.expiresAt);
+  if (expiresAt === null) throw new Error('Укажите дату окончания наблюдённой сверки.');
+  return { remainingTokens, expiresAt };
+}
+
+function usageReceiptDigest(receipts: readonly UsageReceipt[]): string {
+  return createHash('sha256').update(JSON.stringify(receipts)).digest('hex');
 }
 
 function parseChatFile(value: unknown): Loaded<ChatFile> {
@@ -1385,6 +1537,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
   const migrationMarker = join(storageRoot, 'chats.migrated');
   const settingsPath = join(storageRoot, 'settings.json');
   const usagePath = join(storageRoot, 'usage.json');
+  const profileBalancePath = join(storageRoot, 'profile-balance.json');
   const providerUploadPath = join(storageRoot, 'provider-uploads.json');
   const homeDraftPath = join(storageRoot, 'home-draft.json');
   const homeDraftFilesDirectory = join(storageRoot, 'home-draft', 'files');
@@ -1770,6 +1923,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     assertOwnedPath(storageRoot, migrationMarker),
     assertOwnedPath(storageRoot, settingsPath),
     assertOwnedPath(storageRoot, usagePath),
+    assertOwnedPath(storageRoot, profileBalancePath),
     assertOwnedPath(storageRoot, providerUploadPath),
     assertOwnedPath(storageRoot, homeDraftPath),
     assertOwnedPath(storageRoot, homeDraftFilesDirectory),
@@ -1791,7 +1945,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
   }
 
   // Parse every existing file before creating or migrating any of them.
-  const [projectFile, settingsFile, usageFile, homeDraftFile, providerUploadFile] = await Promise.all([
+  const [projectFile, settingsFile, usageFile, profileBalanceFile, homeDraftFile, providerUploadFile] = await Promise.all([
     loadVersioned<ProjectFile>(projectPath, { schemaVersion: 2, projects: [] }, parseProjectFile),
     loadVersioned<SettingsFile>(settingsPath, {
       schemaVersion: 10,
@@ -1814,6 +1968,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       },
     }, parseSettingsFile),
     loadUsageLedger(usagePath),
+    loadProfileBalanceFile(profileBalancePath),
     loadHomeDraftFile(homeDraftPath),
     loadProviderUploadLedger(providerUploadPath),
   ]);
@@ -1920,6 +2075,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
   if (projectFile.needsWrite) await writeOwnedAtomic(projectPath, projectFile.value);
   if (settingsFile.needsWrite) await writeOwnedAtomic(settingsPath, settingsFile.value);
   if (usageFile.needsWrite) await writeOwnedAtomic(usagePath, usageFile.value);
+  if (profileBalanceFile.needsWrite) await writeOwnedAtomic(profileBalancePath, profileBalanceFile.value);
   if (providerUploadFile.needsWrite) await writeOwnedAtomic(providerUploadPath, providerUploadFile.value);
   const initialHomeDraft = homeDraftFile.needsWrite
     ? { ...homeDraftFile.value, modelId: settingsFile.value.settings.defaultModelId }
@@ -1930,6 +2086,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
   let chats = loadedChats;
   let settings = settingsFile.value.settings;
   let usageReceipts = usageFile.value.receipts;
+  let profileBalanceAnchors = profileBalanceFile.value.anchors;
   let providerUploadEntries = providerUploadFile.value.entries;
   let homeDraft = initialHomeDraft;
   const selectionRevisions = new Map(chats.map((chat) => [chat.id, { permissionProfile: 0, skill: 0 }]));
@@ -1978,6 +2135,15 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     }
     await writeOwnedAtomic(usagePath, value);
     usageReceipts = next;
+  };
+  const saveProfileBalanceAnchors = async (next: ProfileBalanceAnchor[]): Promise<void> => {
+    if (next.length > MAX_PROFILE_BALANCE_ANCHORS) throw new Error('Достигнут лимит сохранённых сверок; существующая история не изменена.');
+    const value: ProfileBalanceFile = { schemaVersion: 1, anchors: next };
+    if (Buffer.byteLength(`${JSON.stringify(value, null, 2)}\n`, 'utf8') > MAX_PROFILE_BALANCE_BYTES) {
+      throw new Error('Файл сверок баланса превысил безопасный размер; существующие данные сохранены.');
+    }
+    await writeOwnedAtomic(profileBalancePath, value);
+    profileBalanceAnchors = next;
   };
   const saveProviderUploadEntries = async (next: ProviderUploadLedgerEntry[]): Promise<void> => {
     if (next.length > MAX_PROVIDER_UPLOAD_ENTRIES) throw new Error('Лимит записей загрузки достигнут; история не сокращена.');
@@ -3071,17 +3237,103 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       });
     },
     getUsageLedger: () => serialize(async () => structuredClone(summarizeUsage(usageReceipts))),
-    getUsageProfileView: (installedSkillCount) => serialize(async () => buildUsageProfileView({
-      generatedAt: new Date().toISOString(),
-      timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
-      receipts: usageReceipts,
-      chats: chats.map((chat) => ({
-        id: chat.id, title: chat.title, archived: chat.archived, messages: chat.messages,
-        turns: chat.turns, toolReceipts: chat.toolReceipts,
-      })),
-      projects: projects.map((project) => ({ id: project.id })),
-      installedSkillCount,
+    getUsageProfileView: (installedSkillCount, accountScopeInput = null) => serialize(async () => {
+      const accountScope = accountScopeInput === null ? null : requireAccountScope(accountScopeInput);
+      const storedAnchor = accountScope
+        ? profileBalanceAnchors.find((anchor) => anchor.accountScope === accountScope) ?? null
+        : null;
+      const boundedBaselineCount = storedAnchor
+        ? Math.min(storedAnchor.baselineReceiptCount, usageReceipts.length) : 0;
+      const balanceAnchor: UsageBalanceAnchorViewInput | null = storedAnchor ? {
+        source: storedAnchor.source,
+        observedAt: storedAnchor.observedAt,
+        expiresAt: storedAnchor.expiresAt,
+        unknownUsageCount: storedAnchor.unknownUsageCount,
+        families: structuredClone(storedAnchor.families),
+        baselineReceiptCount: boundedBaselineCount,
+        baselineMatches: storedAnchor.baselineReceiptCount <= usageReceipts.length
+          && usageReceiptDigest(usageReceipts.slice(0, storedAnchor.baselineReceiptCount)) === storedAnchor.baselineReceiptDigest,
+      } : null;
+      return buildUsageProfileView({
+        generatedAt: new Date().toISOString(),
+        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+        receipts: usageReceipts,
+        chats: chats.map((chat) => ({
+          id: chat.id, title: chat.title, archived: chat.archived, messages: chat.messages,
+          turns: chat.turns, toolReceipts: chat.toolReceipts,
+        })),
+        projects: projects.map((project) => ({ id: project.id })),
+        installedSkillCount,
+        balanceAnchor,
+      });
+    }),
+    getUsageReceiptBaseline: () => serialize(async () => ({
+      receiptCount: usageReceipts.length,
+      digest: usageReceiptDigest(usageReceipts),
     })),
+    saveProviderBalanceAnchor: (accountScopeInput, observationInput, expectedBaselineInput) => {
+      const accountScope = requireAccountScope(accountScopeInput);
+      const observation = validateProviderBalanceObservation(observationInput);
+      const expectedBaseline = validateUsageReceiptBaseline(expectedBaselineInput);
+      return serialize(async () => {
+        if (usageReceipts.length !== expectedBaseline.receiptCount
+          || usageReceiptDigest(usageReceipts) !== expectedBaseline.digest) {
+          throw new Error('История запросов изменилась во время сверки; повторите её после завершения ходов.');
+        }
+        const anchor = validateProfileBalanceAnchor({
+          accountScope,
+          source: 'api',
+          observedAt: observation.observedAt,
+          expiresAt: null,
+          unknownUsageCount: observation.unknownUsageCount,
+          families: observation.families,
+          baselineReceiptCount: expectedBaseline.receiptCount,
+          baselineReceiptDigest: expectedBaseline.digest,
+        });
+        const existingIndex = profileBalanceAnchors.findIndex((row) => row.accountScope === accountScope);
+        if (existingIndex < 0 && profileBalanceAnchors.length >= MAX_PROFILE_BALANCE_ANCHORS) {
+          throw new Error('Достигнут лимит сохранённых сверок; старые данные не удалены.');
+        }
+        const next = [...profileBalanceAnchors];
+        if (existingIndex < 0) next.push(anchor);
+        else next[existingIndex] = anchor;
+        await saveProfileBalanceAnchors(next);
+      });
+    },
+    saveStudioBalanceAnchor: (accountScopeInput, inputValue, expectedBaselineInput) => {
+      const accountScope = requireAccountScope(accountScopeInput);
+      const studioInput = validateStudioBalanceInput(inputValue);
+      const expectedBaseline = validateUsageReceiptBaseline(expectedBaselineInput);
+      return serialize(async () => {
+        if (usageReceipts.length !== expectedBaseline.receiptCount
+          || usageReceiptDigest(usageReceipts) !== expectedBaseline.digest) {
+          throw new Error('История запросов изменилась во время сверки; сохранённые значения не изменены.');
+        }
+        const anchor = validateProfileBalanceAnchor({
+          accountScope,
+          source: 'studio',
+          observedAt: new Date().toISOString(),
+          expiresAt: studioInput.expiresAt,
+          unknownUsageCount: 0,
+          families: BALANCE_FAMILIES.map((family) => ({
+            family, state: 'known' as const, value: studioInput.remainingTokens[family],
+          })),
+          baselineReceiptCount: expectedBaseline.receiptCount,
+          baselineReceiptDigest: expectedBaseline.digest,
+        });
+        const existingIndex = profileBalanceAnchors.findIndex((row) => row.accountScope === accountScope);
+        if (existingIndex < 0 && profileBalanceAnchors.length >= MAX_PROFILE_BALANCE_ANCHORS) {
+          throw new Error('Достигнут лимит сохранённых сверок; старые данные не удалены.');
+        }
+        const next = [...profileBalanceAnchors];
+        if (existingIndex < 0) next.push(anchor);
+        else next[existingIndex] = anchor;
+        await saveProfileBalanceAnchors(next);
+      });
+    },
+    invalidateUsageBalanceAnchors: () => serialize(async () => {
+      if (profileBalanceAnchors.length > 0) await saveProfileBalanceAnchors([]);
+    }),
     getProviderUploadEntries: (scopeInput) => serialize(async () => {
       if (typeof scopeInput !== 'string' || !/^[a-f0-9]{64}$/.test(scopeInput)) throw new Error('Не удалось подтвердить область файлового аккаунта.');
       return structuredClone(providerUploadEntries.filter((entry) => entry.accountScope === scopeInput));

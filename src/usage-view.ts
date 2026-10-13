@@ -1,4 +1,4 @@
-import type { ChatToolReceipt, ChatTurnRecord, Project, UsageAggregate, UsageProfileChatRow, UsageProfileDay, UsageProfileView, UsageReceipt } from './contracts';
+import type { BalanceFamilyId, ChatToolReceipt, ChatTurnRecord, Project, ProviderBalanceFamily, UsageAggregate, UsageBalanceView, UsageProfileChatRow, UsageProfileDay, UsageProfileView, UsageReceipt } from './contracts';
 import { CHAT_MODEL_FAMILIES, modelFamilyForId } from './model-catalog';
 import { summarizeUsage } from './usage';
 
@@ -16,12 +16,52 @@ export interface UsageProfileInput {
   }[];
   projects: readonly Pick<Project, 'id'>[];
   installedSkillCount: number | null;
+  balanceAnchor?: UsageBalanceAnchorViewInput | null;
+}
+
+export interface UsageBalanceAnchorViewInput {
+  source: 'api' | 'studio';
+  observedAt: string;
+  expiresAt: string | null;
+  unknownUsageCount: number | null;
+  families: readonly ProviderBalanceFamily[];
+  baselineReceiptCount: number;
+  baselineMatches: boolean;
 }
 
 const COUNT_FIELDS = ['promptTokens', 'completionTokens', 'totalTokens', 'precachedPromptTokens'] as const;
 const DAY_MS = 86_400_000;
 const FAMILY_KEYS = CHAT_MODEL_FAMILIES.map((family) => family.family);
 const STATUS_RANK = { pending: 0, failed: 1, cancelled: 1, completed: 2 } as const;
+
+export function createBalanceScopeGuard() {
+  let generation = 0;
+  let transitions = 0;
+  return {
+    getGeneration: (): number => generation,
+    isTransitioning: (): boolean => transitions > 0,
+    isCurrent: (expectedGeneration: number): boolean => expectedGeneration === generation && transitions === 0,
+    runStable: async <T,>(operation: () => Promise<T>): Promise<T> => {
+      const expectedGeneration = generation;
+      if (transitions > 0) throw new Error('Идёт смена ключа аккаунта. Повторите действие после её завершения.');
+      const result = await operation();
+      if (expectedGeneration !== generation || transitions > 0) {
+        throw new Error('Ключ аккаунта изменился во время операции. Повторите действие.');
+      }
+      return result;
+    },
+    beginTransition: (): (() => void) => {
+      generation += 1;
+      transitions += 1;
+      let finished = false;
+      return () => {
+        if (finished) return;
+        finished = true;
+        transitions -= 1;
+      };
+    },
+  };
+}
 
 function dateParts(value: Date, formatter: Intl.DateTimeFormat): { year: number; month: number; day: number } {
   const parts = formatter.formatToParts(value);
@@ -194,6 +234,108 @@ function familyFor(receipt: UsageReceipt): string {
   return modelFamilyForId(receipt.modelId)?.family ?? 'unknown';
 }
 
+function balanceView(
+  receipts: readonly UsageReceipt[],
+  anchor: UsageBalanceAnchorViewInput | null | undefined,
+  generatedAtMs: number,
+  formatter: Intl.DateTimeFormat,
+  today: string,
+): UsageBalanceView {
+  const empty = (): UsageBalanceView => ({
+    state: 'unknown', source: null, observedAt: null, expiresAt: null,
+    unknownUsageCount: null, isEstimate: false, incomplete: true,
+    families: FAMILY_KEYS.map((family) => ({
+      family: family as BalanceFamilyId, state: 'unknown', snapshotRemainingTokens: null,
+      usedSinceSnapshot: 0, estimatedRemainingTokens: null, unknownRequests: 0, conflictedRequests: 0,
+    })),
+  });
+  if (!anchor || !Number.isSafeInteger(anchor.baselineReceiptCount)
+    || anchor.baselineReceiptCount < 0 || anchor.baselineReceiptCount > receipts.length) return empty();
+
+  const observedAtMs = Date.parse(anchor.observedAt);
+  const validObservedAt = Number.isFinite(observedAtMs) && new Date(observedAtMs).toISOString() === anchor.observedAt;
+  const expired = anchor.expiresAt !== null && validObservedAt && today > anchor.expiresAt;
+  const prefix = receipts.slice(0, anchor.baselineReceiptCount);
+  const tail = receipts.slice(anchor.baselineReceiptCount);
+  const prefixProviderIds = new Map<string, UsageReceipt[]>();
+  const prefixLocalIds = new Set(prefix.map((receipt) => receipt.localRequestId));
+  for (const receipt of prefix) {
+    if (!receipt.providerRequestId) continue;
+    const rows = prefixProviderIds.get(receipt.providerRequestId) ?? [];
+    rows.push(receipt);
+    prefixProviderIds.set(receipt.providerRequestId, rows);
+  }
+
+  let crossBoundaryConflictCount = 0;
+  const postAnchor: UsageReceipt[] = [];
+  for (const receipt of tail) {
+    if (prefixLocalIds.has(receipt.localRequestId)) {
+      crossBoundaryConflictCount += 1;
+      continue;
+    }
+    const previousRows = receipt.providerRequestId ? prefixProviderIds.get(receipt.providerRequestId) : undefined;
+    if (previousRows) {
+      const combined = [...previousRows, receipt];
+      const merged = mergeDuplicateRows(combined);
+      const previousConflicts = new Set(previousRows.flatMap((row) => row.conflictedFields));
+      const introducedConflict = merged.receipt.conflictedFields.some((field) => !previousConflicts.has(field));
+      const compatible = combined.every((row) => sameProvenance(combined[0]!, row))
+        && !merged.metadataConflict && !introducedConflict;
+      if (compatible) continue;
+      crossBoundaryConflictCount += 1;
+      continue;
+    }
+    const createdAtMs = Date.parse(receipt.createdAt);
+    if (validObservedAt && createdAtMs <= observedAtMs) {
+      crossBoundaryConflictCount += 1;
+      continue;
+    }
+    postAnchor.push(receipt);
+  }
+
+  const deduplicatedTail = deduplicateReceipts(postAnchor);
+  const tailByFamily = groupBy(deduplicatedTail.receipts, familyFor);
+  const tailIdentityConflict = deduplicatedTail.identityConflicts > 0;
+  const unknownTailFamily = deduplicatedTail.receipts.some((receipt) => familyFor(receipt) === 'unknown');
+  const unknownTailExpense = deduplicatedTail.receipts.some((receipt) =>
+    receipt.totalTokens === null || receipt.conflictedFields.includes('totalTokens'));
+  const invalidBaseline = !anchor.baselineMatches || !validObservedAt;
+  const incomplete = invalidBaseline || anchor.unknownUsageCount === null || anchor.unknownUsageCount > 0
+    || crossBoundaryConflictCount > 0 || tailIdentityConflict || unknownTailFamily || unknownTailExpense;
+  const families = FAMILY_KEYS.map((family): UsageBalanceView['families'][number] => {
+    const base = anchor.families.find((entry) => entry.family === family);
+    const familyReceipts = tailByFamily.get(family) ?? [];
+    const total = summarizeUsage(familyReceipts).totalTokens;
+    const snapshotRemainingTokens = base?.state === 'known' ? base.value ?? null : null;
+    const familyUnknown = total.unknownRequests;
+    const familyConflicts = total.conflictedRequests;
+    const unusableEstimate = expired || invalidBaseline || tailIdentityConflict || crossBoundaryConflictCount > 0
+      || unknownTailFamily
+      || familyUnknown > 0 || familyConflicts > 0;
+    const familyState = expired ? 'expired' : base?.state ?? 'missing';
+    return {
+      family: family as BalanceFamilyId,
+      state: familyState,
+      snapshotRemainingTokens: expired ? null : snapshotRemainingTokens,
+      usedSinceSnapshot: total.knownTokens,
+      estimatedRemainingTokens: !unusableEstimate && snapshotRemainingTokens !== null
+        ? Math.max(0, snapshotRemainingTokens - total.knownTokens) : null,
+      unknownRequests: familyUnknown,
+      conflictedRequests: familyConflicts + (unusableEstimate ? crossBoundaryConflictCount + (tailIdentityConflict ? 1 : 0) : 0),
+    };
+  });
+  return {
+    state: expired ? 'expired' : 'available',
+    source: anchor.source,
+    observedAt: anchor.observedAt,
+    expiresAt: anchor.expiresAt,
+    unknownUsageCount: anchor.unknownUsageCount,
+    isEstimate: true,
+    incomplete: incomplete || families.some((family) => family.state !== 'known'),
+    families,
+  };
+}
+
 function familyAggregates(receipts: readonly UsageReceipt[]): UsageAggregate[] {
   const groups = groupBy(receipts, familyFor);
   return [...FAMILY_KEYS, 'unknown'].map((key) => aggregateFor(key, groups.get(key) ?? []));
@@ -326,6 +468,7 @@ export function buildUsageProfileView(input: UsageProfileInput): UsageProfileVie
   return {
     generatedAt: input.generatedAt,
     timeZone: input.timeZone,
+    balance: balanceView(input.receipts, input.balanceAnchor, generatedAtMs, formatter, today),
     total: aggregateFor('all', receipts),
     byFamily: familyAggregates(receipts),
     byModel: summarizeUsage(receipts).byModel,

@@ -25,6 +25,7 @@ import { createNumberedProjectFolder, prepareProjectFolders, removeEmptyCreatedF
 import { getCopyableUserMessageText } from './chat-transcript';
 import { createVoiceRuntime, VOICE_MAX_OUTPUT_BYTES, type VoiceRuntime } from './voice';
 import { prepareVoiceModelCache } from './voice-model-cache';
+import { createBalanceScopeGuard } from './usage-view';
 import {
   acquirePrimaryInstance,
   createCloseAdmission,
@@ -985,6 +986,78 @@ async function registerIpcHandlers(
   approvals: ReturnType<typeof createPermissionApprovals>,
 ): Promise<void> {
   const { runtime, availability, providerConnection, voiceRuntime, voiceAvailability, skills, hooks } = mainRuntime;
+  const balanceScopeGuard = createBalanceScopeGuard();
+  let balanceOperationActive = false;
+  let keySaveQueue: Promise<void> = Promise.resolve();
+  const accountScopeForKey = (key: string): string => createHash('sha256').update(key, 'utf8').digest('hex');
+  const hasActiveTurns = (): boolean => runtime.list().some((turn) => turn.status === 'queued' || turn.status === 'running');
+  const assertBalanceScopeCurrent = (generation: number): void => {
+    if (!balanceScopeGuard.isCurrent(generation)) {
+      throw new Error('Ключ аккаунта изменился во время сверки. Повторите действие.');
+    }
+  };
+  const requireBalanceIdle = (): void => {
+    if (hasActiveTurns()) throw new Error('Сверка доступна после завершения всех ходов.');
+  };
+  const requireBalanceScope = async (generation: number, requireConnected = true): Promise<string> => {
+    assertBalanceScopeCurrent(generation);
+    if (requireConnected && providerConnection.getConnectionStatus().state !== 'connected') {
+      throw new Error('Сначала подключитесь к аккаунту GigaChat.');
+    }
+    requireBalanceIdle();
+    const key = await secureStore.load();
+    if (!key) throw new Error('Сохранённый ключ аккаунта недоступен.');
+    assertBalanceScopeCurrent(generation);
+    requireBalanceIdle();
+    return accountScopeForKey(key);
+  };
+  const getProfileViewForCurrentScope = async (installedSkillCount: number | null) => {
+    const generation = balanceScopeGuard.getGeneration();
+    let accountScope: string | null = null;
+    if (!balanceScopeGuard.isTransitioning()) {
+      try {
+        const key = await secureStore.load();
+        if (key && balanceScopeGuard.isCurrent(generation)) {
+          accountScope = accountScopeForKey(key);
+        }
+      } catch {
+        accountScope = null;
+      }
+    }
+    const view = await store.getUsageProfileView(installedSkillCount, accountScope);
+    if (!balanceScopeGuard.isCurrent(generation)) {
+      return store.getUsageProfileView(installedSkillCount, null);
+    }
+    return view;
+  };
+  const saveAuthorizationKey = (input: unknown): Promise<ReturnType<typeof secureStore.status> extends Promise<infer T> ? T : never> => {
+    if (typeof input !== 'string' || !input.trim() || Buffer.byteLength(input.trim(), 'utf8') > 16 * 1024) {
+      return Promise.reject(new Error('Введите ключ длиной не более 16 КБ.'));
+    }
+    const nextKey = input.trim();
+    const finishScopeTransition = balanceScopeGuard.beginTransition();
+    providerConnection.invalidateSavedKey();
+    const cancellation = runtime.cancelAll().then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    const operation = keySaveQueue.then(async () => {
+      const cancelled = await cancellation;
+      if (!cancelled.ok) throw cancelled.error;
+      let previousScope: string | null = null;
+      try {
+        const previousKey = await secureStore.load();
+        if (previousKey) previousScope = accountScopeForKey(previousKey);
+      } catch {
+        previousScope = null;
+      }
+      if (previousScope !== accountScopeForKey(nextKey)) await store.invalidateUsageBalanceAnchors();
+      await secureStore.save(nextKey);
+      return secureStore.status();
+    });
+    keySaveQueue = operation.then(() => undefined, () => undefined);
+    return operation.finally(finishScopeTransition);
+  };
   const nonCriticalChannels = new Set([
     'projects:list', 'projects:pick-folder', 'projects:open-folder', 'projects:read-instructions', 'projects:instructions-backup-path',
     'chats:list', 'chats:get', 'chats:open-artifact', 'chats:open-folder', 'chats:draft-attachment-preview', 'chats:artifact-preview',
@@ -1117,10 +1190,12 @@ async function registerIpcHandlers(
   };
 
   const refreshModelRegistry = async (): Promise<ModelRegistrySnapshot> => {
-    if (providerConnection.getConnectionStatus().state === 'connected') {
-      await providerConnection.listModels().catch(() => undefined);
-    }
-    return providerConnection.getModelRegistry();
+    return balanceScopeGuard.runStable(async () => {
+      if (providerConnection.getConnectionStatus().state === 'connected') {
+        await providerConnection.listModels().catch(() => undefined);
+      }
+      return providerConnection.getModelRegistry();
+    });
   };
   const queuedHomeTurns = new Set<string>();
 
@@ -1451,14 +1526,9 @@ async function registerIpcHandlers(
   handle('hooks:set-enabled', (id, enabled) => withLocalFailureNotification(store, () => hooks.setEnabled(id, enabled)));
 
   handle('onboarding:key-status', () => secureStore.status());
-  handle('onboarding:key-save', async (key) => {
-    providerConnection.invalidateSavedKey();
-    await runtime.cancelAll();
-    await secureStore.save(key);
-    return secureStore.status();
-  });
+  handle('onboarding:key-save', (key) => saveAuthorizationKey(key));
   handle('onboarding:connection-status', () => providerConnection.getConnectionStatus());
-  handle('onboarding:connect', () => providerConnection.connect(), { track: false });
+  handle('onboarding:connect', () => balanceScopeGuard.runStable(() => providerConnection.connect()), { track: false });
   handle('onboarding:connect-cancel', () => providerConnection.cancelConnect());
   handle('onboarding:disconnect', async () => {
     const status = providerConnection.disconnect();
@@ -1496,7 +1566,49 @@ async function registerIpcHandlers(
   handle('usage:get-profile-view', async () => {
     const registry = await skills.list().catch(() => null);
     const installedSkillCount = registry && registry.issues.length === 0 ? registry.skills.length : null;
-    return store.getUsageProfileView(installedSkillCount);
+    return getProfileViewForCurrentScope(installedSkillCount);
+  });
+  handle('usage:refresh-balance', async () => {
+    if (balanceOperationActive) throw new Error('Сверка уже выполняется.');
+    balanceOperationActive = true;
+    const generation = balanceScopeGuard.getGeneration();
+    try {
+      const accountScope = await requireBalanceScope(generation);
+      const baseline = await store.getUsageReceiptBaseline();
+      assertBalanceScopeCurrent(generation);
+      requireBalanceIdle();
+      const observation = await providerConnection.getBalance();
+      assertBalanceScopeCurrent(generation);
+      if (providerConnection.getConnectionStatus().state !== 'connected') {
+        throw new Error('Подключение изменилось во время сверки. Повторите действие.');
+      }
+      requireBalanceIdle();
+      await store.saveProviderBalanceAnchor(accountScope, observation, baseline);
+      assertBalanceScopeCurrent(generation);
+      const registry = await skills.list().catch(() => null);
+      const installedSkillCount = registry && registry.issues.length === 0 ? registry.skills.length : null;
+      return getProfileViewForCurrentScope(installedSkillCount);
+    } finally {
+      balanceOperationActive = false;
+    }
+  });
+  handle('usage:save-studio-balance-anchor', async (input) => {
+    if (balanceOperationActive) throw new Error('Сверка уже выполняется.');
+    balanceOperationActive = true;
+    const generation = balanceScopeGuard.getGeneration();
+    try {
+      const accountScope = await requireBalanceScope(generation, false);
+      const baseline = await store.getUsageReceiptBaseline();
+      assertBalanceScopeCurrent(generation);
+      requireBalanceIdle();
+      await store.saveStudioBalanceAnchor(accountScope, input, baseline);
+      assertBalanceScopeCurrent(generation);
+      const registry = await skills.list().catch(() => null);
+      const installedSkillCount = registry && registry.issues.length === 0 ? registry.skills.length : null;
+      return getProfileViewForCurrentScope(installedSkillCount);
+    } finally {
+      balanceOperationActive = false;
+    }
   });
   handle('settings:update', async (patchInput) => {
     const patch = requireSettingsPatch(patchInput);

@@ -794,6 +794,121 @@ test('retains an older unavailable model ID when reading a chat after reload', a
   assert.equal((await restored.getChat(chat.id)).modelId, 'retired/model-v0');
 });
 
+test('persists a balance anchor over an unchanged historical pending receipt and subtracts only later usage', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-balance-anchor-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const accountA = createHash('sha256').update('synthetic-account-A').digest('hex');
+  await store.recordUsageReceipt({
+    localRequestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', chatId: chat.id, requestKind: 'chat',
+    modelId: 'GigaChat-3-Pro', providerRequestId: 'before-anchor-pending', providerModel: null,
+    createdAt: '2026-10-13T09:00:00.000Z', status: 'pending', promptTokens: null,
+    completionTokens: null, totalTokens: null, precachedPromptTokens: null, conflictedFields: [],
+  });
+  const baseline = await store.getUsageReceiptBaseline();
+  await store.saveProviderBalanceAnchor(accountA, {
+    observedAt: '2026-10-13T10:00:00.000Z', unknownUsageCount: 0,
+    families: [
+      { family: 'ultra', state: 'known', value: 5_000 },
+      { family: 'max', state: 'known', value: 4_000 },
+      { family: 'pro', state: 'known', value: 3_000 },
+      { family: 'lite', state: 'known', value: 2_000 },
+    ],
+  }, baseline);
+  await store.recordUsageReceipt({
+    localRequestId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', chatId: chat.id, requestKind: 'tool-continuation',
+    modelId: 'GigaChat-3-Pro', providerRequestId: 'after-anchor', providerModel: 'GigaChat-3-Pro',
+    createdAt: '2026-10-13T11:00:00.000Z', status: 'completed', promptTokens: 40,
+    completionTokens: 8, totalTokens: 37, precachedPromptTokens: 12, conflictedFields: [],
+  });
+
+  const restored = await openStore(directory);
+  const view = await restored.getUsageProfileView(0, accountA);
+  const pro = view.balance.families.find((family) => family.family === 'pro');
+  assert.equal(view.balance.source, 'api');
+  assert.equal(view.balance.incomplete, false, 'an unchanged old pending receipt is already covered by the observed snapshot');
+  assert.equal(pro?.usedSinceSnapshot, 37, 'cached prompt tokens are not subtracted again');
+  assert.equal(pro?.estimatedRemainingTokens, 2_963);
+  assert.equal((await restored.getUsageProfileView(0, 'b'.repeat(64))).balance.state, 'unknown');
+  assert.equal('accountScope' in view.balance, false, 'private account scope never enters the renderer DTO');
+  assert.equal('baselineReceiptDigest' in view.balance, false);
+});
+
+test('rejects a balance observation if receipt identity changes while the request is in flight', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-balance-cas-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const account = createHash('sha256').update('synthetic-cas-account').digest('hex');
+  const baseline = await store.getUsageReceiptBaseline();
+  await store.recordUsageReceipt({
+    localRequestId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', chatId: chat.id, requestKind: 'chat',
+    modelId: 'GigaChat-3-Pro', providerRequestId: null, providerModel: null,
+    createdAt: '2026-10-13T11:00:00.000Z', status: 'completed', promptTokens: 10,
+    completionTokens: 2, totalTokens: 12, precachedPromptTokens: null, conflictedFields: [],
+  });
+  await assert.rejects(store.saveProviderBalanceAnchor(account, {
+    observedAt: '2026-10-13T10:00:00.000Z', unknownUsageCount: 0,
+    families: [
+      { family: 'ultra', state: 'known', value: 10 }, { family: 'max', state: 'known', value: 10 },
+      { family: 'pro', state: 'known', value: 10 }, { family: 'lite', state: 'known', value: 10 },
+    ],
+  }, baseline), /история запросов изменилась/i);
+  assert.equal((await store.getUsageProfileView(0, account)).balance.state, 'unknown');
+});
+
+test('invalidating active balance anchors prevents A to B to A from reusing an old snapshot', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-balance-scope-change-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const accountA = createHash('sha256').update('synthetic-old-key-A').digest('hex');
+  const baseline = await store.getUsageReceiptBaseline();
+  const families = [
+    { family: 'ultra', state: 'known', value: 100 }, { family: 'max', state: 'known', value: 100 },
+    { family: 'pro', state: 'known', value: 100 }, { family: 'lite', state: 'known', value: 100 },
+  ];
+  await store.saveProviderBalanceAnchor(accountA, {
+    observedAt: '2026-10-13T10:00:00.000Z', unknownUsageCount: 0, families,
+  }, baseline);
+  await store.recordUsageReceipt({
+    localRequestId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', chatId: chat.id, requestKind: 'chat',
+    modelId: 'GigaChat-3-Pro', providerRequestId: null, providerModel: null,
+    createdAt: '2026-10-13T11:00:00.000Z', status: 'completed', promptTokens: 15,
+    completionTokens: 3, totalTokens: 18, precachedPromptTokens: null, conflictedFields: [],
+  });
+  assert.equal((await store.getUsageProfileView(0, accountA)).balance.families.find((family) => family.family === 'pro')?.estimatedRemainingTokens, 82);
+
+  await store.invalidateUsageBalanceAnchors();
+  const reopened = await openStore(directory);
+  const returnedToA = await reopened.getUsageProfileView(0, accountA);
+  assert.equal(returnedToA.balance.state, 'unknown', 'raw usage has no account scope, so old calibration cannot be revived');
+  assert.equal(returnedToA.total.totalTokens.knownTokens, 18, 'invalidation preserves the raw usage ledger');
+});
+
+test('persists only explicit complete Studio observations and their provenance', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-balance-studio-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const account = createHash('sha256').update('synthetic-studio-account').digest('hex');
+  const baseline = await store.getUsageReceiptBaseline();
+  const input = {
+    remainingTokens: { ultra: 49_000, max: 24_000, pro: 39_000, lite: 249_000 },
+    expiresAt: '2027-10-12',
+  };
+  assert.throws(() => store.saveStudioBalanceAnchor(account, {
+    ...input, extra: 'not accepted',
+  }, baseline));
+  assert.equal((await store.getUsageProfileView(0, account)).balance.state, 'unknown');
+
+  await store.saveStudioBalanceAnchor(account, input, baseline);
+  const view = await (await openStore(directory)).getUsageProfileView(0, account);
+  assert.equal(view.balance.source, 'studio');
+  assert.equal(view.balance.families.find((family) => family.family === 'ultra')?.snapshotRemainingTokens, 49_000);
+  assert.equal(view.balance.expiresAt, '2027-10-12');
+});
+
 test('inserts a queued reply after its user anchor and assembles only history through the next anchor', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-queued-history-'));
   t.after(() => rm(directory, { recursive: true, force: true }));

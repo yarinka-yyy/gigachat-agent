@@ -3,9 +3,9 @@ import { randomUUID, X509Certificate } from 'node:crypto';
 import { type ClientRequest, type IncomingHttpHeaders, type IncomingMessage } from 'node:http';
 import { Agent, request as httpsRequest } from 'node:https';
 import * as tls from 'node:tls';
-import type { GigaChatProvider, ModelRegistrySnapshot, ProviderAttachmentReference, ProviderConnectionSnapshot, ProviderErrorCategory, ProviderEvent, ProviderFileRecord, ProviderFileUploadInput, ProviderProtocolExchange, ProviderTurnRequest, ProviderUsageValues } from './contracts';
+import type { BalanceFamilyId, GigaChatProvider, ModelRegistrySnapshot, ProviderAttachmentReference, ProviderBalanceObservation, ProviderConnectionSnapshot, ProviderErrorCategory, ProviderEvent, ProviderFileRecord, ProviderFileUploadInput, ProviderProtocolExchange, ProviderTurnRequest, ProviderUsageValues } from './contracts';
 import { discoveredModelRegistry, failedModelRegistry, isModelAvailable, requireModelId, unavailableModelRegistry, type GigaChatModelId } from './models';
-import { isChatModelAvailable } from './model-catalog';
+import { billingFamilyForUsageLabel, CHAT_MODEL_FAMILIES, isChatModelAvailable } from './model-catalog';
 import { attachmentContentType, inspectLocalAttachmentContent, LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES, PROVIDER_MEDIA_LIMIT_BYTES, PROVIDER_REQUEST_LIMIT_BYTES } from './attachment-policy';
 
 export const GIGACHAT_API_BASE_URL = 'https://api.giga.chat/v1';
@@ -241,6 +241,7 @@ function validateProviderAttachments(value: unknown, messages: readonly Provider
 export interface GigaChatProviderConnection extends GigaChatProvider {
   getConnectionStatus(): ProviderConnectionSnapshot;
   getModelRegistry(): ModelRegistrySnapshot;
+  getBalance(signal?: AbortSignal): Promise<ProviderBalanceObservation>;
   connect(): Promise<ProviderConnectionSnapshot>;
   cancelConnect(): ProviderConnectionSnapshot;
   disconnect(): ProviderConnectionSnapshot;
@@ -753,6 +754,29 @@ export function createGigaChatProvider(options: {
     } finally { operation.dispose(); }
   };
 
+  const getBalance = async (signal?: AbortSignal): Promise<ProviderBalanceObservation> => {
+    const operationGeneration = generation;
+    const operation = linkAbortSignals(sessionController.signal, ...(signal ? [signal] : []));
+    try {
+      if (connectionStatus.state !== 'connected') throw new GigaChatProviderError('auth');
+      const response = await requestWithAuthRetry((tokenValue) => ({
+        url: `${GIGACHAT_API_BASE_URL}/balance`,
+        method: 'GET',
+        headers: { Authorization: `Bearer ${tokenValue}`, Accept: 'application/json' },
+        signal: operation.controller.signal,
+      }), operation.controller.signal, operationGeneration);
+      if (response.statusCode !== 200) {
+        response.cancel();
+        throw statusError(response.statusCode);
+      }
+      const value = await readJsonResponse(response, operation.controller.signal);
+      assertCurrent(operationGeneration, operation.controller.signal);
+      return parseBalanceObservation(value, new Date(now()).toISOString());
+    } catch (error) {
+      throw error instanceof GigaChatProviderError ? error : transportError(error, operation.controller.signal);
+    } finally { operation.dispose(); }
+  };
+
   const connect = async (): Promise<ProviderConnectionSnapshot> => {
     const operationGeneration = reset();
     const operation = linkAbortSignals(sessionController.signal);
@@ -911,6 +935,7 @@ export function createGigaChatProvider(options: {
   return {
     getConnectionStatus: getStatus,
     getModelRegistry,
+    getBalance,
     connect,
     cancelConnect,
     disconnect: () => { reset(); return getStatus(); },
@@ -1065,6 +1090,40 @@ function parseTokenCounts(value: unknown, expectedLength: number): ProviderToken
     }
     return { object: 'tokens', tokens: entry.tokens, characters: entry.characters };
   });
+}
+
+function parseBalanceObservation(value: unknown, observedAt: string): ProviderBalanceObservation {
+  if (!isRecord(value) || !Array.isArray(value.balance) || value.balance.length > 128) {
+    throw new GigaChatProviderError('protocol');
+  }
+  const rows = new Map<BalanceFamilyId, number[]>();
+  let unknownUsageCount = 0;
+  for (const row of value.balance) {
+    if (!isRecord(row) || typeof row.usage !== 'string' || !row.usage.trim() || row.usage.length > 200
+      // eslint-disable-next-line no-control-regex -- Provider billing labels are untrusted and never returned to the renderer.
+      || /[\u0000-\u001f\u007f]/.test(row.usage)
+      || !Number.isSafeInteger(row.value) || (row.value as number) < 0) {
+      throw new GigaChatProviderError('protocol');
+    }
+    const family = billingFamilyForUsageLabel(row.usage);
+    if (!family) {
+      unknownUsageCount += 1;
+      continue;
+    }
+    const familyRows = rows.get(family.family) ?? [];
+    familyRows.push(row.value as number);
+    rows.set(family.family, familyRows);
+  }
+  return {
+    observedAt,
+    unknownUsageCount,
+    families: CHAT_MODEL_FAMILIES.map(({ family }) => {
+      const values = rows.get(family) ?? [];
+      return values.length === 1
+        ? { family, state: 'known' as const, value: values[0]! }
+        : { family, state: values.length ? 'ambiguous' as const : 'missing' as const };
+    }),
+  };
 }
 
 async function* readSseData(body: AsyncIterable<Uint8Array>, signal: AbortSignal): AsyncGenerator<string> {

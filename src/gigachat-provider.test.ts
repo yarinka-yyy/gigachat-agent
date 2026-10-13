@@ -134,6 +134,146 @@ test('connect uses OAuth Basic/RqUID/scope, then discovers models without exposi
   assert.doesNotMatch(JSON.stringify(status), /synthetic-authorization-key|synthetic-access-token/);
 });
 
+test('reads bounded balance through the connected authenticated transport and hides unknown labels', async () => {
+  const requests: ProviderTransportRequest[] = [];
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-authorization-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => {
+      requests.push(request);
+      if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-access-token'));
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }] });
+      return jsonResponse(200, { balance: [
+        { usage: 'GigaChat-Ultra', value: 49_950_331 },
+        { usage: 'GigaChat-Max', value: 24_994_339 },
+        { usage: 'GigaChat-2-Pro', value: 39_992_622 },
+        { usage: 'GigaChat-2', value: 249_993_370 },
+        { usage: 'Embeddings', value: 123 },
+        { usage: 'private-unknown-label', value: 456 },
+      ] });
+    }),
+  });
+  assert.equal((await provider.connect()).state, 'connected');
+
+  const result = await provider.getBalance();
+
+  assert.deepEqual(result, {
+    observedAt: new Date(FIXED_NOW).toISOString(),
+    unknownUsageCount: 2,
+    families: [
+      { family: 'ultra', state: 'known', value: 49_950_331 },
+      { family: 'max', state: 'known', value: 24_994_339 },
+      { family: 'pro', state: 'known', value: 39_992_622 },
+      { family: 'lite', state: 'known', value: 249_993_370 },
+    ],
+  });
+  assert.equal(requests.length, 3, 'the connected access token is reused; this call adds one GET only');
+  assert.equal(requests[2]?.url, `${GIGACHAT_API_BASE_URL}/balance`);
+  assert.equal(requests[2]?.method, 'GET');
+  assert.equal(requests[2]?.headers.Authorization, 'Bearer synthetic-access-token');
+  assert.doesNotMatch(JSON.stringify(result), /Embeddings|private-unknown-label|synthetic-access-token/);
+});
+
+test('balance duplicates remain ambiguous, missing families stay missing, and invalid data fails closed', async () => {
+  let responseBody: unknown = { balance: [
+    { usage: 'GigaChat-3-Ultra', value: 0 },
+    { usage: 'GigaChat-Ultra', value: 2 },
+    { usage: 'GigaChat-Pro', value: 3 },
+    { usage: 'GigaChat', value: 4 },
+  ] };
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => {
+      if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }] });
+      return jsonResponse(200, responseBody);
+    }),
+  });
+  assert.equal((await provider.connect()).state, 'connected');
+
+  const duplicate = await provider.getBalance();
+  assert.deepEqual(duplicate.families, [
+    { family: 'ultra', state: 'ambiguous' },
+    { family: 'max', state: 'missing' },
+    { family: 'pro', state: 'known', value: 3 },
+    { family: 'lite', state: 'known', value: 4 },
+  ]);
+
+  for (const invalid of [
+    { balance: [{ usage: 'GigaChat-Ultra', value: -1 }] },
+    { balance: [{ usage: 'GigaChat-Ultra', value: 1.5 }] },
+    { balance: [{ usage: 'GigaChat-Ultra\n', value: 1 }] },
+    { balance: new Array(129).fill({ usage: 'GigaChat-Ultra', value: 1 }) },
+  ]) {
+    responseBody = invalid;
+    await assert.rejects(provider.getBalance(),
+      (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
+  }
+});
+
+test('balance retries one 401 with the existing OAuth refresh and surfaces forbidden status safely', async () => {
+  let oauthRequests = 0;
+  let balanceRequests = 0;
+  let forbidden = false;
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => {
+      if (request.url === GIGACHAT_OAUTH_URL) {
+        oauthRequests += 1;
+        return jsonResponse(200, token(`synthetic-token-${oauthRequests}`));
+      }
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }] });
+      balanceRequests += 1;
+      if (forbidden) return jsonResponse(403, { private: 'response body must not escape' });
+      if (balanceRequests === 1) return jsonResponse(401, { private: 'expired token' });
+      return jsonResponse(200, { balance: [{ usage: 'GigaChat-Ultra', value: 5 }] });
+    }),
+  });
+  assert.equal((await provider.connect()).state, 'connected');
+  const result = await provider.getBalance();
+  assert.equal(result.families[0]?.state, 'known');
+  assert.equal(oauthRequests, 2, 'one existing refresh follows the first 401');
+  assert.equal(balanceRequests, 2);
+
+  forbidden = true;
+  await assert.rejects(provider.getBalance(), (error: unknown) => error instanceof GigaChatProviderError
+    && error.category === 'auth' && error.httpStatus === 403 && !error.message.includes('response body'));
+  assert.equal(balanceRequests, 3);
+  assert.equal(oauthRequests, 2, '403 does not start another OAuth flow');
+});
+
+test('saved-key invalidation cancels a pending balance response and rejects its late body', async () => {
+  const pending = deferred<ProviderTransportResponse>();
+  let balanceStarted = false;
+  let cancelled = 0;
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => {
+      if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }] });
+      balanceStarted = true;
+      return pending.promise;
+    }),
+  });
+  assert.equal((await provider.connect()).state, 'connected');
+
+  const request = provider.getBalance();
+  await waitFor(() => balanceStarted);
+  provider.invalidateSavedKey();
+  await assert.rejects(request,
+    (error: unknown) => error instanceof GigaChatProviderError && error.category === 'cancel');
+  pending.resolve({
+    ...jsonResponse(200, { balance: [{ usage: 'GigaChat-Ultra', value: 1 }] }),
+    cancel: () => { cancelled += 1; },
+  });
+  await delay(0);
+  assert.equal(cancelled, 1);
+  assert.equal(provider.getConnectionStatus().state, 'not-configured');
+});
+
 test('uploads binary bytes as multipart without UTF-8 conversion and validates the returned file reference', async () => {
   const requests: ProviderTransportRequest[] = [];
   const provider = createGigaChatProvider({

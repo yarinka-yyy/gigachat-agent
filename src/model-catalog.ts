@@ -5,7 +5,7 @@ import { isModelAvailable } from './models';
 export const CHAT_MODEL_FAMILIES = [
   {
     family: 'ultra', displayName: 'GigaChat Ultra', currentId: 'GigaChat-3-Ultra',
-    legacyIds: [], poolEvidence: {
+    legacyIds: [], billingAliases: ['GigaChat-Ultra'], poolEvidence: {
       kind: 'account-observed', source: 'official Freemium tariff + app/.qa/capability-spike/summary.md',
       verifiedAt: '2026-10-12', details: 'Бесплатный пул сопоставлен по официальному тарифу и реальной проверке установленного приложения.',
     },
@@ -95,6 +95,13 @@ export function chatModelUnavailableReason(registry: ModelRegistrySnapshot, mode
 export function modelFamilyForId(modelId: string | null | undefined) {
   if (!modelId) return null;
   return CHAT_MODEL_FAMILIES.find((family) => family.currentId === modelId || (family.legacyIds as readonly string[]).includes(modelId)) ?? null;
+}
+
+export function billingFamilyForUsageLabel(label: string | null | undefined) {
+  if (!label) return null;
+  return CHAT_MODEL_FAMILIES.find((family) => family.currentId === label || family.displayName === label
+    || (family.legacyIds as readonly string[]).includes(label)
+    || ('billingAliases' in family && (family.billingAliases as readonly string[]).includes(label))) ?? null;
 }
 
 export function legacyModelUpgrade(modelId: string | null | undefined) {
