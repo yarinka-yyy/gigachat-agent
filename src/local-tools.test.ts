@@ -450,6 +450,211 @@ test('lists, searches, reads, sends structured writes, and opens files inside a 
   assert.ok(events.every((event) => !('script' in event) && !('path' in event)));
 });
 
+test('searches one selected UTF-8 file with literal case-insensitive matching and stable line numbers', async (t) => {
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  const relativeFile = 'docs/nested/mixed.txt';
+  const absoluteFile = join(fixture.projectFolder, 'docs', 'nested', 'mixed.txt');
+  const text = 'start\r\nEnglish NEEDLE\rRussian Ёж.* marker\r\nRussian ЁжZZ marker\nend';
+  await mkdir(join(fixture.projectFolder, 'docs', 'nested'), { recursive: true });
+  await writeFile(absoluteFile, text, 'utf8');
+  const requests: PowerShellRequest[] = [];
+  const tools = createLocalTools({
+    resolveProject: async (id) => id === fixture.project.id ? fixture.project : null,
+    runPowerShell: async (request) => {
+      requests.push(request);
+      return { exitCode: 0, stdout: `${Buffer.from(text, 'utf8').toString('base64')}\n`,
+        stderr: '', timedOut: false, outputLimited: false };
+    },
+  });
+
+  assert.deepEqual(await tools.search(projectId, 'ask', 'Ёж.*', 'docs\\nested\\mixed.txt'), [
+    { path: relativeFile, line: 3, text: 'Russian Ёж.* marker' },
+  ]);
+  assert.deepEqual(await tools.search(projectId, 'ask', 'needle', relativeFile), [
+    { path: relativeFile, line: 2, text: 'English NEEDLE' },
+  ]);
+  assert.equal(requests.length, 2);
+  assert.ok(requests.every((request) => request.workingFolder === fixture.projectFolder));
+  assert.ok(requests.every((request) => request.maxOutputBytes === 2 * 1024 * 1024));
+  assert.ok(requests.every((request) => request.script.includes("$relative = 'docs\\nested\\mixed.txt'")));
+  assert.ok(requests.every((request) => request.script.includes('$utf8Strict.GetString($bytes)')
+    && request.script.includes('$stream.Length -gt 1048576')
+    && request.script.includes('Assert-NoReparse $target')));
+  assert.ok(requests.every((request) => !request.script.includes('GIGACHAT_LOCAL_TOOL:search')
+    && !request.script.includes('GetFileSystemEntries')));
+  assert.equal(await readFile(absoluteFile, 'utf8'), text);
+});
+
+test('file search returns empty on no match and limits full-line matches before clipping', async (t) => {
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  const absoluteFile = join(fixture.projectFolder, 'results.txt');
+  const longMatchingLine = `${'x'.repeat(2005)}needle-after-the-visible-prefix`;
+  const text = [longMatchingLine, ...Array.from({ length: 205 }, (_, index) => `needle row ${index + 1}`)].join('\r');
+  await writeFile(absoluteFile, text, 'utf8');
+  let calls = 0;
+  const tools = createLocalTools({
+    resolveProject: async (id) => id === fixture.project.id ? fixture.project : null,
+    runPowerShell: async () => {
+      calls += 1;
+      return { exitCode: 0, stdout: `${Buffer.from(text, 'utf8').toString('base64')}\n`,
+        stderr: '', timedOut: false, outputLimited: false };
+    },
+  });
+
+  assert.deepEqual(await tools.search(projectId, 'ask', 'not-present', 'results.txt'), []);
+  const matches = await tools.search(projectId, 'ask', 'needle', 'results.txt');
+  assert.equal(matches.length, 200);
+  assert.deepEqual(matches[0], { path: 'results.txt', line: 1, text: 'x'.repeat(2000) });
+  assert.equal(matches[0]?.text.includes('needle'), false, 'the full source line is matched before its displayed text is clipped');
+  assert.deepEqual(matches[1], { path: 'results.txt', line: 2, text: 'needle row 1' });
+  assert.equal(matches[matches.length - 1]?.line, 200);
+  assert.equal(calls, 2);
+});
+
+test('searching an empty selected file returns no matches', async (t) => {
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  const absoluteFile = join(fixture.projectFolder, 'empty.txt');
+  await writeFile(absoluteFile, '');
+  const tools = createLocalTools({
+    resolveProject: async (id) => id === fixture.project.id ? fixture.project : null,
+    runPowerShell: async () => ({ exitCode: 0, stdout: '\n', stderr: '', timedOut: false, outputLimited: false }),
+  });
+
+  assert.deepEqual(await tools.search(projectId, 'ask', 'needle', 'empty.txt'), []);
+  assert.equal((await readFile(absoluteFile)).byteLength, 0);
+});
+
+test('file search rejects malformed Base64, invalid UTF-8, binary data, and oversized helper output', async (t) => {
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  const absoluteFile = join(fixture.projectFolder, 'source.txt');
+  await writeFile(absoluteFile, 'selected file', 'utf8');
+  const outputs = [
+    { value: '*!\n', error: /неверный формат/ },
+    { value: `${Buffer.from([0xff, 0xc3]).toString('base64')}\n`, error: /корректный UTF-8/ },
+    { value: `${Buffer.from([0x61, 0x00, 0x62]).toString('base64')}\n`, error: /Бинарный файл/ },
+    { value: `${Buffer.alloc(MAX_LOCAL_FILE_BYTES + 1, 0x61).toString('base64')}\n`, error: /больше данных/ },
+  ];
+  let output = '';
+  const tools = createLocalTools({
+    resolveProject: async (id) => id === fixture.project.id ? fixture.project : null,
+    runPowerShell: async () => ({ exitCode: 0, stdout: output, stderr: '', timedOut: false, outputLimited: false }),
+  });
+
+  for (const invalid of outputs) {
+    output = invalid.value;
+    await assert.rejects(tools.search(projectId, 'ask', 'x', 'source.txt'), invalid.error);
+  }
+  assert.equal(await readFile(absoluteFile, 'utf8'), 'selected file');
+});
+
+test('single-file search honors cancellation before helper start and after a deferred helper result', async (t) => {
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  await writeFile(join(fixture.projectFolder, 'source.txt'), 'needle', 'utf8');
+  let calls = 0;
+  const preAborted = new AbortController();
+  preAborted.abort();
+  const preAbortTools = createLocalTools({
+    resolveProject: async (id) => id === fixture.project.id ? fixture.project : null,
+    runPowerShell: async () => {
+      calls += 1;
+      return { exitCode: 0, stdout: '', stderr: '', timedOut: false, outputLimited: false };
+    },
+  });
+  await assert.rejects(preAbortTools.search(projectId, 'ask', 'needle', 'source.txt', { signal: preAborted.signal }), { name: 'AbortError' });
+  assert.equal(calls, 0);
+
+  const controller = new AbortController();
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolveStarted) => { markStarted = resolveStarted; });
+  let releaseRunner!: () => void;
+  const deferredResult = new Promise<void>((resolveRunner) => { releaseRunner = resolveRunner; });
+  const delayedTools = createLocalTools({
+    resolveProject: async (id) => id === fixture.project.id ? fixture.project : null,
+    runPowerShell: async () => {
+      calls += 1;
+      markStarted();
+      await deferredResult;
+      return { exitCode: 0, stdout: `${Buffer.from('needle', 'utf8').toString('base64')}\n`,
+        stderr: '', timedOut: false, outputLimited: false };
+    },
+  });
+  const pending = delayedTools.search(projectId, 'ask', 'needle', 'source.txt', { signal: controller.signal });
+  await started;
+  controller.abort();
+  releaseRunner();
+  await assert.rejects(pending, { name: 'AbortError' });
+  assert.equal(calls, 1);
+});
+
+test('custom search can read a selected file when public read is denied', async (t) => {
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  const text = 'English needle in a custom-allowed search';
+  await writeFile(join(fixture.projectFolder, 'notes.txt'), text, 'utf8');
+  const requests: PowerShellRequest[] = [];
+  const tools = createLocalTools({
+    resolveProject: async (id) => id === fixture.project.id ? fixture.project : null,
+    getCustomPolicy: async () => parseCustomConfig(DEFAULT_CUSTOM_CONFIG.replace('read = "allow"', 'read = "deny"')),
+    runPowerShell: async (request) => {
+      requests.push(request);
+      return { exitCode: 0, stdout: `${Buffer.from(text, 'utf8').toString('base64')}\n`,
+        stderr: '', timedOut: false, outputLimited: false };
+    },
+  });
+
+  assert.deepEqual(await tools.search(projectId, 'custom', 'NEEDLE', 'notes.txt'), [
+    { path: 'notes.txt', line: 1, text },
+  ]);
+  await assert.rejects(tools.read(projectId, 'custom', 'notes.txt'), /Запрещено пользовательским профилем/);
+  assert.equal(requests.length, 1, 'denied public read must stop before invoking the helper');
+  assert.match(requests[0]?.script ?? '', /\$stream = \[IO\.File\]::Open/);
+  assert.doesNotMatch(requests[0]?.script ?? '', /GIGACHAT_LOCAL_TOOL:search|GetFileSystemEntries/);
+});
+
+test('denied, rebound, and reparse selected-file searches do not invoke the helper', async (t) => {
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  const selectedFile = join(fixture.projectFolder, 'selected.txt');
+  await writeFile(selectedFile, 'needle', 'utf8');
+  await writeFile(join(fixture.outsideFolder, 'sentinel.txt'), 'outside needle', 'utf8');
+  let calls = 0;
+  const tools = createLocalTools({
+    resolveProject: async (id) => id === fixture.project.id ? fixture.project : null,
+    runPowerShell: async () => {
+      calls += 1;
+      return { exitCode: 0, stdout: `${Buffer.from('needle', 'utf8').toString('base64')}\n`,
+        stderr: '', timedOut: false, outputLimited: false };
+    },
+  });
+  const denied = createLocalTools({
+    resolveProject: async (id) => id === fixture.project.id ? fixture.project : null,
+    getCustomPolicy: async () => parseCustomConfig(DEFAULT_CUSTOM_CONFIG.replace('search = "allow"', 'search = "deny"')),
+    runPowerShell: async () => {
+      calls += 1;
+      return { exitCode: 0, stdout: '[]', stderr: '', timedOut: false, outputLimited: false };
+    },
+  });
+
+  await assert.rejects(denied.search(projectId, 'custom', 'needle', 'selected.txt'), /Запрещено пользовательским профилем/);
+  assert.equal(calls, 0);
+  const acceptedFolder = fixture.projectFolder;
+  fixture.project.workingFolder = fixture.outsideFolder;
+  await assert.rejects(tools.search(projectId, 'ask', 'needle', 'sentinel.txt', { expectedWorkingFolder: acceptedFolder }), /Рабочая папка проекта изменилась после принятия хода/);
+  assert.equal(calls, 0);
+
+  fixture.project.workingFolder = acceptedFolder;
+  await symlink(fixture.outsideFolder, join(fixture.projectFolder, 'outside-link'), 'junction');
+  await assert.rejects(tools.search(projectId, 'ask', 'needle', 'outside-link/sentinel.txt'), /ссыл|повторной обработки/);
+  assert.equal(calls, 0);
+  assert.equal(await readFile(selectedFile, 'utf8'), 'needle');
+  assert.equal(await readFile(join(fixture.outsideFolder, 'sentinel.txt'), 'utf8'), 'outside needle');
+});
+
 test('does not dispatch a project command through the operating-system file association', async (t) => {
   const fixture = await createFixture();
   t.after(fixture.cleanup);

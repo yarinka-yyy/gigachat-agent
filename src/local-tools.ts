@@ -975,8 +975,29 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
       throwIfAborted(searchOptions.signal);
       const query = requireText(queryInput, 'Поисковая строка', 256).toLocaleLowerCase();
       const pathParts = requireRelativePath(pathInput, true);
-      const { root } = await prepareTarget(projectIdInput, profileInput, 'project-files', 'search',
+      const { root, target } = await prepareTarget(projectIdInput, profileInput, 'project-files', 'search',
         pathParts.join(sep), true, false, true, searchOptions.signal, undefined, searchOptions.expectedWorkingFolder, searchOptions.skillId ?? null);
+      throwIfAborted(searchOptions.signal);
+      const targetInfo = await lstat(target).catch(() => null);
+      if (!targetInfo || targetInfo.isSymbolicLink()) {
+        throw new LocalToolError('Файл или папка проекта не найдены либо недоступны.');
+      }
+      if (targetInfo.isFile()) {
+        const output = await runBoundedFileScript(options.runPowerShell, root,
+          buildReadScript(root, pathParts), searchOptions.signal, 2 * 1024 * 1024);
+        const lines = decodeText(parseBase64Output(output, MAX_LOCAL_FILE_BYTES)).split(/\r\n|\n|\r/);
+        const matches: LocalSearchMatch[] = [];
+        for (const [index, line] of lines.entries()) {
+          throwIfAborted(searchOptions.signal);
+          if (line.toLocaleLowerCase().includes(query)) {
+            matches.push({ path: pathParts.join('/'), line: index + 1, text: line.slice(0, 2000) });
+            if (matches.length >= MAX_SEARCH_MATCHES) break;
+          }
+        }
+        throwIfAborted(searchOptions.signal);
+        return matches;
+      }
+      if (!targetInfo.isDirectory()) throw new LocalToolError('Поиск поддерживает только файлы и папки проекта.');
       const output = await runBoundedFileScript(options.runPowerShell, root,
         buildSearchScript(root, pathParts, query), searchOptions.signal, MAX_ENUMERATION_OUTPUT_BYTES);
       return parseSearchRows(output, pathParts);
