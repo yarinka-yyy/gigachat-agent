@@ -24,10 +24,14 @@ export interface NextTurnContext {
   provenance: ContextProvenance;
   textTokenCount: number | null;
   textCountProvenance: ContextProvenance;
-  wireBytes: number;
+  wireBytes: number | null;
   maxWireBytes: number;
   blocks: ContextBlockSize[];
   textInputs: string[];
+}
+
+export interface BuildNextTurnContextOptions {
+  allowMissingModelForPreview?: boolean;
 }
 
 function byteLength(value: string): number {
@@ -116,7 +120,10 @@ function sizeBlocks(request: ProviderTurnRequest, functionSchemaBytes: number): 
   return blocks;
 }
 
-export function buildNextTurnContext(input: NextTurnContextInput): NextTurnContext {
+export function buildNextTurnContext(
+  input: NextTurnContextInput,
+  options: BuildNextTurnContextOptions = {},
+): NextTurnContext {
   const selected = selectRecentMessages(input.messages, input.compactSnapshot);
   let protocolHistory: ProviderProtocolExchange[];
   if (!selected.coveredPrefix) protocolHistory = (input.protocolHistory ?? []).map((exchange) => structuredClone(exchange));
@@ -141,13 +148,15 @@ export function buildNextTurnContext(input: NextTurnContextInput): NextTurnConte
     messages: selected.messages,
     protocolHistory,
   });
-  const serialized = serializeProviderTurnRequest(request);
+  const serialized = request.modelId === null && options.allowMissingModelForPreview
+    ? serializeProviderTurnRequest({ ...request, modelId: 'x' })
+    : serializeProviderTurnRequest(request);
   return {
     request,
     provenance: 'unknown',
     textTokenCount: null,
     textCountProvenance: 'unknown',
-    wireBytes: serialized.wireBytes,
+    wireBytes: request.modelId === null ? null : serialized.wireBytes,
     maxWireBytes: MAX_PROVIDER_REQUEST_BYTES,
     blocks: sizeBlocks(request, serialized.functionSchemaBytes),
     textInputs: serialized.textInputs,

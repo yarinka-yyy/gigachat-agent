@@ -5,6 +5,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, safeStorage, screen, session, shell, systemPreferences, Tray, WebContentsView, type IpcMainInvokeEvent, type MediaAccessPermissionRequest } from 'electron';
 import { openStore, type LocalStore } from './store';
 import { COMPACTION_QUALITY_VERIFIED, COMPACTION_UNAVAILABLE_REASON, COMPACTION_TASK_INSTRUCTION, buildNextTurnContext, validateCompactSummary } from './context';
+import { createContextPreview } from './context-preview';
 import { createLocalTools, createPowerShellHelper, resolvePowerShellHelperPath } from './local-tools';
 import { createTurnRuntime, queueAcceptedTurnOrMarkNotSent, type PreparedCompactionContext, type TurnRuntime } from './runtime';
 import type { AcceptedTurnInput, AttachmentImportBatchResult, ChatArtifact, ChatPatch, CompactSnapshot, FolderOpener, HomeDraftAttachment, HookRunResult, ModelRegistrySnapshot, NotificationSettings, PreferredOpener, RuntimeAvailability, SettingsPatch, Theme, VoiceAvailability } from './contracts';
@@ -1061,7 +1062,7 @@ async function registerIpcHandlers(
   const nonCriticalChannels = new Set([
     'projects:list', 'projects:pick-folder', 'projects:open-folder', 'projects:read-instructions', 'projects:instructions-backup-path',
     'chats:list', 'chats:get', 'chats:open-artifact', 'chats:open-folder', 'chats:draft-attachment-preview', 'chats:artifact-preview',
-    'runtime:list', 'runtime:status', 'permissions:read-config', 'permissions:respond',
+    'runtime:list', 'runtime:status', 'context:preview', 'permissions:read-config', 'permissions:respond',
     'voice:status', 'voice:cancel', 'skills:list', 'skills:read-source', 'skills:open-folder', 'hooks:list', 'hooks:inspect',
     'onboarding:key-status', 'onboarding:browser-status', 'onboarding:browser-open', 'onboarding:browser-close',
     'onboarding:connection-status',
@@ -1072,7 +1073,7 @@ async function registerIpcHandlers(
     'settings:get-auto-start', 'settings:read-instructions',
   ]);
   const readOnlyChannels = new Set([
-    'projects:list', 'projects:read-instructions', 'projects:instructions-backup-path',
+    'projects:list', 'projects:read-instructions', 'projects:instructions-backup-path', 'context:preview',
     'chats:list', 'chats:get', 'chats:draft-attachment-preview', 'chats:artifact-preview', 'home-draft:get', 'home-draft:attachment-preview', 'runtime:list', 'runtime:status', 'permissions:read-config',
     'voice:status', 'skills:list', 'skills:read-source', 'hooks:list', 'hooks:inspect', 'onboarding:key-status', 'onboarding:connection-status', 'models:get-registry',
     'onboarding:browser-status', 'browser:status', 'settings:get', 'usage:local-stats', 'usage:get-ledger', 'usage:get-profile-view',
@@ -1283,6 +1284,11 @@ async function registerIpcHandlers(
   handle('projects:instructions-backup-path', (id) => store.projectInstructionsBackupPath(requireId(id)));
 
   handle('chats:list', () => store.listChats());
+  handle('context:preview', (input) => createContextPreview(input, {
+    store,
+    skills,
+    hasActiveTurn: (chatId) => runtime.list(chatId).some((turn) => turn.status === 'queued' || turn.status === 'running'),
+  }));
   handle('chats:get', (id) => store.getChat(id));
   handle('home-draft:get', () => store.getHomeDraft());
   handle('home-draft:attachment-preview', async (idInput) => {

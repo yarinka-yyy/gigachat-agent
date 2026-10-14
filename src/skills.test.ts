@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -67,6 +67,28 @@ test('enables validated Skills, serializes rapid changes, and stops offering a r
   assert.deepEqual((await registry.list()).skills, []);
   assert.equal(await registry.getEnabled('global/review'), null);
   await assert.rejects(registry.setEnabled('global/review', true), /не найден/);
+});
+
+test('read-only selected Skill lookup leaves the registry and unrelated missing roots untouched', async (t) => {
+  const { userDataPath, registry } = await createFixture(t);
+  const sourcePath = join(userDataPath, 'skills', 'global', 'review', 'SKILL.md');
+  const enabledPath = join(userDataPath, 'skills', 'enabled.json');
+  const unrelatedProjectRoot = join(userDataPath, 'skills', 'projects', project.id);
+  const contents = reviewSkill;
+  const enabledContents = `${JSON.stringify({ schemaVersion: 1, enabled: ['global/review', 'global/missing'] }, null, 2)}\n`;
+  await mkdir(join(userDataPath, 'skills', 'global', 'review'), { recursive: true });
+  await writeFile(sourcePath, contents, 'utf8');
+  await writeFile(enabledPath, enabledContents, 'utf8');
+
+  const selected = await registry.getEnabledReadOnly('global/review');
+  assert.equal(selected?.instructions, 'Проверяй только факты из diff.');
+  assert.equal(await registry.getEnabledReadOnly('global/missing'), null);
+  assert.equal((await lstat(unrelatedProjectRoot).catch(() => null)), null,
+    'a selected global Skill lookup does not provision unrelated project directories');
+  assert.equal(await readFile(sourcePath, 'utf8'), contents);
+  assert.equal(await readFile(enabledPath, 'utf8'), enabledContents);
+  await assert.rejects(lstat(join(userDataPath, 'skills', 'global', 'missing')),
+    (error: unknown) => typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT');
 });
 
 test('does not follow a junction outside the app-owned registry', async (t) => {

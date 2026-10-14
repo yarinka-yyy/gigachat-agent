@@ -15,7 +15,7 @@ import {
   isChatModelAvailable,
   legacyModelUpgrade,
 } from './model-catalog';
-import { basicAgentWorkflowStatus, getModelCapabilities } from './model-capabilities';
+import { basicAgentWorkflowStatus, getModelCapabilities, getModelContextLimit } from './model-capabilities';
 
 test('accepts bounded provider model IDs without a local namespace whitelist', () => {
   assert.equal(requireModelId('future/model.v4:preview'), 'future/model.v4:preview');
@@ -152,6 +152,29 @@ test('capability gates distinguish verified, unverified, and unavailable workflo
   ultra.txt = 'unavailable';
   assert.equal(getModelCapabilities('GigaChat-3-Ultra').txt, 'verified');
   assert.notEqual(getModelCapabilities('GigaChat-3-Ultra').evidence.details, 'mutated test copy');
+});
+
+test('context limits are documented only for the exact Ultra 3 and Max 2 API IDs', () => {
+  for (const modelId of ['GigaChat-3-Ultra', 'GigaChat-2-Max']) {
+    assert.deepEqual(getModelContextLimit(modelId), {
+      limitTokens: 128_000,
+      provenance: 'official-model-docs',
+      source: 'developers.sber.ru models/main + models/updates',
+      verifiedAt: '2026-10-14',
+    });
+  }
+  for (const modelId of [
+    'GigaChat-3-Pro', 'GigaChat-3-Lightning', 'GigaChat-2-Pro', 'GigaChat-2', 'future/model-v5', null,
+  ]) {
+    assert.deepEqual(getModelContextLimit(modelId), {
+      limitTokens: null, provenance: 'unknown', source: null, verifiedAt: null,
+    });
+  }
+  for (const inheritedKey of ['constructor', 'toString', '__proto__']) {
+    assert.deepEqual(getModelContextLimit(inheritedKey), {
+      limitTokens: null, provenance: 'unknown', source: null, verifiedAt: null,
+    });
+  }
 });
 
 test('real Stage1 evidence gates file formats independently from the verified chat workflow', () => {

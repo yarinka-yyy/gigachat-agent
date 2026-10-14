@@ -52,6 +52,19 @@ test('builds ordered next-turn layers and keeps only protocol pairs after the ex
   assert.equal(requestContext.textTokenCount, null);
 });
 
+test('preview-only missing model preserves the actual null selection and never claims serialized bytes', () => {
+  const noModel = input([user('no-model')], { modelId: null });
+  assert.throws(() => buildNextTurnContext(noModel), (error: unknown) =>
+    error instanceof GigaChatProviderError && error.category === 'protocol');
+
+  const preview = buildNextTurnContext(noModel, { allowMissingModelForPreview: true });
+  assert.equal(preview.request.modelId, null);
+  assert.equal(preview.wireBytes, null);
+  assert.equal(preview.textTokenCount, null);
+  assert.equal(preview.provenance, 'unknown');
+  assert.ok(preview.blocks.some((block) => block.source === 'function-schema' && block.utf8Bytes > 0));
+});
+
 test('keeps an answer inserted after a boundary that the saved snapshot did not cover', () => {
   const beforeReply = [user('u1')];
   const current = [user('u1'), assistant('retry-answer'), user('u2')];

@@ -17,6 +17,42 @@ export interface ModelCapabilities {
   };
 }
 
+export interface ModelContextLimitEvidence {
+  limitTokens: number | null;
+  provenance: 'official-model-docs' | 'unknown';
+  source: string | null;
+  verifiedAt: string | null;
+}
+
+const UNKNOWN_CONTEXT_LIMIT: Readonly<ModelContextLimitEvidence> = {
+  limitTokens: null,
+  provenance: 'unknown',
+  source: null,
+  verifiedAt: null,
+};
+
+const DOCUMENTED_CONTEXT_LIMITS: Readonly<Record<string, Readonly<ModelContextLimitEvidence>>> = {
+  'GigaChat-3-Ultra': {
+    limitTokens: 128_000,
+    provenance: 'official-model-docs',
+    source: 'developers.sber.ru models/main + models/updates',
+    verifiedAt: '2026-10-14',
+  },
+  'GigaChat-2-Max': {
+    limitTokens: 128_000,
+    provenance: 'official-model-docs',
+    source: 'developers.sber.ru models/main + models/updates',
+    verifiedAt: '2026-10-14',
+  },
+};
+
+export function getModelContextLimit(modelId: string | null): ModelContextLimitEvidence {
+  const evidence = modelId !== null && Object.prototype.hasOwnProperty.call(DOCUMENTED_CONTEXT_LIMITS, modelId)
+    ? DOCUMENTED_CONTEXT_LIMITS[modelId]!
+    : UNKNOWN_CONTEXT_LIMIT;
+  return { ...evidence };
+}
+
 const UNVERIFIED: ModelCapabilities = {
   textStream: 'unverified',
   functionCalls: 'unverified',

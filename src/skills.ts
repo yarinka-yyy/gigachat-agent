@@ -44,6 +44,7 @@ export interface SkillRegistry {
   setEnabled(id: unknown, enabled: unknown): Promise<SkillRegistrySnapshot>;
   openFolder(scope: unknown, projectId?: unknown): Promise<string>;
   getEnabled(id: unknown): Promise<(SkillRecord & { instructions: string }) | null>;
+  getEnabledReadOnly(id: unknown): Promise<(SkillRecord & { instructions: string }) | null>;
 }
 
 interface ParsedSkill {
@@ -252,6 +253,49 @@ export function createSkillRegistry(options: {
     return skill;
   };
 
+  const getEnabledReadOnly = async (idInput: unknown): Promise<(SkillRecord & { instructions: string }) | null> => {
+    const id = requireSkillId(idInput);
+    const enabled = await loadEnabled();
+    if (!enabled.has(id)) return null;
+    const parts = id.split('/');
+    const scope: SkillScope = parts[0] === 'global' ? 'global' : 'project';
+    const projectId = scope === 'project' ? parts[1]! : null;
+    const slug = parts[parts.length - 1]!;
+    const project = projectId === null ? null : (await options.listProjects()).find((item) => item.id === projectId) ?? null;
+    if (projectId !== null && !project) return null;
+
+    const userInfo = await lstat(userDataPath).catch((error: unknown) => isMissing(error) ? null : Promise.reject(error));
+    if (!userInfo) return null;
+    if (!userInfo.isDirectory() || userInfo.isSymbolicLink()) throw new Error('Каталог данных приложения недоступен.');
+    await realpath(userDataPath);
+
+    const root = scope === 'global'
+      ? join(skillsRoot, 'global')
+      : join(skillsRoot, 'projects', projectId!);
+    const directory = join(root, slug);
+    const filePath = join(directory, 'SKILL.md');
+    await assertOwnedPath(userDataPath, filePath);
+    const directoryInfo = await lstat(directory).catch((error: unknown) => isMissing(error) ? null : Promise.reject(error));
+    if (!directoryInfo) return null;
+    if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) throw new Error('Папка Skill недоступна для безопасного чтения.');
+    const fileInfo = await lstat(filePath).catch((error: unknown) => isMissing(error) ? null : Promise.reject(error));
+    if (!fileInfo) return null;
+    if (!fileInfo.isFile() || fileInfo.isSymbolicLink() || fileInfo.size > MAX_SKILL_BYTES) return null;
+    try {
+      const parsed = parseSkillMarkdown(await readFile(filePath, 'utf8'));
+      const location = scope === 'global'
+        ? `Global/${slug}/SKILL.md`
+        : `Project/${project?.name ?? projectId}/${slug}/SKILL.md`;
+      return {
+        id, name: parsed.name, description: parsed.description, command: slug, scope,
+        projectId, projectName: project?.name ?? null, source: location, enabled: true,
+        instructions: parsed.instructions,
+      };
+    } catch {
+      return null;
+    }
+  };
+
   return {
     list: snapshot,
     readSource: async (idInput) => {
@@ -301,5 +345,6 @@ export function createSkillRegistry(options: {
       const parsed = parseSkillMarkdown(await readFile(skill.filePath, 'utf8'));
       return { ...skill.record, enabled: true, instructions: parsed.instructions };
     },
+    getEnabledReadOnly,
   };
 }

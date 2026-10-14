@@ -7,6 +7,8 @@ import type {
   LocalUsageStats,
   UsageLedgerSummary,
   UsageProfileView,
+  ContextPreviewRequest,
+  ContextPreviewView,
   BrowserBounds,
   EmbeddedBrowserStatus,
   ChatDetail,
@@ -75,6 +77,9 @@ const runCloseAttempt = (discardBrowserMetadata = false): Promise<CloseAttemptRe
 };
 
 const api: AppApi = {
+  context: {
+    preview: (input: ContextPreviewRequest) => ipcRenderer.invoke('context:preview', input) as Promise<ContextPreviewView>,
+  },
   homeDraft: {
     get: () => ipcRenderer.invoke('home-draft:get') as Promise<HomeDraftRecord>,
     save: (input: HomeDraftInput) => ipcRenderer.invoke('home-draft:save', input) as Promise<HomeDraftRecord>,

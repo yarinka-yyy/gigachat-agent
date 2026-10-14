@@ -84,6 +84,47 @@ export interface CompactionPrefix {
 
 export type ContextProvenance = 'unknown' | 'estimated' | 'verified';
 
+export type ContextPreviewSource = 'home' | 'chat';
+
+export type ContextPreviewUnknownReason =
+  | 'token-estimate-unavailable'
+  | 'model-limit-undocumented'
+  | 'pending-attachment-content'
+  | 'historical-attachment-content'
+  | 'historical-attachment-metadata'
+  | 'opaque-function-state';
+
+export type ContextPreviewBlockSource = ContextBlockSize['source'];
+
+export type ContextPreviewRequest =
+  | { source: 'home'; visibleText: string }
+  | { source: 'chat'; chatId: string; visibleText: string };
+
+export interface ContextPreviewBlockSummary {
+  source: ContextPreviewBlockSource;
+  count: number;
+  utf8Bytes: number;
+}
+
+export interface ContextPreviewView {
+  modelId: string | null;
+  contextLimit: {
+    tokens: number | null;
+    provenance: 'official-model-docs' | 'unknown';
+    source: string | null;
+    verifiedAt: string | null;
+  };
+  estimatedTokens: null;
+  tokenEstimateProvenance: 'unknown';
+  preparationWireBytes: number | null;
+  maximumWireBytes: number;
+  preparationWireBytesIncludeAttachments: false;
+  blocks: ContextPreviewBlockSummary[];
+  pendingAttachments: { count: number; sizeBytes: number };
+  historicalAttachments: { count: number; sizeBytes: number | null };
+  unknownReasons: ContextPreviewUnknownReason[];
+}
+
 export interface ContextBlockSize {
   source: 'runtime' | 'global' | 'project' | 'skill' | 'summary' | 'message' | 'protocol' | 'function-schema';
   label: string;
@@ -712,6 +753,9 @@ export interface OnboardingBrowserStatus {
 }
 
 export interface AppApi {
+  context: {
+    preview(input: ContextPreviewRequest): Promise<ContextPreviewView>;
+  };
   homeDraft: {
     get(): Promise<HomeDraftRecord>;
     save(input: HomeDraftInput): Promise<HomeDraftRecord>;
