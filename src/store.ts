@@ -25,9 +25,20 @@ type ProfileBalanceAnchor = Omit<UsageBalanceAnchorViewInput, 'baselineMatches'>
 };
 type ProfileBalanceFile = { schemaVersion: 1; anchors: ProfileBalanceAnchor[] };
 type ProviderUploadFile = { schemaVersion: 1; entries: ProviderUploadLedgerEntry[] };
-type ProjectDeleteState = { projects: ProjectFile; chats: ChatDetail[]; instructionText: string | null };
-type ProjectDeleteJournal = {
+type ProviderStateOwnerBinding = { accountScope: string; stateIdHash: string };
+type ProviderStateMessageBinding = ProviderStateOwnerBinding & { messageId: string };
+type ProviderStateReceiptBinding = ProviderStateOwnerBinding & { receiptId: string; anchorMessageId: string };
+type ProviderStateCompactBinding = ProviderStateOwnerBinding & { snapshotId: string; functionsStateId: string };
+type ProviderStateOwnership = {
   schemaVersion: 1;
+  messages: ProviderStateMessageBinding[];
+  receipts: ProviderStateReceiptBinding[];
+  compact: ProviderStateCompactBinding | null;
+};
+type StoredChat = { detail: ChatDetail; providerStateOwnership: ProviderStateOwnership };
+type ProjectDeleteState = { projects: ProjectFile; chats: StoredChat[]; instructionText: string | null };
+type ProjectDeleteJournal = {
+  schemaVersion: 2;
   operationId: string;
   projectId: string;
   before: ProjectDeleteState;
@@ -125,7 +136,8 @@ export interface LocalStore {
   getMessagesThrough(chatId: unknown, messageId: unknown): Promise<ChatMessage[]>;
   getToolProtocolThrough(chatId: unknown, messageId: unknown): Promise<ProviderProtocolExchange[]>;
   getCompactionPrefix(chatId: unknown, boundaryMessageId: unknown): Promise<CompactionPrefix>;
-  beginToolReceipt(chatId: unknown, messageId: unknown, receipt: Omit<ChatToolReceipt, 'anchorMessageId' | 'status' | 'result' | 'createdAt'>): Promise<{ shouldExecute: boolean; receipt: ChatToolReceipt }>;
+  beginToolReceipt(chatId: unknown, messageId: unknown, receipt: Omit<ChatToolReceipt, 'anchorMessageId' | 'status' | 'result' | 'createdAt'>, accountScope?: unknown): Promise<{ shouldExecute: boolean; receipt: ChatToolReceipt }>;
+  getProviderStateOwnership(chatId: unknown, accountScope: unknown): Promise<ProviderStateOwnershipView>;
   completeToolReceipt(chatId: unknown, messageId: unknown, receiptId: unknown, status: 'completed' | 'unknown', result: unknown): Promise<void>;
   createChat(projectId?: unknown, kind?: unknown): Promise<ChatSummary>;
   updateChat(id: unknown, patch: unknown): Promise<ChatSummary>;
@@ -138,8 +150,8 @@ export interface LocalStore {
   consumeTurnReservation(turn: AcceptedTurnInput, signal?: AbortSignal): Promise<void>;
   validateAcceptedTurn(turn: AcceptedTurnInput): Promise<void>;
   updateRuntimeTurn(turn: RuntimeTurnSnapshot): Promise<void>;
-  appendAssistantMessageFromRuntime(turn: AcceptedTurnInput, text: unknown, terminalTurn: RuntimeTurnSnapshot, signal?: AbortSignal, functionsStateId?: unknown): Promise<ChatDetail>;
-  commitCompactSnapshot(id: unknown, snapshot: CompactSnapshot, expectedSnapshotId: string | null, signal?: AbortSignal, terminalTurn?: RuntimeTurnSnapshot): Promise<ChatDetail>;
+  appendAssistantMessageFromRuntime(turn: AcceptedTurnInput, text: unknown, terminalTurn: RuntimeTurnSnapshot, signal?: AbortSignal, functionsStateId?: unknown, accountScope?: unknown): Promise<ChatDetail>;
+  commitCompactSnapshot(id: unknown, snapshot: CompactSnapshot, expectedSnapshotId: string | null, signal?: AbortSignal, terminalTurn?: RuntimeTurnSnapshot, providerState?: unknown): Promise<ChatDetail>;
   importFile(id: unknown, sourcePath: string, projectId?: unknown): Promise<ChatDetail>;
   getArtifactPath(id: unknown, artifactId: unknown): Promise<string>;
   getChatFolder(id: unknown): Promise<string>;
@@ -168,6 +180,12 @@ export interface LocalStore {
   saveProjectInstructionsCopy(id: unknown, contents: unknown): Promise<string>;
 }
 
+export interface ProviderStateOwnershipView {
+  messages: Array<{ messageId: string; owned: boolean }>;
+  receipts: Array<{ receiptId: string; anchorMessageId: string; owned: boolean }>;
+  compact: { snapshotId: string; owned: boolean; functionsStateId: string | null } | null;
+}
+
 type Loaded<T> = { value: T; needsWrite: boolean };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -182,6 +200,117 @@ function requireId(value: unknown): string {
     throw new Error('Некорректный идентификатор.');
   }
   return value;
+}
+
+function requireProviderStateId(value: unknown): string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 4096
+    // eslint-disable-next-line no-control-regex -- Match the provider parser's state-ID boundary.
+    || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error('Некорректное состояние ответа GigaChat.');
+  }
+  return value;
+}
+
+function requireProviderAccountScope(value: unknown): string {
+  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value)) {
+    throw new Error('Некорректная область учётной записи GigaChat.');
+  }
+  return value;
+}
+
+function hashProviderStateId(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+function emptyProviderStateOwnership(): ProviderStateOwnership {
+  return { schemaVersion: 1, messages: [], receipts: [], compact: null };
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const expected = [...keys].sort();
+  const actual = Object.keys(value).sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function validateProviderStateOwnership(value: unknown, detail: ChatDetail): ProviderStateOwnership {
+  if (!isRecord(value) || !hasExactKeys(value, ['schemaVersion', 'messages', 'receipts', 'compact'])
+    || value.schemaVersion !== 1 || !Array.isArray(value.messages) || !Array.isArray(value.receipts)) {
+    throw new Error('Invalid provider-state ownership metadata.');
+  }
+  if (value.messages.length > detail.messages.length || value.receipts.length > detail.toolReceipts.length) {
+    throw new Error('Provider-state ownership metadata exceeds chat resources.');
+  }
+  const assistantMessagesById = new Map<string, ChatMessage>();
+  for (const message of detail.messages) {
+    if (message.role === 'assistant' && !assistantMessagesById.has(message.id)) assistantMessagesById.set(message.id, message);
+  }
+  const receiptsByKey = new Map<string, ChatToolReceipt>();
+  for (const receipt of detail.toolReceipts) {
+    const key = `${receipt.receiptId}:${receipt.anchorMessageId}`;
+    if (!receiptsByKey.has(key)) receiptsByKey.set(key, receipt);
+  }
+  const messages = value.messages.map((entry: unknown): ProviderStateMessageBinding => {
+    if (!isRecord(entry) || !hasExactKeys(entry, ['messageId', 'accountScope', 'stateIdHash'])
+      || typeof entry.stateIdHash !== 'string' || !/^[a-f0-9]{64}$/.test(entry.stateIdHash)) {
+      throw new Error('Invalid provider-state message binding.');
+    }
+    const messageId = requireId(entry.messageId);
+    const accountScope = requireProviderAccountScope(entry.accountScope);
+    const message = assistantMessagesById.get(messageId);
+    if (!message?.functionsStateId || hashProviderStateId(requireProviderStateId(message.functionsStateId)) !== entry.stateIdHash) {
+      throw new Error('Unbound provider-state message binding.');
+    }
+    return { messageId, accountScope, stateIdHash: entry.stateIdHash };
+  });
+  const receipts = value.receipts.map((entry: unknown): ProviderStateReceiptBinding => {
+    if (!isRecord(entry) || !hasExactKeys(entry, ['receiptId', 'anchorMessageId', 'accountScope', 'stateIdHash'])
+      || typeof entry.receiptId !== 'string' || !/^[a-f0-9]{64}$/.test(entry.receiptId)
+      || typeof entry.stateIdHash !== 'string' || !/^[a-f0-9]{64}$/.test(entry.stateIdHash)) {
+      throw new Error('Invalid provider-state receipt binding.');
+    }
+    const anchorMessageId = requireId(entry.anchorMessageId);
+    const accountScope = requireProviderAccountScope(entry.accountScope);
+    const receipt = receiptsByKey.get(`${entry.receiptId}:${anchorMessageId}`);
+    if (!receipt?.functionsStateId || hashProviderStateId(requireProviderStateId(receipt.functionsStateId)) !== entry.stateIdHash) {
+      throw new Error('Unbound provider-state receipt binding.');
+    }
+    return { receiptId: entry.receiptId, anchorMessageId, accountScope, stateIdHash: entry.stateIdHash };
+  });
+  if (new Set(messages.map((entry) => entry.messageId)).size !== messages.length
+    || new Set(receipts.map((entry) => `${entry.receiptId}:${entry.anchorMessageId}`)).size !== receipts.length) {
+    throw new Error('Duplicate provider-state ownership binding.');
+  }
+  let compact: ProviderStateCompactBinding | null = null;
+  if (value.compact !== null) {
+    const entry = value.compact;
+    if (!isRecord(entry) || !hasExactKeys(entry, ['snapshotId', 'functionsStateId', 'accountScope', 'stateIdHash'])
+      || typeof entry.stateIdHash !== 'string' || !/^[a-f0-9]{64}$/.test(entry.stateIdHash)) {
+      throw new Error('Invalid provider-state compact binding.');
+    }
+    const snapshotId = requireId(entry.snapshotId);
+    const functionsStateId = requireProviderStateId(entry.functionsStateId);
+    const accountScope = requireProviderAccountScope(entry.accountScope);
+    if (detail.compactSnapshot?.id !== snapshotId || hashProviderStateId(functionsStateId) !== entry.stateIdHash) {
+      throw new Error('Unbound provider-state compact binding.');
+    }
+    compact = { snapshotId, functionsStateId, accountScope, stateIdHash: entry.stateIdHash };
+  }
+  return { schemaVersion: 1, messages, receipts, compact };
+}
+
+function validateStoredChat(value: unknown): Loaded<StoredChat> {
+  const loaded = validateChatDetail(value);
+  if (!isRecord(value)) throw new Error('Invalid stored chat.');
+  const version = value.schemaVersion as number;
+  if (version < 12) {
+    if (Object.prototype.hasOwnProperty.call(value, 'providerStateOwnership')) throw new Error('Legacy chat contains unversioned private state.');
+    return { value: { detail: loaded.value, providerStateOwnership: emptyProviderStateOwnership() }, needsWrite: true };
+  }
+  if (version !== 12) throw new Error('Unknown stored chat schema.');
+  return {
+    value: { detail: loaded.value, providerStateOwnership: validateProviderStateOwnership(value.providerStateOwnership, loaded.value) },
+    needsWrite: loaded.needsWrite,
+  };
 }
 
 function requireName(value: unknown, label: string, maxLength: number): string {
@@ -811,7 +940,7 @@ function recordFromRuntimeTurn(turn: RuntimeTurnSnapshot): ChatTurnRecord {
 }
 
 function validateChatDetail(value: unknown): Loaded<ChatDetail> {
-  if (!isRecord(value) || (value.schemaVersion !== 3 && value.schemaVersion !== 4 && value.schemaVersion !== 5 && value.schemaVersion !== 6 && value.schemaVersion !== 7 && value.schemaVersion !== 8 && value.schemaVersion !== 9 && value.schemaVersion !== 10 && value.schemaVersion !== 11)
+  if (!isRecord(value) || (value.schemaVersion !== 3 && value.schemaVersion !== 4 && value.schemaVersion !== 5 && value.schemaVersion !== 6 && value.schemaVersion !== 7 && value.schemaVersion !== 8 && value.schemaVersion !== 9 && value.schemaVersion !== 10 && value.schemaVersion !== 11 && value.schemaVersion !== 12)
     || !Array.isArray(value.messages) || !Array.isArray(value.artifacts)
     || (value.schemaVersion >= 7 && !Array.isArray(value.toolReceipts))
     || (value.schemaVersion >= 8 && !('compactSnapshot' in value))
@@ -967,7 +1096,7 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
     value: { ...chat, messages, artifacts, draftAttachments, toolReceipts, turns, nextTurnPermissionProfile, nextTurnSkillId,
       modelId: version >= 6 && value.modelId !== null ? requireModelId(value.modelId) : null,
       compactSnapshot },
-    needsWrite: version < 11,
+    needsWrite: version < 12,
   };
 }
 
@@ -978,8 +1107,8 @@ function summary(chat: ChatDetail): ChatSummary {
   };
 }
 
-function detailFile(chat: ChatDetail): Record<string, unknown> {
-  return { schemaVersion: 11, ...chat };
+function detailFile(chat: ChatDetail, providerStateOwnership = emptyProviderStateOwnership()): Record<string, unknown> {
+  return { schemaVersion: 12, ...chat, providerStateOwnership: validateProviderStateOwnership(providerStateOwnership, chat) };
 }
 
 function preserveSkillInvocation(existing: ChatTurnRecord | null, next: ChatTurnRecord): ChatTurnRecord {
@@ -1240,7 +1369,12 @@ function validateHomeSendJournal(value: unknown): HomeSendJournal {
   const rawChat = isRecord(value.chat) ? value.chat : null;
   const legacySchema8 = rawChat?.schemaVersion === 8;
   const legacySchema9 = rawChat?.schemaVersion === 9;
-  let chat = validateChatDetail(value.chat).value;
+  const storedChat = validateStoredChat(value.chat).value;
+  if (storedChat.providerStateOwnership.messages.length !== 0 || storedChat.providerStateOwnership.receipts.length !== 0
+    || storedChat.providerStateOwnership.compact !== null) {
+    throw new Error('Домашний журнал не может назначать владельца состоянию провайдера.');
+  }
+  let chat = storedChat.detail;
   const turn = validateAcceptedTurnRecord(value.turn, legacySchema8 || legacySchema9);
   const attachments = value.attachments.map(validateHomeDraftAttachment);
   const nextDraft = validateHomeDraftRecord(value.nextDraft);
@@ -1358,9 +1492,10 @@ function skillForProject(skillId: string | null, projectId: string | null): stri
 }
 
 function validateProjectDeleteJournal(value: unknown): ProjectDeleteJournal {
-  if (!isRecord(value) || value.schemaVersion !== 1 || !isRecord(value.before) || !isRecord(value.after)) {
+  if (!isRecord(value) || (value.schemaVersion !== 1 && value.schemaVersion !== 2) || !isRecord(value.before) || !isRecord(value.after)) {
     throw new Error('Invalid project deletion journal.');
   }
+  const journalVersion = value.schemaVersion;
   const operationId = requireId(value.operationId);
   const projectId = requireId(value.projectId);
   const readState = (input: Record<string, unknown>): ProjectDeleteState => {
@@ -1369,7 +1504,12 @@ function validateProjectDeleteJournal(value: unknown): ProjectDeleteJournal {
       throw new Error('Invalid project deletion state.');
     }
     const projects = parseProjectFile(input.projects).value;
-    const chats = input.chats.map((chat) => validateChatDetail(chat).value);
+    const chats = input.chats.map((chat) => {
+      if (!isRecord(chat) || (journalVersion === 1 ? typeof chat.schemaVersion !== 'number' || chat.schemaVersion > 11 : chat.schemaVersion !== 12)) {
+        throw new Error('Invalid project deletion chat snapshot.');
+      }
+      return validateStoredChat(chat).value;
+    });
     return {
       projects,
       chats,
@@ -1383,22 +1523,23 @@ function validateProjectDeleteJournal(value: unknown): ProjectDeleteJournal {
     || !sameJson(before.projects.projects.filter((project) => project.id !== projectId), after.projects.projects)) {
     throw new Error('Project deletion journal has inconsistent project snapshots.');
   }
-  const beforeById = new Map(before.chats.map((chat) => [chat.id, chat]));
-  const afterById = new Map(after.chats.map((chat) => [chat.id, chat]));
+  const beforeById = new Map(before.chats.map((chat) => [chat.detail.id, chat]));
+  const afterById = new Map(after.chats.map((chat) => [chat.detail.id, chat]));
   if (beforeById.size !== before.chats.length || afterById.size !== after.chats.length
     || beforeById.size !== afterById.size) {
     throw new Error('Project deletion journal has inconsistent chat snapshots.');
   }
   for (const [id, previous] of beforeById) {
     const next = afterById.get(id);
-    if (!next || previous.projectId !== projectId || next.projectId !== null
-      || !sameJson({ ...previous, projectId: null, updatedAt: next.updatedAt,
-        nextTurnSkillId: detachProjectSkill(previous.nextTurnSkillId, projectId) }, next)) {
+    if (!next || previous.detail.projectId !== projectId || next.detail.projectId !== null
+      || !sameJson({ ...previous.detail, projectId: null, updatedAt: next.detail.updatedAt,
+        nextTurnSkillId: detachProjectSkill(previous.detail.nextTurnSkillId, projectId) }, next.detail)
+      || !sameJson(previous.providerStateOwnership, next.providerStateOwnership)) {
       throw new Error('Project deletion journal has inconsistent chat snapshots.');
     }
   }
   if (after.instructionText !== null) throw new Error('Project deletion journal has an invalid instruction target.');
-  return { schemaVersion: 1, operationId, projectId, before, after };
+  return { schemaVersion: 2, operationId, projectId, before, after };
 }
 
 function parseSettingsFile(value: unknown): Loaded<SettingsFile> {
@@ -1577,7 +1718,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     schemaVersion: 1,
     operationId: journal.operationId,
     sourceRevision: journal.sourceRevision,
-    chat: detailFile(journal.chat),
+    chat: detailFile(journal.chat, emptyProviderStateOwnership()),
     turn: journal.turn,
     attachments: journal.attachments,
     nextDraft: { schemaVersion: 1, ...journal.nextDraft },
@@ -1591,10 +1732,11 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       throw error;
     });
     if (existingChatContents !== null) {
-      let existingChat: ChatDetail;
-      try { existingChat = validateChatDetail(JSON.parse(existingChatContents) as unknown).value; }
+      let existingChat: StoredChat;
+      try { existingChat = validateStoredChat(JSON.parse(existingChatContents) as unknown).value; }
       catch { throw storageError(chatFilePath); }
-      if (!sameJson(existingChat, journal.chat)) {
+      if (!sameJson(existingChat.detail, journal.chat)
+        || !sameJson(existingChat.providerStateOwnership, emptyProviderStateOwnership())) {
         throw new Error('Отправка приостановлена: чат с тем же ID уже содержит другие данные. Существующий чат сохранён.');
       }
     }
@@ -1624,7 +1766,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         throw new Error('Копирование файла чата не прошло проверку целостности.');
       }
     }
-    if (existingChatContents === null) await writeOwnedAtomic(chatFilePath, detailFile(journal.chat));
+    if (existingChatContents === null) await writeOwnedAtomic(chatFilePath, detailFile(journal.chat, emptyProviderStateOwnership()));
     await testFaults?.afterHomeSendStage?.('chat');
     await writeOwnedAtomic(homeDraftPath, { schemaVersion: 1, ...journal.nextDraft });
     await testFaults?.afterHomeSendStage?.('draft');
@@ -1756,23 +1898,23 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       throw new Error('Удаление проекта приостановлено: список проектов изменился после записи журнала. Данные сохранены.');
     }
 
-    const afterChats = new Map(journal.after.chats.map((chat) => [chat.id, chat]));
-    const chatWrites: Array<{ path: string; detail: ChatDetail }> = [];
+    const afterChats = new Map(journal.after.chats.map((chat) => [chat.detail.id, chat]));
+    const chatWrites: Array<{ path: string; chat: StoredChat }> = [];
     for (const before of journal.before.chats) {
-      const after = afterChats.get(before.id);
+      const after = afterChats.get(before.detail.id);
       if (!after) throw new Error('Журнал удаления проекта повреждён.');
-      const path = join(chatsDirectory, before.id, 'chat.json');
+      const path = join(chatsDirectory, before.detail.id, 'chat.json');
       await assertOwnedPath(storageRoot, path);
       const contents = await readFile(path, 'utf8').catch((error: unknown) => {
         if (isMissingFile(error)) throw storageError(path);
         throw error;
       });
-      let current: ChatDetail;
-      try { current = validateChatDetail(JSON.parse(contents) as unknown).value; }
+      let current: StoredChat;
+      try { current = validateStoredChat(JSON.parse(contents) as unknown).value; }
       catch { throw storageError(path); }
-      if (sameJson(current, before)) chatWrites.push({ path, detail: after });
+      if (sameJson(current, before)) chatWrites.push({ path, chat: after });
       else if (!sameJson(current, after)) {
-        throw new Error(`Удаление проекта приостановлено: чат ${before.id} изменился после записи журнала. Данные сохранены.`);
+        throw new Error(`Удаление проекта приостановлено: чат ${before.detail.id} изменился после записи журнала. Данные сохранены.`);
       }
     }
 
@@ -1788,7 +1930,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     }
 
     for (const [index, item] of chatWrites.entries()) {
-      await writeOwnedAtomic(item.path, detailFile(item.detail));
+      await writeOwnedAtomic(item.path, detailFile(item.chat.detail, item.chat.providerStateOwnership));
       await testFaults?.afterProjectDeleteStage?.('chat', index);
     }
     if (!sameJson(currentProjects, journal.after.projects)) {
@@ -1994,8 +2136,9 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     throw error;
   });
   const loadedChats: ChatDetail[] = [];
+  const loadedChatOwnership = new Map<string, ProviderStateOwnership>();
   const existingChatDetails = new Set<string>();
-  const chatsNeedingMigration: ChatDetail[] = [];
+  const chatsNeedingMigration: StoredChat[] = [];
   const storageIssues: string[] = [];
   for (const entry of entries) {
     if (entry.isSymbolicLink()) throw new Error('Каталог чата не может быть символической ссылкой.');
@@ -2014,16 +2157,19 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     }
     existingChatDetails.add(entry.name);
     try {
-      const detail = validateChatDetail(JSON.parse(contents) as unknown);
-      if (detail.value.id !== entry.name) throw new Error('Chat ID mismatch.');
+      const stored = validateStoredChat(JSON.parse(contents) as unknown);
+      if (stored.value.detail.id !== entry.name) throw new Error('Chat ID mismatch.');
       const recoveryAt = new Date().toISOString();
-      const turns = detail.value.turns.map((turn) => turn.status === 'queued' || turn.status === 'running'
+      const turns = stored.value.detail.turns.map((turn) => turn.status === 'queued' || turn.status === 'running'
         ? { ...turn, status: 'interrupted' as const, endedAt: recoveryAt, error: turn.error ?? 'Приложение завершилось до сохранения ответа.' }
         : turn);
-      const recoveredChat = turns.some((turn, index) => turn !== detail.value.turns[index])
-        ? { ...detail.value, turns } : detail.value;
+      const recoveredChat = turns.some((turn, index) => turn !== stored.value.detail.turns[index])
+        ? { ...stored.value.detail, turns } : stored.value.detail;
       loadedChats.push(recoveredChat);
-      if (detail.needsWrite || recoveredChat !== detail.value) chatsNeedingMigration.push(recoveredChat);
+      loadedChatOwnership.set(recoveredChat.id, stored.value.providerStateOwnership);
+      if (stored.needsWrite || recoveredChat !== stored.value.detail) {
+        chatsNeedingMigration.push({ detail: recoveredChat, providerStateOwnership: stored.value.providerStateOwnership });
+      }
     } catch {
       storageIssues.push(`Чат ${entry.name} недоступен: файл истории повреждён; каталог сохранён.`);
     }
@@ -2062,14 +2208,16 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     for (const legacy of legacyChats) {
       if (existingChatDetails.has(legacy.id)) continue;
       const detail: ChatDetail = { ...legacy, nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: null, messages: [], turns: [], toolReceipts: [], artifacts: [], draftAttachments: [], compactSnapshot: null };
-      await writeOwnedAtomic(join(chatsDirectory, legacy.id, 'chat.json'), detailFile(detail));
+      const providerStateOwnership = emptyProviderStateOwnership();
+      await writeOwnedAtomic(join(chatsDirectory, legacy.id, 'chat.json'), detailFile(detail, providerStateOwnership));
       loadedChats.push(detail);
+      loadedChatOwnership.set(detail.id, providerStateOwnership);
     }
     await writeOwnedTextAtomic(migrationMarker, '3\n');
   }
 
   for (const chat of chatsNeedingMigration) {
-    await writeOwnedAtomic(join(chatsDirectory, chat.id, 'chat.json'), detailFile(chat));
+    await writeOwnedAtomic(join(chatsDirectory, chat.detail.id, 'chat.json'), detailFile(chat.detail, chat.providerStateOwnership));
   }
 
   if (projectFile.needsWrite) await writeOwnedAtomic(projectPath, projectFile.value);
@@ -2084,6 +2232,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
 
   let projects = projectFile.value.projects;
   let chats = loadedChats;
+  const providerStateOwnershipByChatId = loadedChatOwnership;
   let settings = settingsFile.value.settings;
   let usageReceipts = usageFile.value.receipts;
   let profileBalanceAnchors = profileBalanceFile.value.anchors;
@@ -2109,13 +2258,15 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         chats = chats.some((chat) => chat.id === journal.chat.id)
           ? chats.map((chat) => chat.id === journal.chat.id ? journal.chat : chat)
           : [...chats, journal.chat];
+        providerStateOwnershipByChatId.set(journal.chat.id, emptyProviderStateOwnership());
       }
       if (pendingProjectDelete) {
         const journal = pendingProjectDelete;
         await applyProjectDeleteJournal(journal);
         projects = journal.after.projects.projects;
-        const updates = new Map(journal.after.chats.map((chat) => [chat.id, chat]));
-        chats = chats.map((chat) => updates.get(chat.id) ?? chat);
+        const updates = new Map(journal.after.chats.map((chat) => [chat.detail.id, chat]));
+        chats = chats.map((chat) => updates.get(chat.id)?.detail ?? chat);
+        for (const [id, updated] of updates) providerStateOwnershipByChatId.set(id, structuredClone(updated.providerStateOwnership));
         pendingProjectDelete = null;
       }
       return operation();
@@ -2155,11 +2306,15 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     providerUploadEntries = next;
   };
   const chatFolder = (id: string): string => join(chatsDirectory, requireId(id));
-  const saveChat = async (chat: ChatDetail, signal?: AbortSignal): Promise<void> => {
-    await writeOwnedAtomic(join(chatFolder(chat.id), 'chat.json'), detailFile(chat), signal);
+  const saveChat = async (chat: ChatDetail, signal?: AbortSignal, nextOwnership?: ProviderStateOwnership): Promise<void> => {
+    const providerStateOwnership = validateProviderStateOwnership(
+      nextOwnership ?? providerStateOwnershipByChatId.get(chat.id) ?? emptyProviderStateOwnership(), chat,
+    );
+    await writeOwnedAtomic(join(chatFolder(chat.id), 'chat.json'), detailFile(chat, providerStateOwnership), signal);
     chats = chats.some((item) => item.id === chat.id)
       ? chats.map((item) => item.id === chat.id ? chat : item)
       : [...chats, chat];
+    providerStateOwnershipByChatId.set(chat.id, structuredClone(providerStateOwnership));
   };
   const findChat = (idInput: unknown): ChatDetail => {
     const chat = chats.find((item) => item.id === requireId(idInput));
@@ -2521,6 +2676,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       pendingHomeSendJournal = null;
       homeDraft = journal.nextDraft;
       chats = [...chats, journal.chat];
+      providerStateOwnershipByChatId.set(journal.chat.id, emptyProviderStateOwnership());
       return { detail: structuredClone(journal.chat), turn: structuredClone(turn), newlyAccepted: true };
     }),
     createProject: (nameInput, folderInput = null) => serialize(async () => {
@@ -2592,25 +2748,31 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       const instructionText = instructions ? await readInstructionsFile(instructionsPath) : null;
       const before: ProjectDeleteState = {
         projects: { schemaVersion: 2, projects: projects.map((item) => ({ ...item })) },
-        chats: linkedChats.map((item) => structuredClone(item)),
+        chats: linkedChats.map((item) => ({
+          detail: structuredClone(item),
+          providerStateOwnership: structuredClone(providerStateOwnershipByChatId.get(item.id) ?? emptyProviderStateOwnership()),
+        })),
         instructionText,
       };
       const after: ProjectDeleteState = {
         projects: { schemaVersion: 2, projects: projects.filter((item) => item.id !== id) },
         chats: linkedChats.map((chat) => ({
-          ...chat,
-          projectId: null,
-          nextTurnSkillId: detachProjectSkill(chat.nextTurnSkillId, id),
-          updatedAt: now,
+          detail: {
+            ...chat,
+            projectId: null,
+            nextTurnSkillId: detachProjectSkill(chat.nextTurnSkillId, id),
+            updatedAt: now,
+          },
+          providerStateOwnership: structuredClone(providerStateOwnershipByChatId.get(chat.id) ?? emptyProviderStateOwnership()),
         })),
         instructionText: null,
       };
       const journalRecord = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         operationId: randomUUID(),
         projectId: id,
-        before: { ...before, chats: before.chats.map(detailFile) },
-        after: { ...after, chats: after.chats.map(detailFile) },
+        before: { ...before, chats: before.chats.map((chat) => detailFile(chat.detail, chat.providerStateOwnership)) },
+        after: { ...after, chats: after.chats.map((chat) => detailFile(chat.detail, chat.providerStateOwnership)) },
       };
       const journal = validateProjectDeleteJournal(journalRecord);
       await writeOwnedAtomic(projectDeleteJournalPath, journalRecord);
@@ -2618,8 +2780,9 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       await testFaults?.afterProjectDeleteStage?.('journal');
       await applyProjectDeleteJournal(journal);
       projects = journal.after.projects.projects;
-      const updates = new Map(journal.after.chats.map((chat) => [chat.id, chat]));
-      chats = chats.map((chat) => updates.get(chat.id) ?? chat);
+      const updates = new Map(journal.after.chats.map((chat) => [chat.detail.id, chat]));
+      chats = chats.map((chat) => updates.get(chat.id)?.detail ?? chat);
+      for (const [chatId, updated] of updates) providerStateOwnershipByChatId.set(chatId, structuredClone(updated.providerStateOwnership));
       pendingProjectDelete = null;
     }),
     listChats: () => serialize(async () => chats.map(summary)),
@@ -2651,9 +2814,47 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         result: receipt.status === 'pending' ? UNKNOWN_TOOL_RESULT : receipt.result ?? UNKNOWN_TOOL_RESULT,
       }));
     }),
-    beginToolReceipt: (chatIdInput, messageIdInput, receiptInput) => serialize(async () => {
+    getProviderStateOwnership: (chatIdInput, accountScopeInput) => serialize(async () => {
+      const chat = findChat(chatIdInput);
+      const accountScope = requireProviderAccountScope(accountScopeInput);
+      const ownership = providerStateOwnershipByChatId.get(chat.id) ?? emptyProviderStateOwnership();
+      const messageBindings = new Map(ownership.messages.map((entry) => [entry.messageId, entry]));
+      const receiptBindings = new Map(ownership.receipts.map((entry) => [`${entry.receiptId}:${entry.anchorMessageId}`, entry]));
+      const messages = chat.messages.filter((message) => message.functionsStateId !== undefined).map((message) => {
+        const binding = messageBindings.get(message.id);
+        return {
+          messageId: message.id,
+          owned: Boolean(binding && binding.accountScope === accountScope
+            && binding.stateIdHash === hashProviderStateId(message.functionsStateId!)),
+        };
+      });
+      const receipts = chat.toolReceipts.filter((receipt) => receipt.functionsStateId !== null).map((receipt) => {
+        const binding = receiptBindings.get(`${receipt.receiptId}:${receipt.anchorMessageId}`);
+        return {
+          receiptId: receipt.receiptId,
+          anchorMessageId: receipt.anchorMessageId,
+          owned: Boolean(binding && binding.accountScope === accountScope
+            && binding.stateIdHash === hashProviderStateId(receipt.functionsStateId!)),
+        };
+      });
+      const compact = chat.compactSnapshot ? {
+        snapshotId: chat.compactSnapshot.id,
+        owned: Boolean(ownership.compact && ownership.compact.snapshotId === chat.compactSnapshot.id
+          && ownership.compact.accountScope === accountScope
+          && ownership.compact.stateIdHash === hashProviderStateId(ownership.compact.functionsStateId)),
+        functionsStateId: ownership.compact && ownership.compact.snapshotId === chat.compactSnapshot.id
+          && ownership.compact.accountScope === accountScope
+          && ownership.compact.stateIdHash === hashProviderStateId(ownership.compact.functionsStateId)
+          ? ownership.compact.functionsStateId : null,
+      } : null;
+      return structuredClone({ messages, receipts, compact });
+    }),
+    beginToolReceipt: (chatIdInput, messageIdInput, receiptInput, accountScopeInput) => serialize(async () => {
       const chat = findChat(chatIdInput);
       const messageId = requireId(messageIdInput);
+      const requestedOwner = accountScopeInput === undefined
+        ? null
+        : requireProviderAccountScope(accountScopeInput);
       if (!chat.messages.some((message) => message.id === messageId && message.role === 'user')) {
         throw new Error('Инструмент не привязан к принятому сообщению.');
       }
@@ -2677,6 +2878,19 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
           || /[\u0000-\u001f\u007f]/.test(receiptInput.functionsStateId)))) {
         throw new Error('Аргументы инструмента превышают допустимый размер.');
       }
+      const inputStateId = receiptInput.functionsStateId === null ? null : requireProviderStateId(receiptInput.functionsStateId);
+      if (requestedOwner && inputStateId === null) throw new Error('Нельзя привязать учётную запись к пустому состоянию ответа.');
+      const currentOwnership = providerStateOwnershipByChatId.get(chat.id) ?? emptyProviderStateOwnership();
+      const existingBinding = (receiptId: string, anchorMessageId: string): ProviderStateReceiptBinding | undefined =>
+        currentOwnership.receipts.find((binding) => binding.receiptId === receiptId && binding.anchorMessageId === anchorMessageId);
+      const assertExistingOwner = (receipt: ChatToolReceipt): void => {
+        if (!requestedOwner) return;
+        const binding = existingBinding(receipt.receiptId, receipt.anchorMessageId);
+        if (!receipt.functionsStateId || receipt.functionsStateId !== inputStateId || !binding || binding.accountScope !== requestedOwner
+          || binding.stateIdHash !== hashProviderStateId(receipt.functionsStateId)) {
+          throw new Error('Состояние инструмента уже сохранено без совпадающего владельца.');
+        }
+      };
       const existingRows = chat.toolReceipts.filter((receipt) => receipt.receiptId === receiptInput.receiptId);
       if (existingRows.some((receipt) => receipt.name !== receiptInput.name
         || !sameJson(receipt.arguments, receiptInput.arguments)
@@ -2687,6 +2901,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       }
       const sameAnchor = existingRows.find((receipt) => receipt.anchorMessageId === messageId);
       if (sameAnchor) {
+        assertExistingOwner(sameAnchor);
         if (sameAnchor.status === 'pending') {
           const recovered: ChatToolReceipt = { ...sameAnchor, status: 'unknown', result: UNKNOWN_TOOL_RESULT };
           const updated = { ...chat, updatedAt: new Date().toISOString(), toolReceipts: chat.toolReceipts.map((row) => row === sameAnchor ? recovered : row) };
@@ -2717,7 +2932,15 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
           : row);
         if (toolReceipts.length >= MAX_TOOL_RECEIPTS_PER_CHAT) throw new Error('Лимит истории локальных инструментов чата достигнут.');
         const updated = { ...chat, updatedAt: now, toolReceipts: [...toolReceipts, receipt] };
-        await saveChat(updated);
+        const nextOwnership = structuredClone(currentOwnership);
+        if (requestedOwner) {
+          if (!receipt.functionsStateId || receipt.functionsStateId !== inputStateId) {
+            throw new Error('Повтор side effect не совпадает с переданным состоянием ответа.');
+          }
+          nextOwnership.receipts.push({ receiptId: receipt.receiptId, anchorMessageId: receipt.anchorMessageId,
+            accountScope: requestedOwner, stateIdHash: hashProviderStateId(receipt.functionsStateId) });
+        }
+        await saveChat(updated, undefined, nextOwnership);
         return { shouldExecute: false, receipt: structuredClone(receipt) };
       }
       const earlier = existingRows[0];
@@ -2736,7 +2959,15 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         };
       if (chat.toolReceipts.length >= MAX_TOOL_RECEIPTS_PER_CHAT) throw new Error('Лимит истории локальных инструментов чата достигнут.');
       const updated = { ...chat, updatedAt: now, toolReceipts: [...chat.toolReceipts, receipt] };
-      await saveChat(updated);
+      const nextOwnership = structuredClone(currentOwnership);
+      if (requestedOwner) {
+        if (!receipt.functionsStateId || receipt.functionsStateId !== inputStateId) {
+          throw new Error('Повтор инструмента не совпадает с переданным состоянием ответа.');
+        }
+        nextOwnership.receipts.push({ receiptId: receipt.receiptId, anchorMessageId: receipt.anchorMessageId,
+          accountScope: requestedOwner, stateIdHash: hashProviderStateId(receipt.functionsStateId) });
+      }
+      await saveChat(updated, undefined, nextOwnership);
       return { shouldExecute: !earlier, receipt: structuredClone(receipt) };
     }),
     completeToolReceipt: (chatIdInput, messageIdInput, receiptIdInput, statusInput, resultInput) => serialize(async () => {
@@ -3010,7 +3241,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       else turns.push(record);
       await saveChat({ ...chat, turns, updatedAt: new Date().toISOString() });
     }),
-    appendAssistantMessageFromRuntime: (turnInput, textInput, terminalTurnInput, signal, functionsStateIdInput) => serialize(async () => {
+    appendAssistantMessageFromRuntime: (turnInput, textInput, terminalTurnInput, signal, functionsStateIdInput, accountScopeInput) => serialize(async () => {
       if (signal?.aborted) throw createAbortError();
       const acceptedTurn = structuredClone(turnInput);
       validateAcceptedTurnBinding(acceptedTurn);
@@ -3027,12 +3258,11 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       if (typeof textInput !== 'string' || !textInput.trim() || textInput.length > 100_000) {
         throw new Error('Ответ должен содержать от 1 до 100 000 символов.');
       }
-      if (functionsStateIdInput !== undefined && (typeof functionsStateIdInput !== 'string' || !functionsStateIdInput
-        || functionsStateIdInput.length > 4096
-        // eslint-disable-next-line no-control-regex -- Reject control characters in persisted provider state IDs.
-        || /[\u0000-\u001f\u007f]/.test(functionsStateIdInput))) {
-        throw new Error('Некорректное состояние ответа GigaChat.');
-      }
+      const functionsStateId = functionsStateIdInput === undefined ? null : requireProviderStateId(functionsStateIdInput);
+      const requestedOwner = accountScopeInput === undefined
+        ? null
+        : requireProviderAccountScope(accountScopeInput);
+      if (requestedOwner && functionsStateId === null) throw new Error('Нельзя привязать учётную запись к пустому состоянию ответа.');
       const now = terminalTurn.endedAt ?? new Date().toISOString();
       const currentTurnIndex = chat.turns.findIndex((item) => item.turnId === acceptedTurn.turnId);
       const currentTurn = currentTurnIndex >= 0 ? chat.turns[currentTurnIndex] : null;
@@ -3043,12 +3273,20 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       }
       const completedTurn = preserveSkillInvocation(currentTurn, terminalTurn);
       const existingMessage = chat.messages.find((message) => message.id === acceptedTurn.assistantMessageId);
+      const currentOwnership = providerStateOwnershipByChatId.get(chat.id) ?? emptyProviderStateOwnership();
+      const previousBinding = currentOwnership.messages.find((binding) => binding.messageId === acceptedTurn.assistantMessageId);
       if (existingMessage) {
         const savedTurn = currentTurn;
         if (existingMessage.role === 'assistant' && existingMessage.source === 'runtime'
           && existingMessage.text === textInput.trim()
           && existingMessage.functionsStateId === functionsStateIdInput
-          && savedTurn?.status === 'completed') return structuredClone(chat);
+          && savedTurn?.status === 'completed') {
+          if (requestedOwner && (!previousBinding || previousBinding.accountScope !== requestedOwner
+            || previousBinding.stateIdHash !== hashProviderStateId(functionsStateId!))) {
+            throw new Error('Зарезервированный ответ уже сохранён без совпадающего владельца.');
+          }
+          return structuredClone(chat);
+        }
         throw new Error('Зарезервированный ответ уже сохранён с другими данными.');
       }
       if (currentTurn && ['failed', 'cancelled', 'interrupted'].includes(currentTurn.status)) {
@@ -3056,7 +3294,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       }
       const message: ChatMessage = {
         id: acceptedTurn.assistantMessageId, role: 'assistant', source: 'runtime', text: textInput.trim(), createdAt: now,
-        ...(functionsStateIdInput === undefined ? {} : { functionsStateId: functionsStateIdInput }),
+        ...(functionsStateId === null ? {} : { functionsStateId }),
       };
       const messages = [...chat.messages];
       messages.splice(anchor + 1, 0, message);
@@ -3065,12 +3303,29 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       if (currentTurnIndex >= 0) turns[currentTurnIndex] = completedRecord;
       else turns.push(completedRecord);
       const updated = { ...chat, updatedAt: now, messages, turns };
-      await saveChat(updated, signal);
+      const nextOwnership = structuredClone(currentOwnership);
+      if (requestedOwner) {
+        if (previousBinding) throw new Error('Владелец сохранённого ответа не может быть заменён.');
+        nextOwnership.messages.push({ messageId: message.id, accountScope: requestedOwner,
+          stateIdHash: hashProviderStateId(functionsStateId!) });
+      }
+      await saveChat(updated, signal, nextOwnership);
       return structuredClone(updated);
     }),
-    commitCompactSnapshot: (idInput, snapshotInput, expectedSnapshotIdInput, signal, terminalTurnInput) => serialize(async () => {
+    commitCompactSnapshot: (idInput, snapshotInput, expectedSnapshotIdInput, signal, terminalTurnInput, providerStateInput) => serialize(async () => {
       if (signal?.aborted) throw createAbortError();
       const chat = findChat(idInput);
+      let compactOwner: ProviderStateOwnerBinding & { functionsStateId: string } | null = null;
+      if (providerStateInput !== undefined) {
+        if (!isRecord(providerStateInput) || !hasExactKeys(providerStateInput, ['accountScope', 'functionsStateId'])) {
+          throw new Error('Некорректный владелец сводки.');
+        }
+        compactOwner = {
+          accountScope: requireProviderAccountScope(providerStateInput.accountScope),
+          functionsStateId: requireProviderStateId(providerStateInput.functionsStateId),
+          stateIdHash: hashProviderStateId(requireProviderStateId(providerStateInput.functionsStateId)),
+        };
+      }
       if (expectedSnapshotIdInput !== null && typeof expectedSnapshotIdInput !== 'string') {
         throw new Error('Некорректная версия сводки.');
       }
@@ -3078,6 +3333,19 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       if (currentSnapshotId !== expectedSnapshotIdInput) throw new Error('Сводка чата изменилась; новая сводка не сохранена.');
       const snapshot = validateCompactSnapshot(snapshotInput, chat.messages);
       if (!snapshot) throw new Error('Некорректная сводка чата.');
+      const currentOwnership = providerStateOwnershipByChatId.get(chat.id) ?? emptyProviderStateOwnership();
+      if (currentSnapshotId === snapshot.id && chat.compactSnapshot) {
+        if (!sameJson(chat.compactSnapshot, snapshot)) {
+          throw new Error('Сводка с тем же идентификатором уже сохранена с другими данными.');
+        }
+        const existingOwner = currentOwnership.compact;
+        if (compactOwner && (!existingOwner || existingOwner.snapshotId !== snapshot.id
+          || existingOwner.accountScope !== compactOwner.accountScope
+          || existingOwner.functionsStateId !== compactOwner.functionsStateId
+          || existingOwner.stateIdHash !== compactOwner.stateIdHash)) {
+          throw new Error('Владелец сохранённой сводки не может быть заменён или восстановлен.');
+        }
+      }
       const prefix = buildCompactionPrefix(chat, snapshot.boundaryMessageId, snapshot.coveredThroughMessageId);
       if (prefix.coveredPrefixHash !== snapshot.coveredPrefixHash) throw new Error('История изменилась во время сжатия; прежняя сводка сохранена.');
       const previousBoundaryIndex = chat.compactSnapshot
@@ -3108,7 +3376,14 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       await testFaults?.beforeCompactSnapshotCommit?.();
       if (signal?.aborted) throw createAbortError();
       const updated = { ...chat, compactSnapshot: snapshot, turns, updatedAt: new Date().toISOString() };
-      await saveChat(updated, signal);
+      const nextOwnership = structuredClone(currentOwnership);
+      if (currentSnapshotId !== snapshot.id) {
+        nextOwnership.compact = compactOwner
+          ? { snapshotId: snapshot.id, functionsStateId: compactOwner.functionsStateId,
+            accountScope: compactOwner.accountScope, stateIdHash: compactOwner.stateIdHash }
+          : null;
+      }
+      await saveChat(updated, signal, nextOwnership);
       return structuredClone(updated);
     }),
     importFile: (idInput, sourcePath, projectIdInput = null) => serialize(async () => {
@@ -3154,6 +3429,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         }
         if (!existing) {
           chats = chats.filter((item) => item.id !== chat.id);
+          providerStateOwnershipByChatId.delete(chat.id);
           const folder = chatFolder(chat.id);
           await assertOwnedPath(storageRoot, folder).then(() => rm(folder, { recursive: true, force: true })).catch(() => undefined);
         }
@@ -3188,6 +3464,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       await assertOwnedPath(storageRoot, quarantinePath);
       await rename(path, quarantinePath);
       chats = chats.filter((item) => item.id !== chat.id);
+      providerStateOwnershipByChatId.delete(chat.id);
       selectionRevisions.delete(chat.id);
       for (const [turnId, reservation] of turnReservations) {
         if (reservation.chatId === chat.id) turnReservations.delete(turnId);

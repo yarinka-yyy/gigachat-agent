@@ -29,7 +29,13 @@ function openStore(directory: string, options: StoreOpenOptions = {}) {
   return openStoreProduction(directory, { instructionCommitter: syntheticInstructionCommitter, ...options });
 }
 
-async function appendAcceptedAnswer(store: Awaited<ReturnType<typeof openStore>>, turn: AcceptedTurnInput, text: string): Promise<void> {
+async function appendAcceptedAnswer(
+  store: Awaited<ReturnType<typeof openStore>>,
+  turn: AcceptedTurnInput,
+  text: string,
+  functionsStateId?: string,
+  accountScope?: string,
+): Promise<void> {
   const detail = await store.getChat(turn.chatId);
   const accepted = detail.turns.find((item) => item.turnId === turn.turnId);
   assert.ok(accepted);
@@ -38,7 +44,7 @@ async function appendAcceptedAnswer(store: Awaited<ReturnType<typeof openStore>>
     assistantMessageId: turn.assistantMessageId, modelId: turn.modelId, status: 'completed',
     createdAt: accepted.createdAt, endedAt: timestamp, activity: [],
   };
-  await store.appendAssistantMessageFromRuntime(turn, text, completed);
+  await store.appendAssistantMessageFromRuntime(turn, text, completed, undefined, functionsStateId, accountScope);
 }
 
 function completedCompactionTurn(turn: AcceptedTurnInput, createdAt: string): RuntimeTurnSnapshot {
@@ -52,6 +58,7 @@ function completedCompactionTurn(turn: AcceptedTurnInput, createdAt: string): Ru
 function downgradeHomeSendJournalToSchema8(journal: Record<string, unknown>): void {
   const legacyChat = journal.chat as Record<string, unknown>;
   legacyChat.schemaVersion = 8;
+  delete legacyChat.providerStateOwnership;
   delete legacyChat.turns;
   delete legacyChat.draftAttachments;
   for (const message of legacyChat.messages as Array<Record<string, unknown>>) delete message.attachmentIds;
@@ -522,7 +529,7 @@ test('schema 8 home-send journal recovers linked local files without inventing a
   assert.equal(accepted?.turn.messages[0]?.attachmentIds, undefined);
   assert.deepEqual(await readFile(await recovered.getArtifactPath(detail.id, staged.attachments[0]!.id)), Buffer.from('local bytes from schema 8'));
   const savedChat = JSON.parse(await readFile(join(directory, 'chats', detail.id, 'chat.json'), 'utf8')) as Record<string, unknown>;
-  assert.equal(savedChat.schemaVersion, 11);
+  assert.equal(savedChat.schemaVersion, 12);
 });
 
 test('schema 8 compact snapshot validates against its original linked-file prefix then upgrades the hash', async (t) => {
@@ -541,6 +548,7 @@ test('schema 8 compact snapshot validates against its original linked-file prefi
   for (const message of legacyMessages) delete message.attachmentIds;
   const oldHash = hashCompactionPrefix(legacyMessages as unknown as ChatMessage[], []);
   legacy.schemaVersion = 8;
+  delete legacy.providerStateOwnership;
   delete legacy.draftAttachments;
   delete legacy.turns;
   legacy.messages = legacyMessages;
@@ -560,7 +568,7 @@ test('schema 8 compact snapshot validates against its original linked-file prefi
   assert.equal(detail.compactSnapshot?.coveredPrefixHash, hashCompactionPrefix(detail.messages, []));
   assert.equal(await readFile(await restored.getArtifactPath(chat.id, pendingId), 'utf8'), 'local attachment bytes');
   const saved = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown>;
-  assert.equal(saved.schemaVersion, 11);
+  assert.equal(saved.schemaVersion, 12);
   assert.deepEqual((saved.compactSnapshot as CompactSnapshot).coveredPrefixHash, detail.compactSnapshot?.coveredPrefixHash);
 });
 
@@ -580,6 +588,7 @@ test('rejects tampered schema 8 attachment migrations without rewriting source b
     const messages = structuredClone(legacy.messages) as Array<Record<string, unknown>>;
     for (const message of messages) delete message.attachmentIds;
     legacy.schemaVersion = 8;
+    delete legacy.providerStateOwnership;
     delete legacy.draftAttachments;
     delete legacy.turns;
     legacy.messages = messages;
@@ -1302,7 +1311,7 @@ test('migrates v1 projects, chats, drafts, and theme without losing data', async
   assert.equal(JSON.parse(await readFile(join(directory, 'projects.json'), 'utf8')).schemaVersion, 2);
   assert.equal(JSON.parse(await readFile(join(directory, 'chats.json'), 'utf8')).schemaVersion, 1);
   assert.equal(await readFile(join(directory, 'chats.json.bak'), 'utf8'), await readFile(join(directory, 'chats.json'), 'utf8'));
-  assert.equal(JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')).schemaVersion, 11);
+  assert.equal(JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')).schemaVersion, 12);
   assert.equal(JSON.parse(await readFile(join(directory, 'settings.json'), 'utf8')).schemaVersion, 10);
   await store.deleteChat(chat.id);
   assert.deepEqual(await (await openStore(directory)).listChats(), []);
@@ -1360,7 +1369,7 @@ test('unfinished legacy migration preserves existing invalid chat details', asyn
         assert.deepEqual(restored.messages, kind === 'valid' ? detail.messages : []);
         if (validUnmarkedLegacyDetail) {
           const migratedDetail = JSON.parse(await readFile(detailPath, 'utf8')) as Record<string, unknown>;
-          assert.equal(migratedDetail.schemaVersion, 11);
+          assert.equal(migratedDetail.schemaVersion, 12);
           assert.equal(migratedDetail.compactSnapshot, null);
           assert.equal(migratedDetail.draft, 'newer draft');
         }
@@ -1612,6 +1621,346 @@ test('trusted runtime assistant append preserves draft and final provider state 
   assert.deepEqual(restored.turns, detail.turns);
 });
 
+test('schema 11 provider states migrate as unowned without changing public history or compact hashes', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-provider-state-schema11-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const scopeA = 'a'.repeat(64);
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const accepted = await store.acceptLocalMessage(chat.id, 'Legacy state fixture.', 'legacy-state-turn');
+  await appendAcceptedAnswer(store, accepted.turn, 'Legacy answer.', 'legacy-message-state', scopeA);
+  const receipt = {
+    receiptId: 'b'.repeat(64), name: 'read', arguments: { path: 'notes.txt' },
+    content: 'LEGACY_READ_RESULT', functionsStateId: 'legacy-receipt-state',
+  };
+  await store.beginToolReceipt(chat.id, accepted.turn.messageId, receipt, scopeA);
+  const prefix = await store.getCompactionPrefix(chat.id, accepted.turn.messageId);
+  const snapshot: CompactSnapshot = {
+    id: 'legacy-state-compact', version: 1, boundaryMessageId: accepted.turn.messageId,
+    coveredThroughMessageId: prefix.coveredThroughMessageId, coveredPrefixHash: prefix.coveredPrefixHash,
+    text: 'Legacy compact summary.', modelId: 'GigaChat-3-Pro', provenance: 'fixture', createdAt: timestamp,
+  };
+  await store.commitCompactSnapshot(chat.id, snapshot, null, undefined, undefined,
+    { accountScope: scopeA, functionsStateId: 'legacy-compact-state' });
+  const before = await store.getChat(chat.id);
+  const filePath = join(directory, 'chats', chat.id, 'chat.json');
+  const schema11 = JSON.parse(await readFile(filePath, 'utf8')) as Record<string, unknown>;
+  schema11.schemaVersion = 11;
+  delete schema11.providerStateOwnership;
+  await writeFile(filePath, JSON.stringify(schema11), 'utf8');
+
+  const restored = await openStore(directory);
+  const detail = await restored.getChat(chat.id);
+  assert.deepEqual(detail.messages, before.messages);
+  assert.deepEqual(detail.toolReceipts, before.toolReceipts);
+  assert.deepEqual(detail.compactSnapshot, snapshot);
+  assert.equal(detail.compactSnapshot?.coveredPrefixHash, before.compactSnapshot?.coveredPrefixHash);
+  assert.deepEqual(await restored.getProviderStateOwnership(chat.id, scopeA), {
+    messages: [{ messageId: accepted.turn.assistantMessageId, owned: false }],
+    receipts: [{ receiptId: receipt.receiptId, anchorMessageId: accepted.turn.messageId, owned: false }],
+    compact: { snapshotId: snapshot.id, owned: false, functionsStateId: null },
+  });
+  const migrated = JSON.parse(await readFile(filePath, 'utf8')) as Record<string, unknown>;
+  assert.equal(migrated.schemaVersion, 12);
+  assert.deepEqual(migrated.providerStateOwnership, {
+    schemaVersion: 1, messages: [], receipts: [], compact: null,
+  });
+  const bytesBeforeLegacyRetry = await readFile(filePath);
+  await assert.rejects(restored.commitCompactSnapshot(chat.id, snapshot, snapshot.id, undefined, undefined,
+    { accountScope: scopeA, functionsStateId: 'legacy-compact-state' }), /владел/i);
+  assert.deepEqual(await readFile(filePath), bytesBeforeLegacyRetry, 'an idempotent legacy snapshot retry cannot claim state');
+  await assert.rejects(appendAcceptedAnswer(restored, accepted.turn, 'Legacy answer.', 'legacy-message-state', scopeA), /владельц/i);
+  assert.deepEqual(await readFile(filePath), bytesBeforeLegacyRetry, 'an idempotent answer retry cannot claim legacy state');
+  await assert.rejects(restored.beginToolReceipt(chat.id, accepted.turn.messageId, receipt, scopeA), /владельц/i);
+  assert.deepEqual(await readFile(filePath), bytesBeforeLegacyRetry, 'an idempotent receipt retry cannot claim legacy state');
+  assert.deepEqual(await restored.getProviderStateOwnership(chat.id, scopeA), {
+    messages: [{ messageId: accepted.turn.assistantMessageId, owned: false }],
+    receipts: [{ receiptId: receipt.receiptId, anchorMessageId: accepted.turn.messageId, owned: false }],
+    compact: { snapshotId: snapshot.id, owned: false, functionsStateId: null },
+  });
+  const publicJson = JSON.stringify(detail);
+  assert.equal(publicJson.includes('providerStateOwnership'), false);
+  assert.equal(publicJson.includes(scopeA), false);
+  assert.equal(publicJson.includes('legacy-compact-state'), false);
+});
+
+test('captured assistant state is private, account-bound, idempotent, and saved only after atomic write', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-provider-state-message-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const scopeA = 'a'.repeat(64);
+  const scopeB = 'b'.repeat(64);
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const accepted = await store.acceptLocalMessage(chat.id, 'Capture state A.', 'turn-state-a');
+  await appendAcceptedAnswer(store, accepted.turn, 'The answer.', 'opaque-state-A', scopeA);
+  const detail = await store.getChat(chat.id);
+  assert.equal(detail.messages[1]?.functionsStateId, 'opaque-state-A');
+  assert.equal(Object.prototype.hasOwnProperty.call(detail, 'providerStateOwnership'), false);
+  assert.equal(JSON.stringify(detail).includes(scopeA), false);
+  assert.deepEqual(await store.getProviderStateOwnership(chat.id, scopeA), {
+    messages: [{ messageId: accepted.turn.assistantMessageId, owned: true }], receipts: [], compact: null,
+  });
+  assert.deepEqual(await store.getProviderStateOwnership(chat.id, scopeB), {
+    messages: [{ messageId: accepted.turn.assistantMessageId, owned: false }], receipts: [], compact: null,
+  });
+
+  const mutableView = await store.getProviderStateOwnership(chat.id, scopeA);
+  mutableView.messages[0]!.owned = false;
+  assert.equal((await store.getProviderStateOwnership(chat.id, scopeA)).messages[0]?.owned, true,
+    'a returned view cannot mutate the authoritative owner map');
+  await appendAcceptedAnswer(store, accepted.turn, 'The answer.', 'opaque-state-A', scopeA);
+  await assert.rejects(appendAcceptedAnswer(store, accepted.turn, 'The answer.', 'opaque-state-A', scopeB), /владельц/i);
+  assert.equal((await store.getProviderStateOwnership(chat.id, scopeA)).messages[0]?.owned, true);
+
+  const other = await store.createChat();
+  const otherTurn = await store.acceptLocalMessage(other.id, 'A second chat.', 'turn-state-other');
+  const otherPath = join(directory, 'chats', other.id, 'chat.json');
+  const beforeBytes = await readFile(otherPath);
+  const beforeDetail = await store.getChat(other.id);
+  const blockedPath = `${otherPath}.held`;
+  await rename(otherPath, blockedPath);
+  await mkdir(otherPath);
+  try {
+    await assert.rejects(appendAcceptedAnswer(store, otherTurn.turn, 'Must not commit.', 'opaque-state-failed', scopeA));
+    assert.deepEqual(await store.getChat(other.id), beforeDetail, 'failed terminal save leaves public memory unchanged');
+    assert.deepEqual(await store.getProviderStateOwnership(other.id, scopeA), { messages: [], receipts: [], compact: null });
+    assert.deepEqual(await readFile(blockedPath), beforeBytes, 'failed terminal save leaves the prior chat bytes intact');
+  } finally {
+    await rm(otherPath, { recursive: true, force: true });
+    await rename(blockedPath, otherPath);
+  }
+  assert.deepEqual(await readFile(otherPath), beforeBytes);
+  const reopened = await openStore(directory);
+  assert.equal((await reopened.getProviderStateOwnership(chat.id, scopeA)).messages[0]?.owned, true);
+  assert.deepEqual(await reopened.getProviderStateOwnership(other.id, scopeA), { messages: [], receipts: [], compact: null });
+  await reopened.deleteChat(chat.id);
+  assert.deepEqual(await (await openStore(directory)).getProviderStateOwnership(other.id, scopeA), { messages: [], receipts: [], compact: null },
+    'deleting one chat does not affect another chat owner');
+});
+
+test('tool receipt ownership is keyed by receipt and anchor and cannot be rebound', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-provider-state-receipts-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const scopeA = 'a'.repeat(64);
+  const scopeB = 'b'.repeat(64);
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const first = await store.acceptLocalMessage(chat.id, 'First tool request.', 'turn-receipt-one');
+  const second = await store.acceptLocalMessage(chat.id, 'Second tool request.', 'turn-receipt-two');
+  const input = {
+    receiptId: 'c'.repeat(64), name: 'read', arguments: { path: 'same.txt' },
+    content: 'SAME_STATE_RESULT', functionsStateId: 'shared-receipt-state',
+  };
+  assert.equal((await store.beginToolReceipt(chat.id, first.turn.messageId, input, scopeA)).shouldExecute, true);
+  const result = JSON.stringify({ ok: true, result: { bytes: 12 } });
+  await store.completeToolReceipt(chat.id, first.turn.messageId, input.receiptId, 'completed', result);
+  assert.equal((await store.beginToolReceipt(chat.id, second.turn.messageId, input, scopeB)).shouldExecute, false);
+  assert.equal((await store.beginToolReceipt(chat.id, second.turn.messageId, input, scopeB)).shouldExecute, false,
+    'same-resource retries preserve the same binding');
+  const firstA = await store.getProviderStateOwnership(chat.id, scopeA);
+  const firstB = await store.getProviderStateOwnership(chat.id, scopeB);
+  assert.deepEqual(firstA.receipts, [
+    { receiptId: input.receiptId, anchorMessageId: first.turn.messageId, owned: true },
+    { receiptId: input.receiptId, anchorMessageId: second.turn.messageId, owned: false },
+  ]);
+  assert.deepEqual(firstB.receipts, [
+    { receiptId: input.receiptId, anchorMessageId: first.turn.messageId, owned: false },
+    { receiptId: input.receiptId, anchorMessageId: second.turn.messageId, owned: true },
+  ]);
+  const filePath = join(directory, 'chats', chat.id, 'chat.json');
+  const before = await readFile(filePath);
+  await assert.rejects(store.beginToolReceipt(chat.id, second.turn.messageId, input, scopeA), /владельц/i);
+  assert.deepEqual(await readFile(filePath), before, 'a different owner cannot overwrite an existing receipt binding');
+  const reopened = await openStore(directory);
+  assert.deepEqual((await reopened.getProviderStateOwnership(chat.id, scopeA)).receipts, firstA.receipts);
+  assert.deepEqual((await reopened.getProviderStateOwnership(chat.id, scopeB)).receipts, firstB.receipts);
+});
+
+test('compact state commits with its snapshot and a replacement without state clears the old pointer', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-provider-state-compact-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const scopeA = 'a'.repeat(64);
+  const scopeB = 'b'.repeat(64);
+  let failCompactSave = false;
+  const store = await openStore(directory, { testFaults: {
+    beforeCompactSnapshotCommit: () => { if (failCompactSave) throw new Error('synthetic compact owner save failure'); },
+  } });
+  const chat = await store.createChat();
+  const first = await store.acceptLocalMessage(chat.id, 'First compacted message.', 'turn-compact-owner-one');
+  const firstPrefix = await store.getCompactionPrefix(chat.id, first.turn.messageId);
+  const firstSnapshot: CompactSnapshot = {
+    id: 'compact-owner-first', version: 1, boundaryMessageId: first.turn.messageId,
+    coveredThroughMessageId: firstPrefix.coveredThroughMessageId, coveredPrefixHash: firstPrefix.coveredPrefixHash,
+    text: 'First compact summary.', modelId: 'GigaChat-3-Pro', provenance: 'fixture', createdAt: timestamp,
+  };
+  await store.commitCompactSnapshot(chat.id, firstSnapshot, null, undefined, undefined,
+    { accountScope: scopeA, functionsStateId: 'compact-state-A' });
+  assert.deepEqual(await store.getProviderStateOwnership(chat.id, scopeA), {
+    messages: [], receipts: [], compact: { snapshotId: firstSnapshot.id, owned: true, functionsStateId: 'compact-state-A' },
+  });
+  assert.deepEqual(await store.getProviderStateOwnership(chat.id, scopeB), {
+    messages: [], receipts: [], compact: { snapshotId: firstSnapshot.id, owned: false, functionsStateId: null },
+  });
+  const publicDetail = await store.getChat(chat.id);
+  assert.equal(Object.prototype.hasOwnProperty.call(publicDetail.compactSnapshot!, 'functionsStateId'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(publicDetail, 'providerStateOwnership'), false);
+  const onDiskAfterFirst = JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')) as Record<string, unknown>;
+  assert.equal(Object.prototype.hasOwnProperty.call(onDiskAfterFirst.compactSnapshot as object, 'functionsStateId'), false);
+  assert.equal((onDiskAfterFirst.providerStateOwnership as { compact: { functionsStateId: string } }).compact.functionsStateId, 'compact-state-A');
+  assert.equal((await (await openStore(directory)).getProviderStateOwnership(chat.id, scopeA)).compact?.functionsStateId, 'compact-state-A',
+    'compact ownership survives a close and reopen');
+
+  await store.commitCompactSnapshot(chat.id, firstSnapshot, firstSnapshot.id, undefined, undefined,
+    { accountScope: scopeA, functionsStateId: 'compact-state-A' });
+  await store.commitCompactSnapshot(chat.id, firstSnapshot, firstSnapshot.id);
+  assert.deepEqual(await store.getProviderStateOwnership(chat.id, scopeA), {
+    messages: [], receipts: [], compact: { snapshotId: firstSnapshot.id, owned: true, functionsStateId: 'compact-state-A' },
+  }, 'same-ID retries with or without the optional owner preserve the original binding');
+  const filePath = join(directory, 'chats', chat.id, 'chat.json');
+  const bytesBeforeSameIdRejects = await readFile(filePath);
+  await assert.rejects(store.commitCompactSnapshot(chat.id, firstSnapshot, firstSnapshot.id, undefined, undefined,
+    { accountScope: scopeB, functionsStateId: 'compact-state-B' }), /владел/i);
+  assert.deepEqual(await readFile(filePath), bytesBeforeSameIdRejects, 'a same-ID retry cannot rebind compact state');
+  await assert.rejects(store.commitCompactSnapshot(chat.id, { ...firstSnapshot, text: 'Conflicting same-ID summary.' }, firstSnapshot.id), /другими данными/);
+  assert.deepEqual(await readFile(filePath), bytesBeforeSameIdRejects, 'a same-ID retry cannot replace public snapshot data');
+
+  const second = await store.acceptLocalMessage(chat.id, 'Second compacted message.', 'turn-compact-owner-two');
+  const secondPrefix = await store.getCompactionPrefix(chat.id, second.turn.messageId);
+  const secondSnapshot: CompactSnapshot = {
+    id: 'compact-owner-second', version: 1, boundaryMessageId: second.turn.messageId,
+    coveredThroughMessageId: secondPrefix.coveredThroughMessageId, coveredPrefixHash: secondPrefix.coveredPrefixHash,
+    text: 'Second compact summary.', modelId: 'GigaChat-3-Pro', provenance: 'fixture', createdAt: timestamp,
+  };
+  const bytesBeforeFailure = await readFile(filePath);
+  const detailBeforeFailure = await store.getChat(chat.id);
+  failCompactSave = true;
+  await assert.rejects(store.commitCompactSnapshot(chat.id, secondSnapshot, firstSnapshot.id, undefined, undefined,
+    { accountScope: scopeB, functionsStateId: 'compact-state-B' }), /synthetic compact owner save failure/);
+  failCompactSave = false;
+  assert.deepEqual(await readFile(filePath), bytesBeforeFailure);
+  assert.deepEqual(await store.getChat(chat.id), detailBeforeFailure);
+  assert.equal((await store.getProviderStateOwnership(chat.id, scopeA)).compact?.functionsStateId, 'compact-state-A');
+  const wrongPrefix = { ...secondSnapshot, coveredPrefixHash: '0'.repeat(64) };
+  await assert.rejects(store.commitCompactSnapshot(chat.id, wrongPrefix, firstSnapshot.id), /История изменилась/);
+  assert.deepEqual(await readFile(filePath), bytesBeforeFailure, 'prefix conflict leaves public and private state bytes intact');
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(store.commitCompactSnapshot(chat.id, secondSnapshot, firstSnapshot.id, controller.signal, undefined,
+    { accountScope: scopeB, functionsStateId: 'compact-state-B' }), (error: unknown) => error instanceof Error && error.name === 'AbortError');
+  assert.deepEqual(await readFile(filePath), bytesBeforeFailure, 'abort leaves both public and private state bytes intact');
+  assert.equal((await store.getProviderStateOwnership(chat.id, scopeA)).compact?.functionsStateId, 'compact-state-A');
+
+  await store.commitCompactSnapshot(chat.id, secondSnapshot, firstSnapshot.id);
+  assert.deepEqual(await store.getProviderStateOwnership(chat.id, scopeA), {
+    messages: [], receipts: [], compact: { snapshotId: secondSnapshot.id, owned: false, functionsStateId: null },
+  });
+  assert.deepEqual(await store.getProviderStateOwnership(chat.id, scopeB), {
+    messages: [], receipts: [], compact: { snapshotId: secondSnapshot.id, owned: false, functionsStateId: null },
+  });
+  const reopened = await openStore(directory);
+  assert.deepEqual(await reopened.getProviderStateOwnership(chat.id, scopeA), {
+    messages: [], receipts: [], compact: { snapshotId: secondSnapshot.id, owned: false, functionsStateId: null },
+  });
+  const finalDetail = await reopened.getChat(chat.id);
+  assert.deepEqual(finalDetail.messages, detailBeforeFailure.messages);
+  assert.deepEqual(finalDetail.toolReceipts, detailBeforeFailure.toolReceipts);
+  assert.deepEqual(finalDetail.compactSnapshot, secondSnapshot);
+});
+
+test('rejects malformed schema 12 provider-state metadata without rewriting corrupt chat bytes', async (t) => {
+  const cases = ['hash', 'scope', 'duplicate', 'unbound-message', 'receipt-hash', 'receipt-duplicate',
+    'unbound-receipt', 'compact-snapshot', 'compact-hash', 'unknown-schema'] as const;
+  for (const corruption of cases) {
+    await t.test(corruption, async (t) => {
+      const directory = await mkdtemp(join(tmpdir(), `gigachat-provider-state-corrupt-${corruption}-`));
+      t.after(() => rm(directory, { recursive: true, force: true }));
+      const scopeA = 'a'.repeat(64);
+      const store = await openStore(directory);
+      const chat = await store.createChat();
+      const accepted = await store.acceptLocalMessage(chat.id, 'Private owner validation.', `turn-corrupt-${corruption}`);
+      await appendAcceptedAnswer(store, accepted.turn, 'Owned state.', `state-corrupt-${corruption}`, scopeA);
+      const receipt = {
+        receiptId: 'a'.repeat(64), name: 'read', arguments: { path: 'private.txt' }, content: 'receipt result',
+        functionsStateId: `receipt-state-${corruption}`,
+      };
+      await store.beginToolReceipt(chat.id, accepted.turn.messageId, receipt, scopeA);
+      const prefix = await store.getCompactionPrefix(chat.id, accepted.turn.messageId);
+      const snapshot: CompactSnapshot = {
+        id: `snapshot-corrupt-${corruption}`, version: 1, boundaryMessageId: accepted.turn.messageId,
+        coveredThroughMessageId: prefix.coveredThroughMessageId, coveredPrefixHash: prefix.coveredPrefixHash,
+        text: 'Corruption fixture.', modelId: 'GigaChat-3-Pro', provenance: 'fixture', createdAt: timestamp,
+      };
+      await store.commitCompactSnapshot(chat.id, snapshot, null, undefined, undefined,
+        { accountScope: scopeA, functionsStateId: `compact-state-${corruption}` });
+      const path = join(directory, 'chats', chat.id, 'chat.json');
+      const raw = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+      const ownership = raw.providerStateOwnership as {
+        schemaVersion: number;
+        messages: Array<Record<string, unknown>>;
+        receipts: Array<Record<string, unknown>>;
+        compact: Record<string, unknown> | null;
+      };
+      switch (corruption) {
+        case 'hash': ownership.messages[0]!.stateIdHash = '0'.repeat(64); break;
+        case 'scope': ownership.messages[0]!.accountScope = 'A'.repeat(64); break;
+        case 'duplicate': ownership.messages.push({ ...ownership.messages[0] }); break;
+        case 'unbound-message': ownership.messages[0]!.messageId = 'not-a-stored-message'; break;
+        case 'receipt-hash': ownership.receipts[0]!.stateIdHash = '0'.repeat(64); break;
+        case 'receipt-duplicate': ownership.receipts.push({ ...ownership.receipts[0] }); break;
+        case 'unbound-receipt': ownership.receipts[0]!.anchorMessageId = 'not-a-user-anchor'; break;
+        case 'compact-snapshot': ownership.compact!.snapshotId = 'not-the-current-snapshot'; break;
+        case 'compact-hash': ownership.compact!.stateIdHash = 'f'.repeat(64); break;
+        case 'unknown-schema': raw.schemaVersion = 13; break;
+      }
+      const corruptBytes = JSON.stringify(raw);
+      await writeFile(path, corruptBytes, 'utf8');
+      const reopened = await openStore(directory);
+      assert.deepEqual(await reopened.listChats(), [], 'corrupt private metadata is not partially exposed');
+      assert.match((await reopened.getStorageIssues()).join('\n'), /повреждён/);
+      assert.equal(await readFile(path, 'utf8'), corruptBytes, 'rejected metadata bytes remain unchanged');
+    });
+  }
+});
+
+test('rejects project-delete journals that change private state ownership without altering source files', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-provider-state-project-journal-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const scopeA = 'a'.repeat(64);
+  const scopeB = 'b'.repeat(64);
+  const store = await openStore(directory);
+  const project = await store.createProject('Journal ownership');
+  const chat = await store.createChat(project.id);
+  const accepted = await store.acceptLocalMessage(chat.id, 'Keep owner invariant.', 'turn-journal-owner');
+  await appendAcceptedAnswer(store, accepted.turn, 'Owned answer.', 'journal-state', scopeA);
+  const projectsPath = join(directory, 'projects.json');
+  const chatPath = join(directory, 'chats', chat.id, 'chat.json');
+  const projects = JSON.parse(await readFile(projectsPath, 'utf8')) as { schemaVersion: number; projects: Array<Record<string, unknown>> };
+  const beforeChat = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown>;
+  const ownership = structuredClone(beforeChat.providerStateOwnership) as {
+    schemaVersion: number; messages: Array<Record<string, unknown>>; receipts: Array<Record<string, unknown>>; compact: unknown;
+  };
+  const tamperedOwnership = { ...ownership, messages: ownership.messages.map((entry) => ({ ...entry, accountScope: scopeB })) };
+  const afterChat = { ...beforeChat, projectId: null, providerStateOwnership: tamperedOwnership };
+  const journalPath = join(directory, 'project-delete.journal.json');
+  const beforeProjectBytes = await readFile(projectsPath);
+  const beforeChatBytes = await readFile(chatPath);
+  const journal = {
+    schemaVersion: 2, operationId: 'journal-owner-change', projectId: project.id,
+    before: { projects, chats: [beforeChat], instructionText: null },
+    after: {
+      projects: { ...projects, projects: projects.projects.filter((entry) => entry.id !== project.id) },
+      chats: [afterChat], instructionText: null,
+    },
+  };
+  const journalBytes = JSON.stringify(journal);
+  await writeFile(journalPath, journalBytes, 'utf8');
+  await assert.rejects(openStore(directory));
+  assert.deepEqual(await readFile(projectsPath), beforeProjectBytes);
+  assert.deepEqual(await readFile(chatPath), beforeChatBytes);
+  assert.equal(await readFile(journalPath, 'utf8'), journalBytes);
+  assert.equal((await store.getProviderStateOwnership(chat.id, scopeA)).messages[0]?.owned, true);
+});
+
 test('accepted chat and compaction turns stop at the persisted per-chat record limit without changing data', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-turn-capacity-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -1687,6 +2036,7 @@ test('schema 9 compact metadata survives turn-record migration without invented 
   const path = join(directory, 'chats', chat.id, 'chat.json');
   const legacy = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
   legacy.schemaVersion = 9;
+  delete legacy.providerStateOwnership;
   delete legacy.turns;
   await writeFile(path, JSON.stringify(legacy), 'utf8');
 
@@ -1696,7 +2046,7 @@ test('schema 9 compact metadata survives turn-record migration without invented 
   assert.deepEqual(migrated.compactSnapshot, snapshot);
   assert.deepEqual(migrated.turns, [], 'schema 9 history has no reliable turn metadata to invent');
   const saved = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  assert.equal(saved.schemaVersion, 11);
+  assert.equal(saved.schemaVersion, 12);
   assert.deepEqual(saved.compactSnapshot, snapshot);
 });
 
@@ -1734,6 +2084,7 @@ test('migrates a schema 10 chat to 11 without rewriting attachment links, raw us
   const chatPath = join(directory, 'chats', chat.id, 'chat.json');
   const schemaTen = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown>;
   schemaTen.schemaVersion = 10;
+  delete schemaTen.providerStateOwnership;
   for (const value of schemaTen.turns as Array<Record<string, unknown>>) {
     delete value.pendingSkillId;
     delete value.invokedSkillId;
@@ -1762,7 +2113,7 @@ test('migrates a schema 10 chat to 11 without rewriting attachment links, raw us
   assert.equal((await restored.getUsageProfileView(0)).skills.unknownTurnCount, 1,
     'legacy completed turn remains unknown rather than being migrated to known-no-Skill');
   const saved = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown>;
-  assert.equal(saved.schemaVersion, 11);
+  assert.equal(saved.schemaVersion, 12);
   assert.equal(((saved.turns as Array<Record<string, unknown>>)[0])?.invokedSkillId, undefined);
 });
 
@@ -1779,6 +2130,7 @@ test('schema 9 home-send journal recovers a stable interrupted turn without repl
         const journal = JSON.parse(await readFile(journalPath, 'utf8')) as Record<string, unknown>;
         const chat = journal.chat as Record<string, unknown>;
         chat.schemaVersion = 9;
+        delete chat.providerStateOwnership;
         delete chat.turns;
         delete (journal.turn as Record<string, unknown>).assistantMessageId;
         const nextDraft = journal.nextDraft as Record<string, unknown>;
@@ -1813,7 +2165,7 @@ test('schema 9 home-send journal recovers a stable interrupted turn without repl
   assert.equal(detail.messages.some((message) => message.role === 'assistant'), false);
   assert.deepEqual(accepted?.turn.messages.map((message) => message.id), [detail.messages[0]?.id]);
   assert.equal(await readFile(source, 'utf8'), 'preserved local source');
-  assert.equal((JSON.parse(await readFile(join(directory, 'chats', detail.id, 'chat.json'), 'utf8')) as Record<string, unknown>).schemaVersion, 11);
+  assert.equal((JSON.parse(await readFile(join(directory, 'chats', detail.id, 'chat.json'), 'utf8')) as Record<string, unknown>).schemaVersion, 12);
 });
 
 test('persists each provider pairing while reusing a completed side effect for a new state ID', async (t) => {
@@ -1858,6 +2210,7 @@ test('migrates existing chat detail schema 3 and preserves its draft', async (t)
   const path = join(directory, 'chats', chat.id, 'chat.json');
   const oldDetail = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
   oldDetail.schemaVersion = 3;
+  delete oldDetail.providerStateOwnership;
   delete oldDetail.turns;
   delete oldDetail.nextTurnPermissionProfile;
   await writeFile(path, JSON.stringify(oldDetail));
@@ -1866,7 +2219,7 @@ test('migrates existing chat detail schema 3 and preserves its draft', async (t)
   assert.equal((await restored.getChat(chat.id)).draft, 'Сохранённый черновик');
   assert.equal((await restored.getChat(chat.id)).nextTurnPermissionProfile, null);
   const migrated = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  assert.equal(migrated.schemaVersion, 11);
+  assert.equal(migrated.schemaVersion, 12);
   assert.equal(migrated.nextTurnPermissionProfile, null);
   assert.equal(migrated.nextTurnSkillId, null);
 });
@@ -1883,6 +2236,7 @@ test('migrates schema 8 with an empty pending list and preserves legacy messageI
   const path = join(directory, 'chats', chat.id, 'chat.json');
   const legacyBytes = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
   legacyBytes.schemaVersion = 8;
+  delete legacyBytes.providerStateOwnership;
   delete legacyBytes.draftAttachments;
   delete legacyBytes.turns;
   await writeFile(path, JSON.stringify(legacyBytes));
@@ -1893,7 +2247,7 @@ test('migrates schema 8 with an empty pending list and preserves legacy messageI
   assert.equal(detail.artifacts[0]?.messageId, null);
   assert.deepEqual(detail.draftAttachments, []);
   const saved = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  assert.equal(saved.schemaVersion, 11);
+  assert.equal(saved.schemaVersion, 12);
   assert.deepEqual(saved.draftAttachments, []);
 });
 
@@ -1907,6 +2261,7 @@ test('migrates chat detail schema 4 to 5 without changing history or artifacts',
   const path = join(directory, 'chats', chat.id, 'chat.json');
   const oldDetail = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
   oldDetail.schemaVersion = 4;
+  delete oldDetail.providerStateOwnership;
   delete oldDetail.turns;
   delete oldDetail.nextTurnSkillId;
   await writeFile(path, JSON.stringify(oldDetail));
@@ -1917,7 +2272,7 @@ test('migrates chat detail schema 4 to 5 without changing history or artifacts',
   assert.equal(detail.nextTurnSkillId, null);
   assert.equal(detail.draft, 'Черновик');
   assert.equal(detail.messages[0]?.text, 'Сохранённая история');
-  assert.equal(JSON.parse(await readFile(path, 'utf8')).schemaVersion, 11);
+  assert.equal(JSON.parse(await readFile(path, 'utf8')).schemaVersion, 12);
 });
 
 test('migrates previous settings and chat schemas with an empty model choice', async (t) => {
@@ -1930,6 +2285,7 @@ test('migrates previous settings and chat schemas with an empty model choice', a
   const oldChat = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown>;
   const oldSettings = JSON.parse(await readFile(settingsPath, 'utf8')) as { schemaVersion: number; settings: Record<string, unknown> };
   oldChat.schemaVersion = 5;
+  delete oldChat.providerStateOwnership;
   delete oldChat.turns;
   delete oldChat.modelId;
   oldSettings.schemaVersion = 6;
@@ -1940,7 +2296,7 @@ test('migrates previous settings and chat schemas with an empty model choice', a
   assert.equal((await restored.getChat(chat.id)).modelId, null);
   assert.equal((await restored.getSettings()).defaultModelId, null);
   assert.equal((await restored.getSettings()).microphoneConsent, 'unasked');
-  assert.equal(JSON.parse(await readFile(chatPath, 'utf8')).schemaVersion, 11);
+  assert.equal(JSON.parse(await readFile(chatPath, 'utf8')).schemaVersion, 12);
   assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).schemaVersion, 10);
 });
 
@@ -2362,7 +2718,8 @@ test('rolls a prepared project deletion forward after a partial durable write', 
   const project = await store.createProject('Восстанавливаемый проект');
   const firstChat = await store.createChat(project.id);
   const secondChat = await store.createChat(project.id);
-  await store.appendLocalMessage(firstChat.id, 'История первого чата');
+  const legacyTurn = await store.acceptLocalMessage(firstChat.id, 'История первого чата', 'delete-recovery-legacy-state');
+  await appendAcceptedAnswer(store, legacyTurn.turn, 'Ответ с историческим состоянием.', 'legacy-journal-state', 'f'.repeat(64));
   await store.appendLocalMessage(secondChat.id, 'История второго чата');
   await store.saveProjectInstructions(project.id, 'Старые правила', (await store.readProjectInstructionDocument(project.id)).revision);
 
@@ -2374,8 +2731,13 @@ test('rolls a prepared project deletion forward after a partial durable write', 
   const afterProjects = { ...beforeProjects, projects: beforeProjects.projects.filter((item) => item.id !== project.id) };
   const firstChatPath = join(directory, 'chats', firstChat.id, 'chat.json');
   const secondChatPath = join(directory, 'chats', secondChat.id, 'chat.json');
-  const beforeFirst = JSON.parse(await readFile(firstChatPath, 'utf8')) as Record<string, unknown>;
-  const beforeSecond = JSON.parse(await readFile(secondChatPath, 'utf8')) as Record<string, unknown>;
+  const legacyV11 = (value: Record<string, unknown>): Record<string, unknown> => {
+    const chat: Record<string, unknown> = { ...value, schemaVersion: 11 };
+    delete chat.providerStateOwnership;
+    return chat;
+  };
+  const beforeFirst = legacyV11(JSON.parse(await readFile(firstChatPath, 'utf8')) as Record<string, unknown>);
+  const beforeSecond = legacyV11(JSON.parse(await readFile(secondChatPath, 'utf8')) as Record<string, unknown>);
   const afterFirst = { ...beforeFirst, projectId: null };
   const afterSecond = { ...beforeSecond, projectId: null };
   const before = {
@@ -2401,6 +2763,10 @@ test('rolls a prepared project deletion forward after a partial durable write', 
   assert.deepEqual(await recovered.listProjects(), []);
   assert.equal((await recovered.getChat(firstChat.id)).projectId, null);
   assert.equal((await recovered.getChat(firstChat.id)).messages[0]?.text, 'История первого чата');
+  assert.equal((await recovered.getChat(firstChat.id)).messages[1]?.functionsStateId, 'legacy-journal-state');
+  assert.deepEqual(await recovered.getProviderStateOwnership(firstChat.id, 'f'.repeat(64)), {
+    messages: [{ messageId: legacyTurn.turn.assistantMessageId, owned: false }], receipts: [], compact: null,
+  }, 'a v1 public-only journal never claims old state for the active account');
   assert.equal((await recovered.getChat(secondChat.id)).projectId, null);
   assert.equal((await recovered.getChat(secondChat.id)).messages[0]?.text, 'История второго чата');
   await assert.rejects(stat(join(directory, 'project-instructions', project.id, 'AGENTS.md')), { code: 'ENOENT' });
@@ -2416,7 +2782,9 @@ test('rejects duplicate chats in a project deletion journal without changing sou
   const projects = JSON.parse(await readFile(join(directory, 'projects.json'), 'utf8')) as {
     schemaVersion: number; projects: Array<Record<string, unknown>>;
   };
-  const chatDetail = JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')) as Record<string, unknown>;
+  const currentChatDetail = JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')) as Record<string, unknown>;
+  const chatDetail: Record<string, unknown> = { ...currentChatDetail, schemaVersion: 11 };
+  delete chatDetail.providerStateOwnership;
   const duplicate = { ...chatDetail, projectId: null };
   const afterProjects = { ...projects, projects: projects.projects.filter((item) => item.id !== project.id) };
   const journalPath = join(directory, 'project-delete.journal.json');
@@ -2466,8 +2834,14 @@ test('recovers project deletion after every durable journal stage', async (t) =>
     await store.updateProject(project.id, { workingFolder });
     const firstChat = await store.createChat(project.id);
     const secondChat = await store.createChat(project.id);
-    await store.appendLocalMessage(firstChat.id, 'first history');
-    await store.appendLocalMessage(secondChat.id, 'second history');
+    const firstTurn = await store.acceptLocalMessage(firstChat.id, 'first history', 'delete-first-provider-state');
+    await appendAcceptedAnswer(store, firstTurn.turn, 'first answer', 'delete-first-answer-state', 'c'.repeat(64));
+    const secondTurn = await store.acceptLocalMessage(secondChat.id, 'second history', 'delete-second-provider-state');
+    await store.beginToolReceipt(secondChat.id, secondTurn.turn.messageId, {
+      receiptId: 'd'.repeat(64), name: 'read', arguments: { path: 'fixture.txt' }, content: 'second result',
+      functionsStateId: 'delete-second-receipt-state',
+    }, 'e'.repeat(64));
+    await appendAcceptedAnswer(store, secondTurn.turn, 'second answer');
 
     await assert.rejects(store.deleteProject(project.id), new RegExp(`synthetic ${stage}`),
       `fault injection did not reject at ${stage}:${index ?? '-'} (callback reached: ${injected})`);
@@ -2477,6 +2851,12 @@ test('recovers project deletion after every durable journal stage', async (t) =>
     assert.equal((await recovered.getChat(firstChat.id)).messages[0]?.text, 'first history');
     assert.equal((await recovered.getChat(secondChat.id)).projectId, null, `${stage}:${index ?? '-'} second chat`);
     assert.equal((await recovered.getChat(secondChat.id)).messages[0]?.text, 'second history');
+    assert.deepEqual(await recovered.getProviderStateOwnership(firstChat.id, 'c'.repeat(64)), {
+      messages: [{ messageId: firstTurn.turn.assistantMessageId, owned: true }], receipts: [], compact: null,
+    }, `${stage}:${index ?? '-'} assistant owner`);
+    assert.deepEqual(await recovered.getProviderStateOwnership(secondChat.id, 'e'.repeat(64)), {
+      messages: [], receipts: [{ receiptId: 'd'.repeat(64), anchorMessageId: secondTurn.turn.messageId, owned: true }], compact: null,
+    }, `${stage}:${index ?? '-'} receipt owner`);
     await assert.rejects(stat(join(dataDirectory, 'project-delete.journal.json')), { code: 'ENOENT' });
     assert.equal(await readFile(join(workingFolder, 'keep.txt'), 'utf8'), 'external sentinel');
     assert.equal(await readFile(join(workingFolder, 'AGENTS.md'), 'utf8'), 'project rules');
@@ -2484,6 +2864,8 @@ test('recovers project deletion after every durable journal stage', async (t) =>
     const repeated = await openStore(dataDirectory);
     assert.deepEqual(await repeated.listProjects(), []);
     assert.equal((await repeated.getChat(firstChat.id)).messages[0]?.text, 'first history');
+    assert.equal((await repeated.getProviderStateOwnership(firstChat.id, 'c'.repeat(64))).messages[0]?.owned, true);
+    assert.equal((await repeated.getProviderStateOwnership(secondChat.id, 'e'.repeat(64))).receipts[0]?.owned, true);
   }
 });
 
