@@ -24,6 +24,7 @@ import { HookDispatchAbortError } from './hooks';
 import { MAX_USAGE_COUNT, mergeUsageReceipt } from './usage';
 import { validateCompactSummary } from './context';
 import { MISSING_REMOTE_ATTACHMENT_MESSAGE, MissingRemoteAttachmentError } from './attachments';
+import { HISTORICAL_PROVIDER_STATE_ATTACHMENTS_MESSAGE, HistoricalProviderStateAttachmentsError } from './provider-state';
 import type { ProviderStateOwner } from './provider-state';
 
 const MAX_ACTIVITY_PER_TURN = 50;
@@ -1307,9 +1308,11 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
                                   ? 'Не удалось сохранить usage; запрос не будет продолжен.'
                                   : terminalError instanceof Error && terminalError.message === 'TOOL_RECEIPT_STORE_UNAVAILABLE'
                                     ? 'Сохранение истории инструментов недоступно; действие не выполнено.'
-                                    : terminalError instanceof MissingRemoteAttachmentError
-                                      ? MISSING_REMOTE_ATTACHMENT_MESSAGE
-                                    : 'Ход завершился ошибкой. Сообщение пользователя сохранено локально.';
+                                    : terminalError instanceof HistoricalProviderStateAttachmentsError
+                                      ? HISTORICAL_PROVIDER_STATE_ATTACHMENTS_MESSAGE
+                                      : terminalError instanceof MissingRemoteAttachmentError
+                                        ? MISSING_REMOTE_ATTACHMENT_MESSAGE
+                                        : 'Ход завершился ошибкой. Сообщение пользователя сохранено локально.';
         }
         publish(turn);
         if (options.persistTurnRecord) {

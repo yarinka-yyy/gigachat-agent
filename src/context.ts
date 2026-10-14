@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import type { ChatMessage, CompactSnapshot, ContextBlockSize, ContextProvenance, InstructionLayer, ProviderProtocolExchange, ProviderTurnRequest } from './contracts';
 import { buildInstructionRequest, type InstructionInput } from './instructions';
 import { MAX_PROVIDER_REQUEST_BYTES, serializeProviderTurnRequest, type GigaChatProviderConnection } from './gigachat-provider';
+import { filterProviderStateForOutboundRequest, type ProviderStateOutboundFilterInput } from './provider-state';
 
 export const COMPACTION_TASK_INSTRUCTION = [
   'Составь краткую сводку предыдущего диалога для продолжения работы.',
@@ -32,6 +33,7 @@ export interface NextTurnContext {
 
 export interface BuildNextTurnContextOptions {
   allowMissingModelForPreview?: boolean;
+  providerStateFilter?: Pick<ProviderStateOutboundFilterInput, 'detail' | 'ownership' | 'currentAnchorMessageId'>;
 }
 
 function byteLength(value: string): number {
@@ -141,13 +143,23 @@ export function buildNextTurnContext(
   const shouldAddFilesOnlyTask = input.taskInstruction === undefined && input.usageKind !== 'compaction'
     && input.functionCallMode !== 'none' && currentAnchor?.role === 'user' && currentAnchor.text === ''
     && Array.isArray(currentAnchor.attachmentIds) && currentAnchor.attachmentIds.length > 0;
-  const request = buildInstructionRequest({
+  let request = buildInstructionRequest({
     ...input,
     ...(shouldAddFilesOnlyTask ? { taskInstruction: FILES_ONLY_TASK_INSTRUCTION } : {}),
     compactSnapshot: input.compactSnapshot ? { text: input.compactSnapshot.text } : null,
     messages: selected.messages,
     protocolHistory,
   });
+  if (options.providerStateFilter) {
+    request = filterProviderStateForOutboundRequest({
+      request,
+      detail: options.providerStateFilter.detail,
+      ownership: options.providerStateFilter.ownership,
+      currentAnchorMessageId: options.providerStateFilter.currentAnchorMessageId,
+      rawMessages: input.messages,
+      rawProtocolHistory: input.protocolHistory ?? [],
+    }).request;
+  }
   const serialized = request.modelId === null && options.allowMissingModelForPreview
     ? serializeProviderTurnRequest({ ...request, modelId: 'x' })
     : serializeProviderTurnRequest(request);

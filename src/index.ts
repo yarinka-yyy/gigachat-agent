@@ -813,6 +813,9 @@ async function createMainRuntime(
       const messages = compactionPrefix?.messages ?? await store.getMessagesThrough(turn.chatId, turn.messageId);
       const protocolHistory = compactionPrefix?.protocolHistory ?? await store.getToolProtocolThrough(turn.chatId, turn.messageId);
       if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
+      assertProviderStateOwner(providerStateOwner, providerStateScopeGuard, signal);
+      const providerStateOwnership = await store.getProviderStateOwnership(turn.chatId, providerStateOwner.accountScope);
+      assertProviderStateOwner(providerStateOwner, providerStateScopeGuard, signal);
       const context = buildNextTurnContext({
         globalText,
         projectInstructions: project ? [{ scope: project.name, text: projectInstructions }] : [],
@@ -831,6 +834,12 @@ async function createMainRuntime(
           usageKind: 'compaction' as const,
           functionCallMode: 'none' as const,
         } : {}),
+      }, {
+        providerStateFilter: {
+          detail,
+          ownership: providerStateOwnership,
+          currentAnchorMessageId: turn.operation === 'compaction' ? null : turn.messageId,
+        },
       });
       if (turn.operation === 'compaction' && compactionPrefix) {
         assertProviderStateOwner(providerStateOwner, providerStateScopeGuard, signal);

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
 import { test } from 'node:test';
-import type { ChatMessage, CompactSnapshot, ProviderProtocolExchange } from './contracts';
+import type { ChatDetail, ChatMessage, CompactSnapshot, ProviderProtocolExchange } from './contracts';
 import { buildNextTurnContext, countContextTextTokens, hashCompactionPrefix } from './context';
 import { GigaChatProviderError, MAX_PROVIDER_REQUEST_BYTES, serializeProviderTurnRequest } from './gigachat-provider';
 
@@ -31,6 +31,14 @@ function input(messages: ChatMessage[], extra: Partial<Parameters<typeof buildNe
     permissionProfile: 'ask' as const,
     modelId: 'vendor/model.v4:preview',
     ...extra,
+  };
+}
+
+function stateDetail(messages: ChatMessage[], toolReceipts: ChatDetail['toolReceipts'] = []): ChatDetail {
+  return {
+    id: 'chat-context-state', title: 'Context state fixture', projectId: null, pinned: false, archived: false,
+    createdAt: at, updatedAt: at, kind: 'text', draft: '', nextTurnPermissionProfile: null, modelId: 'GigaChat-3-Pro',
+    nextTurnSkillId: null, messages, turns: [], toolReceipts, artifacts: [], draftAttachments: [], compactSnapshot: null,
   };
 }
 
@@ -82,6 +90,41 @@ test('fails closed when the prefix under a snapshot changed and does not hide or
   assert.throws(() => buildNextTurnContext(input([user('u1')], {
     protocolHistory: [{ anchorMessageId: 'missing', name: 'read', arguments: {}, content: null, functionsStateId: null, result: '{"ok":true}' }],
   })), (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
+});
+
+test('filters state after compact-prefix validation and sizes the same filtered request', () => {
+  const oldUser = user('old-user');
+  const coveredAssistant = assistant('covered-assistant', 'Earlier covered result');
+  coveredAssistant.functionsStateId = 'covered-legacy-state';
+  const unownedAssistant = assistant('old-assistant', 'Later retained result');
+  unownedAssistant.functionsStateId = 'legacy-state';
+  const currentUser = user('current-user', 'Continue');
+  const messages = [oldUser, coveredAssistant, unownedAssistant, currentUser];
+  const compactSnapshot = snapshot('old-user', 'covered-assistant', [oldUser, coveredAssistant]);
+  const ownership = { messages: [
+    { messageId: coveredAssistant.id, owned: false },
+    { messageId: unownedAssistant.id, owned: false },
+  ], receipts: [], compact: null };
+  const raw = stateDetail(messages);
+  const rawBefore = structuredClone({ messages, protocolHistory: [] as ProviderProtocolExchange[] });
+  const context = buildNextTurnContext(input(messages, { compactSnapshot }), {
+    providerStateFilter: { detail: raw, ownership, currentAnchorMessageId: currentUser.id },
+  });
+  const serialized = serializeProviderTurnRequest(context.request);
+
+  assert.deepEqual(context.request.messages.map((message) => message.id), ['old-assistant', 'current-user']);
+  assert.equal(Object.prototype.hasOwnProperty.call(context.request.messages[0]!, 'functionsStateId'), false);
+  assert.equal(context.request.system.find((layer) => layer.source === 'summary')?.text, compactSnapshot.text);
+  assert.equal(context.wireBytes, serialized.wireBytes);
+  assert.deepEqual(context.textInputs, serialized.textInputs);
+  assert.deepEqual({ messages, protocolHistory: [] }, rawBefore, 'request filtering preserves hash-covered raw history');
+
+  const changedCoveredAssistant = { ...coveredAssistant, functionsStateId: 'different-covered-state' };
+  const changedMessages = [oldUser, changedCoveredAssistant, unownedAssistant, currentUser];
+  assert.throws(() => buildNextTurnContext(input(changedMessages, { compactSnapshot }), {
+    providerStateFilter: { detail: raw, ownership, currentAnchorMessageId: currentUser.id },
+  }), /История под сводкой изменилась/,
+  'a changed state inside the raw compact prefix is rejected before request-only filtering');
 });
 
 test('hashes saved prefixes independently of JSON key order, including nested function arguments', () => {
