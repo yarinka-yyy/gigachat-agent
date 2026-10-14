@@ -24,6 +24,7 @@ import { HookDispatchAbortError } from './hooks';
 import { MAX_USAGE_COUNT, mergeUsageReceipt } from './usage';
 import { validateCompactSummary } from './context';
 import { MISSING_REMOTE_ATTACHMENT_MESSAGE, MissingRemoteAttachmentError } from './attachments';
+import type { ProviderStateOwner } from './provider-state';
 
 const MAX_ACTIVITY_PER_TURN = 50;
 const MAX_ASSISTANT_CHARS = 100_000;
@@ -57,21 +58,26 @@ export interface PreparedCompactionContext {
 export interface PreparedTurn {
   request: ProviderTurnRequest;
   compaction?: PreparedCompactionContext;
+  providerStateOwner?: ProviderStateOwner;
 }
 
 export interface TurnRuntimeOptions {
   provider?: GigaChatProvider | null;
   tools: LocalTools;
   prepareTurn(turn: AcceptedTurnInput, signal: AbortSignal): Promise<ProviderTurnRequest | PreparedTurn>;
-  prepareProviderRequest?(turn: AcceptedTurnInput, request: ProviderTurnRequest, signal: AbortSignal): Promise<ProviderTurnRequest>;
+  prepareProviderRequest?(turn: AcceptedTurnInput, request: ProviderTurnRequest, signal: AbortSignal,
+    providerStateOwner?: ProviderStateOwner): Promise<ProviderTurnRequest>;
+  assertProviderStateOwner?(providerStateOwner: ProviderStateOwner | undefined, signal: AbortSignal): void;
   consumeTurn(turn: AcceptedTurnInput, signal: AbortSignal): Promise<void>;
   releaseTurn(turn: AcceptedTurnInput): void;
   persistTurnRecord?(turn: RuntimeTurnSnapshot): Promise<void>;
-  appendAssistant(turn: AcceptedTurnInput, text: string, signal: AbortSignal, functionsStateId: string | undefined, terminalTurn: RuntimeTurnSnapshot): Promise<void>;
-  appendCompaction?(turn: AcceptedTurnInput, text: string, signal: AbortSignal, context: PreparedCompactionContext, terminalTurn: RuntimeTurnSnapshot): Promise<void>;
+  appendAssistant(turn: AcceptedTurnInput, text: string, signal: AbortSignal, functionsStateId: string | undefined,
+    terminalTurn: RuntimeTurnSnapshot, providerStateOwner?: ProviderStateOwner): Promise<void>;
+  appendCompaction?(turn: AcceptedTurnInput, text: string, signal: AbortSignal, context: PreparedCompactionContext,
+    terminalTurn: RuntimeTurnSnapshot, functionsStateId?: string, providerStateOwner?: ProviderStateOwner): Promise<void>;
   compactionEnabled?: boolean;
   recordUsageReceipt(receipt: UsageReceipt): Promise<void>;
-  beginToolReceipt?(turn: AcceptedTurnInput, receipt: ToolReceiptInput): Promise<ToolReceiptStart>;
+  beginToolReceipt?(turn: AcceptedTurnInput, receipt: ToolReceiptInput, providerStateOwner?: ProviderStateOwner): Promise<ToolReceiptStart>;
   completeToolReceipt?(turn: AcceptedTurnInput, receiptId: string, status: 'completed' | 'unknown', result: string): Promise<void>;
   runHooks?(turn: AcceptedTurnInput, input: HookDispatchInput, signal: AbortSignal): Promise<HookRunResult[]>;
   validateRetry?(turn: AcceptedTurnInput, original: AcceptedTurnInput): Promise<void>;
@@ -859,11 +865,14 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       const prepared = await waitFor(preparation, controller.signal, prepareTimeoutMs, 'TURN_PREPARE_TIMEOUT');
       let request: ProviderTurnRequest;
       let compactionContext: PreparedCompactionContext | null = null;
+      let providerStateOwner: ProviderStateOwner | undefined;
       if (typeof prepared === 'object' && prepared !== null && 'request' in prepared) {
         request = prepared.request;
         compactionContext = prepared.compaction ?? null;
+        providerStateOwner = prepared.providerStateOwner;
       } else request = prepared;
       if (controller.signal.aborted) throw abortError();
+      options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
       if (!request.modelId) throw new Error('MODEL_NOT_SELECTED');
       if (turn.input.operation === 'compaction') {
         if (!compactionContext) throw new Error('COMPACTION_CONTEXT_UNAVAILABLE');
@@ -873,8 +882,9 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       } else await runHookEvent({ event: 'user-prompt-submitted', projectId: turn.input.projectId });
 
       if (turn.input.operation !== 'compaction' && options.prepareProviderRequest) {
+        options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
         const attachmentPreparation = Promise.resolve().then(() =>
-          options.prepareProviderRequest!(turn.input, request, controller.signal));
+          options.prepareProviderRequest!(turn.input, request, controller.signal, providerStateOwner));
         request = await waitTracked(
           attachmentPreparation,
           prepareTimeoutMs,
@@ -882,6 +892,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           'Подготовка вложений не подтверждена; очередь приостановлена.',
         );
         if (controller.signal.aborted) throw abortError();
+        options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
       }
 
       let toolRounds = 0;
@@ -934,6 +945,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
             throw abortError();
           }
         }
+        options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
         stopState.streamConfirmed = false;
         iterator = options.provider.stream(request, controller.signal)[Symbol.asyncIterator]();
         let completed = false;
@@ -1058,7 +1070,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
             functionsStateId: functionCall.functionsStateId,
           };
           if (controller.signal.aborted) throw abortError();
-          const beginPromise = options.beginToolReceipt(turn.input, receiptInput);
+          options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
+          const beginPromise = options.beginToolReceipt(turn.input, receiptInput, providerStateOwner);
           const begun = await waitTracked(beginPromise, operationTimeoutMs, 'TOOL_INTENT_SAVE_TIMEOUT', 'Подтверждение сохранения намерения инструмента ожидается; очередь приостановлена.');
           const storedReceipt = begun.receipt;
           let exchange: ProviderProtocolExchange;
@@ -1188,14 +1201,16 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           errorCategory: undefined,
           retryEligible: undefined,
         });
+        options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
         const appendOperation = turn.input.operation === 'compaction'
           ? options.appendCompaction && compactionContext
-            ? options.appendCompaction(turn.input, validateCompactSummary(answer), controller.signal, compactionContext, terminalTurn)
+            ? options.appendCompaction(turn.input, validateCompactSummary(answer), controller.signal, compactionContext,
+              terminalTurn, completedFunctionsStateId, providerStateOwner)
               .then(async () => {
                 await runHookEvent({ event: 'after-compaction', projectId: turn.input.projectId }, new AbortController().signal, turn.input, terminalTurn).catch(() => undefined);
               })
             : Promise.reject(new Error('COMPACTION_SAVE_UNAVAILABLE'))
-          : options.appendAssistant(turn.input, answer, controller.signal, completedFunctionsStateId, terminalTurn);
+          : options.appendAssistant(turn.input, answer, controller.signal, completedFunctionsStateId, terminalTurn, providerStateOwner);
         const appending = appendOperation.catch((error: unknown) => {
           if (isAbortError(error)) throw error;
           throw Object.assign(new Error('ASSISTANT_SAVE_FAILED'), { category: 'storage' as const });

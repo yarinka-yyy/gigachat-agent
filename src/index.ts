@@ -28,6 +28,11 @@ import { createVoiceRuntime, VOICE_MAX_OUTPUT_BYTES, type VoiceRuntime } from '.
 import { prepareVoiceModelCache } from './voice-model-cache';
 import { createBalanceScopeGuard } from './usage-view';
 import {
+  assertAuthorizationKeyMatchesOwner,
+  assertProviderStateOwner,
+  captureProviderStateOwner,
+} from './provider-state';
+import {
   acquirePrimaryInstance,
   createCloseAdmission,
   createCloseController,
@@ -499,6 +504,7 @@ interface MainRuntimeBundle {
   runtime: TurnRuntime;
   availability: RuntimeAvailability;
   providerConnection: GigaChatProviderConnection;
+  providerStateScopeGuard: ReturnType<typeof createBalanceScopeGuard>;
   voiceRuntime: VoiceRuntime | null;
   voiceAvailability: VoiceAvailability;
   skills: ReturnType<typeof createSkillRegistry>;
@@ -654,6 +660,7 @@ async function createMainRuntime(
   helperCandidate: ReturnType<typeof createPowerShellHelper> | undefined,
   secureStore: ReturnType<typeof createSecureStore>,
 ): Promise<MainRuntimeBundle> {
+  const providerStateScopeGuard = createBalanceScopeGuard();
   const skills = createSkillRegistry({ userDataPath: app.getPath('userData'), listProjects: () => store.listProjects() });
   const hooks = createHookRegistry({
     userDataPath: app.getPath('userData'),
@@ -776,6 +783,8 @@ async function createMainRuntime(
     prepareTurn: async (turn, signal) => {
       if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
       if (turn.operation === 'compaction' && !COMPACTION_QUALITY_VERIFIED) throw new Error(COMPACTION_UNAVAILABLE_REASON);
+      const providerStateOwner = await captureProviderStateOwner(providerStateScopeGuard, () => secureStore.load(), signal);
+      assertProviderStateOwner(providerStateOwner, providerStateScopeGuard, signal);
       await store.validateAcceptedTurn(turn);
       if (!isChatModelAvailable(providerConnection.getModelRegistry(), turn.modelId)) {
         throw new GigaChatProviderError('model');
@@ -824,8 +833,10 @@ async function createMainRuntime(
         } : {}),
       });
       if (turn.operation === 'compaction' && compactionPrefix) {
+        assertProviderStateOwner(providerStateOwner, providerStateScopeGuard, signal);
         return {
           request: context.request,
+          providerStateOwner,
           compaction: {
             boundaryMessageId: turn.compactBoundaryMessageId!,
             coveredThroughMessageId: compactionPrefix.coveredThroughMessageId,
@@ -835,22 +846,42 @@ async function createMainRuntime(
           },
         };
       }
-      return context.request;
+      assertProviderStateOwner(providerStateOwner, providerStateScopeGuard, signal);
+      return { request: context.request, providerStateOwner };
     },
-    prepareProviderRequest: (turn, request, signal) => prepareTurnAttachments(turn, request, signal, {
-      store,
-      provider: providerConnection,
-      loadAuthorizationKey: () => secureStore.load(),
-    }),
+    assertProviderStateOwner: (owner, signal) => assertProviderStateOwner(owner, providerStateScopeGuard, signal),
+    prepareProviderRequest: async (turn, request, signal, owner) => {
+      assertProviderStateOwner(owner, providerStateScopeGuard, signal);
+      const prepared = await prepareTurnAttachments(turn, request, signal, {
+        store,
+        provider: providerConnection,
+        loadAuthorizationKey: async () => {
+          assertProviderStateOwner(owner, providerStateScopeGuard, signal);
+          const key = await secureStore.load();
+          assertAuthorizationKeyMatchesOwner(owner, key, providerStateScopeGuard, signal);
+          return key;
+        },
+      });
+      assertProviderStateOwner(owner, providerStateScopeGuard, signal);
+      return prepared;
+    },
     consumeTurn: (turn: AcceptedTurnInput, signal) => store.consumeTurnReservation(turn, signal),
     releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
     persistTurnRecord: (turn) => store.updateRuntimeTurn(turn),
-    beginToolReceipt: (turn, receipt) => store.beginToolReceipt(turn.chatId, turn.messageId, receipt),
-    completeToolReceipt: (turn, receiptId, status, result) => store.completeToolReceipt(turn.chatId, turn.messageId, receiptId, status, result),
-    appendAssistant: async (turn, text, signal, functionsStateId, terminalTurn) => {
-      await store.appendAssistantMessageFromRuntime(turn, text, terminalTurn, signal, functionsStateId);
+    beginToolReceipt: (turn, receipt, owner) => {
+      assertProviderStateOwner(owner, providerStateScopeGuard);
+      return store.beginToolReceipt(turn.chatId, turn.messageId, receipt,
+        receipt.functionsStateId ? owner.accountScope : undefined);
     },
-    appendCompaction: async (turn, text, signal, context: PreparedCompactionContext, terminalTurn) => {
+    completeToolReceipt: (turn, receiptId, status, result) => store.completeToolReceipt(turn.chatId, turn.messageId, receiptId, status, result),
+    appendAssistant: async (turn, text, signal, functionsStateId, terminalTurn, owner) => {
+      assertProviderStateOwner(owner, providerStateScopeGuard, signal);
+      await store.appendAssistantMessageFromRuntime(turn, text, terminalTurn, signal, functionsStateId,
+        functionsStateId ? owner.accountScope : undefined);
+    },
+    appendCompaction: async (turn, text, signal, context: PreparedCompactionContext, terminalTurn,
+      functionsStateId, owner) => {
+      assertProviderStateOwner(owner, providerStateScopeGuard, signal);
       const snapshot: CompactSnapshot = {
         id: randomUUID(),
         version: 1,
@@ -862,7 +893,8 @@ async function createMainRuntime(
         provenance: context.provenance,
         createdAt: new Date().toISOString(),
       };
-      await store.commitCompactSnapshot(turn.chatId, snapshot, context.expectedSnapshotId, signal, terminalTurn);
+      await store.commitCompactSnapshot(turn.chatId, snapshot, context.expectedSnapshotId, signal, terminalTurn,
+        functionsStateId ? { accountScope: owner.accountScope, functionsStateId } : undefined);
     },
     compactionEnabled: COMPACTION_QUALITY_VERIFIED,
     recordUsageReceipt: (receipt) => store.recordUsageReceipt(receipt),
@@ -958,6 +990,7 @@ async function createMainRuntime(
   return {
     runtime: turnRuntime,
     providerConnection,
+    providerStateScopeGuard,
     availability: {
       providerConfigured: false,
       helperRecovered: Boolean(helper),
@@ -986,8 +1019,7 @@ async function registerIpcHandlers(
   customPermissions: Awaited<ReturnType<typeof openCustomPermissions>>,
   approvals: ReturnType<typeof createPermissionApprovals>,
 ): Promise<void> {
-  const { runtime, availability, providerConnection, voiceRuntime, voiceAvailability, skills, hooks } = mainRuntime;
-  const balanceScopeGuard = createBalanceScopeGuard();
+  const { runtime, availability, providerConnection, voiceRuntime, voiceAvailability, skills, hooks, providerStateScopeGuard: balanceScopeGuard } = mainRuntime;
   let balanceOperationActive = false;
   let keySaveQueue: Promise<void> = Promise.resolve();
   const accountScopeForKey = (key: string): string => createHash('sha256').update(key, 'utf8').digest('hex');

@@ -4,15 +4,17 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import type { AcceptedTurnInput, ChatToolReceipt, GigaChatProvider, HookDispatchInput, HookRunResult, ProviderEvent, ProviderTurnRequest, RuntimeTurnSnapshot, UsageReceipt } from './contracts';
+import type { AcceptedTurnInput, ChatToolReceipt, CompactSnapshot, GigaChatProvider, HookDispatchInput, HookRunResult, ProviderEvent, ProviderTurnRequest, RuntimeTurnSnapshot, UsageReceipt } from './contracts';
 import type { LocalTools } from './local-tools';
 import { LocalToolError } from './local-tools';
 import { HookDispatchAbortError } from './hooks';
-import { createTurnRuntime, queueAcceptedTurnOrMarkNotSent, type ToolReceiptInput, type ToolReceiptStart, type TurnRuntimeOptions } from './runtime';
+import { createTurnRuntime, queueAcceptedTurnOrMarkNotSent, type PreparedTurn, type ToolReceiptInput, type ToolReceiptStart, type TurnRuntimeOptions } from './runtime';
 import { mergeUsageReceipt } from './usage';
+import { createBalanceScopeGuard } from './usage-view';
+import { assertProviderStateOwner, captureProviderStateOwner } from './provider-state';
 import { MISSING_REMOTE_ATTACHMENT_MESSAGE, prepareTurnAttachments } from './attachments';
 import { serializeProviderTurnRequest } from './gigachat-provider';
-import { openStore } from './store';
+import { openStore, type LocalStore } from './store';
 
 const testTools = {} as LocalTools;
 
@@ -134,6 +136,88 @@ function makeReceiptStore() {
       receipts.set(key, { ...receipt, status, result });
     },
   };
+}
+
+function makeOwnedStoreRuntime(
+  store: LocalStore,
+  provider: GigaChatProvider,
+  loadAuthorizationKey: () => Promise<string | null>,
+  tools: LocalTools = testTools,
+) {
+  const guard = createBalanceScopeGuard();
+  const runtime = createTurnRuntime({
+    provider,
+    tools,
+    prepareTurn: async (turn, signal): Promise<ProviderTurnRequest | PreparedTurn> => {
+      const providerStateOwner = await captureProviderStateOwner(guard, loadAuthorizationKey, signal);
+      await store.validateAcceptedTurn(turn);
+      let request: ProviderTurnRequest;
+      let compaction: PreparedTurn['compaction'];
+      if (turn.operation === 'compaction') {
+        const prefix = await store.getCompactionPrefix(turn.chatId, turn.compactBoundaryMessageId);
+        request = {
+          system: [], messages: prefix.messages, protocolHistory: prefix.protocolHistory,
+          permissionProfile: turn.permissionProfile, modelId: turn.modelId,
+          usageKind: 'compaction', functionCallMode: 'none',
+        };
+        compaction = {
+          boundaryMessageId: turn.compactBoundaryMessageId!,
+          coveredThroughMessageId: prefix.coveredThroughMessageId,
+          coveredPrefixHash: prefix.coveredPrefixHash,
+          expectedSnapshotId: turn.compactExpectedSnapshotId ?? null,
+          provenance: 'provider',
+        };
+      } else {
+        request = {
+          system: [],
+          messages: await store.getMessagesThrough(turn.chatId, turn.messageId),
+          protocolHistory: await store.getToolProtocolThrough(turn.chatId, turn.messageId),
+          permissionProfile: turn.permissionProfile,
+          modelId: turn.modelId,
+        };
+      }
+      assertProviderStateOwner(providerStateOwner, guard, signal);
+      return { request, providerStateOwner, ...(compaction ? { compaction } : {}) };
+    },
+    assertProviderStateOwner: (owner, signal) => assertProviderStateOwner(owner, guard, signal),
+    prepareProviderRequest: async (_turn, request, signal, owner) => {
+      assertProviderStateOwner(owner, guard, signal);
+      return request;
+    },
+    consumeTurn: (turn, signal) => store.consumeTurnReservation(turn, signal),
+    releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
+    persistTurnRecord: (turn) => store.updateRuntimeTurn(turn),
+    beginToolReceipt: (turn, receipt, owner) => {
+      assertProviderStateOwner(owner, guard);
+      return store.beginToolReceipt(turn.chatId, turn.messageId, receipt,
+        receipt.functionsStateId ? owner.accountScope : undefined);
+    },
+    completeToolReceipt: (turn, receiptId, status, result) =>
+      store.completeToolReceipt(turn.chatId, turn.messageId, receiptId, status, result),
+    appendAssistant: async (turn, text, signal, functionsStateId, terminalTurn, owner) => {
+      assertProviderStateOwner(owner, guard, signal);
+      await store.appendAssistantMessageFromRuntime(turn, text, terminalTurn, signal, functionsStateId,
+        functionsStateId ? owner.accountScope : undefined);
+    },
+    appendCompaction: async (turn, text, signal, context, terminalTurn, functionsStateId, owner) => {
+      assertProviderStateOwner(owner, guard, signal);
+      const snapshot: CompactSnapshot = {
+        id: `snapshot-${turn.turnId}`, version: 1,
+        boundaryMessageId: context.boundaryMessageId,
+        coveredThroughMessageId: context.coveredThroughMessageId,
+        coveredPrefixHash: context.coveredPrefixHash,
+        text,
+        modelId: turn.modelId ?? (() => { throw new Error('Missing fixture model.'); })(),
+        provenance: 'provider',
+        createdAt: new Date().toISOString(),
+      };
+      await store.commitCompactSnapshot(turn.chatId, snapshot, context.expectedSnapshotId, signal, terminalTurn,
+        functionsStateId ? { accountScope: owner.accountScope, functionsStateId } : undefined);
+    },
+    compactionEnabled: true,
+    recordUsageReceipt: async () => undefined,
+  });
+  return { runtime, guard };
 }
 
 function deferred(): { promise: Promise<void>; resolve(): void } {
@@ -1654,6 +1738,191 @@ test('continues GigaChat function rounds with fresh read results and saves the f
   assert.equal(JSON.parse(requests[3]?.protocolHistory?.[2]?.result ?? '{}').result.contents, 'after');
   assert.ok(requests.every((request) => request.modelId === accepted.modelId && request.permissionProfile === accepted.permissionProfile));
   assert.equal(savedStateId, 'state-final');
+});
+
+test('runtime binds assistant, tool and compact state to the captured account and leaves state-free results unowned', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-runtime-provider-state-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Pro' });
+  const toolTurn = await store.acceptLocalMessage(chat.id, 'Прочитай файл с захваченным состоянием', 'turn-state-tool');
+  const noStateToolTurn = await store.acceptLocalMessage(chat.id, 'Прочитай файл без состояния', 'turn-state-free-tool');
+  const noStateTurn = await store.acceptLocalMessage(chat.id, 'Ответь без состояния', 'turn-state-free-answer');
+  let compactCalls = 0;
+  const toolCallsByPrompt = new Set<string>();
+  const provider = makeProvider(async function* (request) {
+    if (request.usageKind === 'compaction') {
+      compactCalls += 1;
+      yield { type: 'text-delta', text: `Сводка ${compactCalls}` };
+      yield compactCalls === 1
+        ? { type: 'completed', functionsStateId: 'state-compact-owned' }
+        : { type: 'completed' };
+      return;
+    }
+    const lastUserText = [...request.messages].reverse().find((message) => message.role === 'user')?.text ?? '';
+    if (lastUserText.includes('захваченным состоянием')) {
+      if (toolCallsByPrompt.has(lastUserText)) {
+        yield { type: 'text-delta', text: 'Содержимое прочитано.' };
+        yield { type: 'completed', functionsStateId: 'state-assistant-owned' };
+      } else {
+        toolCallsByPrompt.add(lastUserText);
+        yield functionCall('read', { path: 'fixture.txt' }, 'state-tool-owned');
+      }
+      return;
+    }
+    if (lastUserText.startsWith('Прочитай файл без состояния')) {
+      if (toolCallsByPrompt.has(lastUserText)) {
+        yield { type: 'text-delta', text: 'Результат чтения.' };
+        yield { type: 'completed' };
+      } else {
+        toolCallsByPrompt.add(lastUserText);
+        yield functionCall('read', { path: 'fixture.txt' });
+      }
+      return;
+    }
+    yield { type: 'text-delta', text: 'Ответ без серверного состояния.' };
+    yield { type: 'completed' };
+  });
+  const tools = { read: async () => ({ contents: 'Синтетический файл.' }) } as unknown as LocalTools;
+  const keyA = 'synthetic-provider-state-account-A';
+  const keyB = 'synthetic-provider-state-account-B';
+  const { runtime, guard } = makeOwnedStoreRuntime(store, provider, async () => keyA, tools);
+
+  assert.ok(runtime.enqueue(toolTurn.turn));
+  assert.ok(runtime.enqueue(noStateToolTurn.turn));
+  assert.ok(runtime.enqueue(noStateTurn.turn));
+  await runtime.whenIdle();
+
+  assert.ok(runtime.list(chat.id).every((turn) => turn.status === 'completed'));
+  const stateA = await captureProviderStateOwner(guard, async () => keyA);
+  const restored = await openStore(directory);
+  const detail = await restored.getChat(chat.id);
+  const publicJson = JSON.stringify({ detail, turns: runtime.list(chat.id) });
+  assert.equal(publicJson.includes(stateA.accountScope), false, 'the account owner is not exposed through chat or runtime snapshots');
+  assert.equal(publicJson.includes('providerStateOwnership'), false);
+  assert.equal(detail.messages.find((message) => message.id === toolTurn.turn.assistantMessageId)?.functionsStateId,
+    'state-assistant-owned');
+  assert.equal(Object.prototype.hasOwnProperty.call(
+    detail.messages.find((message) => message.id === noStateTurn.turn.assistantMessageId)!, 'functionsStateId'), false);
+  assert.deepEqual(detail.toolReceipts.map((receipt) => receipt.functionsStateId), ['state-tool-owned', null]);
+
+  const stateAView = await restored.getProviderStateOwnership(chat.id, stateA.accountScope);
+  assert.deepEqual(stateAView.messages, [{ messageId: toolTurn.turn.assistantMessageId, owned: true }]);
+  assert.deepEqual(stateAView.receipts, [{ receiptId: detail.toolReceipts[0]!.receiptId,
+    anchorMessageId: toolTurn.turn.messageId, owned: true }]);
+  assert.deepEqual((await restored.getToolProtocolThrough(chat.id, noStateToolTurn.turn.messageId))
+    .map((exchange) => exchange.functionsStateId), ['state-tool-owned', null]);
+
+  const compactTurn = await restored.acceptCompactionTurn(chat.id, 'turn-state-compact-owned');
+  const originalMessages = (await restored.getChat(chat.id)).messages;
+  assert.ok(runtime.enqueueCompaction(compactTurn.turn));
+  await runtime.whenIdle();
+  const compacted = await (await openStore(directory)).getChat(chat.id);
+  assert.deepEqual(compacted.messages, originalMessages, 'compaction keeps the public raw message history intact');
+  assert.equal(compacted.compactSnapshot?.text, 'Сводка 1');
+  assert.deepEqual(await (await openStore(directory)).getProviderStateOwnership(chat.id, stateA.accountScope), {
+    ...stateAView,
+    compact: { snapshotId: compacted.compactSnapshot!.id, owned: true, functionsStateId: 'state-compact-owned' },
+  });
+
+  const noStateCompactTurn = await (await openStore(directory)).acceptCompactionTurn(chat.id, 'turn-state-compact-unowned');
+  assert.ok(runtime.enqueueCompaction(noStateCompactTurn.turn));
+  await runtime.whenIdle();
+  const noStateCompactedStore = await openStore(directory);
+  const noStateCompacted = await noStateCompactedStore.getChat(chat.id);
+  assert.equal(noStateCompacted.compactSnapshot?.text, 'Сводка 2');
+  assert.deepEqual((await noStateCompactedStore.getProviderStateOwnership(chat.id, stateA.accountScope)).compact,
+    { snapshotId: noStateCompacted.compactSnapshot!.id, owned: false, functionsStateId: null },
+    'a new compact snapshot without a returned state does not inherit the prior owner');
+
+  const finishKeyTransition = guard.beginTransition();
+  finishKeyTransition();
+  const stateB = await captureProviderStateOwner(guard, async () => keyB);
+  const stateBView = await noStateCompactedStore.getProviderStateOwnership(chat.id, stateB.accountScope);
+  assert.ok(stateBView.messages.every((message) => !message.owned));
+  assert.ok(stateBView.receipts.every((receipt) => !receipt.owned));
+  assert.equal(stateBView.compact?.owned, false);
+});
+
+test('key transition during preparation and delayed provider results cannot write under the next account', async (t) => {
+  const preparationDirectory = await mkdtemp(join(tmpdir(), 'gigachat-runtime-state-prepare-transition-'));
+  t.after(() => rm(preparationDirectory, { recursive: true, force: true }));
+  const preparationStore = await openStore(preparationDirectory);
+  const preparationChat = await preparationStore.createChat();
+  await preparationStore.updateChat(preparationChat.id, { modelId: 'GigaChat-3-Pro' });
+  const preparationTurn = await preparationStore.acceptLocalMessage(preparationChat.id, 'Подготовка с ключом A', 'turn-state-prepare-transition');
+  const keyLoadStarted = deferred();
+  const pendingKey = deferredValue<string | null>();
+  let preparationStreams = 0;
+  const preparationRuntime = makeOwnedStoreRuntime(preparationStore, makeProvider(async function* () {
+    preparationStreams += 1;
+    yield { type: 'text-delta', text: 'не должно начаться' };
+    yield { type: 'completed', functionsStateId: 'state-not-started' };
+  }), async () => {
+    keyLoadStarted.resolve();
+    return pendingKey.promise;
+  });
+  assert.ok(preparationRuntime.runtime.enqueue(preparationTurn.turn));
+  await keyLoadStarted.promise;
+  const finishPreparationTransition = preparationRuntime.guard.beginTransition();
+  finishPreparationTransition();
+  pendingKey.resolve('synthetic-provider-state-account-A');
+  await preparationRuntime.runtime.whenIdle();
+  assert.equal(preparationStreams, 0);
+  assert.equal((await preparationStore.getChat(preparationChat.id)).messages.some((message) => message.role === 'assistant'), false);
+
+  const lateResultDirectory = await mkdtemp(join(tmpdir(), 'gigachat-runtime-state-late-result-'));
+  t.after(() => rm(lateResultDirectory, { recursive: true, force: true }));
+  const lateResultStore = await openStore(lateResultDirectory);
+  const lateResultChat = await lateResultStore.createChat();
+  await lateResultStore.updateChat(lateResultChat.id, { modelId: 'GigaChat-3-Pro' });
+  const lateResultTurn = await lateResultStore.acceptLocalMessage(lateResultChat.id, 'Запрос ключа A', 'turn-state-late-result');
+  const streamStarted = deferred();
+  const releaseProviderResult = deferred();
+  const lateEvent = functionCall('read', { path: 'fixture.txt' }, 'state-late-tool-receipt');
+  let toolCalls = 0;
+  const lateRuntime = makeOwnedStoreRuntime(lateResultStore, makeProvider(async function* () {
+    streamStarted.resolve();
+    await releaseProviderResult.promise;
+    yield lateEvent;
+  }), async () => 'synthetic-provider-state-account-A', {
+    read: async () => { toolCalls += 1; return { contents: 'should not run' }; },
+  } as unknown as LocalTools);
+  assert.ok(lateRuntime.runtime.enqueue(lateResultTurn.turn));
+  await streamStarted.promise;
+  const finishLateResultTransition = lateRuntime.guard.beginTransition();
+  finishLateResultTransition();
+  releaseProviderResult.resolve();
+  await lateRuntime.runtime.whenIdle();
+  const lateReceiptDetail = await lateResultStore.getChat(lateResultChat.id);
+  assert.equal(lateReceiptDetail.toolReceipts.length, 0, 'a late function call is rejected before receipt or tool execution');
+  assert.equal(toolCalls, 0);
+  assert.equal(lateReceiptDetail.messages.some((message) => message.role === 'assistant'), false);
+
+  const completionDirectory = await mkdtemp(join(tmpdir(), 'gigachat-runtime-state-late-completion-'));
+  t.after(() => rm(completionDirectory, { recursive: true, force: true }));
+  const completionStore = await openStore(completionDirectory);
+  const completionChat = await completionStore.createChat();
+  await completionStore.updateChat(completionChat.id, { modelId: 'GigaChat-3-Pro' });
+  const completionTurn = await completionStore.acceptLocalMessage(completionChat.id, 'Поздний ответ ключа A', 'turn-state-late-completion');
+  const completionStarted = deferred();
+  const releaseCompletion = deferred();
+  const completionRuntime = makeOwnedStoreRuntime(completionStore, makeProvider(async function* () {
+    completionStarted.resolve();
+    await releaseCompletion.promise;
+    yield { type: 'text-delta', text: 'поздний ответ' };
+    yield { type: 'completed', functionsStateId: 'state-late-assistant' };
+  }), async () => 'synthetic-provider-state-account-A');
+  assert.ok(completionRuntime.runtime.enqueue(completionTurn.turn));
+  await completionStarted.promise;
+  const finishCompletionTransition = completionRuntime.guard.beginTransition();
+  finishCompletionTransition();
+  releaseCompletion.resolve();
+  await completionRuntime.runtime.whenIdle();
+  const completionDetail = await completionStore.getChat(completionChat.id);
+  assert.equal(completionDetail.messages.some((message) => message.role === 'assistant'), false,
+    'a completed provider result captured under A is not committed after the account generation changes');
 });
 
 test('uploads only the accepted message attachments inside the FIFO turn and does not resend them on a text follow-up', async (t) => {
