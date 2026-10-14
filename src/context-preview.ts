@@ -12,7 +12,7 @@ import type {
 } from './contracts';
 import { buildNextTurnContext, hashCompactionPrefix, type BuildNextTurnContextOptions, type NextTurnContextInput } from './context';
 import { getModelContextLimit } from './model-capabilities';
-import type { LocalStore } from './store';
+import type { LocalStore, ProviderStateOwnershipView } from './store';
 import type { SkillRegistry } from './skills';
 
 const MAX_PREVIEW_TEXT_LENGTH = 100_000;
@@ -32,6 +32,7 @@ export interface ContextPreviewDependencies {
   store: PreviewStore;
   skills: Pick<SkillRegistry, 'getEnabledReadOnly'>;
   hasActiveTurn(chatId: string): boolean;
+  getProviderStateOwnership(chatId: string | null): Promise<ProviderStateOwnershipView | null>;
   buildContext?: (input: NextTurnContextInput, options?: BuildNextTurnContextOptions) => ReturnType<typeof buildNextTurnContext>;
 }
 
@@ -118,6 +119,10 @@ function skillSignature(skill: Awaited<ReturnType<SkillRegistry['getEnabled']>>)
   } : null);
 }
 
+function ownershipSignature(ownership: ProviderStateOwnershipView | null): string {
+  return ownership === null ? 'null' : JSON.stringify(ownership);
+}
+
 function aggregateBlocks(blocks: readonly ContextBlockSize[]): ContextPreviewBlockSummary[] {
   const sourceOrder: ContextBlockSize['source'][] = [
     'runtime', 'global', 'project', 'skill', 'summary', 'message', 'protocol', 'function-schema',
@@ -201,6 +206,8 @@ export async function createContextPreview(
     ? await store.getToolProtocolThrough(detail.id, latestUser.id)
     : [];
   const protocolHistorySignature = hashCompactionPrefix([], protocolHistory);
+  const ownershipChatId = detail?.id ?? null;
+  const providerStateOwnership = await dependencies.getProviderStateOwnership(ownershipChatId);
   const pendingAttachments = homeDraft ? homeDraft.attachments : detail!.draftAttachments;
   const previewMessage = {
     id: `${PREVIEW_MESSAGE_ID_PREFIX}${randomUUID()}`,
@@ -223,9 +230,18 @@ export async function createContextPreview(
     compactSnapshot: detail?.compactSnapshot ?? null,
     permissionProfile,
     modelId,
-  }, { allowMissingModelForPreview: true });
+  }, {
+    allowMissingModelForPreview: true,
+    ...(detail && providerStateOwnership ? {
+      providerStateFilter: {
+        detail,
+        ownership: providerStateOwnership,
+        currentAnchorMessageId: previewMessage.id,
+      },
+    } : {}),
+  });
 
-  const [latestSettings, latestSource, latestProjects, latestGlobalText, latestProjectInstructions, latestSkill, latestProtocolHistory] = await Promise.all([
+  const [latestSettings, latestSource, latestProjects, latestGlobalText, latestProjectInstructions, latestSkill, latestProtocolHistory, latestOwnership] = await Promise.all([
     store.getSettings(),
     input.source === 'home' ? store.getHomeDraft() : store.getChat(input.chatId),
     store.listProjects(),
@@ -233,6 +249,7 @@ export async function createContextPreview(
     project ? store.readProjectInstructions(project.id, project.workingFolder) : Promise.resolve(''),
     skillId === null ? Promise.resolve(null) : skills.getEnabledReadOnly(skillId),
     detail && latestUser ? store.getToolProtocolThrough(detail.id, latestUser.id) : Promise.resolve([]),
+    dependencies.getProviderStateOwnership(ownershipChatId),
   ]);
   const latestDetail = detail ? latestSource as ChatDetail : null;
   const latestUserMessage = latestDetail
@@ -244,6 +261,7 @@ export async function createContextPreview(
     || projectSignature(project) !== projectSignature(latestProject)
     || globalText !== latestGlobalText || projectInstructions !== latestProjectInstructions
     || skillSignature(selectedSkill) !== skillSignature(latestSkill)
+    || ownershipSignature(providerStateOwnership) !== ownershipSignature(latestOwnership)
     || protocolHistorySignature !== hashCompactionPrefix([], latestProtocolHistory)
     || (detail && latestUser?.id !== latestUserMessage?.id)
     || (latestDetail && activeTurnExists(latestDetail, hasActiveTurn))) {
@@ -257,8 +275,8 @@ export async function createContextPreview(
   if (pendingAttachments.length > 0) unknownReasons.add('pending-attachment-content');
   if (historyAttachments.count > 0) unknownReasons.add('historical-attachment-content');
   if (historyAttachments.metadataMissing) unknownReasons.add('historical-attachment-metadata');
-  if ((detail?.messages ?? []).some((message) => message.functionsStateId !== undefined && message.functionsStateId !== '')
-    || protocolHistory.some((exchange) => exchange.functionsStateId !== null)) {
+  if (context.request.messages.some((message) => message.functionsStateId !== undefined && message.functionsStateId !== '')
+    || (context.request.protocolHistory ?? []).some((exchange) => exchange.functionsStateId !== null)) {
     unknownReasons.add('opaque-function-state');
   }
 
@@ -272,7 +290,7 @@ export async function createContextPreview(
     },
     estimatedTokens: null,
     tokenEstimateProvenance: 'unknown',
-    preparationWireBytes: context.wireBytes,
+    preparationWireBytes: providerStateOwnership === null ? null : context.wireBytes,
     maximumWireBytes: context.maxWireBytes,
     preparationWireBytesIncludeAttachments: false,
     blocks: aggregateBlocks(context.blocks),

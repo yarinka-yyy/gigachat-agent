@@ -1325,10 +1325,19 @@ async function registerIpcHandlers(
   handle('projects:instructions-backup-path', (id) => store.projectInstructionsBackupPath(requireId(id)));
 
   handle('chats:list', () => store.listChats());
-  handle('context:preview', (input) => createContextPreview(input, {
-    store,
-    skills,
-    hasActiveTurn: (chatId) => runtime.list(chatId).some((turn) => turn.status === 'queued' || turn.status === 'running'),
+  handle('context:preview', (input) => balanceScopeGuard.runStable(async () => {
+    const key = await secureStore.load();
+    const accountScope = key === null ? null : accountScopeForKey(key);
+    return createContextPreview(input, {
+      store,
+      skills,
+      hasActiveTurn: (chatId) => runtime.list(chatId).some((turn) => turn.status === 'queued' || turn.status === 'running'),
+      getProviderStateOwnership: async (chatId) => {
+        if (accountScope === null) return null;
+        if (chatId === null) return { messages: [], receipts: [], compact: null };
+        return store.getProviderStateOwnership(chatId, accountScope);
+      },
+    });
   }));
   handle('chats:get', (id) => store.getChat(id));
   handle('home-draft:get', () => store.getHomeDraft());
