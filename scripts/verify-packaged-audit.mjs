@@ -37,6 +37,7 @@ async function runNodeDriver() {
   const holdForReview = process.argv.includes('--hold-for-review');
   const { register } = await import('tsx/esm/api');
   register();
+  require('tsx/cjs/api').register();
   const { rules } = await import('../webpack.rules.ts');
   const webpack = require('webpack');
   const forgeWebpackEntry = fileURLToPath(import.meta.resolve('@electron-forge/plugin-webpack'));
@@ -53,8 +54,113 @@ async function runNodeDriver() {
   console.log(`Renderer QA fixture: ${fixture}`);
   const bundleDirectory = join(fixture, 'renderer');
   const userDataDirectory = join(fixture, 'user-data');
+  const sessionDataDirectory = join(fixture, 'session-data');
   await mkdir(bundleDirectory, { recursive: true });
   await mkdir(userDataDirectory, { recursive: true });
+  await mkdir(sessionDataDirectory, { recursive: true });
+
+  const { buildUsageProfileView } = await import('../src/usage-view.ts');
+  const { summarizeUsage } = await import('../src/usage.ts');
+  const generatedAt = '2024-03-02T12:00:00.000Z';
+  const profileChatId = 'profile-archived-chat';
+  const profileReceipts = [
+    ['00000000-0000-4000-8000-000000000001', '2024-02-26T12:00:00.000Z', 'GigaChat-3-Lightning', 1_234_567, 'chat'],
+    ['00000000-0000-4000-8000-000000000002', '2024-02-27T12:00:00.000Z', 'GigaChat-3-Ultra', 0, 'compaction'],
+    ['00000000-0000-4000-8000-000000000003', '2024-02-28T12:00:00.000Z', 'GigaChat-3-Pro', null, 'tool-continuation'],
+    ['00000000-0000-4000-8000-000000000004', '2024-03-01T20:00:00.000Z', 'GigaChat-2-Max', 5_200, 'chat'],
+    ['00000000-0000-4000-8000-000000000005', '2024-03-01T22:00:00.000Z', 'Synthetic-Unmapped-Model', 765_432, 'chat'],
+  ].map(([localRequestId, createdAt, modelId, totalTokens, requestKind]) => ({
+    localRequestId, chatId: profileChatId, requestKind, modelId, providerRequestId: null, providerModel: null,
+    createdAt, status: 'completed', promptTokens: totalTokens, completionTokens: totalTokens === null ? null : 0,
+    totalTokens, precachedPromptTokens: 0, conflictedFields: [],
+  }));
+  const profileChats = [{
+    id: profileChatId, title: 'Сохранённый учебный чат', archived: true,
+    messages: [
+      { id: 'profile-user-feb26', role: 'user', text: 'Первый вопрос', createdAt: '2024-02-26T12:00:00.000Z', source: 'runtime' },
+      { id: 'profile-user-feb27', role: 'user', text: 'Второй вопрос', createdAt: '2024-02-27T12:00:00.000Z', source: 'runtime' },
+      { id: 'profile-example', role: 'user', text: 'Пример', createdAt: generatedAt, source: 'example' },
+      { id: 'profile-assistant', role: 'assistant', text: 'Ответ', createdAt: generatedAt, source: 'runtime' },
+    ],
+    turns: [{ invokedSkillId: 'global/profile-review', pendingSkillId: null, status: 'completed', startedAt: '2024-02-26T12:01:00.000Z' }],
+    toolReceipts: [{ name: 'read', status: 'completed' }, { name: 'write', status: 'unknown' }],
+  }];
+  const profileProjects = [{ id: 'profile-project' }, { id: 'profile-archived-project' }];
+  const apiAnchor = {
+    source: 'api', observedAt: '2024-03-01T23:59:00.000Z', expiresAt: null, unknownUsageCount: 0,
+    families: [
+      { family: 'ultra', state: 'known', value: 9_100_000 },
+      { family: 'max', state: 'known', value: 8_200_000 },
+      { family: 'pro', state: 'known', value: 7_300_000 },
+      { family: 'lite', state: 'known', value: 6_400_000 },
+    ],
+    baselineReceiptCount: profileReceipts.length, baselineMatches: true,
+  };
+  const studioInput = { remainingTokens: { ultra: 1_100_000, max: 2_200_000, pro: 3_300_000, lite: 4_400_000 }, expiresAt: '2027-10-12' };
+  const studioAnchor = { ...apiAnchor, source: 'studio', expiresAt: '2027-10-12', families: apiAnchor.families.map((family) => ({
+    ...family, value: studioInput.remainingTokens[family.family],
+  })) };
+  const profileView = (receipts, balanceAnchor = null) => buildUsageProfileView({
+    generatedAt, timeZone: 'Europe/Moscow', receipts, chats: profileChats, projects: profileProjects,
+    installedSkillCount: 3, balanceAnchor,
+  });
+  const emptyProfile = profileView([], null);
+  const richProfile = profileView(profileReceipts, apiAnchor);
+  const studioProfile = profileView(profileReceipts, studioAnchor);
+  const expiredProfile = profileView(profileReceipts, {
+    ...studioAnchor, observedAt: '2024-02-01T12:00:00.000Z', expiresAt: '2024-03-01',
+  });
+  const partialLiteReceipt = {
+    ...profileReceipts[0], localRequestId: '00000000-0000-4000-8000-000000000006',
+    createdAt: '2024-03-02T01:00:00.000Z', totalTokens: null, promptTokens: null, completionTokens: null,
+  };
+  const unknownFamilyReceipt = {
+    ...profileReceipts[4], localRequestId: '00000000-0000-4000-8000-000000000007',
+    createdAt: '2024-03-02T02:00:00.000Z', totalTokens: 12_345, promptTokens: 12_345,
+  };
+  const largeReceipt = {
+    ...profileReceipts[0], localRequestId: '00000000-0000-4000-8000-000000000008',
+    createdAt: '2024-03-01T18:00:00.000Z', modelId: 'GigaChat-3-Pro', totalTokens: 2_100_000_000, promptTokens: 2_100_000_000,
+  };
+  const allUnknownReceipt = {
+    ...profileReceipts[2], localRequestId: '00000000-0000-4000-8000-000000000009',
+    createdAt: '2024-03-01T11:00:00.000Z', totalTokens: null, promptTokens: null, completionTokens: null,
+  };
+  const postAnchorLiteReceipt = {
+    ...profileReceipts[0], localRequestId: '00000000-0000-4000-8000-000000000010',
+    createdAt: '2024-03-02T01:00:00.000Z', modelId: 'GigaChat-3-Lightning', totalTokens: 631, promptTokens: 631, completionTokens: 0,
+  };
+  const postAnchorLiteProfile = profileView([...profileReceipts, postAnchorLiteReceipt], apiAnchor);
+  const ordinaryYearProfile = buildUsageProfileView({
+    generatedAt: '2025-03-02T12:00:00.000Z', timeZone: 'Europe/Moscow', receipts: [], chats: [], projects: [],
+    installedSkillCount: 0, balanceAnchor: null,
+  });
+  const profileFixtures = {
+    empty: emptyProfile,
+    rich: richProfile,
+    studio: studioProfile,
+    expired: expiredProfile,
+    partialLite: profileView([...profileReceipts, partialLiteReceipt], apiAnchor),
+    unknownFamilyTail: profileView([...profileReceipts, unknownFamilyReceipt], apiAnchor),
+    large: profileView([...profileReceipts, largeReceipt], apiAnchor),
+    allUnknown: profileView([allUnknownReceipt], null),
+    postAnchorLite: postAnchorLiteProfile,
+    ordinaryYear: ordinaryYearProfile,
+    richLedger: summarizeUsage(profileReceipts),
+    emptyLedger: summarizeUsage([]),
+    studioInput,
+  };
+  assert.equal(richProfile.localActivity.rollingYear.days.length, 366, 'synthetic profile must cover a leap-year window');
+  assert.equal(ordinaryYearProfile.localActivity.rollingYear.days.length, 365, 'synthetic profile must also cover an ordinary-year window');
+  assert.equal(richProfile.total.totalTokens.knownTokens, 2_005_199, 'synthetic profile totals are independently fixed');
+  const postAnchorLite = postAnchorLiteProfile.balance.families.find((family) => family.family === 'lite');
+  assert.equal(postAnchorLite?.usedSinceSnapshot, 631, 'only Lite usage after the snapshot is deducted');
+  assert.equal(postAnchorLite?.estimatedRemainingTokens, 6_399_369, 'baseline receipts are not deducted again from the observed Lite remainder');
+  assert.ok(profileFixtures.unknownFamilyTail.balance.families.every((family) => family.estimatedRemainingTokens === null),
+    'an unknown-family expense makes each family estimate unknown instead of treating it as zero');
+  assert.equal(profileFixtures.partialLite.balance.families.find((family) => family.family === 'lite')?.estimatedRemainingTokens, null,
+    'an incomplete Lite receipt does not produce a partial numeric estimate');
+  await writeFile(join(fixture, 'usage-profile-fixtures.json'), JSON.stringify(profileFixtures), 'utf8');
 
   const compiler = webpack({
     module: { rules: [
@@ -174,8 +280,13 @@ async function runElectronHost() {
   const fixturePath = await realpath(fixture);
   assert.equal(dirname(fixturePath), await realpath(join(repo, '.qa')));
   const profile = join(fixturePath, 'user-data');
+  const sessionData = join(fixturePath, 'session-data');
   const bundleDirectory = join(fixturePath, 'renderer');
+  const profileFixtures = JSON.parse(await readFile(join(fixturePath, 'usage-profile-fixtures.json'), 'utf8'));
   app.setPath('userData', profile);
+  app.setPath('sessionData', sessionData);
+  assert.equal(await realpath(app.getPath('userData')), await realpath(profile), 'Electron userData must be the owned synthetic fixture before readiness');
+  assert.equal(await realpath(app.getPath('sessionData')), await realpath(sessionData), 'Electron sessionData must be the owned synthetic fixture before readiness');
 
   const timestamp = '2026-10-03T00:00:00.000Z';
   const makeProject = (id, name, workingFolder = null) => ({ id, name, pinned: false, archived: false, createdAt: timestamp, updatedAt: timestamp, workingFolder });
@@ -219,6 +330,11 @@ async function runElectronHost() {
     connectionStatus: { state: 'not-configured', errorCategory: null }, connectionCalls: [], nextConnectionFailure: null,
     keyStatus: { available: true, saved: false, usable: false },
     hookRegistry: { hooks: [], issues: [] }, hookCalls: [],
+    profileFixtures,
+    profileView: profileFixtures.empty, profileViewCalls: 0, profileRefreshCalls: 0, profileAnchorSaveCalls: [],
+    deferProfileGets: false, pendingProfileGets: [], rejectNextProfileRefresh: false,
+    nextProfileRefreshView: null, rejectNextProfileAnchorSave: false,
+    deferProfileAnchorSave: false, pendingProfileAnchorSaves: [],
     usageLedger: {
       key: 'all', requestCount: 0, completedRequestCount: 0, pendingRequestCount: 0, failedRequestCount: 0, cancelledRequestCount: 0,
       promptTokens: { knownTokens: 0, unknownRequests: 0, conflictedRequests: 0 },
@@ -821,6 +937,47 @@ async function runElectronHost() {
     }
     if (group === 'usage' && method === 'getLocalStats') return { chatCount: state.chats.length, projectCount: state.projects.length, activityDayCount: 0 };
     if (group === 'usage' && method === 'getLedger') return clone(state.usageLedger);
+    if (group === 'usage' && method === 'getProfileView') {
+      state.profileViewCalls += 1;
+      if (state.deferProfileGets) {
+        const request = deferred();
+        state.pendingProfileGets.push(request);
+        return request.promise;
+      }
+      return clone(state.profileView);
+    }
+    if (group === 'usage' && method === 'refreshBalance') {
+      state.profileRefreshCalls += 1;
+      if (state.rejectNextProfileRefresh) {
+        state.rejectNextProfileRefresh = false;
+        const error = new Error('network');
+        error.name = 'GigaChatProviderError';
+        throw error;
+      }
+      state.profileView = clone(state.nextProfileRefreshView ?? state.profileFixtures.rich);
+      state.nextProfileRefreshView = null;
+      state.usageLedger = clone(state.profileFixtures.richLedger);
+      return clone(state.profileView);
+    }
+    if (group === 'usage' && method === 'saveStudioBalanceAnchor') {
+      const input = clone(args[0]);
+      state.profileAnchorSaveCalls.push(input);
+      if (state.rejectNextProfileAnchorSave) {
+        state.rejectNextProfileAnchorSave = false;
+        const error = new Error('storage');
+        error.name = 'GigaChatProviderError';
+        throw error;
+      }
+      assert.deepEqual(input, state.profileFixtures.studioInput, 'renderer sends only the values explicitly entered in the manual Studio check');
+      if (state.deferProfileAnchorSave) {
+        const request = deferred();
+        state.pendingProfileAnchorSaves.push({ request, view: clone(state.profileFixtures.studio) });
+        return request.promise;
+      }
+      state.profileView = clone(state.profileFixtures.studio);
+      state.usageLedger = clone(state.profileFixtures.richLedger);
+      return clone(state.profileView);
+    }
     return null;
   });
   ipcMain.handle('audit:close-ready', (_event, discardBrowserMetadata) => {
@@ -1643,6 +1800,7 @@ async function runElectronHost() {
     await app.whenReady();
     console.log('Electron app ready');
     assert.equal(await realpath(app.getPath('userData')), await realpath(profile), 'Electron userData must be the synthetic fixture');
+    assert.equal(await realpath(app.getPath('sessionData')), await realpath(sessionData), 'Electron sessionData must remain the synthetic fixture');
     window = new BrowserWindow({
       show: false,
       width: 1120,
@@ -2434,13 +2592,479 @@ async function runElectronHost() {
     const draftUpdatesBeforeClear = state.updateCalls.length;
     await fillTextarea(draftSelector, '');
     await waitUntil('compact command text is cleared from the local draft', () => state.updateCalls.slice(draftUpdatesBeforeClear).some((item) => item.id === 'chat-a' && item.patch.draft === ''));
+    await click('button[aria-label="Закрыть уведомление"]');
+    await waitDom('compaction notice is dismissed before profile captures', `!document.querySelector('.notice')`);
+    const profileOriginalSize = window.getSize();
+    const profileOriginalZoom = window.webContents.getZoomFactor();
+    window.setSize(1280, 900);
+    window.webContents.setZoomFactor(1);
+    await waitDom('wide profile viewport is ready', `innerWidth >= 1200 && innerHeight >= 800`);
+    state.connectionStatus = { state: 'connected', errorCategory: null };
+    state.profileView = clone(state.profileFixtures.empty);
+    state.usageLedger = clone(state.profileFixtures.emptyLedger);
+
+    state.deferProfileGets = true;
+    const profileGetsBeforeLateRoute = state.profileViewCalls;
+    const pendingProfileReadsBeforeLateRoute = state.pendingProfileGets.length;
     await click('.profile-button');
-    await waitDom('usage and balance remain unknown without receipts', `document.querySelector('.profile-page .usage-unavailable strong')?.textContent === 'Неизвестен'
-      && document.querySelector('.profile-page').textContent.includes('Пока нет измерений API')`);
-    assert.equal(state.usageLedger.requestCount, 0, 'synthetic renderer fixture has no usage receipts');
+    await waitDom('profile reports its loading state', `document.querySelector('.profile-page[aria-busy="true"] .profile-loading')`);
+    await waitUntil('profile read is pending before route change', () => state.pendingProfileGets.length === pendingProfileReadsBeforeLateRoute + 1);
     await click('button[aria-label="Назад"]');
-    await waitDom('chat returns after usage unknown check', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'`);
-    passed('Rendered context, balance, and compaction remain unknown or unavailable without changing history');
+    await waitDom('late profile read route returns to Chat A', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'`);
+    state.deferProfileGets = false;
+    state.pendingProfileGets[pendingProfileReadsBeforeLateRoute].resolve(clone(state.profileFixtures.rich));
+    await waitUntil('late profile read is ignored after route change', () => evaluate(`!document.querySelector('.profile-page')
+      && document.querySelector('.chat-header-title')?.textContent === 'Chat A'`));
+    assert.equal(state.profileViewCalls, profileGetsBeforeLateRoute + 1, 'late-route test performs exactly one profile read');
+
+    await click('.profile-button');
+    await waitDom('empty profile keeps missing usage and balances unknown', `document.querySelector('.profile-page h1')?.textContent === 'Профиль'
+      && document.querySelector('.profile-balance-empty strong')?.textContent === 'Остаток неизвестен'
+      && document.querySelector('.profile-chart-empty')?.textContent.includes('Пока нет измеренных вызовов API.')`);
+    assert.equal(state.usageLedger.requestCount, 0, 'synthetic renderer fixture has no usage receipts');
+    assert.equal(await evaluate(`document.querySelectorAll('.profile-balance-card').length`), 4,
+      'empty profile still presents all four families without inventing an allocation');
+    assert.equal(await evaluate(`document.querySelector('.profile-metric-primary strong')?.textContent.trim()`), '0',
+      'known empty history is shown as zero rather than an unknown estimate');
+    await capture('stage6-profile-empty');
+
+    state.rejectNextProfileRefresh = true;
+    const profileRefreshBeforeError = state.profileRefreshCalls;
+    await clickText('.profile-balance-actions button', 'Обновить остаток');
+    await waitDom('balance failure is translated to safe Russian copy', `document.querySelector('.profile-balance-section [role="alert"]')?.textContent.includes('Не удалось связаться с сервером')`);
+    assert.equal(state.profileRefreshCalls, profileRefreshBeforeError + 1, 'refresh failure uses exactly one existing IPC request');
+    const profileErrorText = await evaluate(`document.querySelector('.profile-balance-section [role="alert"]')?.textContent ?? ''`);
+    assert.ok(!/GigaChatProviderError|network|auth|HTTP/i.test(profileErrorText), 'provider names and transport details are not shown in the UI');
+    state.nextProfileRefreshView = state.profileFixtures.rich;
+    await clickText('.profile-balance-actions button', 'Обновить остаток');
+    await waitDom('profile refresh shows independently known usage', `document.querySelector('.profile-metric-primary strong')?.textContent.replace(/\\D/g, '') === '2005199'
+      && document.querySelectorAll('.profile-balance-card').length === 4`);
+    assert.equal(await evaluate(`document.querySelectorAll('.profile-heat-cell').length`), 366,
+      'the leap-year profile renders every day in its rolling year');
+    assert.equal(await evaluate(`document.querySelectorAll('.profile-balance-status').length`), 4,
+      'the API snapshot is rendered separately from the four family estimates');
+    assert.ok((await evaluate(`document.querySelector('.profile-balance-section')?.textContent ?? ''`)).includes('Срок API не сообщает'),
+      'the UI does not invent an API expiry');
+    const richProfileText = await evaluate(`document.querySelector('.profile-page')?.textContent ?? ''`);
+    assert.ok(richProfileText.includes('Сохранённый учебный чат') && richProfileText.includes('Установлено Skills')
+      && richProfileText.includes('Вызовы инструментов'), 'the profile includes archived-chat, Skill, and saved tool receipt measurements');
+    assert.equal(await evaluate(`document.querySelectorAll('.profile-metric')[1]?.querySelector('strong')?.textContent.replace(/\\D/g, '')`), '5',
+      'API request count includes the synthetic continuation and compaction receipts');
+    await capture('stage6-profile-rich-api');
+
+    state.nextProfileRefreshView = state.profileFixtures.ordinaryYear;
+    await clickText('.profile-balance-actions button', 'Обновить остаток');
+    await waitDom('ordinary-year profile updates without retaining leap-day count', `document.querySelectorAll('.profile-heat-cell').length === 365`);
+    state.nextProfileRefreshView = state.profileFixtures.rich;
+    await clickText('.profile-balance-actions button', 'Обновить остаток');
+    await waitDom('rich profile returns to its leap-year days', `document.querySelectorAll('.profile-heat-cell').length === 366`);
+
+    const moveProfilePointer = async (selector) => {
+      const point = await evaluate(`(() => {
+        const element = document.querySelector(${JSON.stringify(selector)});
+        if (!element) return null;
+        element.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        const rect = element.getBoundingClientRect();
+        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+      })()`);
+      assert.ok(point, `profile pointer target exists: ${selector}`);
+      const zoom = window.webContents.getZoomFactor();
+      window.webContents.sendInputEvent({ type: 'mouseMove', x: Math.round(point.x * zoom), y: Math.round(point.y * zoom) });
+    };
+    const heatASelector = '.profile-heat-cell[aria-label^="27 февраля 2024"]';
+    const heatBSelector = '.profile-heat-cell[aria-label^="28 февраля 2024"]';
+    await evaluate(`(() => {
+      const cell = document.querySelector(${JSON.stringify(heatASelector)});
+      cell?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      cell?.focus();
+    })()`);
+    await waitDom('keyboard focus previews its own calendar day', `document.activeElement?.matches(${JSON.stringify(heatASelector)})
+      && document.querySelector('.profile-heat-detail')?.textContent.includes('27 февраля 2024')`);
+    const focusedHeatBeforeHover = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const a = document.querySelector(${JSON.stringify(heatASelector)});
+      const b = document.querySelector(${JSON.stringify(heatBSelector)});
+      return { active: document.activeElement === a, aTabIndex: a?.tabIndex, bTabIndex: b?.tabIndex,
+        detail: document.querySelector('.profile-heat-detail')?.textContent ?? '' };
+    })())`));
+    assert.equal(focusedHeatBeforeHover.active, true, 'keyboard focus stays on the first calendar day');
+    assert.equal(focusedHeatBeforeHover.aTabIndex, 0, 'focused calendar cell remains the roving tab stop');
+    assert.equal(focusedHeatBeforeHover.bTabIndex, -1, 'the neighboring cell does not take the roving tab stop');
+    assert.ok(focusedHeatBeforeHover.detail.includes('GigaChat Ultra 0'), 'the focused date exposes its confirmed zero separately');
+    await moveProfilePointer(heatBSelector);
+    await waitDom('pointer hover previews a different day without moving keyboard focus', `document.querySelector('.profile-heat-detail')?.textContent.includes('28 февраля 2024')
+      && document.querySelector('.profile-heat-detail')?.textContent.includes('GigaChat Pro Неизвестно')`);
+    const hoveredHeat = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const a = document.querySelector(${JSON.stringify(heatASelector)});
+      const b = document.querySelector(${JSON.stringify(heatBSelector)});
+      return { active: document.activeElement === a, aTabIndex: a?.tabIndex, bTabIndex: b?.tabIndex };
+    })())`));
+    assert.deepEqual(hoveredHeat, { active: true, aTabIndex: 0, bTabIndex: -1 },
+      'hovering another day changes only the preview, not focus or keyboard navigation');
+    await capture('stage6-profile-calendar-hover-priority');
+    await moveProfilePointer('.profile-heading h1');
+    await waitDom('pointer leaving the calendar restores the focused day preview', `document.querySelector('.profile-heat-detail')?.textContent.includes('27 февраля 2024')
+      && document.activeElement?.matches(${JSON.stringify(heatASelector)})`);
+    await evaluate(`document.querySelector(${JSON.stringify(heatASelector)})?.blur()`);
+    await waitDom('blur clears the calendar preview without leaving a ghost selection', `document.querySelector('.profile-heat-detail')?.getAttribute('aria-hidden') === 'true'
+      && !document.querySelector('.profile-heat-detail')?.textContent.includes('27 февраля 2024')`);
+    await capture('stage6-profile-rich-calendar-focus');
+
+    state.nextProfileRefreshView = state.profileFixtures.unknownFamilyTail;
+    await clickText('.profile-balance-actions button', 'Обновить остаток');
+    await waitDom('unmapped usage makes all family estimates unknown', `document.querySelector('.profile-balance-grid')?.textContent.includes('Неизвестно')
+      && document.querySelector('.profile-uncertainty')`);
+    const unknownDaySelector = '.profile-heat-cell[aria-label^="2 марта 2024"]';
+    await evaluate(`document.querySelector(${JSON.stringify(unknownDaySelector)})?.focus()`);
+    await waitDom('calendar identifies unknown model spend without assigning it to a family', `document.querySelector('.profile-heat-detail')?.textContent.includes('GigaChat Lite Неизвестно')
+      && document.querySelector('.profile-heat-detail span')?.textContent.replace(/\\D/g, '') === '777777'
+      && document.querySelector(${JSON.stringify(unknownDaySelector)})?.getAttribute('aria-label').replace(/\\D/g, '').includes('777777')`);
+    await capture('stage6-profile-calendar-unmapped-day');
+    await evaluate(`document.activeElement?.blur()`);
+
+    state.nextProfileRefreshView = state.profileFixtures.partialLite;
+    await clickText('.profile-balance-actions button', 'Обновить остаток');
+    await waitDom('partial Lite expense is not displayed as a numeric remaining estimate', `(() => {
+      const lite = [...document.querySelectorAll('.profile-balance-card')].find((card) => card.textContent.includes('GigaChat Lite'));
+      return lite?.querySelector('.profile-balance-value')?.textContent === 'Неизвестно'
+        && [...document.querySelectorAll('.profile-balance-card')].filter((card) => !card.textContent.includes('GigaChat Lite'))
+          .every((card) => card.querySelector('.profile-balance-value')?.textContent !== 'Неизвестно');
+    })()`);
+    state.nextProfileRefreshView = state.profileFixtures.allUnknown;
+    await clickText('.profile-balance-actions button', 'Обновить остаток');
+    await waitDom('all-unknown usage is never presented as measured zero', `document.querySelector('.profile-metric-primary strong')?.textContent === 'Неизвестно'`);
+    state.nextProfileRefreshView = state.profileFixtures.large;
+    await clickText('.profile-balance-actions button', 'Обновить остаток');
+    await waitDom('large token values remain readable in the profile table', `document.querySelector('.profile-detail-grid')?.textContent.replace(/\\D/g, '').includes('2100000000')`);
+    await clickText('.profile-chart-range button', '30 дней');
+    await clickText('.profile-chart-switch button', 'По дням');
+    await waitDom('daily chart shows the large March 1 total', `document.querySelector('g[data-chart-date="2024-03-01"] > title')?.textContent.replace(/\\D/g, '').includes('2100000000')`);
+    await evaluate(`document.querySelector('.profile-chart-section')?.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' })`);
+    await waitDom('large chart is centered in the visible profile area', `(() => {
+      const area = document.querySelector('.profile-page')?.closest('.view-area')?.getBoundingClientRect();
+      const chart = document.querySelector('.profile-chart-section')?.getBoundingClientRect();
+      return Boolean(area && chart && chart.top >= area.top - 1 && chart.bottom <= area.bottom + 1);
+    })()`);
+    const largeChartEvidence = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const svg = document.querySelector('.profile-usage-chart');
+      const labels = [...(svg?.querySelectorAll('.profile-chart-axis') ?? [])].map((label) => {
+        const box = label.getBBox();
+        return { x: box.x, width: box.width, text: label.textContent ?? '' };
+      });
+      return { width: svg?.viewBox.baseVal.width ?? 0, labels,
+        point: svg?.querySelector('g[data-chart-date="2024-03-01"] title')?.textContent ?? '' };
+    })())`));
+    assert.ok(largeChartEvidence.width > 0 && largeChartEvidence.labels.length > 0,
+      'large totals retain a rendered chart and readable axis labels');
+    assert.ok(largeChartEvidence.labels.every((label) => label.x >= 0 && label.x + label.width <= largeChartEvidence.width + 1),
+      `large chart axis labels remain inside the SVG: ${JSON.stringify(largeChartEvidence.labels)}`);
+    assert.ok(largeChartEvidence.point.replace(/\D/g, '').includes('2100000000'),
+      'the chart point keeps the complete large count accessible even when axis labels are compact');
+    await capture('stage6-profile-large-chart-axis');
+    await evaluate(`(() => { const area = document.querySelector('.profile-page')?.closest('.view-area'); if (area) area.scrollTop = 0; })()`);
+    await waitDom('profile returns to its top after the large-chart capture', `document.querySelector('.profile-page')?.closest('.view-area')?.scrollTop === 0`);
+    state.nextProfileRefreshView = state.profileFixtures.expired;
+    await clickText('.profile-balance-actions button', 'Обновить остаток');
+    await waitDom('expired manual snapshot is marked expired rather than current', `document.querySelectorAll('.profile-balance-status').length === 4
+      && [...document.querySelectorAll('.profile-balance-status')].every((item) => item.textContent.includes('истёк'))`);
+
+    state.nextProfileRefreshView = state.profileFixtures.rich;
+    await clickText('.profile-balance-actions button', 'Обновить остаток');
+    await waitDom('rich chart fixture is restored before chart interaction', `document.querySelectorAll('.profile-heat-cell').length === 366`);
+    for (const [label, key, expectedTokens] of [['Сегодня', 'today', 765_432], ['Неделя', 'week', 2_005_199], ['Месяц', 'month', 770_632]]) {
+      await clickText('.profile-period-switch button', label);
+      assert.equal(state.profileFixtures.rich.localActivity[key].totalTokens.knownTokens, expectedTokens,
+        `${label} synthetic fixture matches its independently calculated expected total`);
+      assert.equal(await evaluate(`document.querySelector('.profile-period-value')?.textContent.replace(/\\D/g, '')`), String(expectedTokens),
+        `${label} summary renders its independently calculated total`);
+    }
+    await clickText('.profile-chart-range button', '30 дней');
+    await clickText('.profile-chart-switch button', 'По дням');
+    await waitDom('daily chart exposes one point for each selected day', `document.querySelectorAll('.profile-usage-chart [data-chart-date]').length === 30`);
+    await clickText('.profile-chart-range button', '90 дней');
+    await clickText('.profile-chart-switch button', 'По неделям');
+    const expectedWeekCount = new Set(state.profileFixtures.rich.localActivity.rollingYear.days.slice(-90).map((day) => {
+      const date = new Date(`${day.date}T00:00:00.000Z`);
+      date.setUTCDate(date.getUTCDate() - (date.getUTCDay() + 6) % 7);
+      return date.toISOString().slice(0, 10);
+    })).size;
+    await waitDom('weekly chart groups the selected range by Monday', `document.querySelectorAll('.profile-usage-chart [data-chart-date]').length === ${expectedWeekCount}`);
+    await clickText('.profile-chart-range button', '12 месяцев');
+    await clickText('.profile-chart-switch button', 'Нарастающим итогом');
+    await waitDom('cumulative chart spans the full rolling year', `document.querySelectorAll('.profile-usage-chart [data-chart-date]').length === 366`);
+    await clickText('.profile-chart-range button', '30 дней');
+    await clickText('.profile-chart-switch button', 'По дням');
+    await waitDom('daily chart restores its thirty point slots', `document.querySelectorAll('.profile-usage-chart [data-chart-date]').length === 30`);
+    await evaluate(`document.querySelector('.profile-usage-chart')?.scrollIntoView({ block: 'center', inline: 'nearest' })`);
+    const expectedChartSlots = [
+      ['2024-02-02', '2 февраля 2024 г.'], ['2024-02-17', '17 февраля 2024 г.'], ['2024-03-02', '2 марта 2024 г.'],
+    ];
+    const chartDates = JSON.parse(await evaluate(`JSON.stringify([...document.querySelectorAll('.profile-usage-chart [data-chart-date]')].map((point) => point.getAttribute('data-chart-date'))) `));
+    assert.equal(chartDates.length, 30, 'the point interaction fixture uses all thirty daily slots');
+    for (const [date, label] of expectedChartSlots) {
+      await moveProfilePointer(`.profile-usage-chart g[data-chart-date="${date}"] .profile-chart-hit`);
+      await waitDom(`chart hit target resolves to ${date}`, `document.querySelector('#profile-chart-tooltip strong')?.textContent === ${JSON.stringify(label)}`);
+    }
+    await moveProfilePointer('.profile-chart-heading h2');
+    await waitDom('chart tooltip is hidden before measuring its resting layout', `!document.querySelector('#profile-chart-tooltip')`);
+    const chartLayoutBeforeHover = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const svg = document.querySelector('.profile-usage-chart');
+      const details = document.querySelector('.profile-detail-grid');
+      const chart = document.querySelector('.profile-chart-section');
+      const owner = document.querySelector('.profile-page')?.closest('.view-area');
+      const rect = (element) => { const box = element?.getBoundingClientRect(); return box ? { left: box.left, top: box.top, width: box.width, height: box.height } : null; };
+      const contentTop = (element) => { const box = element?.getBoundingClientRect(); const area = owner?.getBoundingClientRect(); return box && area && owner ? box.top - area.top + owner.scrollTop : null; };
+      return { svg: rect(svg), details: rect(details), chart: rect(chart), scrollTop: owner?.scrollTop ?? null,
+        chartContentTop: contentTop(chart), detailsContentTop: contentTop(details) };
+    })())`));
+    assert.ok(chartLayoutBeforeHover.svg && chartLayoutBeforeHover.details, 'profile chart and following details are present for the rendered interaction');
+    await moveProfilePointer('.profile-usage-chart g[data-chart-date="2024-02-17"] .profile-chart-hit');
+    await waitDom('pointer hover selects a chart point and reveals its tooltip', `document.querySelector('#profile-chart-tooltip')
+      && document.querySelector('.profile-usage-chart')?.getAttribute('aria-describedby') === 'profile-chart-tooltip'`);
+    const chartLayoutWithTooltip = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const owner = document.querySelector('.profile-page')?.closest('.view-area');
+      const chart = document.querySelector('.profile-chart-section');
+      const details = document.querySelector('.profile-detail-grid')?.getBoundingClientRect();
+      const ownerRect = owner?.getBoundingClientRect();
+      return { chartHeight: chart?.getBoundingClientRect().height ?? null,
+        chartContentTop: chart && ownerRect && owner ? chart.getBoundingClientRect().top - ownerRect.top + owner.scrollTop : null,
+        detailsContentTop: details && ownerRect && owner ? details.top - ownerRect.top + owner.scrollTop : null,
+        scrollTop: owner?.scrollTop ?? null, tooltip: document.querySelector('#profile-chart-tooltip')?.textContent ?? '' };
+    })())`));
+    assert.ok(chartLayoutWithTooltip.tooltip.length > 0, 'chart tooltip has real point data');
+    assert.ok(Math.abs(chartLayoutWithTooltip.chartHeight - chartLayoutBeforeHover.chart.height) <= 1
+      && Math.abs(chartLayoutWithTooltip.chartContentTop - chartLayoutBeforeHover.chartContentTop) <= 1
+      && Math.abs(chartLayoutWithTooltip.detailsContentTop - chartLayoutBeforeHover.detailsContentTop) <= 1,
+    `chart tooltip reveal does not change content geometry (scroll ${chartLayoutBeforeHover.scrollTop} -> ${chartLayoutWithTooltip.scrollTop}): ${JSON.stringify({
+      before: { chartHeight: chartLayoutBeforeHover.chart.height, chartTop: chartLayoutBeforeHover.chartContentTop, detailsTop: chartLayoutBeforeHover.detailsContentTop },
+      after: { chartHeight: chartLayoutWithTooltip.chartHeight, chartTop: chartLayoutWithTooltip.chartContentTop, detailsTop: chartLayoutWithTooltip.detailsContentTop },
+    })}`);
+    await capture('stage6-profile-chart-tooltip');
+    await moveProfilePointer('.profile-chart-heading h2');
+    await waitDom('pointer leaving chart hides its tooltip', `!document.querySelector('#profile-chart-tooltip')`);
+    const chartLayoutAfterTooltip = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const owner = document.querySelector('.profile-page')?.closest('.view-area');
+      const ownerRect = owner?.getBoundingClientRect();
+      const chart = document.querySelector('.profile-chart-section');
+      const details = document.querySelector('.profile-detail-grid');
+      return { chartHeight: chart?.getBoundingClientRect().height ?? null,
+        chartContentTop: chart && ownerRect && owner ? chart.getBoundingClientRect().top - ownerRect.top + owner.scrollTop : null,
+        detailsContentTop: details && ownerRect && owner ? details.getBoundingClientRect().top - ownerRect.top + owner.scrollTop : null,
+        scrollTop: owner?.scrollTop ?? null };
+    })())`));
+    assert.ok(Math.abs(chartLayoutAfterTooltip.chartHeight - chartLayoutBeforeHover.chart.height) <= 1
+      && Math.abs(chartLayoutAfterTooltip.chartContentTop - chartLayoutBeforeHover.chartContentTop) <= 1
+      && Math.abs(chartLayoutAfterTooltip.detailsContentTop - chartLayoutBeforeHover.detailsContentTop) <= 1,
+    `chart tooltip dismissal preserves content geometry (scroll ${chartLayoutBeforeHover.scrollTop} -> ${chartLayoutAfterTooltip.scrollTop}): ${JSON.stringify(chartLayoutAfterTooltip)}`);
+    await evaluate(`document.querySelector('.profile-usage-chart')?.focus()`);
+    await sendKey('HOME');
+    await waitDom('keyboard Home selects the first chart point', `document.querySelector('.profile-usage-chart')?.getAttribute('aria-describedby') === 'profile-chart-tooltip'
+      && document.querySelector('#profile-chart-tooltip strong')?.textContent === '2 февраля 2024 г.'
+      && document.querySelector('.profile-usage-chart')?.getAttribute('aria-label')?.includes('2 февраля 2024 г.')`);
+    await sendKey('END');
+    assert.ok((await evaluate(`document.querySelector('.profile-usage-chart')?.getAttribute('aria-label') ?? ''`)).includes('2 марта 2024'),
+      'keyboard End reaches the latest chart point');
+    await evaluate(`document.activeElement?.blur()`);
+    await capture('stage6-profile-rich-chart');
+
+    const studioInputs = [
+      ['Остаток GigaChat Ultra', '1100000'], ['Остаток GigaChat Max', '2200000'],
+      ['Остаток GigaChat Pro', '3300000'], ['Остаток GigaChat Lite', '4400000'],
+      ['Дата окончания остатка', '2027-10-12'],
+    ];
+    const profileAnchorCallsBeforeBlank = state.profileAnchorSaveCalls.length;
+    await clickText('.profile-balance-actions button', 'Сверить с сайтом');
+    await waitDom('manual Studio form opens with keyboard focus', `document.querySelector('.profile-anchor-form[aria-busy="false"]')
+      && document.activeElement?.getAttribute('aria-label') === 'Остаток GigaChat Ultra'`);
+    await clickText('.profile-anchor-footer button', 'Сохранить сверку');
+    assert.equal(state.profileAnchorSaveCalls.length, profileAnchorCallsBeforeBlank, 'required manual values block blank input before IPC');
+    assert.equal(await evaluate(`document.querySelector('.profile-anchor-form')?.checkValidity()`), false,
+      'manual anchor form uses native required validation');
+    await fillInput('input[aria-label="Остаток GigaChat Ultra"]', '-1');
+    assert.equal(await evaluate(`document.querySelector('.profile-anchor-form')?.checkValidity()`), false,
+      'negative manual balance is rejected by native validation');
+    await clickText('.profile-anchor-footer button', 'Сохранить сверку');
+    assert.equal(state.profileAnchorSaveCalls.length, profileAnchorCallsBeforeBlank,
+      'invalid manual values are rejected before IPC');
+    await fillInput('input[aria-label="Остаток GigaChat Ultra"]', '1100000');
+    for (const [label, value] of studioInputs) await fillInput(`input[aria-label=${JSON.stringify(label)}]`, value);
+    state.rejectNextProfileAnchorSave = true;
+    await clickText('.profile-anchor-footer button', 'Сохранить сверку');
+    await waitDom('manual anchor storage failure is safe and leaves the form open', `document.querySelector('.profile-anchor-form [role="alert"]')?.textContent.includes('Не удалось сохранить сверку на этом устройстве')`);
+    assert.equal(await evaluate(`document.querySelector('input[aria-label="Остаток GigaChat Lite"]')?.value`), '4400000',
+      'failed save retains the entered family values');
+    assert.ok(!(await evaluate(`document.querySelector('.profile-anchor-form')?.textContent ?? ''`)).includes('storage'),
+      'manual-save error does not expose storage/provider internals');
+    state.deferProfileAnchorSave = true;
+    const profileAnchorCallsBeforeBusy = state.profileAnchorSaveCalls.length;
+    await clickText('.profile-anchor-footer button', 'Сохранить сверку');
+    await waitUntil('manual anchor write is pending', () => state.pendingProfileAnchorSaves.length === 1
+      && state.profileAnchorSaveCalls.length === profileAnchorCallsBeforeBusy + 1);
+    await waitDom('manual anchor form blocks conflicting input while saving', `document.querySelector('.profile-anchor-form[aria-busy="true"]')
+      && [...document.querySelectorAll('.profile-anchor-form input')].every((input) => input.disabled)
+      && [...document.querySelectorAll('.profile-anchor-form button')].every((button) => button.disabled)`);
+    assert.equal(await evaluate(`document.querySelector('input[aria-label="Остаток GigaChat Ultra"]')?.value`), '1100000',
+      'busy save does not clear or rewrite the user-entered anchor');
+    const pendingProfileAnchor = state.pendingProfileAnchorSaves[0];
+    state.profileView = clone(pendingProfileAnchor.view);
+    state.usageLedger = clone(state.profileFixtures.richLedger);
+    state.deferProfileAnchorSave = false;
+    pendingProfileAnchor.request.resolve(clone(pendingProfileAnchor.view));
+    await waitDom('successful manual anchor closes with its measured provenance', `!document.querySelector('.profile-anchor-form')
+      && document.querySelector('.profile-balance-section')?.textContent.includes('Бесплатный остаток')
+      && document.querySelector('.profile-balance-section')?.textContent.includes('До 12 окт. 2027')
+      && document.querySelector('.profile-balance-section [role="status"]')?.textContent.includes('Сверка сохранена')`);
+    await capture('stage6-profile-studio-anchor');
+    await clickText('.profile-balance-actions button', 'Сверить с сайтом');
+    await waitDom('manual anchor cancellation form opens', `document.querySelector('.profile-anchor-form')`);
+    await sendKey('ESC');
+    await waitDom('Escape closes manual form and restores its trigger focus', `!document.querySelector('.profile-anchor-form')
+      && document.activeElement?.textContent.includes('Сверить с сайтом')`);
+
+    const profileOriginalTheme = state.appSettings.theme;
+    const profileThemeCases = [
+      { value: 'dark', label: 'Тёмная' }, { value: 'emerald', label: 'Изумрудная' },
+      { value: 'light', label: 'Светлая' }, { value: 'warm', label: 'Тёплая' }, { value: 'system', label: 'Как в Windows' },
+    ];
+    for (const themeCase of profileThemeCases) {
+      await click('.profile-settings-button');
+      await clickText('.settings-nav-item', 'Оформление');
+      if (themeCase.value === 'system') await click('.system-theme');
+      else await clickText('.theme-option', themeCase.label);
+      await waitUntil(`${themeCase.label} profile theme is saved`, () => state.appSettings.theme === themeCase.value);
+      const resolvedTheme = themeCase.value === 'system'
+        ? await evaluate(`matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'`)
+        : themeCase.value;
+      await click('button.window-action[aria-label="Назад"]');
+      await waitDom(`${themeCase.label} returns to the profile screen`, `document.querySelector('.profile-page h1')?.textContent === 'Профиль'
+        && document.querySelector('.app-frame')?.classList.contains(${JSON.stringify(`theme-${resolvedTheme}`)})`);
+      await evaluate(`document.querySelector('.profile-chart-section')?.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' })`);
+      await waitDom(`${themeCase.label} calendar and chart context is fully visible`, `(() => {
+        const area = document.querySelector('.profile-page')?.closest('.view-area')?.getBoundingClientRect();
+        const chart = document.querySelector('.profile-chart-section')?.getBoundingClientRect();
+        return Boolean(area && chart && chart.top >= area.top - 1 && chart.bottom <= area.bottom + 1);
+      })()`);
+      await capture(`stage6-profile-theme-${themeCase.value}-calendar-chart`);
+      await evaluate(`(() => { const area = document.querySelector('.profile-page')?.closest('.view-area'); if (area) area.scrollTop = 0; })()`);
+      await waitDom(`${themeCase.label} profile returns to the top before its overview capture`, `document.querySelector('.profile-page')?.closest('.view-area')?.scrollTop === 0`);
+      await capture(`stage6-profile-theme-${themeCase.value}`);
+    }
+    await click('.profile-settings-button');
+    await clickText('.settings-nav-item', 'Оформление');
+    const originalProfileThemeCase = profileThemeCases.find((themeCase) => themeCase.value === profileOriginalTheme);
+    assert.ok(originalProfileThemeCase, 'fixture starts in one of the supported theme states');
+    if (profileOriginalTheme === 'system') await click('.system-theme');
+    else await clickText('.theme-option', originalProfileThemeCase.label);
+    await waitUntil('profile fixture theme is restored', () => state.appSettings.theme === profileOriginalTheme);
+    await click('button.window-action[aria-label="Назад"]');
+    await waitDom('profile screen remains ready for responsive captures', `document.querySelector('.profile-page h1')?.textContent === 'Профиль'`);
+
+    window.setSize(1520, 940);
+    await waitDom('wide profile screen has a usable content region', `document.querySelector('.profile-page')?.getBoundingClientRect().width > 700`);
+    await capture('stage6-profile-wide');
+    window.setSize(560, 480);
+    await waitDom('narrow profile screen reflows without page-level horizontal overflow', `innerWidth <= 600
+      && document.querySelector('.profile-page')?.clientWidth > 0
+      && document.querySelector('.profile-page')?.scrollWidth <= document.querySelector('.profile-page')?.clientWidth + 1`);
+    const narrowProfileLayout = JSON.parse(await evaluate(`JSON.stringify((() => {
+      const page = document.querySelector('.profile-page')?.getBoundingClientRect();
+      const chart = document.querySelector('.profile-chart-frame')?.getBoundingClientRect();
+      const heatmap = document.querySelector('.profile-heatmap-scroll');
+      return { pageWidth: page?.width ?? 0, chartWidth: chart?.width ?? 0,
+        heatmapClientWidth: heatmap?.clientWidth ?? 0, heatmapScrollWidth: heatmap?.scrollWidth ?? 0,
+        chartClientWidth: document.querySelector('.profile-chart-scroll')?.clientWidth ?? 0,
+        chartScrollWidth: document.querySelector('.profile-chart-scroll')?.scrollWidth ?? 0 };
+    })())`));
+    assert.ok(narrowProfileLayout.pageWidth > 0 && narrowProfileLayout.chartWidth > 0,
+      `narrow profile retains its own responsive content: ${JSON.stringify(narrowProfileLayout)}`);
+    assert.ok(narrowProfileLayout.heatmapScrollWidth >= narrowProfileLayout.heatmapClientWidth
+      && narrowProfileLayout.chartScrollWidth >= narrowProfileLayout.chartClientWidth,
+    `annual calendar and chart own their narrow overflow: ${JSON.stringify(narrowProfileLayout)}`);
+    await capture('stage6-profile-narrow');
+    await evaluate(`document.querySelector('.profile-balance-grid')?.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' })`);
+    await waitDom('narrow balance cards are visible without page-level horizontal overflow', `(() => {
+      const page = document.querySelector('.profile-page');
+      const area = page?.closest('.view-area')?.getBoundingClientRect();
+      const pageRect = page?.getBoundingClientRect();
+      const cards = [...document.querySelectorAll('.profile-balance-card')];
+      return Boolean(page && area && page.scrollWidth <= page.clientWidth + 1 && cards.length === 4
+        && cards.every((card) => {
+          const rect = card.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0 && rect.left >= (pageRect?.left ?? 0) - 1
+            && rect.right <= (pageRect?.right ?? 0) + 1 && rect.top >= area.top - 1 && rect.bottom <= area.bottom + 1;
+        }));
+    })()`);
+    await capture('stage6-profile-narrow-balance-cards');
+    await evaluate(`document.querySelector('.profile-chart-legend')?.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' })`);
+    await waitDom('narrow chart legend and graph remain visible within their own scroll area', `(() => {
+      const page = document.querySelector('.profile-page');
+      const area = page?.closest('.view-area')?.getBoundingClientRect();
+      const pageRect = page?.getBoundingClientRect();
+      const legend = document.querySelector('.profile-chart-legend')?.getBoundingClientRect();
+      const chart = document.querySelector('.profile-chart-scroll')?.getBoundingClientRect();
+      return Boolean(page && area && legend && chart && page.scrollWidth <= page.clientWidth + 1
+        && legend.width > 0 && legend.left >= (pageRect?.left ?? 0) - 1 && legend.right <= (pageRect?.right ?? 0) + 1
+        && legend.top >= area.top - 1 && legend.bottom <= area.bottom + 1
+        && chart.width > 0 && chart.left >= (pageRect?.left ?? 0) - 1 && chart.right <= (pageRect?.right ?? 0) + 1
+        && chart.bottom > area.top && chart.top < area.bottom);
+    })()`);
+    await capture('stage6-profile-narrow-chart-legend');
+    await evaluate(`(() => { const area = document.querySelector('.profile-page')?.closest('.view-area'); if (area) area.scrollTop = 0; })()`);
+    await waitDom('narrow profile scroll is restored to the top before restoring the window', `document.querySelector('.profile-page')?.closest('.view-area')?.scrollTop === 0`);
+    window.setSize(profileOriginalSize[0], profileOriginalSize[1]);
+    window.webContents.setZoomFactor(profileOriginalZoom);
+    await waitDom('profile viewport restores before returning to chat', `document.querySelector('.profile-page h1')?.textContent === 'Профиль'`);
+
+    await click('button[aria-label="Назад"]');
+    await waitDom('Chat A returns after Profile review', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'`);
+    state.profileView = clone(state.profileFixtures.empty);
+    const unknownBalancePickerReads = state.profileViewCalls;
+    await click('button[aria-label="Выбрать модель GigaChat"]');
+    await waitUntil('model picker reads the unknown-balance profile DTO', () => state.profileViewCalls > unknownBalancePickerReads);
+    const unknownBalanceRings = JSON.parse(await evaluate(`JSON.stringify([...document.querySelectorAll('.model-picker-balance')].map((ring) => ({
+      label: ring.getAttribute('aria-label') ?? '', known: ring.classList.contains('is-known'), filled: Boolean(ring.querySelector('.context-ring-fill')),
+    })))`));
+    assert.equal(unknownBalanceRings.length, 4, 'all four model options have a balance ring');
+    assert.ok(unknownBalanceRings.every((ring) => ring.label.includes('Остаток неизвестен') && !ring.known && !ring.filled),
+      'unknown balances keep four neutral unfilled rings and do not imply a pool size');
+    assert.equal(await evaluate(`document.querySelector('.model-picker-option[aria-current="true"]')?.getAttribute('aria-label').includes('Остаток неизвестен')`), true,
+      'the selected model keeps its identity while its balance remains unknown');
+    await capture('stage6-model-picker-unknown-rings');
+    await sendKey('ESC');
+
+    state.profileView = clone(state.profileFixtures.expired);
+    const expiredBalancePickerReads = state.profileViewCalls;
+    await click('button[aria-label="Выбрать модель GigaChat"]');
+    await waitUntil('model picker reads the expired-balance profile DTO', () => state.profileViewCalls > expiredBalancePickerReads);
+    await waitDom('expired labels reach all four model balance rings', `document.querySelectorAll('.model-picker-balance').length === 4
+      && [...document.querySelectorAll('.model-picker-balance')].every((ring) => ring.getAttribute('aria-label')?.includes('Срок сверки истёк'))`);
+    const expiredBalanceRings = JSON.parse(await evaluate(`JSON.stringify([...document.querySelectorAll('.model-picker-balance')].map((ring) => ({
+      label: ring.getAttribute('aria-label') ?? '', known: ring.classList.contains('is-known'), filled: Boolean(ring.querySelector('.context-ring-fill')),
+    })))`));
+    assert.equal(expiredBalanceRings.length, 4, 'expired account observation still has one ring per current model family');
+    assert.ok(expiredBalanceRings.every((ring) => ring.label.includes('Срок сверки истёк') && !ring.known && !ring.filled),
+      'expired balances are labeled stale and do not retain a misleading numeric ring');
+    await capture('stage6-model-picker-expired-rings');
+    await sendKey('ESC');
+
+    state.profileView = clone(state.profileFixtures.postAnchorLite);
+    const modelPickerProfileReads = state.profileViewCalls;
+    await click('button[aria-label="Выбрать модель GigaChat"]');
+    await waitDom('picker shows the separately estimated Lite remainder', `document.querySelector('.model-picker-popup .model-picker-option[aria-label^="GigaChat Lite"]')?.getAttribute('aria-label').includes('Оценка: около')
+      && document.querySelector('.model-picker-popup .model-picker-option[aria-label^="GigaChat Lite"]')?.getAttribute('aria-label').replace(/\\D/g, '').includes('6399369')
+      && document.querySelector('.model-picker-popup .model-picker-option[aria-label^="GigaChat Lite"]')?.getAttribute('aria-label').includes('учтено 631 токенов последующего расхода')
+      && document.querySelector('.model-picker-popup .model-picker-option[aria-label^="GigaChat Lite"]')?.getAttribute('aria-label').includes('Полный размер пула неизвестен')`);
+    await waitUntil('model picker reads the same profile DTO', () => state.profileViewCalls > modelPickerProfileReads);
+    const liteBalanceDescription = await evaluate(`document.querySelector('.model-picker-popup .model-picker-option[aria-label^="GigaChat Lite"]')?.getAttribute('aria-label') ?? ''`);
+    assert.ok(liteBalanceDescription.includes('после сверки по API от'), 'model picker exposes the estimate provenance and observation time');
+    const knownBalanceRings = JSON.parse(await evaluate(`JSON.stringify([...document.querySelectorAll('.model-picker-balance')].map((ring) => ({
+      known: ring.classList.contains('is-known'), filled: Boolean(ring.querySelector('.context-ring-fill')),
+    })))`));
+    assert.equal(knownBalanceRings.length, 4, 'the known balance view retains a ring for every current family');
+    assert.ok(knownBalanceRings.every((ring) => ring.known && !ring.filled),
+      'known remaining balances do not imply a fabricated full-pool percentage');
+    await capture('stage6-model-picker-post-anchor-estimate');
+    await sendKey('ESC');
+    passed('Profile renderer preserves unknowns, calendar focus/hover, balance estimates, manual anchors, and responsive themes');
     const toolTurnBase = {
       id: 'turn-a-approved-tool', chatId: 'chat-a', anchorMessageId: 'chat-a-tool-user', assistantMessageId: 'synthetic-tool-answer', createdAt: timestamp, activity: [
         { kind: 'provider', at: timestamp, activity: 'waiting-for-tool' },
@@ -4949,7 +5573,7 @@ const methods = {
   browser: ['getStatus','newTab','closeTab','activateTab','navigate','back','forward','reload','setBounds'],
   voice: ['getStatus','requestAccess','transcribe','cancel'],
   settings: ['get','update','chooseProjectsFolder','openProjectsFolder','listOpeners','getAppInfo','getAutoStart','setAutoStart','readInstructions','saveInstructions','saveInstructionsCopy','deleteAppData'],
-  usage: ['getLocalStats','getLedger'],
+  usage: ['getLocalStats','getLedger','getProfileView','refreshBalance','saveStudioBalanceAnchor'],
 };
 const api = {};
 for (const [group, names] of Object.entries(methods)) {
