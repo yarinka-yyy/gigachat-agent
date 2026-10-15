@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import type { ChatDetail, ChatMessage, ProviderProtocolExchange, ProviderTurnRequest } from './contracts';
 import type { ProviderStateOwnershipView } from './store';
 
-export const HISTORICAL_PROVIDER_STATE_ATTACHMENTS_MESSAGE = 'Нельзя подтвердить доступ к прежним вложениям для текущего ключа. Создайте новый чат и прикрепите файлы заново.';
+export const HISTORICAL_PROVIDER_STATE_ATTACHMENTS_MESSAGE = 'Нельзя подтвердить доступ к прежним вложениям в текущем подключении. Создайте новый чат и прикрепите файлы заново.';
 
 export class HistoricalProviderStateAttachmentsError extends Error {
   constructor() {
@@ -92,6 +92,19 @@ export function filterProviderStateForOutboundRequest(
   }
   const ownedReceiptIndex = uniqueOwnershipIndex(input.ownership.receipts, (entry) =>
     receiptTupleKey(entry.receiptId, entry.anchorMessageId));
+  const ownedReceiptWireIndex = new Map<string, boolean | null>();
+  for (const entry of input.ownership.receipts) {
+    const key = receiptTupleKey(entry.receiptId, entry.anchorMessageId);
+    ownedReceiptWireIndex.set(key, ownedReceiptWireIndex.has(key) ? null : entry.wireOwned);
+  }
+  const rawProtocolByReceipt = new Map<string, ProviderProtocolExchange[]>();
+  for (const exchange of input.rawProtocolHistory) {
+    if (!exchange.receiptId || !exchange.wire) continue;
+    const key = receiptTupleKey(exchange.receiptId, exchange.anchorMessageId);
+    const entries = rawProtocolByReceipt.get(key) ?? [];
+    entries.push(exchange);
+    rawProtocolByReceipt.set(key, entries);
+  }
   const ownedProtocolStates = new Set<string>();
   for (const [key, receipts] of receiptGroups) {
     if (receipts.length > 0 && receipts.every((receipt) =>
@@ -120,6 +133,35 @@ export function filterProviderStateForOutboundRequest(
   }
 
   for (const exchange of request.protocolHistory ?? []) {
+    if (exchange.wire) {
+      const receiptId = exchange.receiptId;
+      const key = receiptId ? receiptTupleKey(receiptId, exchange.anchorMessageId) : null;
+      const rawMatches = key ? rawProtocolByReceipt.get(key) : undefined;
+      const bindingOwned = key && ownedReceiptWireIndex.get(key) === true;
+      const hasExactRawWire = rawMatches?.length === 1 && JSON.stringify(rawMatches[0]?.wire) === JSON.stringify(exchange.wire);
+      const matchingReceipts = receiptId === undefined ? [] : input.detail.toolReceipts.filter((receipt) =>
+        receipt.receiptId === receiptId && receipt.anchorMessageId === exchange.anchorMessageId);
+      const hasMatchingReceipt = matchingReceipts.length === 1 && matchingReceipts[0]?.name === exchange.name
+        && JSON.stringify(matchingReceipts[0]?.arguments) === JSON.stringify(exchange.arguments)
+        && matchingReceipts[0]?.content === exchange.content
+        && matchingReceipts[0]?.functionsStateId === exchange.functionsStateId;
+      const wireStateId = exchange.wire.toolStateId ?? null;
+      const statePointerMatchesWire = exchange.functionsStateId === wireStateId;
+      const stateOwnedWithWire = wireStateId === null || (key !== null
+        && !ambiguousRawReceiptIds.has(receiptId ?? '')
+        && !ambiguousOwnedReceiptIds.has(receiptId ?? '')
+        && ownedReceiptIndex.get(key) === true);
+      if (!bindingOwned || !hasExactRawWire || !hasMatchingReceipt || !statePointerMatchesWire || !stateOwnedWithWire) {
+        delete exchange.wire;
+        delete exchange.receiptId;
+        exchange.functionsStateId = null;
+        removedState = true;
+        continue;
+      }
+      // The V2 wire and its normalized state pointer form one ownership unit.
+      // Do not let the legacy state pass below strip only half of that unit.
+      continue;
+    }
     if (exchange.functionsStateId === null) continue;
     const stateId = exchange.functionsStateId;
     const key = typeof stateId === 'string' && stateId.length > 0

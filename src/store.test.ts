@@ -529,7 +529,7 @@ test('schema 8 home-send journal recovers linked local files without inventing a
   assert.equal(accepted?.turn.messages[0]?.attachmentIds, undefined);
   assert.deepEqual(await readFile(await recovered.getArtifactPath(detail.id, staged.attachments[0]!.id)), Buffer.from('local bytes from schema 8'));
   const savedChat = JSON.parse(await readFile(join(directory, 'chats', detail.id, 'chat.json'), 'utf8')) as Record<string, unknown>;
-  assert.equal(savedChat.schemaVersion, 12);
+  assert.equal(savedChat.schemaVersion, 13);
 });
 
 test('schema 8 compact snapshot validates against its original linked-file prefix then upgrades the hash', async (t) => {
@@ -568,7 +568,7 @@ test('schema 8 compact snapshot validates against its original linked-file prefi
   assert.equal(detail.compactSnapshot?.coveredPrefixHash, hashCompactionPrefix(detail.messages, []));
   assert.equal(await readFile(await restored.getArtifactPath(chat.id, pendingId), 'utf8'), 'local attachment bytes');
   const saved = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown>;
-  assert.equal(saved.schemaVersion, 12);
+  assert.equal(saved.schemaVersion, 13);
   assert.deepEqual((saved.compactSnapshot as CompactSnapshot).coveredPrefixHash, detail.compactSnapshot?.coveredPrefixHash);
 });
 
@@ -1311,7 +1311,7 @@ test('migrates v1 projects, chats, drafts, and theme without losing data', async
   assert.equal(JSON.parse(await readFile(join(directory, 'projects.json'), 'utf8')).schemaVersion, 2);
   assert.equal(JSON.parse(await readFile(join(directory, 'chats.json'), 'utf8')).schemaVersion, 1);
   assert.equal(await readFile(join(directory, 'chats.json.bak'), 'utf8'), await readFile(join(directory, 'chats.json'), 'utf8'));
-  assert.equal(JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')).schemaVersion, 12);
+  assert.equal(JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')).schemaVersion, 13);
   assert.equal(JSON.parse(await readFile(join(directory, 'settings.json'), 'utf8')).schemaVersion, 10);
   await store.deleteChat(chat.id);
   assert.deepEqual(await (await openStore(directory)).listChats(), []);
@@ -1369,7 +1369,7 @@ test('unfinished legacy migration preserves existing invalid chat details', asyn
         assert.deepEqual(restored.messages, kind === 'valid' ? detail.messages : []);
         if (validUnmarkedLegacyDetail) {
           const migratedDetail = JSON.parse(await readFile(detailPath, 'utf8')) as Record<string, unknown>;
-          assert.equal(migratedDetail.schemaVersion, 12);
+          assert.equal(migratedDetail.schemaVersion, 13);
           assert.equal(migratedDetail.compactSnapshot, null);
           assert.equal(migratedDetail.draft, 'newer draft');
         }
@@ -1657,13 +1657,13 @@ test('schema 11 provider states migrate as unowned without changing public histo
   assert.equal(detail.compactSnapshot?.coveredPrefixHash, before.compactSnapshot?.coveredPrefixHash);
   assert.deepEqual(await restored.getProviderStateOwnership(chat.id, scopeA), {
     messages: [{ messageId: accepted.turn.assistantMessageId, owned: false }],
-    receipts: [{ receiptId: receipt.receiptId, anchorMessageId: accepted.turn.messageId, owned: false }],
+    receipts: [{ receiptId: receipt.receiptId, anchorMessageId: accepted.turn.messageId, owned: false, wireOwned: false }],
     compact: { snapshotId: snapshot.id, owned: false, functionsStateId: null },
   });
   const migrated = JSON.parse(await readFile(filePath, 'utf8')) as Record<string, unknown>;
-  assert.equal(migrated.schemaVersion, 12);
+  assert.equal(migrated.schemaVersion, 13);
   assert.deepEqual(migrated.providerStateOwnership, {
-    schemaVersion: 1, messages: [], receipts: [], compact: null,
+    schemaVersion: 2, messages: [], receipts: [], compact: null,
   });
   const bytesBeforeLegacyRetry = await readFile(filePath);
   await assert.rejects(restored.commitCompactSnapshot(chat.id, snapshot, snapshot.id, undefined, undefined,
@@ -1675,13 +1675,110 @@ test('schema 11 provider states migrate as unowned without changing public histo
   assert.deepEqual(await readFile(filePath), bytesBeforeLegacyRetry, 'an idempotent receipt retry cannot claim legacy state');
   assert.deepEqual(await restored.getProviderStateOwnership(chat.id, scopeA), {
     messages: [{ messageId: accepted.turn.assistantMessageId, owned: false }],
-    receipts: [{ receiptId: receipt.receiptId, anchorMessageId: accepted.turn.messageId, owned: false }],
+    receipts: [{ receiptId: receipt.receiptId, anchorMessageId: accepted.turn.messageId, owned: false, wireOwned: false }],
     compact: { snapshotId: snapshot.id, owned: false, functionsStateId: null },
   });
   const publicJson = JSON.stringify(detail);
   assert.equal(publicJson.includes('providerStateOwnership'), false);
   assert.equal(publicJson.includes(scopeA), false);
   assert.equal(publicJson.includes('legacy-compact-state'), false);
+});
+
+test('schema 12 accepts only private schema 1 and migrates it as legacy V1 state', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-provider-state-schema12-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const scopeA = 'a'.repeat(64);
+  const assistantState = 'legacy-assistant-state-schema12';
+  const receiptState = 'legacy-receipt-state-schema12';
+  const compactState = 'legacy-compact-state-schema12';
+  const accepted = await store.acceptLocalMessage(chat.id, 'Nonempty legacy state fixture.', 'schema12-v1-state');
+  await appendAcceptedAnswer(store, accepted.turn, 'Legacy assistant answer.', assistantState, scopeA);
+  const receipt = {
+    receiptId: 'e'.repeat(64), name: 'read', arguments: { path: 'legacy.txt' }, content: null,
+    functionsStateId: receiptState,
+  };
+  assert.equal((await store.beginToolReceipt(chat.id, accepted.turn.messageId, receipt, scopeA)).shouldExecute, true);
+  await store.completeToolReceipt(chat.id, accepted.turn.messageId, receipt.receiptId, 'completed',
+    JSON.stringify({ ok: true, result: { contents: 'legacy result' } }));
+  const prefix = await store.getCompactionPrefix(chat.id, accepted.turn.messageId);
+  const snapshot: CompactSnapshot = {
+    id: 'schema12-v1-compact', version: 1, boundaryMessageId: accepted.turn.messageId,
+    coveredThroughMessageId: prefix.coveredThroughMessageId, coveredPrefixHash: prefix.coveredPrefixHash,
+    text: 'Legacy compact summary.', modelId: 'GigaChat-3-Pro', provenance: 'fixture', createdAt: timestamp,
+  };
+  await store.commitCompactSnapshot(chat.id, snapshot, null, undefined, undefined,
+    { accountScope: scopeA, functionsStateId: compactState });
+  const before = await store.getChat(chat.id);
+  const path = join(directory, 'chats', chat.id, 'chat.json');
+  const current = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+  current.schemaVersion = 12;
+  const hashState = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex');
+  current.providerStateOwnership = {
+    schemaVersion: 1,
+    messages: [{ messageId: accepted.turn.assistantMessageId, accountScope: scopeA, stateIdHash: hashState(assistantState) }],
+    receipts: [{ receiptId: receipt.receiptId, anchorMessageId: accepted.turn.messageId, accountScope: scopeA, stateIdHash: hashState(receiptState) }],
+    compact: { snapshotId: snapshot.id, functionsStateId: compactState, accountScope: scopeA, stateIdHash: hashState(compactState) },
+  };
+  await writeFile(path, JSON.stringify(current), 'utf8');
+
+  const migratedStore = await openStore(directory);
+  const migrated = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+  assert.equal(migrated.schemaVersion, 13);
+  const migratedOwnership = migrated.providerStateOwnership as {
+    schemaVersion: number; messages: Array<Record<string, unknown>>; receipts: Array<Record<string, unknown>>;
+    compact: Record<string, unknown> | null;
+  };
+  assert.equal(migratedOwnership.schemaVersion, 2);
+  assert.equal(migratedOwnership.messages[0]?.protocolVersion, 'v1');
+  assert.equal(migratedOwnership.receipts[0]?.protocolVersion, 'v1');
+  assert.equal(migratedOwnership.compact?.protocolVersion, 'v1');
+  assert.equal(Object.prototype.hasOwnProperty.call(migratedOwnership.receipts[0]!, 'wire'), false);
+  const migratedDetail = await migratedStore.getChat(chat.id);
+  assert.deepEqual(migratedDetail.messages, before.messages);
+  assert.deepEqual(migratedDetail.toolReceipts, before.toolReceipts);
+  assert.deepEqual(migratedDetail.compactSnapshot, snapshot);
+  assert.deepEqual(await migratedStore.getProviderStateOwnership(chat.id, scopeA), {
+    messages: [{ messageId: accepted.turn.assistantMessageId, owned: false }],
+    receipts: [{ receiptId: receipt.receiptId, anchorMessageId: accepted.turn.messageId, owned: false, wireOwned: false }],
+    compact: { snapshotId: snapshot.id, owned: false, functionsStateId: null },
+  });
+
+  const mismatched = { ...migrated, schemaVersion: 12 };
+  const mismatchedBytes = JSON.stringify(mismatched);
+  await writeFile(path, mismatchedBytes, 'utf8');
+  const rejectedStore = await openStore(directory);
+  assert.ok((await rejectedStore.getStorageIssues()).some((issue) => issue.includes('файл истории повреждён')),
+    'schema 12 must never accept private schema 2 as an upgrade signal');
+  assert.equal(await readFile(path, 'utf8'), mismatchedBytes, 'rejected versions remain byte-for-byte untouched');
+});
+
+test('tool receipt writes project only public receipt fields from structurally wider callers', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-public-tool-receipt-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const accepted = await store.acceptLocalMessage(chat.id, 'Private field projection.', 'private-field-projection');
+  const input = {
+    receiptId: 'a'.repeat(64), name: 'read', arguments: { path: 'fixture.txt' }, content: null,
+    functionsStateId: null,
+    wire: { content: [{ function_call: { name: 'read', arguments: { path: 'fixture.txt' } } }] },
+    wireHash: 'private-wire-hash-sentinel', accountScope: 'private-account-scope-sentinel', protocolVersion: 'v2',
+  };
+  const begun = await store.beginToolReceipt(chat.id, accepted.turn.messageId, input);
+  const detail = await store.getChat(chat.id);
+  const publicReceipt = detail.toolReceipts[0]!;
+  assert.equal(begun.shouldExecute, true);
+  assert.deepEqual(Object.keys(publicReceipt).sort(), [
+    'anchorMessageId', 'arguments', 'content', 'createdAt', 'functionsStateId', 'name', 'receiptId', 'result', 'status',
+  ]);
+  assert.equal(JSON.stringify(detail).includes('private-wire-hash-sentinel'), false);
+  assert.equal(JSON.stringify(detail).includes('private-account-scope-sentinel'), false);
+  assert.equal(JSON.stringify(detail).includes('"wire"'), false);
+  const stored = JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')) as Record<string, unknown>;
+  assert.equal(JSON.stringify(stored.toolReceipts).includes('private-wire-hash-sentinel'), false);
+  assert.deepEqual(stored.providerStateOwnership, { schemaVersion: 2, messages: [], receipts: [], compact: null });
 });
 
 test('captured assistant state is private, account-bound, idempotent, and saved only after atomic write', async (t) => {
@@ -1712,6 +1809,14 @@ test('captured assistant state is private, account-bound, idempotent, and saved 
   await assert.rejects(appendAcceptedAnswer(store, accepted.turn, 'The answer.', 'opaque-state-A', scopeB), /владельц/i);
   assert.equal((await store.getProviderStateOwnership(chat.id, scopeA)).messages[0]?.owned, true);
 
+  const statelessChat = await store.createChat();
+  const statelessTurn = await store.acceptLocalMessage(statelessChat.id, 'No provider state.', 'turn-state-empty');
+  const statelessBefore = await store.getChat(statelessChat.id);
+  await assert.rejects(appendAcceptedAnswer(store, statelessTurn.turn, 'Stateless answer.', undefined, scopeA), /пустому состоянию/i);
+  assert.deepEqual(await store.getChat(statelessChat.id), statelessBefore,
+    'an owner cannot be attached when the assistant answer contains no provider state');
+  assert.deepEqual(await store.getProviderStateOwnership(statelessChat.id, scopeA), { messages: [], receipts: [], compact: null });
+
   const other = await store.createChat();
   const otherTurn = await store.acceptLocalMessage(other.id, 'A second chat.', 'turn-state-other');
   const otherPath = join(directory, 'chats', other.id, 'chat.json');
@@ -1738,7 +1843,7 @@ test('captured assistant state is private, account-bound, idempotent, and saved 
     'deleting one chat does not affect another chat owner');
 });
 
-test('tool receipt ownership is keyed by receipt and anchor and cannot be rebound', async (t) => {
+test('legacy V1 tool receipt state remains unowned for V2 across receipt and anchor reuse', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-provider-state-receipts-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const scopeA = 'a'.repeat(64);
@@ -1760,12 +1865,12 @@ test('tool receipt ownership is keyed by receipt and anchor and cannot be reboun
   const firstA = await store.getProviderStateOwnership(chat.id, scopeA);
   const firstB = await store.getProviderStateOwnership(chat.id, scopeB);
   assert.deepEqual(firstA.receipts, [
-    { receiptId: input.receiptId, anchorMessageId: first.turn.messageId, owned: true },
-    { receiptId: input.receiptId, anchorMessageId: second.turn.messageId, owned: false },
+    { receiptId: input.receiptId, anchorMessageId: first.turn.messageId, owned: false, wireOwned: false },
+    { receiptId: input.receiptId, anchorMessageId: second.turn.messageId, owned: false, wireOwned: false },
   ]);
   assert.deepEqual(firstB.receipts, [
-    { receiptId: input.receiptId, anchorMessageId: first.turn.messageId, owned: false },
-    { receiptId: input.receiptId, anchorMessageId: second.turn.messageId, owned: true },
+    { receiptId: input.receiptId, anchorMessageId: first.turn.messageId, owned: false, wireOwned: false },
+    { receiptId: input.receiptId, anchorMessageId: second.turn.messageId, owned: false, wireOwned: false },
   ]);
   const filePath = join(directory, 'chats', chat.id, 'chat.json');
   const before = await readFile(filePath);
@@ -1867,7 +1972,66 @@ test('compact state commits with its snapshot and a replacement without state cl
   assert.deepEqual(finalDetail.compactSnapshot, secondSnapshot);
 });
 
-test('rejects malformed schema 12 provider-state metadata without rewriting corrupt chat bytes', async (t) => {
+test('V2 wire is part of the compact prefix hash and a coherent wire rewrite is rejected after reopen', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-v2-wire-compact-hash-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const accepted = await store.acceptLocalMessage(chat.id, 'Сохрани V2 вызов в покрытом префиксе.', 'turn-v2-wire-compact');
+  const accountScope = '9'.repeat(64);
+  const stateId = 'e4e2d3c4-5566-7a88-8b99-aabbccddeeff';
+  const wire = {
+    content: [{ function_call: { id: 'e4e2d3c4-5566-4a88-8b99-aabbccddeeff', name: 'read', arguments: { path: 'covered.txt' } } }],
+    messageId: 'assistant-covered-call', toolStateId: stateId,
+  };
+  const receipt = {
+    receiptId: 'f'.repeat(64), name: 'read', arguments: { path: 'covered.txt' }, content: null,
+    functionsStateId: stateId,
+  };
+  assert.equal((await store.beginToolReceipt(chat.id, accepted.turn.messageId, receipt, accountScope, wire)).shouldExecute, true);
+  await store.completeToolReceipt(chat.id, accepted.turn.messageId, receipt.receiptId, 'completed',
+    JSON.stringify({ ok: true, result: { contents: 'covered result' } }));
+  const prefix = await store.getCompactionPrefix(chat.id, accepted.turn.messageId);
+  assert.deepEqual(prefix.protocolHistory[0]?.wire, wire);
+  assert.equal(prefix.coveredPrefixHash, hashCompactionPrefix(prefix.messages, prefix.protocolHistory));
+  const withoutWire = prefix.protocolHistory.map((exchange) => {
+    const copy = structuredClone(exchange);
+    delete copy.wire;
+    delete copy.receiptId;
+    return copy;
+  });
+  assert.notEqual(prefix.coveredPrefixHash, hashCompactionPrefix(prefix.messages, withoutWire),
+    'the V2 call envelope participates in the committed raw-prefix hash');
+  const snapshot: CompactSnapshot = {
+    id: 'compact-v2-wire-prefix', version: 1, boundaryMessageId: accepted.turn.messageId,
+    coveredThroughMessageId: prefix.coveredThroughMessageId, coveredPrefixHash: prefix.coveredPrefixHash,
+    text: 'Summary of the covered V2 call.', modelId: 'GigaChat-3-Pro', provenance: 'fixture', createdAt: timestamp,
+  };
+  await store.commitCompactSnapshot(chat.id, snapshot, null);
+
+  const reopened = await openStore(directory);
+  const reopenedPrefix = await reopened.getCompactionPrefix(chat.id, accepted.turn.messageId);
+  assert.deepEqual(reopenedPrefix.protocolHistory[0]?.wire, wire);
+  assert.equal(reopenedPrefix.coveredPrefixHash, snapshot.coveredPrefixHash);
+
+  const chatPath = join(directory, 'chats', chat.id, 'chat.json');
+  const stored = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown> & {
+    providerStateOwnership: { receipts: Array<{ wire: Record<string, unknown>; wireHash: string }> };
+  };
+  const binding = stored.providerStateOwnership.receipts[0]!;
+  const changedWire = structuredClone(binding.wire) as { messageId?: string };
+  changedWire.messageId = 'assistant-covered-call-tampered';
+  binding.wire = changedWire;
+  binding.wireHash = createHash('sha256').update(JSON.stringify(changedWire), 'utf8').digest('hex');
+  await writeFile(chatPath, JSON.stringify(stored), 'utf8');
+  const tamperedBytes = await readFile(chatPath);
+  const rejected = await openStore(directory);
+  assert.ok((await rejected.getStorageIssues()).some((issue) => issue.includes('файл истории повреждён')),
+    'a wire change with a recomputed private wire hash still invalidates the compact prefix');
+  assert.deepEqual(await readFile(chatPath), tamperedBytes, 'reopen does not rewrite tampered history');
+});
+
+test('rejects malformed schema 13 provider-state metadata without rewriting corrupt chat bytes', async (t) => {
   const cases = ['hash', 'scope', 'duplicate', 'unbound-message', 'receipt-hash', 'receipt-duplicate',
     'unbound-receipt', 'compact-snapshot', 'compact-hash', 'unknown-schema'] as const;
   for (const corruption of cases) {
@@ -1910,7 +2074,7 @@ test('rejects malformed schema 12 provider-state metadata without rewriting corr
         case 'unbound-receipt': ownership.receipts[0]!.anchorMessageId = 'not-a-user-anchor'; break;
         case 'compact-snapshot': ownership.compact!.snapshotId = 'not-the-current-snapshot'; break;
         case 'compact-hash': ownership.compact!.stateIdHash = 'f'.repeat(64); break;
-        case 'unknown-schema': raw.schemaVersion = 13; break;
+        case 'unknown-schema': raw.schemaVersion = 14; break;
       }
       const corruptBytes = JSON.stringify(raw);
       await writeFile(path, corruptBytes, 'utf8');
@@ -2046,7 +2210,7 @@ test('schema 9 compact metadata survives turn-record migration without invented 
   assert.deepEqual(migrated.compactSnapshot, snapshot);
   assert.deepEqual(migrated.turns, [], 'schema 9 history has no reliable turn metadata to invent');
   const saved = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  assert.equal(saved.schemaVersion, 12);
+  assert.equal(saved.schemaVersion, 13);
   assert.deepEqual(saved.compactSnapshot, snapshot);
 });
 
@@ -2113,7 +2277,7 @@ test('migrates a schema 10 chat to 11 without rewriting attachment links, raw us
   assert.equal((await restored.getUsageProfileView(0)).skills.unknownTurnCount, 1,
     'legacy completed turn remains unknown rather than being migrated to known-no-Skill');
   const saved = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown>;
-  assert.equal(saved.schemaVersion, 12);
+  assert.equal(saved.schemaVersion, 13);
   assert.equal(((saved.turns as Array<Record<string, unknown>>)[0])?.invokedSkillId, undefined);
 });
 
@@ -2165,7 +2329,7 @@ test('schema 9 home-send journal recovers a stable interrupted turn without repl
   assert.equal(detail.messages.some((message) => message.role === 'assistant'), false);
   assert.deepEqual(accepted?.turn.messages.map((message) => message.id), [detail.messages[0]?.id]);
   assert.equal(await readFile(source, 'utf8'), 'preserved local source');
-  assert.equal((JSON.parse(await readFile(join(directory, 'chats', detail.id, 'chat.json'), 'utf8')) as Record<string, unknown>).schemaVersion, 12);
+  assert.equal((JSON.parse(await readFile(join(directory, 'chats', detail.id, 'chat.json'), 'utf8')) as Record<string, unknown>).schemaVersion, 13);
 });
 
 test('persists each provider pairing while reusing a completed side effect for a new state ID', async (t) => {
@@ -2201,6 +2365,68 @@ test('persists each provider pairing while reusing a completed side effect for a
   assert.equal(detail.toolReceipts[1]?.effectId, firstReceipt.effectId);
 });
 
+test('V2 side-effect reuse persists the new call and state envelope without repeating the effect', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-tool-receipt-v2-effect-wire-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const accepted = await store.acceptLocalMessage(chat.id, 'Запиши файл ровно один раз.', 'turn-v2-write-once');
+  const accountScope = 'f'.repeat(64);
+  const effectId = 'b'.repeat(64);
+  const argumentsValue = { path: 'result.txt', contents: 'содержимое' };
+  const stateOne = 'b3e2d3c4-5566-7a88-8b99-aabbccddeeff';
+  const stateTwo = 'c3e2d3c4-5566-7a88-8b99-aabbccddeeff';
+  const firstReceipt = {
+    receiptId: 'a'.repeat(64), effectId, name: 'write', arguments: argumentsValue,
+    content: 'Сохраню результат.', functionsStateId: stateOne,
+  };
+  const firstWire = {
+    content: [
+      { text: 'Сохраню результат.' },
+      { function_call: { id: 'a3e2d3c4-5566-4a88-8b99-aabbccddeeff', name: 'write',
+        arguments: '{"path":"result.txt","contents":"содержимое"}' } },
+    ],
+    messageId: 'assistant-write-call-one', toolStateId: stateOne,
+  };
+  let writeEffects = 0;
+  const first = await store.beginToolReceipt(chat.id, accepted.turn.messageId, firstReceipt, accountScope, firstWire);
+  assert.equal(first.shouldExecute, true);
+  if (first.shouldExecute) writeEffects += 1;
+  const result = JSON.stringify({ ok: true, result: { bytes: 22 } });
+  await store.completeToolReceipt(chat.id, accepted.turn.messageId, firstReceipt.receiptId, 'completed', result);
+
+  const secondReceipt = { ...firstReceipt, receiptId: 'c'.repeat(64), functionsStateId: stateTwo };
+  const secondWire = {
+    content: [
+      { text: 'Сохраню результат.' },
+      { function_call: { id: 'c3e2d3c4-5566-4a88-8b99-aabbccddeeff', name: 'write',
+        arguments: '{"path":"result.txt","contents":"содержимое"}' } },
+    ],
+    messageId: 'assistant-write-call-two', toolStateId: stateTwo,
+  };
+  const replay = await store.beginToolReceipt(chat.id, accepted.turn.messageId, secondReceipt, accountScope, secondWire);
+  assert.equal(replay.shouldExecute, false);
+  assert.equal(replay.receipt.result, result);
+  assert.equal(writeEffects, 1, 'a new provider call/state envelope reuses the same durable side effect');
+
+  const reopened = await openStore(directory);
+  const detail = await reopened.getChat(chat.id);
+  assert.equal(detail.toolReceipts.length, 2);
+  assert.deepEqual(detail.toolReceipts.map((receipt) => receipt.functionsStateId), [stateOne, stateTwo]);
+  assert.equal(JSON.stringify(detail).includes('assistant-write-call-one'), false);
+  const exchanges = await reopened.getToolProtocolThrough(chat.id, accepted.turn.messageId);
+  assert.deepEqual(exchanges.map((exchange) => exchange.wire), [firstWire, secondWire]);
+  assert.deepEqual(exchanges.map((exchange) => exchange.result), [result, result]);
+  assert.deepEqual(await reopened.getProviderStateOwnership(chat.id, accountScope), {
+    messages: [],
+    receipts: [
+      { receiptId: firstReceipt.receiptId, anchorMessageId: accepted.turn.messageId, owned: true, wireOwned: true },
+      { receiptId: secondReceipt.receiptId, anchorMessageId: accepted.turn.messageId, owned: true, wireOwned: true },
+    ],
+    compact: null,
+  });
+});
+
 test('migrates existing chat detail schema 3 and preserves its draft', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-chat-detail-v3-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -2219,7 +2445,7 @@ test('migrates existing chat detail schema 3 and preserves its draft', async (t)
   assert.equal((await restored.getChat(chat.id)).draft, 'Сохранённый черновик');
   assert.equal((await restored.getChat(chat.id)).nextTurnPermissionProfile, null);
   const migrated = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  assert.equal(migrated.schemaVersion, 12);
+  assert.equal(migrated.schemaVersion, 13);
   assert.equal(migrated.nextTurnPermissionProfile, null);
   assert.equal(migrated.nextTurnSkillId, null);
 });
@@ -2247,7 +2473,7 @@ test('migrates schema 8 with an empty pending list and preserves legacy messageI
   assert.equal(detail.artifacts[0]?.messageId, null);
   assert.deepEqual(detail.draftAttachments, []);
   const saved = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  assert.equal(saved.schemaVersion, 12);
+  assert.equal(saved.schemaVersion, 13);
   assert.deepEqual(saved.draftAttachments, []);
 });
 
@@ -2272,7 +2498,7 @@ test('migrates chat detail schema 4 to 5 without changing history or artifacts',
   assert.equal(detail.nextTurnSkillId, null);
   assert.equal(detail.draft, 'Черновик');
   assert.equal(detail.messages[0]?.text, 'Сохранённая история');
-  assert.equal(JSON.parse(await readFile(path, 'utf8')).schemaVersion, 12);
+  assert.equal(JSON.parse(await readFile(path, 'utf8')).schemaVersion, 13);
 });
 
 test('migrates previous settings and chat schemas with an empty model choice', async (t) => {
@@ -2296,7 +2522,7 @@ test('migrates previous settings and chat schemas with an empty model choice', a
   assert.equal((await restored.getChat(chat.id)).modelId, null);
   assert.equal((await restored.getSettings()).defaultModelId, null);
   assert.equal((await restored.getSettings()).microphoneConsent, 'unasked');
-  assert.equal(JSON.parse(await readFile(chatPath, 'utf8')).schemaVersion, 12);
+  assert.equal(JSON.parse(await readFile(chatPath, 'utf8')).schemaVersion, 13);
   assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).schemaVersion, 10);
 });
 
@@ -2855,7 +3081,7 @@ test('recovers project deletion after every durable journal stage', async (t) =>
       messages: [{ messageId: firstTurn.turn.assistantMessageId, owned: true }], receipts: [], compact: null,
     }, `${stage}:${index ?? '-'} assistant owner`);
     assert.deepEqual(await recovered.getProviderStateOwnership(secondChat.id, 'e'.repeat(64)), {
-      messages: [], receipts: [{ receiptId: 'd'.repeat(64), anchorMessageId: secondTurn.turn.messageId, owned: true }], compact: null,
+      messages: [], receipts: [{ receiptId: 'd'.repeat(64), anchorMessageId: secondTurn.turn.messageId, owned: false, wireOwned: false }], compact: null,
     }, `${stage}:${index ?? '-'} receipt owner`);
     await assert.rejects(stat(join(dataDirectory, 'project-delete.journal.json')), { code: 'ENOENT' });
     assert.equal(await readFile(join(workingFolder, 'keep.txt'), 'utf8'), 'external sentinel');
@@ -2865,7 +3091,7 @@ test('recovers project deletion after every durable journal stage', async (t) =>
     assert.deepEqual(await repeated.listProjects(), []);
     assert.equal((await repeated.getChat(firstChat.id)).messages[0]?.text, 'first history');
     assert.equal((await repeated.getProviderStateOwnership(firstChat.id, 'c'.repeat(64))).messages[0]?.owned, true);
-    assert.equal((await repeated.getProviderStateOwnership(secondChat.id, 'e'.repeat(64))).receipts[0]?.owned, true);
+    assert.equal((await repeated.getProviderStateOwnership(secondChat.id, 'e'.repeat(64))).receipts[0]?.owned, false);
   }
 });
 

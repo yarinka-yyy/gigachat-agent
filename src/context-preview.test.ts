@@ -100,7 +100,7 @@ function createFixture(options: {
       .map((message) => ({ messageId: message.id, owned: true })),
     receipts: sourceChat.toolReceipts
       .filter((receipt) => typeof receipt.functionsStateId === 'string')
-      .map((receipt) => ({ receiptId: receipt.receiptId, anchorMessageId: receipt.anchorMessageId, owned: true })),
+      .map((receipt) => ({ receiptId: receipt.receiptId, anchorMessageId: receipt.anchorMessageId, owned: true, wireOwned: false })),
     compact: null,
   };
   const fakeStore = {
@@ -430,7 +430,7 @@ test('ownership changes are detected before publishing and the compact raw prefi
     onGetOwnership: (_chatId, call) => call === 1
       ? {
         messages: [{ messageId: lastAssistant.id, owned: true }],
-        receipts: [{ receiptId: protocolReceipt.receiptId, anchorMessageId: protocolReceipt.anchorMessageId, owned: true }],
+        receipts: [{ receiptId: protocolReceipt.receiptId, anchorMessageId: protocolReceipt.anchorMessageId, owned: true, wireOwned: false }],
         compact: null,
       }
       : emptyOwnership,
@@ -457,12 +457,17 @@ test('Store-backed ownership survives A to B to A previews and remains private a
   const store = await openStore(directory);
   const chat = await store.createChat(null, 'text');
   const accepted = await store.acceptLocalMessage(chat.id, 'Private accepted anchor.', 'preview-owner-turn');
+  const protocolStateId = 'b1e2d3c4-5566-7a88-8b99-aabbccddeeff';
   const receiptInput = {
     receiptId: 'd'.repeat(64), name: 'read', arguments: { path: 'private/read-fixture.txt' },
-    content: null, functionsStateId: 'private-protocol-state-A',
+    content: null, functionsStateId: protocolStateId,
+  };
+  const protocolWire = {
+    content: [{ function_call: { name: 'read', arguments: { path: 'private/read-fixture.txt' } } }],
+    messageId: 'private-protocol-message-A', toolStateId: protocolStateId,
   };
   assert.equal((await store.beginToolReceipt(chat.id, accepted.turn.messageId, receiptInput,
-    createHash('sha256').update('synthetic-key-A').digest('hex'))).shouldExecute, true);
+    createHash('sha256').update('synthetic-key-A').digest('hex'), protocolWire)).shouldExecute, true);
   await store.completeToolReceipt(chat.id, accepted.turn.messageId, receiptInput.receiptId, 'completed',
     JSON.stringify({ ok: true, result: 'Private read result.' }));
   const acceptedRecord = accepted.detail.turns.find((turn) => turn.turnId === accepted.turn.turnId);
@@ -499,6 +504,7 @@ test('Store-backed ownership survives A to B to A previews and remains private a
   const scopeA = createHash('sha256').update('synthetic-key-A').digest('hex');
   const scopeB = createHash('sha256').update('synthetic-key-B').digest('hex');
   const fixture = createFixture({ chat: storedDetail });
+  fixture.dependencies.store.getToolProtocolThrough = store.getToolProtocolThrough.bind(store);
   const activeStore: LocalStore = store;
   const dependencies: ContextPreviewDependencies = {
     ...fixture.dependencies,
@@ -516,17 +522,21 @@ test('Store-backed ownership survives A to B to A previews and remains private a
   await preview();
   assert.equal(fixture.builtContexts[0]?.request.messages.find((message) => message.id === stateMessage.id)?.functionsStateId,
     'private-state-A');
-  assert.equal(fixture.builtContexts[0]?.request.protocolHistory?.[0]?.functionsStateId, 'private-protocol-state-A');
+  assert.equal(fixture.builtContexts[0]?.request.protocolHistory?.[0]?.functionsStateId, protocolStateId);
+  assert.deepEqual(fixture.builtContexts[0]?.request.protocolHistory?.[0]?.wire, protocolWire);
   activeScope = scopeB;
   await preview();
   assert.equal(fixture.builtContexts[1]?.request.messages.find((message) => message.id === stateMessage.id)?.functionsStateId, undefined);
   assert.equal(fixture.builtContexts[1]?.request.protocolHistory?.[0]?.functionsStateId, null,
     'a foreign account loses only the outbound state pointer while keeping the raw receipt');
+  assert.equal(fixture.builtContexts[1]?.request.protocolHistory?.[0]?.wire, undefined,
+    'the foreign account cannot receive the private V2 wire');
   activeScope = scopeA;
   await preview();
   assert.equal(fixture.builtContexts[2]?.request.messages.find((message) => message.id === stateMessage.id)?.functionsStateId,
     'private-state-A');
-  assert.equal(fixture.builtContexts[2]?.request.protocolHistory?.[0]?.functionsStateId, 'private-protocol-state-A');
+  assert.equal(fixture.builtContexts[2]?.request.protocolHistory?.[0]?.functionsStateId, protocolStateId);
+  assert.deepEqual(fixture.builtContexts[2]?.request.protocolHistory?.[0]?.wire, protocolWire);
   assert.deepEqual(await store.getChat(chat.id), storedDetail, 'previews do not mutate raw messages or tool receipts');
 
   const reopened = await openStore(directory);
@@ -535,13 +545,14 @@ test('Store-backed ownership survives A to B to A previews and remains private a
   assert.equal((await reopened.getProviderStateOwnership(chat.id, scopeA)).messages.find((entry) => entry.messageId === stateMessage.id)?.owned, true);
   assert.equal((await reopened.getProviderStateOwnership(chat.id, scopeB)).messages.find((entry) => entry.messageId === stateMessage.id)?.owned, false);
   const reopenedReceipt = reopenedDetail.toolReceipts.find((receipt) => receipt.receiptId === receiptInput.receiptId);
-  assert.equal(reopenedReceipt?.functionsStateId, 'private-protocol-state-A');
+  assert.equal(reopenedReceipt?.functionsStateId, protocolStateId);
   assert.equal(reopenedReceipt?.status, 'completed');
   assert.equal((await reopened.getProviderStateOwnership(chat.id, scopeA)).receipts.find((entry) => entry.receiptId === receiptInput.receiptId)?.owned, true);
   assert.equal((await reopened.getProviderStateOwnership(chat.id, scopeB)).receipts.find((entry) => entry.receiptId === receiptInput.receiptId)?.owned, false);
   assert.deepEqual(await readFile(chatPath), rawBefore, 'preview and ownership reads must not rewrite public history or private bindings');
 
   const reopenedFixture = createFixture({ chat: reopenedDetail });
+  reopenedFixture.dependencies.store.getToolProtocolThrough = reopened.getToolProtocolThrough.bind(reopened);
   const publicPreview = await createContextPreview(
     { source: 'chat', chatId: chat.id, visibleText: 'private visible text' },
     {
@@ -555,10 +566,11 @@ test('Store-backed ownership survives A to B to A previews and remains private a
   );
   assert.equal(reopenedFixture.builtContexts[0]?.request.messages.find((message) => message.id === stateMessage.id)?.functionsStateId,
     'private-state-A');
-  assert.equal(reopenedFixture.builtContexts[0]?.request.protocolHistory?.[0]?.functionsStateId, 'private-protocol-state-A');
+  assert.equal(reopenedFixture.builtContexts[0]?.request.protocolHistory?.[0]?.functionsStateId, protocolStateId);
+  assert.deepEqual(reopenedFixture.builtContexts[0]?.request.protocolHistory?.[0]?.wire, protocolWire);
   const serialized = JSON.stringify(publicPreview);
-  for (const secret of [scopeA, scopeB, 'synthetic-key-A', 'synthetic-key-B', 'private-state-A', 'private-protocol-state-A',
-    receiptInput.receiptId, 'private/read-fixture.txt', 'private visible text']) {
+  for (const secret of [scopeA, scopeB, 'synthetic-key-A', 'synthetic-key-B', 'private-state-A', protocolStateId,
+    'private-protocol-message-A', receiptInput.receiptId, 'private/read-fixture.txt', 'private visible text']) {
     assert.equal(serialized.includes(secret), false);
   }
   assert.deepEqual(await reopened.getChat(chat.id), reopenedDetail);

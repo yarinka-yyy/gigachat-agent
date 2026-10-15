@@ -73,6 +73,7 @@ export function hashCompactionPrefix(
       content: exchange.content,
       functionsStateId: exchange.functionsStateId,
       result: exchange.result,
+      ...(exchange.wire ? { receiptId: exchange.receiptId, wire: exchange.wire } : {}),
     })),
   };
   return createHash('sha256').update(canonicalJson(canonical), 'utf8').digest('hex');
@@ -115,10 +116,11 @@ function sizeBlocks(request: ProviderTurnRequest, functionSchemaBytes: number): 
     blocks.push({
       source: 'protocol',
       label: `${exchange.name} · ${exchange.anchorMessageId}`,
-      utf8Bytes: byteLength(JSON.stringify({ arguments: exchange.arguments, content: exchange.content, result: exchange.result })),
+      utf8Bytes: byteLength(JSON.stringify({ arguments: exchange.arguments, content: exchange.content, result: exchange.result,
+        ...(exchange.wire ? { receiptId: exchange.receiptId, wire: exchange.wire } : {}) })),
     });
   }
-  if (functionSchemaBytes > 0) blocks.push({ source: 'function-schema', label: 'Встроенная и шесть локальных функций', utf8Bytes: functionSchemaBytes });
+  if (functionSchemaBytes > 0) blocks.push({ source: 'function-schema', label: 'Схема инструментов', utf8Bytes: functionSchemaBytes });
   return blocks;
 }
 

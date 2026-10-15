@@ -151,12 +151,17 @@ test('hashes saved prefixes independently of JSON key order, including nested fu
 test('bounds the complete wire payload including all function schemas and counts only supplied text blocks', async () => {
   const context = buildNextTurnContext(input([user('u1', 'Привет') ]));
   const serialized = serializeProviderTurnRequest(context.request);
-  const payload = JSON.parse(serialized.body) as { messages: Array<{ content: string }>; functions: unknown[]; function_call: string };
+  const payload = JSON.parse(serialized.body) as {
+    messages: Array<{ content: Array<{ text?: string }> }>;
+    tools: Array<{ functions: { specifications: unknown[] } }>;
+    tool_config: { mode: string };
+  };
   assert.equal(serialized.wireBytes, Buffer.byteLength(serialized.body, 'utf8'));
   assert.ok(serialized.wireBytes <= MAX_PROVIDER_REQUEST_BYTES);
-  assert.equal(payload.functions.length, 7);
-  assert.equal(payload.function_call, 'auto');
+  assert.equal(payload.tools[0]?.functions.specifications.length, 6);
+  assert.equal(payload.tool_config.mode, 'auto');
   assert.equal(serialized.textInputs.length, payload.messages.length);
+  assert.equal(context.blocks.find((block) => block.source === 'function-schema')?.label, 'Схема инструментов');
 
   const measured = await countContextTextTokens(context, {
     countTokens: async (_model, inputs) => inputs.map((text) => ({ object: 'tokens' as const, tokens: 2, characters: text.length })),
@@ -166,13 +171,14 @@ test('bounds the complete wire payload including all function schemas and counts
   assert.equal(measured.provenance, 'unknown');
 });
 
-test('serializes one image per wire message with documents and get_file_content in the same request', () => {
+test('serializes two images and a document in one V2 user message with tools disabled', () => {
   const base = input([{
     ...user('user-attachments', 'Сравни прикреплённые материалы.'),
     attachmentIds: ['local-doc', 'local-image-one', 'local-image-two'],
   }]);
   const request = {
     ...buildNextTurnContext(base).request,
+    functionCallMode: 'none' as const,
     attachments: [
       { messageId: 'user-attachments', attachmentId: 'local-doc', fileId: 'remote-doc', name: 'notes.txt', contentType: 'text/plain', kind: 'document', sizeBytes: 5 },
       { messageId: 'user-attachments', attachmentId: 'local-image-one', fileId: 'remote-image-one', name: 'one.png', contentType: 'image/png', kind: 'image', sizeBytes: 4 },
@@ -182,19 +188,22 @@ test('serializes one image per wire message with documents and get_file_content 
   const frozenLocalIds = [...request.messages[0]!.attachmentIds!];
   const serialized = serializeProviderTurnRequest(request);
   const body = JSON.parse(serialized.body) as {
-    messages: Array<{ role: string; content: string; attachments?: string[] }>;
-    functions: Array<{ name: string }>;
-    function_call: string;
+    messages: Array<{ role: string; content: Array<{ text?: string; files?: Array<{ id: string }> }> }>;
+    tools?: unknown[];
+    tool_config: { mode: string };
   };
   const userMessages = body.messages.filter((message) => message.role === 'user');
 
   assert.deepEqual(userMessages, [
-    { role: 'user', content: 'Сравни прикреплённые материалы.\n\nИзображение 1/2', attachments: ['remote-doc', 'remote-image-one'] },
-    { role: 'user', content: 'Сравни прикреплённые материалы.\n\nИзображение 2/2', attachments: ['remote-image-two'] },
+    { role: 'user', content: [
+      { text: 'Сравни прикреплённые материалы.' },
+      { files: [{ id: 'remote-doc' }, { id: 'remote-image-one' }, { id: 'remote-image-two' }] },
+    ] },
   ]);
-  assert.equal(body.function_call, 'auto');
-  assert.ok(body.functions.some((fn) => fn.name === 'get_file_content'));
-  assert.equal(userMessages.flatMap((message) => message.attachments ?? []).filter((id) => id.startsWith('remote-image')).length, 2);
+  assert.equal(body.tool_config.mode, 'none');
+  assert.equal(body.tools, undefined, 'none mode does not advertise tool schemas');
+  assert.equal(userMessages.flatMap((message) => message.content.flatMap((part) => part.files ?? []))
+    .filter((file) => file.id.startsWith('remote-image')).length, 2);
   assert.deepEqual(request.messages[0]!.attachmentIds, frozenLocalIds, 'wire file IDs never replace immutable local attachment IDs');
 
   const oneImage = serializeProviderTurnRequest({
@@ -204,8 +213,11 @@ test('serializes one image per wire message with documents and get_file_content 
   } as unknown as import('./contracts').ProviderTurnRequest);
   const oneImageUser = (JSON.parse(oneImage.body) as typeof body).messages.filter((message) => message.role === 'user');
   assert.deepEqual(oneImageUser, [
-    { role: 'user', content: 'Сравни прикреплённые материалы.', attachments: ['remote-doc', 'remote-image-one'] },
-  ], 'single-image requests retain their original user text and wire shape');
+    { role: 'user', content: [
+      { text: 'Сравни прикреплённые материалы.' },
+      { files: [{ id: 'remote-doc' }, { id: 'remote-image-one' }] },
+    ] },
+  ], 'single-image requests retain their original text and one V2 file-content part');
 });
 
 test('adds an app-owned task only for a current empty-text user anchor with accepted files', () => {
@@ -214,14 +226,14 @@ test('adds an app-owned task only for a current empty-text user anchor with acce
   const userMessage = context.request.messages[0];
   const taskLayer = context.request.system.find((layer) => layer.label === 'Задача текущего запроса');
   const wire = JSON.parse(serializeProviderTurnRequest(context.request).body) as {
-    messages: Array<{ role: string; content: string }>;
+    messages: Array<{ role: string; content: Array<{ text?: string }> }>;
   };
 
   assert.equal(userMessage?.text, '', 'the accepted chat history keeps its empty user text');
   assert.deepEqual(userMessage?.attachmentIds, ['local-file']);
   assert.equal(taskLayer?.source, 'runtime');
   assert.equal(taskLayer?.text, 'Проанализируй приложенные файлы');
-  assert.equal(wire.messages.find((message) => message.role === 'user')?.content, '');
+  assert.deepEqual(wire.messages.find((message) => message.role === 'user')?.content, [{ text: '' }]);
 
   const ordinary = buildNextTurnContext(input([user('ordinary-empty-anchor', '')], {
     globalText: '', projectInstructions: [], selectedSkill: null,

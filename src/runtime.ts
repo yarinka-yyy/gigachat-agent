@@ -12,6 +12,7 @@ import type {
   ProviderProtocolExchange,
   ProviderTurnRequest,
   ProviderToolName,
+  ProviderV2FunctionWire,
   RuntimeActivity,
   RuntimeTurnSnapshot,
   CompactSnapshot,
@@ -26,6 +27,7 @@ import { validateCompactSummary } from './context';
 import { MISSING_REMOTE_ATTACHMENT_MESSAGE, MissingRemoteAttachmentError } from './attachments';
 import { HISTORICAL_PROVIDER_STATE_ATTACHMENTS_MESSAGE, HistoricalProviderStateAttachmentsError } from './provider-state';
 import type { ProviderStateOwner } from './provider-state';
+import { validateProviderV2FunctionWire } from './provider-wire';
 
 const MAX_ACTIVITY_PER_TURN = 50;
 const MAX_ASSISTANT_CHARS = 100_000;
@@ -78,7 +80,8 @@ export interface TurnRuntimeOptions {
     terminalTurn: RuntimeTurnSnapshot, functionsStateId?: string, providerStateOwner?: ProviderStateOwner): Promise<void>;
   compactionEnabled?: boolean;
   recordUsageReceipt(receipt: UsageReceipt): Promise<void>;
-  beginToolReceipt?(turn: AcceptedTurnInput, receipt: ToolReceiptInput, providerStateOwner?: ProviderStateOwner): Promise<ToolReceiptStart>;
+  beginToolReceipt?(turn: AcceptedTurnInput, receipt: ToolReceiptInput, providerStateOwner?: ProviderStateOwner,
+    wire?: ProviderV2FunctionWire): Promise<ToolReceiptStart>;
   completeToolReceipt?(turn: AcceptedTurnInput, receiptId: string, status: 'completed' | 'unknown', result: string): Promise<void>;
   runHooks?(turn: AcceptedTurnInput, input: HookDispatchInput, signal: AbortSignal): Promise<HookRunResult[]>;
   validateRetry?(turn: AcceptedTurnInput, original: AcceptedTurnInput): Promise<void>;
@@ -300,7 +303,15 @@ function isFunctionCall(value: unknown): value is ProviderFunctionCall {
     || (call.content !== null && typeof call.content !== 'string')
     || (call.functionsStateId !== null && typeof call.functionsStateId !== 'string')
     || call.terminalReason !== 'function_call') return false;
-  try { return Buffer.byteLength(JSON.stringify(call.arguments), 'utf8') <= 1_900_000; }
+  try {
+    if (Buffer.byteLength(JSON.stringify(call.arguments), 'utf8') > 1_900_000) return false;
+    return call.wire === undefined || validateProviderV2FunctionWire(call.wire, {
+      name: call.name,
+      arguments: call.arguments,
+      content: call.content,
+      functionsStateId: call.functionsStateId,
+    }) !== null;
+  }
   catch { return false; }
 }
 
@@ -1071,7 +1082,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           };
           if (controller.signal.aborted) throw abortError();
           options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
-          const beginPromise = options.beginToolReceipt(turn.input, receiptInput, providerStateOwner);
+          const beginPromise = options.beginToolReceipt(turn.input, receiptInput, providerStateOwner, functionCall.wire);
           const begun = await waitTracked(beginPromise, operationTimeoutMs, 'TOOL_INTENT_SAVE_TIMEOUT', 'Подтверждение сохранения намерения инструмента ожидается; очередь приостановлена.');
           const storedReceipt = begun.receipt;
           let exchange: ProviderProtocolExchange;
@@ -1083,6 +1094,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
               content: functionCall.content,
               functionsStateId: functionCall.functionsStateId,
               result: storedReceipt.result ?? errorResult(new Error('Результат инструмента неизвестен.'), true),
+              ...(functionCall.wire ? { receiptId: receiptInput.receiptId, wire: structuredClone(functionCall.wire) } : {}),
             };
           } else {
             const validation = validateToolArguments(functionCall);
@@ -1159,6 +1171,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
                 content: functionCall!.content,
                 functionsStateId: functionCall!.functionsStateId,
                 result: resultText,
+                ...(functionCall!.wire ? { receiptId: receiptInput.receiptId, wire: structuredClone(functionCall!.wire) } : {}),
               };
               if (abortAfterSave || controller.signal.aborted) throw abortError();
               return exchange;

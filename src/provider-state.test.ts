@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import type { ChatDetail, ChatMessage, ChatToolReceipt, ProviderProtocolExchange, ProviderTurnRequest } from './contracts';
 import { createBalanceScopeGuard } from './usage-view';
 import {
+  HISTORICAL_PROVIDER_STATE_ATTACHMENTS_MESSAGE,
   filterProviderStateForOutboundRequest,
   HistoricalProviderStateAttachmentsError,
   assertAuthorizationKeyMatchesOwner,
@@ -143,9 +144,9 @@ test('outbound state survives only exact raw message matches and fully owned rec
       { messageId: 'assistant-mismatch', owned: true },
     ],
     receipts: [
-      { receiptId: 'receipt-owned', anchorMessageId: 'anchor-1', owned: true },
-      { receiptId: 'receipt-mixed-one', anchorMessageId: 'anchor-1', owned: true },
-      { receiptId: 'receipt-mixed-two', anchorMessageId: 'anchor-1', owned: false },
+      { receiptId: 'receipt-owned', anchorMessageId: 'anchor-1', owned: true, wireOwned: false },
+      { receiptId: 'receipt-mixed-one', anchorMessageId: 'anchor-1', owned: true, wireOwned: false },
+      { receiptId: 'receipt-mixed-two', anchorMessageId: 'anchor-1', owned: false, wireOwned: false },
     ],
     compact: null,
   };
@@ -180,8 +181,8 @@ test('a receipt ID reused across anchors is ambiguous even when both owner bindi
     ownership: {
       messages: [],
       receipts: [
-        { receiptId: 'reused-receipt', anchorMessageId: 'anchor-one', owned: true },
-        { receiptId: 'reused-receipt', anchorMessageId: 'anchor-two', owned: true },
+        { receiptId: 'reused-receipt', anchorMessageId: 'anchor-one', owned: true, wireOwned: false },
+        { receiptId: 'reused-receipt', anchorMessageId: 'anchor-two', owned: true, wireOwned: false },
       ],
       compact: null,
     },
@@ -208,13 +209,52 @@ test('a receipt ID reused across anchors is ambiguous even when both owner bindi
     rawProtocolHistory: sameAnchorProtocol,
     ownership: {
       messages: [],
-      receipts: [{ receiptId: 'same-anchor-receipt', anchorMessageId: 'same-anchor', owned: true }],
+      receipts: [{ receiptId: 'same-anchor-receipt', anchorMessageId: 'same-anchor', owned: true, wireOwned: false }],
       compact: null,
     },
     currentAnchorMessageId: 'same-anchor',
   });
   assert.deepEqual(sameAnchorFiltered.request.protocolHistory?.map((exchange) => exchange.functionsStateId), [null, null],
     'one owned binding cannot approve two distinct state values for a reused receipt ID');
+});
+
+test('a V2 wire and its state pointer are filtered as one ownership unit', () => {
+  const stateId = '018f47a2-7b21-7abc-8abc-123456789abc';
+  const receiptId = 'f'.repeat(64);
+  const anchor = stateMessage('wire-anchor', 'user');
+  const receipt = stateReceipt(receiptId, anchor.id, stateId);
+  const wire = {
+    content: [
+      { text: 'Calling a local tool.' },
+      { function_call: { id: '550e8400-e29b-41d4-a716-446655440000', name: 'read', arguments: { path: 'fixture.txt' } } },
+    ],
+    messageId: 'provider-message-1',
+    toolStateId: stateId,
+  };
+  const exchange: ProviderProtocolExchange = {
+    receiptId, anchorMessageId: anchor.id, name: 'read', arguments: { path: 'fixture.txt' },
+    content: 'Calling a local tool.', functionsStateId: stateId, result: '{"ok":true}', wire,
+  };
+  const messages = [anchor];
+  const filtered = filterProviderStateForOutboundRequest({
+    request: stateRequest(messages, [exchange]),
+    detail: stateDetail(messages, [receipt]),
+    rawMessages: messages,
+    rawProtocolHistory: [exchange],
+    ownership: {
+      messages: [],
+      receipts: [{ receiptId, anchorMessageId: anchor.id, owned: false, wireOwned: true }],
+      compact: null,
+    },
+    currentAnchorMessageId: anchor.id,
+  });
+
+  const outbound = filtered.request.protocolHistory?.[0];
+  assert.equal(filtered.removedState, true);
+  assert.equal(outbound?.wire, undefined, 'the wire cannot retain a state pointer whose normalized ownership failed');
+  assert.equal(outbound?.receiptId, undefined);
+  assert.equal(outbound?.functionsStateId, null);
+  assert.equal(receipt.functionsStateId, stateId, 'filtering leaves the saved public receipt untouched');
 });
 
 test('unowned state with historical user files fails closed, while current accepted files remain eligible', () => {
@@ -229,7 +269,7 @@ test('unowned state with historical user files fails closed, while current accep
 
   assert.throws(() => filterProviderStateForOutboundRequest({ ...base, currentAnchorMessageId: current.id }),
     (error: unknown) => error instanceof HistoricalProviderStateAttachmentsError
-      && error.message === 'Нельзя подтвердить доступ к прежним вложениям для текущего ключа. Создайте новый чат и прикрепите файлы заново.');
+      && error.message === HISTORICAL_PROVIDER_STATE_ATTACHMENTS_MESSAGE);
   const currentOnly = stateMessage('current-only', 'user', undefined, ['current-file']);
   const filteredCurrent = filterProviderStateForOutboundRequest({
     request: stateRequest([currentOnly]), detail: stateDetail([currentOnly]), rawMessages: [currentOnly],

@@ -5,7 +5,7 @@ import { createServer as createHttpsServer } from 'node:https';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createServer as createTcpServer, type AddressInfo, type Socket } from 'node:net';
 import { test } from 'node:test';
-import type { ProviderEvent, ProviderTurnRequest } from './contracts';
+import type { AcceptedTurnInput, ProviderEvent, ProviderTurnRequest } from './contracts';
 import {
   createGigaChatProvider,
   createHttpsTransport,
@@ -16,8 +16,56 @@ import {
   type ProviderTransportRequest,
   type ProviderTransportResponse,
 } from './gigachat-provider';
+import { validateProviderV2FunctionWire } from './provider-wire';
+import { createTurnRuntime } from './runtime';
+import type { LocalTools } from './local-tools';
 
 const FIXED_NOW = Date.UTC(2026, 9, 9, 12);
+
+test('V2 function wire preserves exact object and string argument representations', () => {
+  const expected = {
+    name: 'read', arguments: { path: 'notes/a.txt' }, content: 'Read this file.\nKeep its exact text.',
+    functionsStateId: '018f47b2-6c10-7a21-8f2b-1fd4d0470c13',
+  };
+  const objectWire = {
+    content: [
+      { text: expected.content },
+      { function_call: { id: '018f47b2-6c10-4a21-8f2b-1fd4d0470c13', name: 'read', arguments: { path: 'notes/a.txt' } } },
+    ],
+    messageId: 'message-42',
+    toolStateId: expected.functionsStateId,
+  };
+  assert.deepEqual(validateProviderV2FunctionWire(objectWire, expected), objectWire);
+
+  const stringWire = {
+    ...objectWire,
+    content: [
+      { text: expected.content },
+      { function_call: { id: '018f47b2-6c10-4a21-8f2b-1fd4d0470c13', name: 'read', arguments: '{"path":"notes/a.txt"}' } },
+    ],
+  };
+  assert.deepEqual(validateProviderV2FunctionWire(stringWire, expected), stringWire);
+});
+
+test('V2 function wire rejects control characters and malformed non-JSON objects safely', () => {
+  const base = {
+    content: [{ function_call: { name: 'read', arguments: { path: 'notes/a.txt' } } }],
+    messageId: 'message-42',
+    toolStateId: '018f47b2-6c10-7a21-8f2b-1fd4d0470c13',
+  };
+  assert.equal(validateProviderV2FunctionWire({ ...base, messageId: 'message\n42' }), null);
+  assert.equal(validateProviderV2FunctionWire({ ...base, content: [{ function_call: { name: 'read\n', arguments: { path: 'a' } } }] }), null);
+  assert.equal(validateProviderV2FunctionWire({ ...base, content: [{ function_call: { id: 'call\t42', name: 'read', arguments: { path: 'a' } } }] }), null);
+  assert.equal(validateProviderV2FunctionWire({ ...base, toolStateId: '018f47b2-6c10-7a21-8f2b-1fd4d0470c13\u007f' }), null);
+
+  const cyclic: Record<string, unknown> = {};
+  cyclic.self = cyclic;
+  assert.equal(validateProviderV2FunctionWire({ content: [{ function_call: { name: 'read', arguments: cyclic } }] }), null);
+  assert.equal(validateProviderV2FunctionWire({ content: [{ function_call: { name: 'read', arguments: { path: undefined } } }] }), null);
+  assert.equal(validateProviderV2FunctionWire({ content: [{ function_call: { name: 'read', arguments: { path: Number.NaN } } }] }), null);
+  const hostile = new Proxy({ path: 'a' }, { getPrototypeOf() { throw new Error('fixture'); } });
+  assert.equal(validateProviderV2FunctionWire({ content: [{ function_call: { name: 'read', arguments: hostile } }] }), null);
+});
 const TEST_SERVER_KEY = `-----BEGIN PRIVATE KEY-----
 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCzPfEZSXYw3eBW
 3ot6iJNDUXuEiKvJUyhA5DBqO+WfS0bD6ZHRq26YtcT3n8X9BeFgE6LsJJ0krnt1
@@ -81,6 +129,17 @@ function eventStreamResponse(chunks: readonly Uint8Array[], statusCode = 200, co
     body: (async function* () { for (const chunk of chunks) yield chunk; }()),
     cancel() {},
   };
+}
+
+function v2Frame(event: string, payload: unknown): Buffer {
+  return Buffer.from(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`, 'utf8');
+}
+
+function v2TextResponse(model: string): ProviderTransportResponse {
+  return eventStreamResponse([
+    v2Frame('response.message.delta', { model, messages: [{ role: 'assistant', content: [{ text: '' }] }] }),
+    v2Frame('response.message.done', { model, finish_reason: 'stop' }),
+  ]);
 }
 
 function fakeTransport(handler: (request: ProviderTransportRequest) => Promise<ProviderTransportResponse> | ProviderTransportResponse): ProviderTransport {
@@ -432,7 +491,7 @@ test('cancels a response that becomes stale before authenticated response handli
   assert.equal(responseCancelled, 1);
 });
 
-test('reports built-in file-reading progress as activity instead of assistant text', async () => {
+test('reports V2 built-in file-reading progress as activity instead of assistant text', async () => {
   const provider = createGigaChatProvider({
     loadAuthorizationKey: async () => 'synthetic-key',
     now: () => FIXED_NOW,
@@ -440,9 +499,12 @@ test('reports built-in file-reading progress as activity instead of assistant te
       if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
       if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-3-Pro' }] });
       return eventStreamResponse([
-        Buffer.from(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: 'function_in_progress', name: 'get_file_content', content: 'осталось 00:02' }, finish_reason: null }] })}\n\n`),
-        Buffer.from(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: 'assistant', content: 'Документ изучен.' }, finish_reason: 'stop' }] })}\n\n`),
-        Buffer.from('data: [DONE]\n\n'),
+        v2Frame('response.tool.in_progress', {
+          model: 'GigaChat-3-Pro',
+          messages: [{ role: 'assistant', content: [{ tool_execution: { name: 'get_file_content', status: 'in_progress', seconds_left: 2 } }] }],
+        }),
+        v2Frame('response.message.delta', { model: 'GigaChat-3-Pro', messages: [{ role: 'assistant', content: [{ text: 'Документ изучен.' }] }] }),
+        v2Frame('response.message.done', { model: 'GigaChat-3-Pro', finish_reason: 'stop' }),
       ]);
     }),
   });
@@ -453,9 +515,72 @@ test('reports built-in file-reading progress as activity instead of assistant te
     permissionProfile: 'ask', modelId: 'GigaChat-3-Pro',
   }, new AbortController().signal)) events.push(event);
 
-  assert.ok(events.some((event) => event.type === 'activity' && event.activity === 'function-progress'
-    && event.functionName === 'get_file_content' && event.detail === 'осталось 00:02'));
+  assert.deepEqual(events.find((event) => event.type === 'activity' && event.activity === 'function-progress'), {
+    type: 'activity', activity: 'function-progress', functionName: 'get_file_content', detail: 'Осталось 2 с.',
+  });
   assert.deepEqual(events.filter((event) => event.type === 'text-delta').map((event) => event.text), ['Документ изучен.']);
+});
+
+test('passes V2 builtin progress through Runtime without dispatching local tools', async () => {
+  const cases = [
+    { name: 'get_file_content', expected: { activity: 'function-progress', functionName: 'get_file_content', detail: 'Осталось 2 с.' } },
+    { name: 'web_search', expected: { activity: 'tool-started', functionName: null, detail: null } },
+  ] as const;
+
+  for (const [index, item] of cases.entries()) {
+    const provider = createGigaChatProvider({
+      loadAuthorizationKey: async () => 'synthetic-key',
+      now: () => FIXED_NOW,
+      transport: fakeTransport((request) => {
+        if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token(`synthetic-token-${index}`));
+        if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-3-Pro' }] });
+        return eventStreamResponse([
+          v2Frame('response.tool.in_progress', {
+            model: 'GigaChat-3-Pro',
+            messages: [{ role: 'assistant', content: [{ tool_execution: { name: item.name, status: 'in_progress', seconds_left: 2 } }] }],
+          }),
+          v2Frame('response.message.delta', { model: 'GigaChat-3-Pro', messages: [{ role: 'assistant', content: [{ text: 'Ответ без запуска локальных инструментов.' }] }] }),
+          v2Frame('response.message.done', { model: 'GigaChat-3-Pro', finish_reason: 'stop' }),
+        ]);
+      }),
+    });
+    assert.equal((await provider.connect()).state, 'connected');
+
+    let localReadCalls = 0;
+    const savedAnswers: string[] = [];
+    const runtime = createTurnRuntime({
+      provider,
+      tools: { read: async () => { localReadCalls += 1; } } as unknown as LocalTools,
+      prepareTurn: async (turn) => ({
+        system: [], messages: structuredClone(turn.messages), modelId: turn.modelId, permissionProfile: turn.permissionProfile,
+      }),
+      consumeTurn: async () => undefined,
+      releaseTurn: () => undefined,
+      appendAssistant: async (_turn, text) => { savedAnswers.push(text); },
+      recordUsageReceipt: async () => undefined,
+    });
+    const chatId = `builtin-progress-${index}`;
+    const turn: AcceptedTurnInput = {
+      turnId: `builtin-progress-turn-${index}`, chatId, projectId: null, projectWorkingFolder: null,
+      messageId: `builtin-progress-user-${index}`, assistantMessageId: `builtin-progress-assistant-${index}`,
+      historyBoundary: 1,
+      messages: [{ id: `builtin-progress-user-${index}`, role: 'user', text: 'Прочитай вложение', createdAt: '2026-10-12T00:00:00.000Z' }],
+      permissionProfile: 'ask', modelId: 'GigaChat-3-Pro', skillId: null,
+      reservation: { permissionProfileRevision: null, skillRevision: null },
+    };
+    assert.ok(runtime.enqueue(turn));
+    await runtime.whenIdle();
+
+    const completedTurn = runtime.list(chatId)[0];
+    assert.equal(completedTurn?.status, 'completed');
+    assert.deepEqual(savedAnswers, ['Ответ без запуска локальных инструментов.']);
+    assert.equal(localReadCalls, 0);
+    const activity = completedTurn?.activity.find((entry) => entry.kind === 'provider'
+      && (entry.activity === 'function-progress' || entry.activity === 'tool-started'));
+    assert.deepEqual(activity?.kind === 'provider'
+      ? { activity: activity.activity, functionName: activity.functionName ?? null, detail: activity.detail ?? null }
+      : null, item.expected);
+  }
 });
 
 test('discovers future model IDs without inventing model capabilities', async () => {
@@ -487,10 +612,7 @@ test('keeps raw discovery complete but blocks legacy and embedding IDs from chat
       if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-token'));
       if (request.url.endsWith('/models')) return jsonResponse(200, { data: rawIds.map((id) => ({ id })) });
       completionRequests += 1;
-      return eventStreamResponse([
-        Buffer.from('data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'),
-        Buffer.from('data: [DONE]\n\n'),
-      ]);
+      return v2TextResponse('GigaChat-3-Ultra');
     }),
   });
   assert.equal((await provider.connect()).state, 'connected');
@@ -534,7 +656,7 @@ test('a 402 exhausts only its current model, survives discovery refresh, and cle
       completionRequests += 1;
       return failWithQuota
         ? jsonResponse(402, { message: 'sensitive provider detail must not escape' })
-        : eventStreamResponse([Buffer.from('data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')]);
+        : v2TextResponse('GigaChat-3-Ultra');
     }),
   });
 
@@ -675,10 +797,18 @@ test('empty model discovery is an explicit error snapshot', async () => {
   assert.deepEqual(provider.getModelRegistry(), { state: 'error', modelIds: [], errorCategory: 'model' });
 });
 
-test('streams GigaChat v1 SSE across split UTF-8, CRLF and multiline data frames', async () => {
+test('streams V2 SSE across split UTF-8, split CRLF, and a CR-only final delimiter', async () => {
   const completionRequests: ProviderTransportRequest[] = [];
-  const firstFrame = Buffer.from('data: {"choices":[\r\ndata: {"index":0,"delta":{"role":"assistant","content":"Привет "}}]}\r\n\r\n');
-  const splitAt = firstFrame.indexOf(Buffer.from('Привет')) + 1;
+  const deltaFrame = Buffer.from(`event: response.message.delta\r\ndata: ${JSON.stringify({
+    model: 'GigaChat-3-Ultra:3.2.1', created_at: '2026-10-15T00:00:00Z',
+    messages: [{ role: 'assistant', content: [{ text: 'Привет, готово.' }] }],
+  })}\r\n\r\n`);
+  const splitCrlfAt = deltaFrame.indexOf(Buffer.from('\r\n')) + 1;
+  const splitUtf8At = deltaFrame.indexOf(Buffer.from('и')) + 1;
+  const doneFrame = Buffer.from(`event: response.message.done\rdata: ${JSON.stringify({
+    model: 'GigaChat-3-Ultra:3.2.1', created_at: '2026-10-15T00:00:00Z', finish_reason: 'stop',
+    usage: { input_tokens: 100, output_tokens: 40, total_tokens: 140, input_tokens_details: { cached_tokens: 25 } },
+  })}\r\r`);
   const provider = createGigaChatProvider({
     loadAuthorizationKey: async () => 'synthetic-key',
     now: () => FIXED_NOW,
@@ -687,9 +817,8 @@ test('streams GigaChat v1 SSE across split UTF-8, CRLF and multiline data frames
       if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }] });
       completionRequests.push(request);
       return eventStreamResponse([
-        firstFrame.subarray(0, splitAt), firstFrame.subarray(splitAt),
-        Buffer.from('data: {"id":"response-1","model":"future/model-v2","usage":{"prompt_tokens":100,"completion_tokens":40,"total_tokens":140,"precached_prompt_tokens":25},"choices":[{"index":0,"delta":{"content":"мир","functions_state_id":"state-final"},"finish_reason":"stop"}]}\r\n\r\n'),
-        Buffer.from('data: [DONE]\r\n\r\n'),
+        deltaFrame.subarray(0, splitCrlfAt), deltaFrame.subarray(splitCrlfAt, splitUtf8At),
+        deltaFrame.subarray(splitUtf8At), doneFrame,
       ]);
     }),
   });
@@ -697,53 +826,40 @@ test('streams GigaChat v1 SSE across split UTF-8, CRLF and multiline data frames
   assert.equal((await provider.connect()).state, 'connected');
   const events: ProviderEvent[] = [];
   for await (const event of provider.stream({
-    system: [
-      { source: 'runtime', label: 'Runtime', text: 'Runtime rules' },
-      { source: 'global', label: 'Rules', text: 'Правила' },
-    ],
-    messages: [
-      { id: 'message-1', role: 'user', text: 'Вопрос', createdAt: '2026-10-09T00:00:00.000Z' },
-      { id: 'message-2', role: 'assistant', text: 'Ответ', createdAt: '2026-10-09T00:00:01.000Z', functionsStateId: 'state-saved' },
-      { id: 'message-3', role: 'user', text: 'Продолжи', createdAt: '2026-10-09T00:00:02.000Z' },
-    ],
-    protocolHistory: [{
-      anchorMessageId: 'message-1', name: 'read', arguments: { path: 'README.md' }, content: null,
-      functionsStateId: 'state-1', result: '{"ok":true,"result":"текст"}',
-    }],
+    system: [{ source: 'runtime', label: 'Runtime', text: 'Runtime rules' }],
+    messages: [{ id: 'message-1', role: 'user', text: 'Вопрос', createdAt: '2026-10-09T00:00:00.000Z' }],
     permissionProfile: 'ask',
     modelId: 'GigaChat-3-Ultra',
   }, new AbortController().signal)) events.push(event);
 
   assert.deepEqual(events, [
     { type: 'activity', activity: 'receiving' },
-    { type: 'text-delta', text: 'Привет ' },
-    { type: 'usage', promptTokens: 100, completionTokens: 40, totalTokens: 140, precachedPromptTokens: 25, providerRequestId: 'response-1', providerModel: 'future/model-v2' },
-    { type: 'text-delta', text: 'мир' },
-    { type: 'completed', functionsStateId: 'state-final' },
+    { type: 'text-delta', text: 'Привет, готово.' },
+    { type: 'usage', promptTokens: 100, completionTokens: 40, totalTokens: 140, precachedPromptTokens: 25, providerModel: 'GigaChat-3-Ultra:3.2.1' },
+    { type: 'completed' },
   ]);
   assert.equal(completionRequests[0]?.method, 'POST');
+  assert.equal(completionRequests[0]?.url, 'https://api.giga.chat/v2/chat/completions');
   assert.equal(completionRequests[0]?.headers.Accept, 'text/event-stream');
   assert.equal(completionRequests[0]?.headers.Authorization, 'Bearer synthetic-token');
   const completionBody = completionRequests[0]?.body;
   const requestBody = JSON.parse(typeof completionBody === 'string' ? completionBody : Buffer.from(completionBody ?? []).toString('utf8')) as {
-    model: string; messages: Array<Record<string, unknown>>; functions: Array<{ name: string }>; function_call: string; stream: boolean;
+    model: string; messages: Array<Record<string, unknown>>; tools: Array<{ functions: { specifications: Array<{ name: string }> } }>;
+    tool_config: { mode: string }; model_options: { parallel_tool_calls: boolean }; stream: boolean;
   };
   assert.equal(requestBody.model, 'GigaChat-3-Ultra');
   assert.deepEqual(requestBody.messages, [
-    { role: 'system', content: '[Runtime]\nRuntime rules\n\n[Rules]\nПравила' },
-    { role: 'user', content: 'Вопрос' },
-    { role: 'assistant', content: '', functions_state_id: 'state-1', function_call: { name: 'read', arguments: { path: 'README.md' } } },
-    { role: 'function', name: 'read', content: '{"ok":true,"result":"текст"}' },
-    { role: 'assistant', content: 'Ответ', functions_state_id: 'state-saved' },
-    { role: 'user', content: 'Продолжи' },
+    { role: 'system', content: [{ text: '[Runtime]\nRuntime rules' }] },
+    { role: 'user', content: [{ text: 'Вопрос' }] },
   ]);
   assert.equal(requestBody.stream, true);
-  assert.equal(requestBody.function_call, 'auto');
-  assert.deepEqual(requestBody.functions.map((fn) => fn.name), ['list', 'search', 'read', 'write', 'open', 'powershell', 'get_file_content']);
+  assert.equal(requestBody.tool_config.mode, 'auto');
+  assert.equal(requestBody.model_options.parallel_tool_calls, false);
+  assert.deepEqual(requestBody.tools[0]?.functions.specifications.map((fn) => fn.name), ['list', 'search', 'read', 'write', 'open', 'powershell']);
   assert.equal(requestBody.messages.filter((message) => message.role === 'system').length, 1);
 });
 
-test('emits validated terminal usage before a later missing-DONE protocol error', async () => {
+test('retains known V2 usage from a nonterminal delta when the stream ends before message.done', async () => {
   const provider = createGigaChatProvider({
     loadAuthorizationKey: async () => 'synthetic-key',
     now: () => FIXED_NOW,
@@ -751,11 +867,11 @@ test('emits validated terminal usage before a later missing-DONE protocol error'
       ? jsonResponse(200, token('synthetic-token'))
       : request.url.endsWith('/models')
         ? jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }] })
-        : eventStreamResponse([Buffer.from(`data: ${JSON.stringify({
-          id: 'response-usage', model: 'provider-model-v3',
-          usage: { prompt_tokens: 8, total_tokens: 10 },
-          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-        })}\n\n`) ])),
+        : eventStreamResponse([v2Frame('response.message.delta', {
+          id: 'response-usage', model: 'GigaChat-3-Ultra:3.2.1',
+          usage: { input_tokens: 8, total_tokens: 10 },
+          messages: [{ role: 'assistant', content: [{ text: 'part' }] }],
+        })])),
   });
   assert.equal((await provider.connect()).state, 'connected');
   const events: ProviderEvent[] = [];
@@ -767,7 +883,8 @@ test('emits validated terminal usage before a later missing-DONE protocol error'
   assert.deepEqual(events, [
     { type: 'activity', activity: 'receiving' },
     { type: 'usage', promptTokens: 8, completionTokens: null, totalTokens: 10, precachedPromptTokens: null,
-      providerRequestId: 'response-usage', providerModel: 'provider-model-v3' },
+      providerRequestId: 'response-usage', providerModel: 'GigaChat-3-Ultra:3.2.1' },
+    { type: 'text-delta', text: 'part' },
     { type: 'error', category: 'protocol', retryable: false },
   ]);
 });
@@ -780,9 +897,13 @@ test('rejects malformed usage counts without emitting an unvalidated receipt', a
       ? jsonResponse(200, token('synthetic-token'))
       : request.url.endsWith('/models')
         ? jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }] })
-        : eventStreamResponse([Buffer.from(`data: ${JSON.stringify({
-          usage: { prompt_tokens: -1 }, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-        })}\n\n`), Buffer.from('data: [DONE]\n\n') ])),
+        : eventStreamResponse([
+          v2Frame('response.message.delta', {
+            model: 'GigaChat-3-Ultra', usage: { input_tokens: -1 },
+            messages: [{ role: 'assistant', content: [{ text: 'part' }] }],
+          }),
+          v2Frame('response.message.done', { model: 'GigaChat-3-Ultra', finish_reason: 'stop' }),
+        ])),
   });
   assert.equal((await provider.connect()).state, 'connected');
   const events: ProviderEvent[] = [];
@@ -794,8 +915,16 @@ test('rejects malformed usage counts without emitting an unvalidated receipt', a
   assert.equal(events[events.length - 1]?.type, 'error');
 });
 
-test('normalizes an unknown bounded function call with object arguments only after DONE', async () => {
+test('normalizes one unknown bounded V2 function call only after its terminal event', async () => {
   let doneYielded = false;
+  const message = {
+    role: 'assistant',
+    message_id: 'message-function-1',
+    tool_state_id: '018f47b2-6c10-7a21-8f2b-1fd4d0470c13',
+    content: [{ function_call: {
+      id: '018f47b2-6c10-4a21-8f2b-1fd4d0470c13', name: 'archive', arguments: { path: 'a' },
+    } }],
+  };
   const provider = createGigaChatProvider({
     loadAuthorizationKey: async () => 'synthetic-key',
     now: () => FIXED_NOW,
@@ -806,10 +935,9 @@ test('normalizes an unknown bounded function call with object arguments only aft
         statusCode: 200,
         headers: { 'content-type': 'text/event-stream' },
         body: (async function* () {
-          yield Buffer.from(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { function_call: { name: 'archive', arguments: { path: 'a' } }, functions_state_id: 'state-2', }, finish_reason: 'function_call' }] })}\n\n`);
-          await delay(1);
+          yield v2Frame('response.message.delta', { model: 'GigaChat-3-Ultra', messages: [message] });
           doneYielded = true;
-          yield Buffer.from('data: [DONE]\n\n');
+          yield v2Frame('response.message.done', { model: 'GigaChat-3-Ultra', finish_reason: 'function_call', messages: [message] });
         }()),
         cancel() {},
       };
@@ -828,39 +956,145 @@ test('normalizes an unknown bounded function call with object arguments only aft
   assert.deepEqual(events, [
     { type: 'activity', activity: 'receiving' },
     { type: 'function-call', functionCall: {
-      name: 'archive', arguments: { path: 'a' }, content: null, functionsStateId: 'state-2', terminalReason: 'function_call',
+      name: 'archive', arguments: { path: 'a' }, content: null,
+      functionsStateId: '018f47b2-6c10-7a21-8f2b-1fd4d0470c13', terminalReason: 'function_call',
+      wire: {
+        content: message.content,
+        messageId: message.message_id,
+        toolStateId: message.tool_state_id,
+      },
     } },
   ]);
+});
+
+test('accepts terminal-only V2 calls over 32 KiB and rejects model, state, or UTF-8 mismatches before a call', async (t) => {
+  const callId = '018f47b2-6c10-4a21-8f2b-1fd4d0470c13';
+  const stateId = '018f47b2-6c10-7a21-8f2b-1fd4d0470c13';
+  const terminalMessage = (name: string, args: Record<string, unknown>, state = stateId) => ({
+    role: 'assistant', message_id: 'terminal-assistant-message', tool_state_id: state,
+    content: [{ function_call: { id: callId, name, arguments: args } }],
+  });
+  const oversizedContents = 'x'.repeat(40 * 1024);
+  const terminalOnly = terminalMessage('read', { path: 'fixture.txt' });
+  const largeArguments = terminalMessage('write', { path: 'fixture.txt', contents: oversizedContents });
+  const wrongModel = terminalMessage('read', { path: 'fixture.txt' });
+  const invalidState = terminalMessage('read', { path: 'fixture.txt' }, 'not-a-provider-state-id');
+  const invalidUtf8 = Buffer.concat([
+    Buffer.from('event: response.message.delta\ndata: {"model":"GigaChat-3-Ultra","messages":[{"role":"assistant","content":[{"function_call":{"name":"read","arguments":{"path":"'),
+    Buffer.from([0xff]),
+    Buffer.from('"}}]}]}\n\n'),
+  ]);
+  const cases: Array<{
+    name: string;
+    chunks: readonly Uint8Array[];
+    expectedCall?: { name: string; arguments: Record<string, unknown>; message: ReturnType<typeof terminalMessage> };
+  }> = [
+    {
+      name: 'function call present only on the terminal event',
+      chunks: [v2Frame('response.message.done', {
+        model: 'GigaChat-3-Ultra', finish_reason: 'function_call', messages: [terminalOnly],
+      })],
+      expectedCall: { name: 'read', arguments: { path: 'fixture.txt' }, message: terminalOnly },
+    },
+    {
+      name: 'complete call arguments above 32 KiB remain intact within the provider bound',
+      chunks: [v2Frame('response.message.done', {
+        model: 'GigaChat-3-Ultra', finish_reason: 'function_call', messages: [largeArguments],
+      })],
+      expectedCall: {
+        name: 'write', arguments: { path: 'fixture.txt', contents: oversizedContents }, message: largeArguments,
+      },
+    },
+    {
+      name: 'wrong requested model',
+      chunks: [v2Frame('response.message.done', {
+        model: 'GigaChat-3-Pro', finish_reason: 'function_call', messages: [wrongModel],
+      })],
+    },
+    {
+      name: 'invalid provider state ID',
+      chunks: [v2Frame('response.message.done', {
+        model: 'GigaChat-3-Ultra', finish_reason: 'function_call', messages: [invalidState],
+      })],
+    },
+    { name: 'invalid UTF-8 before a function call', chunks: [invalidUtf8] },
+  ];
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const provider = createGigaChatProvider({
+        loadAuthorizationKey: async () => 'synthetic-key',
+        now: () => FIXED_NOW,
+        transport: fakeTransport((request) => request.url === GIGACHAT_OAUTH_URL
+          ? jsonResponse(200, token('synthetic-token'))
+          : request.url.endsWith('/models')
+            ? jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }] })
+            : eventStreamResponse(item.chunks)),
+      });
+      assert.equal((await provider.connect()).state, 'connected');
+      const events: ProviderEvent[] = [];
+      for await (const event of provider.stream({
+        system: [], messages: [{ id: 'message-terminal-call', role: 'user', text: 'Задача', createdAt: '2026-10-09T00:00:00.000Z' }],
+        permissionProfile: 'ask', modelId: 'GigaChat-3-Ultra',
+      }, new AbortController().signal)) events.push(event);
+
+      if (item.expectedCall) {
+        const event = events.find((candidate) => candidate.type === 'function-call');
+        assert.ok(event && event.type === 'function-call');
+        assert.equal(event.functionCall.name, item.expectedCall.name);
+        assert.deepEqual(event.functionCall.arguments, item.expectedCall.arguments);
+        assert.deepEqual(event.functionCall.wire?.content, item.expectedCall.message.content);
+        assert.equal(event.functionCall.wire?.messageId, item.expectedCall.message.message_id);
+        assert.equal(event.functionCall.wire?.toolStateId, item.expectedCall.message.tool_state_id);
+      } else {
+        assert.equal(events.some((event) => event.type === 'function-call'), false);
+        assert.deepEqual(events[events.length - 1], { type: 'error', category: 'protocol', retryable: false });
+      }
+    });
+  }
 });
 
 test('rejects malformed, incomplete, oversized, and unsupported terminal SSE events safely', async (t) => {
   const cases: Array<{ name: string; response: ProviderTransportResponse; category: string }> = [
     {
-      name: 'malformed JSON', response: eventStreamResponse([Buffer.from('data: not-json\n\ndata: [DONE]\n\n')]), category: 'protocol',
+      name: 'malformed JSON', response: eventStreamResponse([Buffer.from('event: response.message.done\ndata: not-json\n\n')]), category: 'protocol',
     },
     {
-      name: 'missing DONE', response: eventStreamResponse([Buffer.from('data: {"choices":[{"index":0,"delta":{"content":"часть"},"finish_reason":"stop"}]}\n\n')]), category: 'protocol',
+      name: 'missing message.done', response: eventStreamResponse([v2Frame('response.message.delta', {
+        model: 'GigaChat-3-Ultra', messages: [{ role: 'assistant', content: [{ text: 'часть' }] }],
+      })]), category: 'protocol',
     },
     {
-      name: 'DONE without stop', response: eventStreamResponse([Buffer.from('data: [DONE]\n\n')]), category: 'protocol',
+      name: 'message.done without finish reason', response: eventStreamResponse([v2Frame('response.message.done', { model: 'GigaChat-3-Ultra' })]), category: 'protocol',
     },
     {
-      name: 'DONE without any terminal finish reason', response: eventStreamResponse([Buffer.from('data: {"choices":[{"index":0,"delta":{"content":"часть"}}]}\n\ndata: [DONE]\n\n')]), category: 'protocol',
+      name: 'conflicting terminal content', response: eventStreamResponse([
+        v2Frame('response.message.delta', { model: 'GigaChat-3-Ultra', messages: [{ role: 'assistant', content: [{ text: 'часть' }] }] }),
+        v2Frame('response.message.done', { model: 'GigaChat-3-Ultra', finish_reason: 'stop', messages: [{ role: 'assistant', content: [{ text: 'другое' }] }] }),
+      ]), category: 'protocol',
     },
     {
-      name: 'data after stop', response: eventStreamResponse([Buffer.from('data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: {"choices":[{"index":0,"delta":{"content":"поздно"}}]}\n\ndata: [DONE]\n\n')]), category: 'protocol',
+      name: 'length finish reason', response: eventStreamResponse([
+        v2Frame('response.message.delta', { model: 'GigaChat-3-Ultra', messages: [{ role: 'assistant', content: [{ text: 'часть' }] }] }),
+        v2Frame('response.message.done', { model: 'GigaChat-3-Ultra', finish_reason: 'length' }),
+      ]), category: 'context',
     },
     {
-      name: 'length finish reason', response: eventStreamResponse([Buffer.from('data: {"choices":[{"index":0,"delta":{"content":"часть"},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n')]), category: 'context',
+      name: 'function terminal missing arguments', response: eventStreamResponse([v2Frame('response.message.done', {
+        model: 'GigaChat-3-Ultra', finish_reason: 'function_call',
+        messages: [{ role: 'assistant', content: [{ function_call: { name: 'read' } }] }],
+      })]), category: 'protocol',
     },
     {
-      name: 'function terminal missing arguments', response: eventStreamResponse([Buffer.from('data: {"choices":[{"index":0,"delta":{"function_call":{"name":"read"}},"finish_reason":"function_call"}]}\n\ndata: [DONE]\n\n')]), category: 'protocol',
+      name: 'function call missing terminal', response: eventStreamResponse([v2Frame('response.message.delta', {
+        model: 'GigaChat-3-Ultra',
+        messages: [{ role: 'assistant', content: [{ function_call: { name: 'future', arguments: { x: 1 } } }] }],
+      })]), category: 'protocol',
     },
     {
-      name: 'function call missing DONE', response: eventStreamResponse([Buffer.from(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { function_call: { name: 'future', arguments: { x: 1 } }, functions_state_id: 'state-1' }, finish_reason: 'function_call' }] })}\n\n`)]), category: 'protocol',
-    },
-    {
-      name: 'oversized stream', response: eventStreamResponse([Buffer.from(`data: ${'x'.repeat(2 * 1024 * 1024)}\n\n`)]), category: 'protocol',
+      name: 'oversized stream', response: eventStreamResponse([v2Frame('response.message.delta', {
+        model: 'GigaChat-3-Ultra', messages: [{ role: 'assistant', content: [{ text: 'x'.repeat(2 * 1024 * 1024) }] }],
+      })]), category: 'protocol',
     },
   ];
   for (const item of cases) {
@@ -882,16 +1116,20 @@ test('rejects malformed, incomplete, oversized, and unsupported terminal SSE eve
       }, new AbortController().signal)) events.push(event);
       assert.deepEqual(events[events.length - 1], { type: 'error', category: item.category, retryable: false });
       assert.equal(events.some((event) => event.type === 'completed'), false);
-      if (item.name === 'function call missing DONE') assert.equal(events.some((event) => event.type === 'function-call'), false);
+      if (item.name === 'function call missing terminal') assert.equal(events.some((event) => event.type === 'function-call'), false);
       if (item.category === 'context') assert.ok(events.some((event) => event.type === 'text-delta' && event.text === 'часть'));
     });
   }
 });
 
-test('DONE closes a healthy SSE stream without waiting for HTTP EOF', async () => {
+test('V2 message.done closes a healthy SSE stream without waiting for HTTP EOF', async () => {
   let nextCalls = 0;
   let responseCancelled = false;
-  const responseBytes = Buffer.from('data: {"choices":[{"index":0,"delta":{"content":"готово"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  const responseBytes = Buffer.from(`event: response.message.delta\r\ndata: ${JSON.stringify({
+    model: 'GigaChat-3-Ultra', messages: [{ role: 'assistant', content: [{ text: 'готово' }] }],
+  })}\r\n\r\nevent: response.message.done\r\ndata: ${JSON.stringify({
+    model: 'GigaChat-3-Ultra', finish_reason: 'stop', usage: { input_tokens: 3, output_tokens: 1, total_tokens: 4 },
+  })}\r\r`);
   const provider = createGigaChatProvider({
     loadAuthorizationKey: async () => 'synthetic-key',
     now: () => FIXED_NOW,
@@ -925,6 +1163,8 @@ test('DONE closes a healthy SSE stream without waiting for HTTP EOF', async () =
   assert.deepEqual(events, [
     { type: 'activity', activity: 'receiving' },
     { type: 'text-delta', text: 'готово' },
+    { type: 'usage', promptTokens: 3, completionTokens: 1, totalTokens: 4, precachedPromptTokens: null,
+      providerModel: 'GigaChat-3-Ultra' },
     { type: 'completed' },
   ]);
   assert.equal(nextCalls, 1);

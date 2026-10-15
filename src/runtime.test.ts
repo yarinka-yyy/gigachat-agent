@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import type { AcceptedTurnInput, ChatToolReceipt, CompactSnapshot, GigaChatProvider, HookDispatchInput, HookRunResult, Project, ProviderEvent, ProviderTurnRequest, RuntimeTurnSnapshot, UsageReceipt } from './contracts';
+import type { AcceptedTurnInput, ChatToolReceipt, CompactSnapshot, GigaChatProvider, HookDispatchInput, HookRunResult, Project, ProviderEvent, ProviderTurnRequest, ProviderV2FunctionWire, RuntimeTurnSnapshot, UsageReceipt } from './contracts';
 import type { CustomPolicy } from './custom-permissions';
 import type { LocalTools, LocalToolsOptions, PowerShellRequest } from './local-tools';
 import { createLocalTools, LocalToolError } from './local-tools';
@@ -211,10 +211,10 @@ function makeOwnedStoreRuntime(
     consumeTurn: (turn, signal) => store.consumeTurnReservation(turn, signal),
     releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
     persistTurnRecord: (turn) => store.updateRuntimeTurn(turn),
-    beginToolReceipt: (turn, receipt, owner) => {
+    beginToolReceipt: (turn, receipt, owner, wire) => {
       assertProviderStateOwner(owner, guard);
       return store.beginToolReceipt(turn.chatId, turn.messageId, receipt,
-        receipt.functionsStateId ? owner.accountScope : undefined);
+        wire || receipt.functionsStateId ? owner.accountScope : undefined, wire);
     },
     completeToolReceipt: (turn, receiptId, status, result) =>
       store.completeToolReceipt(turn.chatId, turn.messageId, receiptId, status, result),
@@ -1773,6 +1773,13 @@ test('runtime binds assistant, tool and compact state to the captured account an
   const toolTurn = await store.acceptLocalMessage(chat.id, 'Прочитай файл с захваченным состоянием', 'turn-state-tool');
   const noStateToolTurn = await store.acceptLocalMessage(chat.id, 'Прочитай файл без состояния', 'turn-state-free-tool');
   const noStateTurn = await store.acceptLocalMessage(chat.id, 'Ответь без состояния', 'turn-state-free-answer');
+  const toolStateId = 'b1e2d3c4-5566-7a88-8b99-aabbccddeeff';
+  const assistantStateId = 'c1e2d3c4-5566-7a88-8b99-aabbccddeeff';
+  const compactStateId = 'd1e2d3c4-5566-7a88-8b99-aabbccddeeff';
+  const functionWire = {
+    content: [{ function_call: { id: 'a1e2d3c4-5566-4a88-8b99-aabbccddeeff', name: 'read', arguments: { path: 'fixture.txt' } } }],
+    messageId: 'assistant-tool-message-owned', toolStateId,
+  };
   let compactCalls = 0;
   const toolCallsByPrompt = new Set<string>();
   const provider = makeProvider(async function* (request) {
@@ -1780,7 +1787,7 @@ test('runtime binds assistant, tool and compact state to the captured account an
       compactCalls += 1;
       yield { type: 'text-delta', text: `Сводка ${compactCalls}` };
       yield compactCalls === 1
-        ? { type: 'completed', functionsStateId: 'state-compact-owned' }
+        ? { type: 'completed', functionsStateId: compactStateId }
         : { type: 'completed' };
       return;
     }
@@ -1788,10 +1795,16 @@ test('runtime binds assistant, tool and compact state to the captured account an
     if (lastUserText.includes('захваченным состоянием')) {
       if (toolCallsByPrompt.has(lastUserText)) {
         yield { type: 'text-delta', text: 'Содержимое прочитано.' };
-        yield { type: 'completed', functionsStateId: 'state-assistant-owned' };
+        yield { type: 'completed', functionsStateId: assistantStateId };
       } else {
         toolCallsByPrompt.add(lastUserText);
-        yield functionCall('read', { path: 'fixture.txt' }, 'state-tool-owned');
+        yield {
+          type: 'function-call',
+          functionCall: {
+            name: 'read', arguments: { path: 'fixture.txt' }, content: null,
+            functionsStateId: toolStateId, terminalReason: 'function_call', wire: functionWire,
+          },
+        };
       }
       return;
     }
@@ -1826,17 +1839,18 @@ test('runtime binds assistant, tool and compact state to the captured account an
   assert.equal(publicJson.includes(stateA.accountScope), false, 'the account owner is not exposed through chat or runtime snapshots');
   assert.equal(publicJson.includes('providerStateOwnership'), false);
   assert.equal(detail.messages.find((message) => message.id === toolTurn.turn.assistantMessageId)?.functionsStateId,
-    'state-assistant-owned');
+    assistantStateId);
   assert.equal(Object.prototype.hasOwnProperty.call(
     detail.messages.find((message) => message.id === noStateTurn.turn.assistantMessageId)!, 'functionsStateId'), false);
-  assert.deepEqual(detail.toolReceipts.map((receipt) => receipt.functionsStateId), ['state-tool-owned', null]);
+  assert.deepEqual(detail.toolReceipts.map((receipt) => receipt.functionsStateId), [toolStateId, null]);
 
   const stateAView = await restored.getProviderStateOwnership(chat.id, stateA.accountScope);
   assert.deepEqual(stateAView.messages, [{ messageId: toolTurn.turn.assistantMessageId, owned: true }]);
   assert.deepEqual(stateAView.receipts, [{ receiptId: detail.toolReceipts[0]!.receiptId,
-    anchorMessageId: toolTurn.turn.messageId, owned: true }]);
-  assert.deepEqual((await restored.getToolProtocolThrough(chat.id, noStateToolTurn.turn.messageId))
-    .map((exchange) => exchange.functionsStateId), ['state-tool-owned', null]);
+    anchorMessageId: toolTurn.turn.messageId, owned: true, wireOwned: true }]);
+  const protocol = await restored.getToolProtocolThrough(chat.id, noStateToolTurn.turn.messageId);
+  assert.deepEqual(protocol.map((exchange) => exchange.functionsStateId), [toolStateId, null]);
+  assert.deepEqual(protocol[0]?.wire, functionWire);
 
   const compactTurn = await restored.acceptCompactionTurn(chat.id, 'turn-state-compact-owned');
   const originalMessages = (await restored.getChat(chat.id)).messages;
@@ -1847,7 +1861,7 @@ test('runtime binds assistant, tool and compact state to the captured account an
   assert.equal(compacted.compactSnapshot?.text, 'Сводка 1');
   assert.deepEqual(await (await openStore(directory)).getProviderStateOwnership(chat.id, stateA.accountScope), {
     ...stateAView,
-    compact: { snapshotId: compacted.compactSnapshot!.id, owned: true, functionsStateId: 'state-compact-owned' },
+    compact: { snapshotId: compacted.compactSnapshot!.id, owned: true, functionsStateId: compactStateId },
   });
 
   const noStateCompactTurn = await (await openStore(directory)).acceptCompactionTurn(chat.id, 'turn-state-compact-unowned');
@@ -1867,6 +1881,272 @@ test('runtime binds assistant, tool and compact state to the captured account an
   assert.ok(stateBView.messages.every((message) => !message.owned));
   assert.ok(stateBView.receipts.every((receipt) => !receipt.owned));
   assert.equal(stateBView.compact?.owned, false);
+});
+
+test('V2 function wire survives runtime, private Store reopen, and request serialization without entering public chat data', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-runtime-v2-wire-reopen-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Pro' });
+  const accepted = await store.acceptLocalMessage(chat.id, 'Прочитай fixture.txt и кратко перескажи.', 'turn-v2-wire-reopen');
+  const key = 'synthetic-v2-wire-owner';
+  const callId = 'a4b1d2e3-1122-4a33-8b44-c55667788990';
+  const assistantMessageId = 'assistant-v2-wire-message';
+  const toolStateId = 'b4b1d2e3-1122-7a33-8b44-c55667788990';
+  const rawArguments = '{"path":"fixture.txt"}';
+  const wire: ProviderV2FunctionWire = {
+    content: [
+      { text: 'Сначала проверю файл. ' },
+      { function_call: { id: callId, name: 'read', arguments: rawArguments } },
+    ],
+    messageId: assistantMessageId,
+    toolStateId,
+  };
+  const requests: ProviderTurnRequest[] = [];
+  let readCalls = 0;
+  const provider = makeProvider(async function* (request) {
+    requests.push(structuredClone(request));
+    if (requests.length === 1) {
+      yield {
+        type: 'function-call',
+        functionCall: {
+          name: 'read', arguments: { path: 'fixture.txt' }, content: 'Сначала проверю файл. ',
+          functionsStateId: toolStateId, terminalReason: 'function_call', wire,
+        },
+      };
+      return;
+    }
+    assert.equal(request.protocolHistory?.length, 1);
+    yield { type: 'text-delta', text: 'В файле одна строка.' };
+    yield { type: 'completed' };
+  });
+  const tools = {
+    read: async (_projectId: string | null, _permissionProfile: string, path: string) => {
+      readCalls += 1;
+      assert.equal(path, 'fixture.txt');
+      return { contents: 'Строка из синтетического файла.' };
+    },
+  } as unknown as LocalTools;
+  const { runtime, guard } = makeOwnedStoreRuntime(store, provider, async () => key, tools, true);
+
+  assert.ok(runtime.enqueue(accepted.turn));
+  await runtime.whenIdle();
+
+  assert.equal(runtime.list(chat.id)[0]?.status, 'completed');
+  assert.equal(readCalls, 1, 'the runtime executes the exact normalized object once');
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1]?.protocolHistory?.[0]?.wire?.messageId, assistantMessageId);
+  assert.equal(requests[1]?.protocolHistory?.[0]?.wire?.toolStateId, toolStateId);
+
+  const owner = await captureProviderStateOwner(guard, async () => key);
+  const reopened = await openStore(directory);
+  const detail = await reopened.getChat(chat.id);
+  const publicReceipt = detail.toolReceipts[0]!;
+  assert.equal(Object.prototype.hasOwnProperty.call(publicReceipt, 'wire'), false);
+  assert.equal(JSON.stringify(detail).includes(owner.accountScope), false);
+  assert.equal(JSON.stringify(detail).includes(assistantMessageId), false);
+  const ownership = await reopened.getProviderStateOwnership(chat.id, owner.accountScope);
+  assert.deepEqual(ownership.receipts, [{ receiptId: publicReceipt.receiptId, anchorMessageId: accepted.turn.messageId, owned: true, wireOwned: true }]);
+
+  const restoredRequest: ProviderTurnRequest = {
+    system: [],
+    messages: await reopened.getMessagesThrough(chat.id, accepted.turn.messageId),
+    protocolHistory: await reopened.getToolProtocolThrough(chat.id, accepted.turn.messageId),
+    permissionProfile: accepted.turn.permissionProfile,
+    modelId: accepted.turn.modelId,
+  };
+  const serialized = JSON.parse(serializeProviderTurnRequest(restoredRequest).body) as {
+    messages: Array<{ role?: string; content?: unknown; message_id?: string; tools_state_id?: string }>;
+  };
+  const assistantCall = serialized.messages.find((message) => message.role === 'assistant'
+    && Array.isArray(message.content)
+    && message.content.some((part) => typeof part === 'object' && part !== null && 'function_call' in part));
+  assert.ok(assistantCall);
+  assert.deepEqual(assistantCall.content, wire.content, 'the reopened wire keeps the original content parts and string arguments');
+  assert.equal(assistantCall.message_id, assistantMessageId);
+  assert.equal(assistantCall.tools_state_id, toolStateId);
+  const toolResult = serialized.messages.find((message) => message.role === 'tool');
+  assert.equal(toolResult?.tools_state_id, toolStateId);
+
+  const retry = await reopened.beginToolReceipt(chat.id, accepted.turn.messageId, {
+    receiptId: publicReceipt.receiptId,
+    name: 'read',
+    arguments: { path: 'fixture.txt' },
+    content: 'Сначала проверю файл. ',
+    functionsStateId: toolStateId,
+  }, owner.accountScope, wire);
+  assert.equal(retry.shouldExecute, false, 'an idempotent replay after reopen does not execute the tool again');
+  assert.equal(readCalls, 1);
+});
+
+test('V2 repeated write calls keep each new wire pair while the durable effect runs once', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-runtime-v2-write-reuse-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Pro' });
+  const accepted = await store.acceptLocalMessage(chat.id, 'Запиши файл ровно один раз.', 'turn-v2-write-reuse');
+  const key = 'synthetic-v2-write-reuse-owner';
+  const argumentsValue = { path: 'result.txt', contents: 'сохранить один раз' };
+  const stateOne = 'b3e2d3c4-5566-7a88-8b99-aabbccddeeff';
+  const stateTwo = 'c3e2d3c4-5566-7a88-8b99-aabbccddeeff';
+  const firstWire: ProviderV2FunctionWire = {
+    content: [
+      { text: 'Записываю файл.' },
+      { function_call: { id: 'a3e2d3c4-5566-4a88-8b99-aabbccddeeff', name: 'write',
+        arguments: '{"path":"result.txt","contents":"сохранить один раз"}' } },
+    ],
+    messageId: 'assistant-write-call-one', toolStateId: stateOne,
+  };
+  const secondWire: ProviderV2FunctionWire = {
+    content: [
+      { text: 'Повторно записываю тот же файл.' },
+      { function_call: { id: 'c3e2d3c4-5566-4a88-8b99-aabbccddeeff', name: 'write',
+        arguments: '{"path":"result.txt","contents":"сохранить один раз"}' } },
+    ],
+    messageId: 'assistant-write-call-two', toolStateId: stateTwo,
+  };
+  const requests: ProviderTurnRequest[] = [];
+  let writes = 0;
+  const provider = makeProvider(async function* (request) {
+    requests.push(structuredClone(request));
+    if (requests.length === 1) {
+      yield { type: 'function-call', functionCall: {
+        name: 'write', arguments: argumentsValue, content: 'Записываю файл.',
+        functionsStateId: stateOne, terminalReason: 'function_call', wire: firstWire,
+      } };
+      return;
+    }
+    if (requests.length === 2) {
+      assert.equal(request.protocolHistory?.length, 1);
+      yield { type: 'function-call', functionCall: {
+        name: 'write', arguments: argumentsValue, content: 'Повторно записываю тот же файл.',
+        functionsStateId: stateTwo, terminalReason: 'function_call', wire: secondWire,
+      } };
+      return;
+    }
+    assert.equal(request.protocolHistory?.length, 2);
+    yield { type: 'text-delta', text: 'Файл записан один раз.' };
+    yield { type: 'completed' };
+  });
+  const tools = {
+    write: async (_projectId: string | null, _permissionProfile: string, path: string, contents: string) => {
+      writes += 1;
+      assert.equal(path, 'result.txt');
+      assert.equal(contents, argumentsValue.contents);
+      return { bytes: Buffer.byteLength(contents, 'utf8') };
+    },
+  } as unknown as LocalTools;
+  const { runtime, guard } = makeOwnedStoreRuntime(store, provider, async () => key, tools, true);
+
+  assert.ok(runtime.enqueue(accepted.turn));
+  await runtime.whenIdle();
+  assert.equal(runtime.list(chat.id)[0]?.status, 'completed');
+  assert.equal(requests.length, 3);
+  assert.equal(writes, 1);
+
+  const owner = await captureProviderStateOwner(guard, async () => key);
+  const reopened = await openStore(directory);
+  const detail = await reopened.getChat(chat.id);
+  assert.equal(detail.toolReceipts.length, 2);
+  assert.deepEqual(detail.toolReceipts.map((receipt) => receipt.functionsStateId), [stateOne, stateTwo]);
+  assert.equal(JSON.stringify(detail).includes('assistant-write-call-one'), false);
+  const history = await reopened.getToolProtocolThrough(chat.id, accepted.turn.messageId);
+  assert.deepEqual(history.map((exchange) => exchange.wire), [firstWire, secondWire]);
+  const expectedResult = JSON.stringify({ ok: true, result: { bytes: Buffer.byteLength(argumentsValue.contents, 'utf8') } });
+  assert.deepEqual(history.map((exchange) => exchange.result), [expectedResult, expectedResult]);
+  assert.deepEqual(await reopened.getProviderStateOwnership(chat.id, owner.accountScope), {
+    messages: [],
+    receipts: [
+      { receiptId: detail.toolReceipts[0]!.receiptId, anchorMessageId: accepted.turn.messageId, owned: true, wireOwned: true },
+      { receiptId: detail.toolReceipts[1]!.receiptId, anchorMessageId: accepted.turn.messageId, owned: true, wireOwned: true },
+    ],
+    compact: null,
+  });
+
+  const serialized = JSON.parse(serializeProviderTurnRequest({
+    system: [],
+    messages: await reopened.getMessagesThrough(chat.id, accepted.turn.messageId),
+    protocolHistory: history,
+    permissionProfile: accepted.turn.permissionProfile,
+    modelId: accepted.turn.modelId,
+  }).body) as { messages: Array<{ role?: string; content?: unknown; message_id?: string; tools_state_id?: string }> };
+  const assistantCalls = serialized.messages.filter((message) => message.role === 'assistant'
+    && Array.isArray(message.content)
+    && message.content.some((part) => typeof part === 'object' && part !== null && 'function_call' in part));
+  assert.deepEqual(assistantCalls.map((message) => ({ content: message.content, id: message.message_id, state: message.tools_state_id })), [
+    { content: firstWire.content, id: firstWire.messageId, state: stateOne },
+    { content: secondWire.content, id: secondWire.messageId, state: stateTwo },
+  ]);
+});
+
+test('a stateless V2 object-argument wire is still captured, persisted, and replayed without a state pointer', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-runtime-v2-stateless-wire-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Pro' });
+  const accepted = await store.acceptLocalMessage(chat.id, 'Прочитай fixture.txt.', 'turn-v2-stateless-wire');
+  const key = 'synthetic-v2-stateless-wire-owner';
+  const argumentsValue = { path: 'fixture.txt' };
+  const wire = {
+    content: [{ function_call: { id: 'a5b1d2e3-1122-4a33-8b44-c55667788990', name: 'read', arguments: argumentsValue } }],
+    messageId: 'assistant-v2-stateless-message',
+  };
+  const requests: ProviderTurnRequest[] = [];
+  let readCalls = 0;
+  const provider = makeProvider(async function* (request) {
+    requests.push(structuredClone(request));
+    if ((request.protocolHistory ?? []).every((exchange) => exchange.anchorMessageId !== accepted.turn.messageId)) {
+      yield {
+        type: 'function-call',
+        functionCall: {
+          name: 'read', arguments: argumentsValue, content: null,
+          functionsStateId: null, terminalReason: 'function_call', wire,
+        },
+      };
+      return;
+    }
+    yield { type: 'text-delta', text: 'Файл прочитан.' };
+    yield { type: 'completed' };
+  });
+  const tools = {
+    read: async (_projectId: string | null, _permissionProfile: string, path: string) => {
+      readCalls += 1;
+      assert.equal(path, 'fixture.txt');
+      return { contents: 'Объект аргументов сохранён.' };
+    },
+  } as unknown as LocalTools;
+  const { runtime } = makeOwnedStoreRuntime(store, provider, async () => key, tools, true);
+
+  assert.ok(runtime.enqueue(accepted.turn));
+  await runtime.whenIdle();
+  assert.equal(runtime.list(chat.id)[0]?.status, 'completed');
+  assert.equal(readCalls, 1);
+
+  const reopened = await openStore(directory);
+  const detail = await reopened.getChat(chat.id);
+  const owner = await captureProviderStateOwner(createBalanceScopeGuard(), async () => key);
+  const ownership = await reopened.getProviderStateOwnership(chat.id, owner.accountScope);
+  assert.deepEqual(ownership.receipts, [{ receiptId: detail.toolReceipts[0]!.receiptId,
+    anchorMessageId: accepted.turn.messageId, owned: false, wireOwned: true }]);
+  const protocolHistory = await reopened.getToolProtocolThrough(chat.id, accepted.turn.messageId);
+  assert.deepEqual(protocolHistory[0]?.wire, wire);
+  assert.equal(protocolHistory[0]?.functionsStateId, null);
+  const serialized = JSON.parse(serializeProviderTurnRequest({
+    system: [], messages: await reopened.getMessagesThrough(chat.id, accepted.turn.messageId),
+    protocolHistory, permissionProfile: accepted.turn.permissionProfile, modelId: accepted.turn.modelId,
+  }).body) as { messages: Array<{ role?: string; content?: unknown; message_id?: string; tools_state_id?: string }> };
+  const assistantCall = serialized.messages.find((message) => message.role === 'assistant'
+    && Array.isArray(message.content)
+    && message.content.some((part) => typeof part === 'object' && part !== null && 'function_call' in part));
+  assert.ok(assistantCall);
+  assert.deepEqual(assistantCall.content, wire.content);
+  assert.equal(assistantCall.message_id, wire.messageId);
+  assert.equal(assistantCall.tools_state_id, undefined);
+  const toolResult = serialized.messages.find((message) => message.role === 'tool');
+  assert.equal(toolResult?.tools_state_id, undefined);
 });
 
 test('plain assistant state stays owned through A-to-B-to-A runtime switches and Store reopen', async (t) => {
@@ -1968,6 +2248,13 @@ test('runtime stops before provider when another account would lose access to hi
   const first = await store.acceptLocalMessage(chat.id, 'Сначала прочитай файл', 'turn-state-history-first', [attachmentId]);
   const keyA = 'synthetic-provider-state-history-A';
   const keyB = 'synthetic-provider-state-history-B';
+  const receiptStateId = 'b2e2d3c4-5566-7a88-8b99-aabbccddeeff';
+  const assistantStateId = 'c2e2d3c4-5566-7a88-8b99-aabbccddeeff';
+  const returnAssistantStateId = 'd2e2d3c4-5566-7a88-8b99-aabbccddeeff';
+  const historyWire = {
+    content: [{ function_call: { id: 'a2e2d3c4-5566-4a88-8b99-aabbccddeeff', name: 'read', arguments: { path: 'historical.txt' } } }],
+    messageId: 'assistant-history-tool-message', toolStateId: receiptStateId,
+  };
   let activeKey = keyA;
   let providerCalls = 0;
   let readEffects = 0;
@@ -1977,11 +2264,17 @@ test('runtime stops before provider when another account would lose access to hi
     observedRequests.push(structuredClone(request));
     const lastUserText = [...request.messages].reverse().find((message) => message.role === 'user')?.text ?? '';
     if (lastUserText.includes('Сначала прочитай файл') && request.protocolHistory?.length !== 1) {
-      yield functionCall('read', { path: 'historical.txt' }, 'state-history-receipt-A');
+      yield {
+        type: 'function-call',
+        functionCall: {
+          name: 'read', arguments: { path: 'historical.txt' }, content: null,
+          functionsStateId: receiptStateId, terminalReason: 'function_call', wire: historyWire,
+        },
+      };
       return;
     }
     yield { type: 'text-delta', text: 'Результат сохранён в истории.' };
-    yield { type: 'completed', functionsStateId: 'state-history-assistant-A' };
+    yield { type: 'completed', functionsStateId: assistantStateId };
   });
   const tools = {
     read: async () => { readEffects += 1; return { contents: 'synthetic file contents' }; },
@@ -1998,8 +2291,9 @@ test('runtime stops before provider when another account would lose access to hi
   assert.equal(readEffects, 1);
   assert.deepEqual(observedRequests[2]?.messages
     .filter((message) => message.role === 'assistant')
-    .map((message) => message.functionsStateId), ['state-history-assistant-A']);
-  assert.deepEqual(observedRequests[2]?.protocolHistory?.map((exchange) => exchange.functionsStateId), ['state-history-receipt-A']);
+    .map((message) => message.functionsStateId), [assistantStateId]);
+  assert.deepEqual(observedRequests[2]?.protocolHistory?.map((exchange) => exchange.functionsStateId), [receiptStateId]);
+  assert.deepEqual(observedRequests[2]?.protocolHistory?.[0]?.wire, historyWire);
 
   const beforeForeignTurn = await store.getChat(chat.id);
   const frozenHistory = structuredClone({ messages: beforeForeignTurn.messages, toolReceipts: beforeForeignTurn.toolReceipts, artifacts: beforeForeignTurn.artifacts });
@@ -2036,7 +2330,7 @@ test('runtime stops before provider when another account would lose access to hi
       { messageId: first.turn.assistantMessageId, owned: true },
       { messageId: followUp.turn.assistantMessageId, owned: true },
     ],
-    receipts: [{ receiptId: afterForeignTurn.toolReceipts[0]!.receiptId, anchorMessageId: first.turn.messageId, owned: true }],
+    receipts: [{ receiptId: afterForeignTurn.toolReceipts[0]!.receiptId, anchorMessageId: first.turn.messageId, owned: true, wireOwned: true }],
     compact: null,
   });
   const ownershipForB = await reopenedAsB.getProviderStateOwnership(chat.id, ownerB.accountScope);
@@ -2054,7 +2348,7 @@ test('runtime stops before provider when another account would lose access to hi
   const returnedRuntime = makeOwnedStoreRuntime(returnedStore, makeProvider(async function* (request) {
     returnRequestMessages.push(structuredClone(request));
     yield { type: 'text-delta', text: 'Ответ после повторного подключения.' };
-    yield { type: 'completed', functionsStateId: 'state-history-assistant-return-A' };
+    yield { type: 'completed', functionsStateId: returnAssistantStateId };
   }), async () => activeKey, tools, true, guard);
   const returnTurn = await returnedStore.acceptLocalMessage(chat.id, 'Продолжи после возврата ключа A.', 'turn-state-history-return-A');
   assert.ok(returnedRuntime.runtime.enqueue(returnTurn.turn));
@@ -2063,8 +2357,9 @@ test('runtime stops before provider when another account would lose access to hi
   assert.equal(returnRequestMessages.length, 1);
   assert.deepEqual(returnRequestMessages[0]?.messages
     .filter((message) => message.role === 'assistant')
-    .map((message) => message.functionsStateId), ['state-history-assistant-A', 'state-history-assistant-A']);
-  assert.deepEqual(returnRequestMessages[0]?.protocolHistory?.map((exchange) => exchange.functionsStateId), ['state-history-receipt-A']);
+    .map((message) => message.functionsStateId), [assistantStateId, assistantStateId]);
+  assert.deepEqual(returnRequestMessages[0]?.protocolHistory?.map((exchange) => exchange.functionsStateId), [receiptStateId]);
+  assert.deepEqual(returnRequestMessages[0]?.protocolHistory?.[0]?.wire, historyWire);
   const reopenedAsA = await openStore(directory);
   const afterReturn = await reopenedAsA.getChat(chat.id);
   assert.deepEqual(afterReturn.messages.slice(0, beforeReturn.messages.length), beforeReturn.messages,
@@ -2283,10 +2578,12 @@ test('uploads only the accepted message attachments inside the FIFO turn and doe
     { messageId: first.turn.messageId, attachmentId: localAttachmentId, fileId: 'remote_attachment_one' },
   ]);
   const firstWire = JSON.parse(serializeProviderTurnRequest(requests[0]!).body) as { messages: Array<Record<string, unknown>> };
-  assert.deepEqual(firstWire.messages.find((message) => message.role === 'user' && 'attachments' in message)?.attachments, ['remote_attachment_one']);
+  const firstUserContent = firstWire.messages.find((message) => message.role === 'user')?.content as Array<Record<string, unknown>>;
+  assert.deepEqual(firstUserContent.find((part) => 'files' in part)?.files, [{ id: 'remote_attachment_one' }]);
   assert.deepEqual(requests[1]?.attachments, [], 'a text follow-up does not reload or resend the prior image/document');
   const secondWire = JSON.parse(serializeProviderTurnRequest(requests[1]!).body) as { messages: Array<Record<string, unknown>> };
-  assert.equal(secondWire.messages.some((message) => 'attachments' in message), false);
+  assert.equal(secondWire.messages.some((message) => Array.isArray(message.content)
+    && (message.content as Array<Record<string, unknown>>).some((part) => 'files' in part)), false);
   const detail = await store.getChat(chat.id);
   assert.deepEqual(detail.messages.find((message) => message.id === first.turn.messageId)?.attachmentIds, [localAttachmentId]);
   assert.equal(detail.artifacts.find((artifact) => artifact.id === localAttachmentId)?.messageId, first.turn.messageId);

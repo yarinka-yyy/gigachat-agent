@@ -359,6 +359,18 @@ export interface ProviderFunctionCall {
   content: string | null;
   functionsStateId: string | null;
   terminalReason: 'function_call';
+  wire?: ProviderV2FunctionWire;
+}
+
+export type ProviderV2FunctionContentPart =
+  | { text: string }
+  | { function_call: { id?: string; name: string; arguments: Record<string, unknown> | string } };
+
+/** Exact validated V2 assistant call data; persisted only in the private Store envelope. */
+export interface ProviderV2FunctionWire {
+  content: ProviderV2FunctionContentPart[];
+  messageId?: string;
+  toolStateId?: string;
 }
 
 export interface ProviderProtocolExchange {
@@ -368,9 +380,11 @@ export interface ProviderProtocolExchange {
   content: string | null;
   functionsStateId: string | null;
   result: string;
+  receiptId?: string;
+  wire?: ProviderV2FunctionWire;
 }
 
-export interface ChatToolReceipt extends Omit<ProviderProtocolExchange, 'result'> {
+export interface ChatToolReceipt extends Omit<ProviderProtocolExchange, 'result' | 'receiptId' | 'wire'> {
   receiptId: string;
   effectId?: string;
   status: 'pending' | 'completed' | 'unknown';

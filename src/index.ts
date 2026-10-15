@@ -877,10 +877,10 @@ async function createMainRuntime(
     consumeTurn: (turn: AcceptedTurnInput, signal) => store.consumeTurnReservation(turn, signal),
     releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
     persistTurnRecord: (turn) => store.updateRuntimeTurn(turn),
-    beginToolReceipt: (turn, receipt, owner) => {
+    beginToolReceipt: (turn, receipt, owner, wire) => {
       assertProviderStateOwner(owner, providerStateScopeGuard);
       return store.beginToolReceipt(turn.chatId, turn.messageId, receipt,
-        receipt.functionsStateId ? owner.accountScope : undefined);
+        wire || receipt.functionsStateId ? owner.accountScope : undefined, wire);
     },
     completeToolReceipt: (turn, receiptId, status, result) => store.completeToolReceipt(turn.chatId, turn.messageId, receiptId, status, result),
     appendAssistant: async (turn, text, signal, functionsStateId, terminalTurn, owner) => {

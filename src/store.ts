@@ -3,7 +3,7 @@ import { Buffer } from 'node:buffer';
 import { constants } from 'node:fs';
 import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { DEFAULT_NOTIFICATION_SETTINGS, PROVIDER_ERROR_CATEGORIES, type AcceptedTurnInput, type BalanceFamilyId, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type ChatTurnRecord, type CompactSnapshot, type CompactionPrefix, type HomeDraftAttachment, type HomeDraftInput, type HomeDraftRecord, type HookEvent, type HookRunResult, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderBalanceFamily, type ProviderBalanceObservation, type ProviderErrorCategory, type ProviderProtocolExchange, type ProviderToolName, type ProviderUploadLedgerEntry, type RuntimeActivity, type RuntimeTurnSnapshot, type Settings, type SettingsPatch, type StudioBalanceAnchorInput, type Theme, type UsageLedgerSummary, type UsageProfileView, type UsageReceipt } from './contracts';
+import { DEFAULT_NOTIFICATION_SETTINGS, PROVIDER_ERROR_CATEGORIES, type AcceptedTurnInput, type BalanceFamilyId, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type ChatTurnRecord, type CompactSnapshot, type CompactionPrefix, type HomeDraftAttachment, type HomeDraftInput, type HomeDraftRecord, type HookEvent, type HookRunResult, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderBalanceFamily, type ProviderBalanceObservation, type ProviderErrorCategory, type ProviderProtocolExchange, type ProviderToolName, type ProviderUploadLedgerEntry, type ProviderV2FunctionWire, type RuntimeActivity, type RuntimeTurnSnapshot, type Settings, type SettingsPatch, type StudioBalanceAnchorInput, type Theme, type UsageLedgerSummary, type UsageProfileView, type UsageReceipt } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { requireModelId } from './models';
 import { isSkillId } from './skills';
@@ -13,6 +13,7 @@ import { MAX_USAGE_RECEIPTS, mergeUsageReceipt, summarizeUsage, validateUsageRec
 import { buildUsageProfileView, type UsageBalanceAnchorViewInput } from './usage-view';
 import { hashCompactionPrefix, validateCompactSummary } from './context';
 import { attachmentContentType, inspectLocalAttachmentContent, LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES } from './attachment-policy';
+import { validateProviderV2FunctionWire } from './provider-wire';
 
 type ProjectFile = { schemaVersion: 2; projects: Project[] };
 type LegacyChat = ChatSummary & { draft: string };
@@ -25,12 +26,19 @@ type ProfileBalanceAnchor = Omit<UsageBalanceAnchorViewInput, 'baselineMatches'>
 };
 type ProfileBalanceFile = { schemaVersion: 1; anchors: ProfileBalanceAnchor[] };
 type ProviderUploadFile = { schemaVersion: 1; entries: ProviderUploadLedgerEntry[] };
-type ProviderStateOwnerBinding = { accountScope: string; stateIdHash: string };
-type ProviderStateMessageBinding = ProviderStateOwnerBinding & { messageId: string };
-type ProviderStateReceiptBinding = ProviderStateOwnerBinding & { receiptId: string; anchorMessageId: string };
-type ProviderStateCompactBinding = ProviderStateOwnerBinding & { snapshotId: string; functionsStateId: string };
+type ProviderProtocolVersion = 'v1' | 'v2';
+type ProviderStateOwnerBinding = { accountScope: string; protocolVersion: ProviderProtocolVersion };
+type ProviderStateMessageBinding = ProviderStateOwnerBinding & { messageId: string; stateIdHash: string };
+type ProviderStateReceiptBinding = ProviderStateOwnerBinding & {
+  receiptId: string;
+  anchorMessageId: string;
+  stateIdHash: string | null;
+  wireHash?: string;
+  wire?: ProviderV2FunctionWire;
+};
+type ProviderStateCompactBinding = ProviderStateOwnerBinding & { snapshotId: string; functionsStateId: string; stateIdHash: string };
 type ProviderStateOwnership = {
-  schemaVersion: 1;
+  schemaVersion: 2;
   messages: ProviderStateMessageBinding[];
   receipts: ProviderStateReceiptBinding[];
   compact: ProviderStateCompactBinding | null;
@@ -38,7 +46,7 @@ type ProviderStateOwnership = {
 type StoredChat = { detail: ChatDetail; providerStateOwnership: ProviderStateOwnership };
 type ProjectDeleteState = { projects: ProjectFile; chats: StoredChat[]; instructionText: string | null };
 type ProjectDeleteJournal = {
-  schemaVersion: 2;
+  schemaVersion: 3;
   operationId: string;
   projectId: string;
   before: ProjectDeleteState;
@@ -136,7 +144,7 @@ export interface LocalStore {
   getMessagesThrough(chatId: unknown, messageId: unknown): Promise<ChatMessage[]>;
   getToolProtocolThrough(chatId: unknown, messageId: unknown): Promise<ProviderProtocolExchange[]>;
   getCompactionPrefix(chatId: unknown, boundaryMessageId: unknown): Promise<CompactionPrefix>;
-  beginToolReceipt(chatId: unknown, messageId: unknown, receipt: Omit<ChatToolReceipt, 'anchorMessageId' | 'status' | 'result' | 'createdAt'>, accountScope?: unknown): Promise<{ shouldExecute: boolean; receipt: ChatToolReceipt }>;
+  beginToolReceipt(chatId: unknown, messageId: unknown, receipt: Omit<ChatToolReceipt, 'anchorMessageId' | 'status' | 'result' | 'createdAt'>, accountScope?: unknown, wire?: unknown): Promise<{ shouldExecute: boolean; receipt: ChatToolReceipt }>;
   getProviderStateOwnership(chatId: unknown, accountScope: unknown): Promise<ProviderStateOwnershipView>;
   completeToolReceipt(chatId: unknown, messageId: unknown, receiptId: unknown, status: 'completed' | 'unknown', result: unknown): Promise<void>;
   createChat(projectId?: unknown, kind?: unknown): Promise<ChatSummary>;
@@ -182,7 +190,7 @@ export interface LocalStore {
 
 export interface ProviderStateOwnershipView {
   messages: Array<{ messageId: string; owned: boolean }>;
-  receipts: Array<{ receiptId: string; anchorMessageId: string; owned: boolean }>;
+  receipts: Array<{ receiptId: string; anchorMessageId: string; owned: boolean; wireOwned: boolean }>;
   compact: { snapshotId: string; owned: boolean; functionsStateId: string | null } | null;
 }
 
@@ -223,20 +231,22 @@ function hashProviderStateId(value: string): string {
 }
 
 function emptyProviderStateOwnership(): ProviderStateOwnership {
-  return { schemaVersion: 1, messages: [], receipts: [], compact: null };
+  return { schemaVersion: 2, messages: [], receipts: [], compact: null };
 }
 
-function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  const expected = [...keys].sort();
-  const actual = Object.keys(value).sort();
-  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[], optional: readonly string[] = []): boolean {
+  const expected = new Set([...keys, ...optional]);
+  const actual = Object.keys(value);
+  return keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+    && actual.every((key) => expected.has(key));
 }
 
 function validateProviderStateOwnership(value: unknown, detail: ChatDetail): ProviderStateOwnership {
   if (!isRecord(value) || !hasExactKeys(value, ['schemaVersion', 'messages', 'receipts', 'compact'])
-    || value.schemaVersion !== 1 || !Array.isArray(value.messages) || !Array.isArray(value.receipts)) {
+    || (value.schemaVersion !== 1 && value.schemaVersion !== 2) || !Array.isArray(value.messages) || !Array.isArray(value.receipts)) {
     throw new Error('Invalid provider-state ownership metadata.');
   }
+  const legacy = value.schemaVersion === 1;
   if (value.messages.length > detail.messages.length || value.receipts.length > detail.toolReceipts.length) {
     throw new Error('Provider-state ownership metadata exceeds chat resources.');
   }
@@ -250,31 +260,66 @@ function validateProviderStateOwnership(value: unknown, detail: ChatDetail): Pro
     if (!receiptsByKey.has(key)) receiptsByKey.set(key, receipt);
   }
   const messages = value.messages.map((entry: unknown): ProviderStateMessageBinding => {
-    if (!isRecord(entry) || !hasExactKeys(entry, ['messageId', 'accountScope', 'stateIdHash'])
+    if (!isRecord(entry) || !hasExactKeys(entry, legacy
+      ? ['messageId', 'accountScope', 'stateIdHash']
+      : ['messageId', 'accountScope', 'protocolVersion', 'stateIdHash'])
       || typeof entry.stateIdHash !== 'string' || !/^[a-f0-9]{64}$/.test(entry.stateIdHash)) {
       throw new Error('Invalid provider-state message binding.');
     }
+    const protocolVersion = legacy ? 'v1' : entry.protocolVersion;
+    if (protocolVersion !== 'v1' && protocolVersion !== 'v2') throw new Error('Invalid provider-state protocol version.');
     const messageId = requireId(entry.messageId);
     const accountScope = requireProviderAccountScope(entry.accountScope);
     const message = assistantMessagesById.get(messageId);
     if (!message?.functionsStateId || hashProviderStateId(requireProviderStateId(message.functionsStateId)) !== entry.stateIdHash) {
       throw new Error('Unbound provider-state message binding.');
     }
-    return { messageId, accountScope, stateIdHash: entry.stateIdHash };
+    return { messageId, accountScope, protocolVersion, stateIdHash: entry.stateIdHash };
   });
   const receipts = value.receipts.map((entry: unknown): ProviderStateReceiptBinding => {
-    if (!isRecord(entry) || !hasExactKeys(entry, ['receiptId', 'anchorMessageId', 'accountScope', 'stateIdHash'])
+    if (!isRecord(entry) || !hasExactKeys(entry, legacy
+      ? ['receiptId', 'anchorMessageId', 'accountScope', 'stateIdHash']
+      : ['receiptId', 'anchorMessageId', 'accountScope', 'protocolVersion', 'stateIdHash'],
+    legacy ? [] : ['wireHash', 'wire'])
       || typeof entry.receiptId !== 'string' || !/^[a-f0-9]{64}$/.test(entry.receiptId)
-      || typeof entry.stateIdHash !== 'string' || !/^[a-f0-9]{64}$/.test(entry.stateIdHash)) {
+      || (legacy ? typeof entry.stateIdHash !== 'string' : entry.stateIdHash !== null
+        && (typeof entry.stateIdHash !== 'string' || !/^[a-f0-9]{64}$/.test(entry.stateIdHash)))) {
       throw new Error('Invalid provider-state receipt binding.');
     }
+    const protocolVersion = legacy ? 'v1' : entry.protocolVersion;
+    if (protocolVersion !== 'v1' && protocolVersion !== 'v2') throw new Error('Invalid provider-state protocol version.');
     const anchorMessageId = requireId(entry.anchorMessageId);
     const accountScope = requireProviderAccountScope(entry.accountScope);
     const receipt = receiptsByKey.get(`${entry.receiptId}:${anchorMessageId}`);
-    if (!receipt?.functionsStateId || hashProviderStateId(requireProviderStateId(receipt.functionsStateId)) !== entry.stateIdHash) {
+    if (!receipt || (receipt.functionsStateId === null
+      ? entry.stateIdHash !== null
+      : hashProviderStateId(requireProviderStateId(receipt.functionsStateId)) !== entry.stateIdHash)) {
       throw new Error('Unbound provider-state receipt binding.');
     }
-    return { receiptId: entry.receiptId, anchorMessageId, accountScope, stateIdHash: entry.stateIdHash };
+    if (legacy) {
+      if (entry.stateIdHash === null || receipt.functionsStateId === null) throw new Error('Invalid legacy provider-state receipt binding.');
+      return { receiptId: entry.receiptId, anchorMessageId, accountScope, protocolVersion: 'v1', stateIdHash: entry.stateIdHash as string };
+    }
+    if (protocolVersion === 'v1') {
+      if (entry.stateIdHash === null || receipt.functionsStateId === null
+        || entry.wire !== undefined || entry.wireHash !== undefined) {
+        throw new Error('Invalid V1 provider-state receipt binding.');
+      }
+      return { receiptId: entry.receiptId, anchorMessageId, accountScope, protocolVersion: 'v1', stateIdHash: entry.stateIdHash as string };
+    }
+    if (entry.stateIdHash !== null && receipt.functionsStateId === null) throw new Error('Invalid V2 provider-state receipt binding.');
+    if (entry.wire === undefined || typeof entry.wireHash !== 'string' || !/^[a-f0-9]{64}$/.test(entry.wireHash)) {
+      throw new Error('Missing V2 provider function wire.');
+    }
+    const wire = validateProviderV2FunctionWire(entry.wire, {
+      name: receipt.name,
+      arguments: receipt.arguments,
+      content: receipt.content,
+      functionsStateId: receipt.functionsStateId,
+    });
+    if (!wire || hashProviderWire(wire) !== entry.wireHash) throw new Error('Invalid V2 provider function wire binding.');
+    return { receiptId: entry.receiptId, anchorMessageId, accountScope, protocolVersion: 'v2',
+      stateIdHash: entry.stateIdHash as string | null, wireHash: entry.wireHash, wire };
   });
   if (new Set(messages.map((entry) => entry.messageId)).size !== messages.length
     || new Set(receipts.map((entry) => `${entry.receiptId}:${entry.anchorMessageId}`)).size !== receipts.length) {
@@ -283,19 +328,23 @@ function validateProviderStateOwnership(value: unknown, detail: ChatDetail): Pro
   let compact: ProviderStateCompactBinding | null = null;
   if (value.compact !== null) {
     const entry = value.compact;
-    if (!isRecord(entry) || !hasExactKeys(entry, ['snapshotId', 'functionsStateId', 'accountScope', 'stateIdHash'])
+    if (!isRecord(entry) || !hasExactKeys(entry, legacy
+      ? ['snapshotId', 'functionsStateId', 'accountScope', 'stateIdHash']
+      : ['snapshotId', 'functionsStateId', 'accountScope', 'protocolVersion', 'stateIdHash'])
       || typeof entry.stateIdHash !== 'string' || !/^[a-f0-9]{64}$/.test(entry.stateIdHash)) {
       throw new Error('Invalid provider-state compact binding.');
     }
+    const protocolVersion = legacy ? 'v1' : entry.protocolVersion;
+    if (protocolVersion !== 'v1' && protocolVersion !== 'v2') throw new Error('Invalid provider-state protocol version.');
     const snapshotId = requireId(entry.snapshotId);
     const functionsStateId = requireProviderStateId(entry.functionsStateId);
     const accountScope = requireProviderAccountScope(entry.accountScope);
     if (detail.compactSnapshot?.id !== snapshotId || hashProviderStateId(functionsStateId) !== entry.stateIdHash) {
       throw new Error('Unbound provider-state compact binding.');
     }
-    compact = { snapshotId, functionsStateId, accountScope, stateIdHash: entry.stateIdHash };
+    compact = { snapshotId, functionsStateId, accountScope, protocolVersion, stateIdHash: entry.stateIdHash };
   }
-  return { schemaVersion: 1, messages, receipts, compact };
+  return { schemaVersion: 2, messages, receipts, compact };
 }
 
 function validateStoredChat(value: unknown): Loaded<StoredChat> {
@@ -306,11 +355,26 @@ function validateStoredChat(value: unknown): Loaded<StoredChat> {
     if (Object.prototype.hasOwnProperty.call(value, 'providerStateOwnership')) throw new Error('Legacy chat contains unversioned private state.');
     return { value: { detail: loaded.value, providerStateOwnership: emptyProviderStateOwnership() }, needsWrite: true };
   }
-  if (version !== 12) throw new Error('Unknown stored chat schema.');
-  return {
-    value: { detail: loaded.value, providerStateOwnership: validateProviderStateOwnership(value.providerStateOwnership, loaded.value) },
-    needsWrite: loaded.needsWrite,
-  };
+  if (version !== 12 && version !== 13) throw new Error('Unknown stored chat schema.');
+  if (!isRecord(value.providerStateOwnership)
+    || (version === 12 && value.providerStateOwnership.schemaVersion !== 1)
+    || (version === 13 && value.providerStateOwnership.schemaVersion !== 2)) {
+    throw new Error('Stored chat and provider-state ownership versions do not match.');
+  }
+  const providerStateOwnership = validateProviderStateOwnership(value.providerStateOwnership, loaded.value);
+  if (version === 13 && loaded.value.compactSnapshot) {
+    const prefix = buildCompactionPrefix(loaded.value, loaded.value.compactSnapshot.boundaryMessageId,
+      loaded.value.compactSnapshot.coveredThroughMessageId, providerStateOwnership);
+    if (prefix.coveredThroughMessageId !== loaded.value.compactSnapshot.coveredThroughMessageId
+      || prefix.coveredPrefixHash !== loaded.value.compactSnapshot.coveredPrefixHash) {
+      throw new Error('Invalid compact prefix hash.');
+    }
+  }
+  return { value: { detail: loaded.value, providerStateOwnership }, needsWrite: version === 12 || loaded.needsWrite };
+}
+
+function hashProviderWire(wire: ProviderV2FunctionWire): string {
+  return createHash('sha256').update(JSON.stringify(wire), 'utf8').digest('hex');
 }
 
 function requireName(value: unknown, label: string, maxLength: number): string {
@@ -940,7 +1004,7 @@ function recordFromRuntimeTurn(turn: RuntimeTurnSnapshot): ChatTurnRecord {
 }
 
 function validateChatDetail(value: unknown): Loaded<ChatDetail> {
-  if (!isRecord(value) || (value.schemaVersion !== 3 && value.schemaVersion !== 4 && value.schemaVersion !== 5 && value.schemaVersion !== 6 && value.schemaVersion !== 7 && value.schemaVersion !== 8 && value.schemaVersion !== 9 && value.schemaVersion !== 10 && value.schemaVersion !== 11 && value.schemaVersion !== 12)
+  if (!isRecord(value) || (value.schemaVersion !== 3 && value.schemaVersion !== 4 && value.schemaVersion !== 5 && value.schemaVersion !== 6 && value.schemaVersion !== 7 && value.schemaVersion !== 8 && value.schemaVersion !== 9 && value.schemaVersion !== 10 && value.schemaVersion !== 11 && value.schemaVersion !== 12 && value.schemaVersion !== 13)
     || !Array.isArray(value.messages) || !Array.isArray(value.artifacts)
     || (value.schemaVersion >= 7 && !Array.isArray(value.toolReceipts))
     || (value.schemaVersion >= 8 && !('compactSnapshot' in value))
@@ -1086,7 +1150,7 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
         || legacyPrefix.coveredPrefixHash !== compactSnapshot.coveredPrefixHash) throw new Error('Invalid legacy compact prefix hash.');
       const migratedPrefix = buildCompactionPrefix(storedChat, compactSnapshot.boundaryMessageId, compactSnapshot.coveredThroughMessageId);
       compactSnapshot = { ...compactSnapshot, coveredPrefixHash: migratedPrefix.coveredPrefixHash };
-    } else {
+    } else if (version < 13) {
       const prefix = buildCompactionPrefix(storedChat, compactSnapshot.boundaryMessageId, compactSnapshot.coveredThroughMessageId);
       if (prefix.coveredThroughMessageId !== compactSnapshot.coveredThroughMessageId
         || prefix.coveredPrefixHash !== compactSnapshot.coveredPrefixHash) throw new Error('Invalid compact prefix hash.');
@@ -1096,7 +1160,7 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
     value: { ...chat, messages, artifacts, draftAttachments, toolReceipts, turns, nextTurnPermissionProfile, nextTurnSkillId,
       modelId: version >= 6 && value.modelId !== null ? requireModelId(value.modelId) : null,
       compactSnapshot },
-    needsWrite: version < 12,
+    needsWrite: version < 13,
   };
 }
 
@@ -1108,7 +1172,7 @@ function summary(chat: ChatDetail): ChatSummary {
 }
 
 function detailFile(chat: ChatDetail, providerStateOwnership = emptyProviderStateOwnership()): Record<string, unknown> {
-  return { schemaVersion: 12, ...chat, providerStateOwnership: validateProviderStateOwnership(providerStateOwnership, chat) };
+  return { schemaVersion: 13, ...chat, providerStateOwnership: validateProviderStateOwnership(providerStateOwnership, chat) };
 }
 
 function preserveSkillInvocation(existing: ChatTurnRecord | null, next: ChatTurnRecord): ChatTurnRecord {
@@ -1440,7 +1504,12 @@ function validateHomeSendJournal(value: unknown): HomeSendJournal {
   };
 }
 
-function buildCompactionPrefix(chat: ChatDetail, boundaryMessageId: string, coveredThroughMessageId?: string): CompactionPrefix {
+function buildCompactionPrefix(
+  chat: ChatDetail,
+  boundaryMessageId: string,
+  coveredThroughMessageId?: string,
+  providerStateOwnership?: ProviderStateOwnership,
+): CompactionPrefix {
   const anchorIndex = chat.messages.findIndex((message) => message.id === boundaryMessageId && message.role === 'user');
   if (anchorIndex < 0) throw new Error('Граница сжатия отсутствует в истории чата.');
   const coveredIndex = coveredThroughMessageId === undefined
@@ -1451,14 +1520,21 @@ function buildCompactionPrefix(chat: ChatDetail, boundaryMessageId: string, cove
   const messages = structuredClone(chat.messages.slice(0, endIndex));
   const userAnchors = new Set(messages.filter((message) => message.role === 'user').map((message) => message.id));
   const receipts = chat.toolReceipts.filter((receipt) => userAnchors.has(receipt.anchorMessageId));
-  const protocolHistory: ProviderProtocolExchange[] = receipts.map((receipt) => ({
+  const receiptBindings = new Map((providerStateOwnership?.receipts ?? []).map((binding) =>
+    [`${binding.receiptId}:${binding.anchorMessageId}`, binding]));
+  const protocolHistory: ProviderProtocolExchange[] = receipts.map((receipt) => {
+    const binding = receiptBindings.get(`${receipt.receiptId}:${receipt.anchorMessageId}`);
+    const wire = binding?.protocolVersion === 'v2' ? binding.wire : undefined;
+    return {
     anchorMessageId: receipt.anchorMessageId,
     name: receipt.name,
     arguments: structuredClone(receipt.arguments),
     content: receipt.content,
     functionsStateId: receipt.functionsStateId,
     result: receipt.status === 'pending' ? UNKNOWN_TOOL_RESULT : receipt.result ?? UNKNOWN_TOOL_RESULT,
-  }));
+      ...(wire ? { receiptId: receipt.receiptId, wire: structuredClone(wire) } : {}),
+    };
+  });
   const resolvedCoveredThroughMessageId = messages[messages.length - 1]?.id;
   if (!resolvedCoveredThroughMessageId) throw new Error('Пустой префикс сжатия.');
   const coveredPrefixHash = hashCompactionPrefix(messages, protocolHistory);
@@ -1492,7 +1568,8 @@ function skillForProject(skillId: string | null, projectId: string | null): stri
 }
 
 function validateProjectDeleteJournal(value: unknown): ProjectDeleteJournal {
-  if (!isRecord(value) || (value.schemaVersion !== 1 && value.schemaVersion !== 2) || !isRecord(value.before) || !isRecord(value.after)) {
+  if (!isRecord(value) || (value.schemaVersion !== 1 && value.schemaVersion !== 2 && value.schemaVersion !== 3)
+    || !isRecord(value.before) || !isRecord(value.after)) {
     throw new Error('Invalid project deletion journal.');
   }
   const journalVersion = value.schemaVersion;
@@ -1505,7 +1582,9 @@ function validateProjectDeleteJournal(value: unknown): ProjectDeleteJournal {
     }
     const projects = parseProjectFile(input.projects).value;
     const chats = input.chats.map((chat) => {
-      if (!isRecord(chat) || (journalVersion === 1 ? typeof chat.schemaVersion !== 'number' || chat.schemaVersion > 11 : chat.schemaVersion !== 12)) {
+      if (!isRecord(chat) || (journalVersion === 1
+        ? typeof chat.schemaVersion !== 'number' || chat.schemaVersion > 11
+        : journalVersion === 2 ? chat.schemaVersion !== 12 : chat.schemaVersion !== 13)) {
         throw new Error('Invalid project deletion chat snapshot.');
       }
       return validateStoredChat(chat).value;
@@ -1539,7 +1618,7 @@ function validateProjectDeleteJournal(value: unknown): ProjectDeleteJournal {
     }
   }
   if (after.instructionText !== null) throw new Error('Project deletion journal has an invalid instruction target.');
-  return { schemaVersion: 2, operationId, projectId, before, after };
+  return { schemaVersion: 3, operationId, projectId, before, after };
 }
 
 function parseSettingsFile(value: unknown): Loaded<SettingsFile> {
@@ -2768,7 +2847,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         instructionText: null,
       };
       const journalRecord = {
-        schemaVersion: 2,
+        schemaVersion: 3,
         operationId: randomUUID(),
         projectId: id,
         before: { ...before, chats: before.chats.map((chat) => detailFile(chat.detail, chat.providerStateOwnership)) },
@@ -2796,7 +2875,8 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     }),
     getCompactionPrefix: (chatIdInput, boundaryMessageIdInput) => serialize(async () => {
       const chat = findChat(chatIdInput);
-      return buildCompactionPrefix(chat, requireId(boundaryMessageIdInput));
+      return buildCompactionPrefix(chat, requireId(boundaryMessageIdInput), undefined,
+        providerStateOwnershipByChatId.get(chat.id) ?? emptyProviderStateOwnership());
     }),
     getToolProtocolThrough: (chatId, messageId) => serialize(async () => {
       const detail = findChat(chatId);
@@ -2805,14 +2885,22 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       if (endIndex < 0) throw new Error('Принятое сообщение не найдено в истории чата.');
       const visibleAnchors = new Set(detail.messages.slice(0, endIndex + 1)
         .filter((message) => message.role === 'user').map((message) => message.id));
-      return detail.toolReceipts.filter((receipt) => visibleAnchors.has(receipt.anchorMessageId)).map((receipt) => ({
+      const ownership = providerStateOwnershipByChatId.get(detail.id) ?? emptyProviderStateOwnership();
+      const receiptBindings = new Map(ownership.receipts.map((binding) =>
+        [`${binding.receiptId}:${binding.anchorMessageId}`, binding]));
+      return detail.toolReceipts.filter((receipt) => visibleAnchors.has(receipt.anchorMessageId)).map((receipt) => {
+        const binding = receiptBindings.get(`${receipt.receiptId}:${receipt.anchorMessageId}`);
+        const wire = binding?.protocolVersion === 'v2' ? binding.wire : undefined;
+        return {
         anchorMessageId: receipt.anchorMessageId,
         name: receipt.name,
         arguments: structuredClone(receipt.arguments),
         content: receipt.content,
         functionsStateId: receipt.functionsStateId,
         result: receipt.status === 'pending' ? UNKNOWN_TOOL_RESULT : receipt.result ?? UNKNOWN_TOOL_RESULT,
-      }));
+          ...(wire ? { receiptId: receipt.receiptId, wire: structuredClone(wire) } : {}),
+        };
+      });
     }),
     getProviderStateOwnership: (chatIdInput, accountScopeInput) => serialize(async () => {
       const chat = findChat(chatIdInput);
@@ -2824,32 +2912,37 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         const binding = messageBindings.get(message.id);
         return {
           messageId: message.id,
-          owned: Boolean(binding && binding.accountScope === accountScope
+          owned: Boolean(binding && binding.protocolVersion === 'v2' && binding.accountScope === accountScope
             && binding.stateIdHash === hashProviderStateId(message.functionsStateId!)),
         };
       });
-      const receipts = chat.toolReceipts.filter((receipt) => receipt.functionsStateId !== null).map((receipt) => {
+      const receipts = chat.toolReceipts.filter((receipt) => {
+        const binding = receiptBindings.get(`${receipt.receiptId}:${receipt.anchorMessageId}`);
+        return receipt.functionsStateId !== null || Boolean(binding?.protocolVersion === 'v2' && binding.wire);
+      }).map((receipt) => {
         const binding = receiptBindings.get(`${receipt.receiptId}:${receipt.anchorMessageId}`);
         return {
           receiptId: receipt.receiptId,
           anchorMessageId: receipt.anchorMessageId,
-          owned: Boolean(binding && binding.accountScope === accountScope
-            && binding.stateIdHash === hashProviderStateId(receipt.functionsStateId!)),
+          owned: Boolean(binding && receipt.functionsStateId !== null && binding.protocolVersion === 'v2'
+            && binding.accountScope === accountScope && binding.stateIdHash === hashProviderStateId(receipt.functionsStateId)),
+          wireOwned: Boolean(binding && binding.protocolVersion === 'v2' && binding.accountScope === accountScope
+            && binding.wire && binding.wireHash === hashProviderWire(binding.wire)),
         };
       });
       const compact = chat.compactSnapshot ? {
         snapshotId: chat.compactSnapshot.id,
-        owned: Boolean(ownership.compact && ownership.compact.snapshotId === chat.compactSnapshot.id
+        owned: Boolean(ownership.compact && ownership.compact.protocolVersion === 'v2' && ownership.compact.snapshotId === chat.compactSnapshot.id
           && ownership.compact.accountScope === accountScope
           && ownership.compact.stateIdHash === hashProviderStateId(ownership.compact.functionsStateId)),
-        functionsStateId: ownership.compact && ownership.compact.snapshotId === chat.compactSnapshot.id
+        functionsStateId: ownership.compact && ownership.compact.protocolVersion === 'v2' && ownership.compact.snapshotId === chat.compactSnapshot.id
           && ownership.compact.accountScope === accountScope
           && ownership.compact.stateIdHash === hashProviderStateId(ownership.compact.functionsStateId)
           ? ownership.compact.functionsStateId : null,
       } : null;
       return structuredClone({ messages, receipts, compact });
     }),
-    beginToolReceipt: (chatIdInput, messageIdInput, receiptInput, accountScopeInput) => serialize(async () => {
+    beginToolReceipt: (chatIdInput, messageIdInput, receiptInput, accountScopeInput, wireInput) => serialize(async () => {
       const chat = findChat(chatIdInput);
       const messageId = requireId(messageIdInput);
       const requestedOwner = accountScopeInput === undefined
@@ -2879,15 +2972,64 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         throw new Error('Аргументы инструмента превышают допустимый размер.');
       }
       const inputStateId = receiptInput.functionsStateId === null ? null : requireProviderStateId(receiptInput.functionsStateId);
-      if (requestedOwner && inputStateId === null) throw new Error('Нельзя привязать учётную запись к пустому состоянию ответа.');
+      const publicReceiptFields: Omit<ChatToolReceipt, 'anchorMessageId' | 'status' | 'result' | 'createdAt'> = {
+        receiptId: receiptInput.receiptId,
+        name: receiptInput.name,
+        arguments: structuredClone(receiptInput.arguments),
+        content: receiptInput.content,
+        functionsStateId: inputStateId,
+        ...(receiptInput.effectId === undefined ? {} : { effectId: receiptInput.effectId }),
+      };
+      const wire = wireInput === undefined ? null : validateProviderV2FunctionWire(wireInput, {
+        name: receiptInput.name,
+        arguments: receiptInput.arguments,
+        content: receiptInput.content,
+        functionsStateId: inputStateId,
+      });
+      if (wireInput !== undefined && !wire) throw new Error('Содержимое вызова не совпадает с выполненными аргументами инструмента.');
+      if (wire && !requestedOwner) throw new Error('V2 вызов инструмента требует владельца учётной записи.');
+      if (requestedOwner && inputStateId === null && !wire) throw new Error('Нельзя привязать учётную запись к пустому состоянию ответа.');
       const currentOwnership = providerStateOwnershipByChatId.get(chat.id) ?? emptyProviderStateOwnership();
       const existingBinding = (receiptId: string, anchorMessageId: string): ProviderStateReceiptBinding | undefined =>
         currentOwnership.receipts.find((binding) => binding.receiptId === receiptId && binding.anchorMessageId === anchorMessageId);
+      const assertExistingWire = (receipt: ChatToolReceipt): void => {
+        const binding = existingBinding(receipt.receiptId, receipt.anchorMessageId);
+        if (wire) {
+          if (!binding || binding.protocolVersion !== 'v2' || !binding.wire
+            || binding.wireHash !== hashProviderWire(binding.wire) || !sameJson(binding.wire, wire)) {
+            throw new Error('Данные сохранённого V2 вызова нельзя заменить или восстановить.');
+          }
+        } else if (binding?.protocolVersion === 'v2') {
+          throw new Error('Для повтора V2 вызова требуется исходный протокол.');
+        }
+      };
+      const receiptBinding = (receipt: ChatToolReceipt): ProviderStateReceiptBinding | null => {
+        if (!requestedOwner) return null;
+        if (wire) return {
+          receiptId: receipt.receiptId,
+          anchorMessageId: receipt.anchorMessageId,
+          accountScope: requestedOwner,
+          protocolVersion: 'v2',
+          stateIdHash: receipt.functionsStateId === null ? null : hashProviderStateId(receipt.functionsStateId),
+          wireHash: hashProviderWire(wire),
+          wire: structuredClone(wire),
+        };
+        return receipt.functionsStateId ? {
+          receiptId: receipt.receiptId,
+          anchorMessageId: receipt.anchorMessageId,
+          accountScope: requestedOwner,
+          protocolVersion: 'v1',
+          stateIdHash: hashProviderStateId(receipt.functionsStateId),
+        } : null;
+      };
       const assertExistingOwner = (receipt: ChatToolReceipt): void => {
         if (!requestedOwner) return;
         const binding = existingBinding(receipt.receiptId, receipt.anchorMessageId);
-        if (!receipt.functionsStateId || receipt.functionsStateId !== inputStateId || !binding || binding.accountScope !== requestedOwner
-          || binding.stateIdHash !== hashProviderStateId(receipt.functionsStateId)) {
+        const stateMatches = receipt.functionsStateId === inputStateId
+          && (receipt.functionsStateId === null ? binding?.stateIdHash === null
+            : binding?.stateIdHash === hashProviderStateId(receipt.functionsStateId));
+        if (!binding || binding.accountScope !== requestedOwner || !stateMatches
+          || binding.protocolVersion !== (wire ? 'v2' : 'v1')) {
           throw new Error('Состояние инструмента уже сохранено без совпадающего владельца.');
         }
       };
@@ -2899,6 +3041,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
           && (receipt.content !== receiptInput.content || receipt.functionsStateId !== receiptInput.functionsStateId)))) {
         throw new Error('Идентификатор запроса инструмента уже связан с другими аргументами.');
       }
+      for (const receipt of existingRows) assertExistingWire(receipt);
       const sameAnchor = existingRows.find((receipt) => receipt.anchorMessageId === messageId);
       if (sameAnchor) {
         assertExistingOwner(sameAnchor);
@@ -2922,7 +3065,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         const now = new Date().toISOString();
         const priorStatus = priorEffect.status === 'completed' ? 'completed' : 'unknown';
         const receipt: ChatToolReceipt = {
-          ...structuredClone(receiptInput), anchorMessageId: messageId,
+          ...publicReceiptFields, anchorMessageId: messageId,
           status: priorStatus,
           result: priorStatus === 'completed' ? priorEffect.result : UNKNOWN_TOOL_RESULT,
           createdAt: now,
@@ -2933,13 +3076,8 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         if (toolReceipts.length >= MAX_TOOL_RECEIPTS_PER_CHAT) throw new Error('Лимит истории локальных инструментов чата достигнут.');
         const updated = { ...chat, updatedAt: now, toolReceipts: [...toolReceipts, receipt] };
         const nextOwnership = structuredClone(currentOwnership);
-        if (requestedOwner) {
-          if (!receipt.functionsStateId || receipt.functionsStateId !== inputStateId) {
-            throw new Error('Повтор side effect не совпадает с переданным состоянием ответа.');
-          }
-          nextOwnership.receipts.push({ receiptId: receipt.receiptId, anchorMessageId: receipt.anchorMessageId,
-            accountScope: requestedOwner, stateIdHash: hashProviderStateId(receipt.functionsStateId) });
-        }
+        const binding = receiptBinding(receipt);
+        if (binding) nextOwnership.receipts.push(binding);
         await saveChat(updated, undefined, nextOwnership);
         return { shouldExecute: false, receipt: structuredClone(receipt) };
       }
@@ -2954,19 +3092,14 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
           createdAt: now,
         }
         : {
-          ...structuredClone(receiptInput), anchorMessageId: messageId,
+          ...publicReceiptFields, anchorMessageId: messageId,
           status: 'pending', result: null, createdAt: now,
         };
       if (chat.toolReceipts.length >= MAX_TOOL_RECEIPTS_PER_CHAT) throw new Error('Лимит истории локальных инструментов чата достигнут.');
       const updated = { ...chat, updatedAt: now, toolReceipts: [...chat.toolReceipts, receipt] };
       const nextOwnership = structuredClone(currentOwnership);
-      if (requestedOwner) {
-        if (!receipt.functionsStateId || receipt.functionsStateId !== inputStateId) {
-          throw new Error('Повтор инструмента не совпадает с переданным состоянием ответа.');
-        }
-        nextOwnership.receipts.push({ receiptId: receipt.receiptId, anchorMessageId: receipt.anchorMessageId,
-          accountScope: requestedOwner, stateIdHash: hashProviderStateId(receipt.functionsStateId) });
-      }
+      const binding = receiptBinding(receipt);
+      if (binding) nextOwnership.receipts.push(binding);
       await saveChat(updated, undefined, nextOwnership);
       return { shouldExecute: !earlier, receipt: structuredClone(receipt) };
     }),
@@ -3281,8 +3414,8 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
           && existingMessage.text === textInput.trim()
           && existingMessage.functionsStateId === functionsStateIdInput
           && savedTurn?.status === 'completed') {
-          if (requestedOwner && (!previousBinding || previousBinding.accountScope !== requestedOwner
-            || previousBinding.stateIdHash !== hashProviderStateId(functionsStateId!))) {
+          if (requestedOwner && functionsStateId !== null && (!previousBinding || previousBinding.protocolVersion !== 'v2'
+            || previousBinding.accountScope !== requestedOwner || previousBinding.stateIdHash !== hashProviderStateId(functionsStateId))) {
             throw new Error('Зарезервированный ответ уже сохранён без совпадающего владельца.');
           }
           return structuredClone(chat);
@@ -3304,9 +3437,9 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       else turns.push(completedRecord);
       const updated = { ...chat, updatedAt: now, messages, turns };
       const nextOwnership = structuredClone(currentOwnership);
-      if (requestedOwner) {
+      if (requestedOwner && functionsStateId !== null) {
         if (previousBinding) throw new Error('Владелец сохранённого ответа не может быть заменён.');
-        nextOwnership.messages.push({ messageId: message.id, accountScope: requestedOwner,
+        nextOwnership.messages.push({ messageId: message.id, accountScope: requestedOwner, protocolVersion: 'v2',
           stateIdHash: hashProviderStateId(functionsStateId!) });
       }
       await saveChat(updated, signal, nextOwnership);
@@ -3315,13 +3448,14 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     commitCompactSnapshot: (idInput, snapshotInput, expectedSnapshotIdInput, signal, terminalTurnInput, providerStateInput) => serialize(async () => {
       if (signal?.aborted) throw createAbortError();
       const chat = findChat(idInput);
-      let compactOwner: ProviderStateOwnerBinding & { functionsStateId: string } | null = null;
+      let compactOwner: ProviderStateOwnerBinding & { functionsStateId: string; stateIdHash: string } | null = null;
       if (providerStateInput !== undefined) {
         if (!isRecord(providerStateInput) || !hasExactKeys(providerStateInput, ['accountScope', 'functionsStateId'])) {
           throw new Error('Некорректный владелец сводки.');
         }
         compactOwner = {
           accountScope: requireProviderAccountScope(providerStateInput.accountScope),
+          protocolVersion: 'v2',
           functionsStateId: requireProviderStateId(providerStateInput.functionsStateId),
           stateIdHash: hashProviderStateId(requireProviderStateId(providerStateInput.functionsStateId)),
         };
@@ -3340,13 +3474,14 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         }
         const existingOwner = currentOwnership.compact;
         if (compactOwner && (!existingOwner || existingOwner.snapshotId !== snapshot.id
+          || existingOwner.protocolVersion !== compactOwner.protocolVersion
           || existingOwner.accountScope !== compactOwner.accountScope
           || existingOwner.functionsStateId !== compactOwner.functionsStateId
           || existingOwner.stateIdHash !== compactOwner.stateIdHash)) {
           throw new Error('Владелец сохранённой сводки не может быть заменён или восстановлен.');
         }
       }
-      const prefix = buildCompactionPrefix(chat, snapshot.boundaryMessageId, snapshot.coveredThroughMessageId);
+      const prefix = buildCompactionPrefix(chat, snapshot.boundaryMessageId, snapshot.coveredThroughMessageId, currentOwnership);
       if (prefix.coveredPrefixHash !== snapshot.coveredPrefixHash) throw new Error('История изменилась во время сжатия; прежняя сводка сохранена.');
       const previousBoundaryIndex = chat.compactSnapshot
         ? chat.messages.findIndex((message) => message.id === chat.compactSnapshot?.boundaryMessageId)
@@ -3380,7 +3515,8 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       if (currentSnapshotId !== snapshot.id) {
         nextOwnership.compact = compactOwner
           ? { snapshotId: snapshot.id, functionsStateId: compactOwner.functionsStateId,
-            accountScope: compactOwner.accountScope, stateIdHash: compactOwner.stateIdHash }
+            accountScope: compactOwner.accountScope, protocolVersion: compactOwner.protocolVersion,
+            stateIdHash: compactOwner.stateIdHash }
           : null;
       }
       await saveChat(updated, signal, nextOwnership);
