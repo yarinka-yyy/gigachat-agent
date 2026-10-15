@@ -2500,7 +2500,7 @@ test('key transition during preparation and delayed provider results cannot writ
     'a completed provider result captured under A is not committed after the account generation changes');
 });
 
-test('uploads only the accepted message attachments inside the FIFO turn and does not resend them on a text follow-up', async (t) => {
+test('reuses owned historical uploads beside a later FIFO question without changing local attachment linkage', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-runtime-attachment-fifo-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const source = join(directory, 'one-turn.txt');
@@ -2513,10 +2513,12 @@ test('uploads only the accepted message attachments inside the FIFO turn and doe
   const first = await store.acceptLocalMessage(chat.id, 'Прочитай этот файл', 'turn-attachment-first', [localAttachmentId]);
   const second = await store.acceptLocalMessage(chat.id, 'Продолжи без повторной отправки файла', 'turn-attachment-second');
   const acceptedSnapshot = structuredClone(first.turn);
+  const secondSnapshot = structuredClone(second.turn);
 
   const uploadStarted = deferred();
   const allowUpload = deferred();
   const uploaded: string[] = [];
+  const providerFiles: Array<{ id: string; filename: string; bytes: number; purpose: 'general' }> = [];
   const requests: ProviderTurnRequest[] = [];
   const provider = {
     stream: async function* (request: ProviderTurnRequest): AsyncGenerator<ProviderEvent> {
@@ -2529,9 +2531,11 @@ test('uploads only the accepted message attachments inside the FIFO turn and doe
       await allowUpload.promise;
       if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
       uploaded.push(input.filename);
-      return { id: 'remote_attachment_one', filename: input.filename, bytes: input.bytes.byteLength, purpose: 'general' as const };
+      const file = { id: 'remote_attachment_one', filename: input.filename, bytes: input.bytes.byteLength, purpose: 'general' as const };
+      providerFiles.push(file);
+      return file;
     },
-    listFiles: async () => [],
+    listFiles: async () => structuredClone(providerFiles),
     deleteFile: async () => undefined,
   } as unknown as import('./gigachat-provider').GigaChatProviderConnection;
 
@@ -2572,6 +2576,9 @@ test('uploads only the accepted message attachments inside the FIFO turn and doe
   await runtime.whenIdle();
 
   assert.deepEqual(first.turn, acceptedSnapshot, 'preparation leaves the accepted turn and local IDs immutable');
+  assert.deepEqual(second.turn, secondSnapshot, 'preparation leaves the later accepted turn and history immutable');
+  assert.equal(second.turn.messages.find((message) => message.id === second.turn.messageId)?.attachmentIds, undefined,
+    'the later accepted message itself remains text-only');
   assert.equal(uploaded.length, 1);
   assert.equal(requests.length, 2);
   assert.deepEqual(requests[0]?.attachments?.map((item) => ({ messageId: item.messageId, attachmentId: item.attachmentId, fileId: item.fileId })), [
@@ -2580,12 +2587,21 @@ test('uploads only the accepted message attachments inside the FIFO turn and doe
   const firstWire = JSON.parse(serializeProviderTurnRequest(requests[0]!).body) as { messages: Array<Record<string, unknown>> };
   const firstUserContent = firstWire.messages.find((message) => message.role === 'user')?.content as Array<Record<string, unknown>>;
   assert.deepEqual(firstUserContent.find((part) => 'files' in part)?.files, [{ id: 'remote_attachment_one' }]);
-  assert.deepEqual(requests[1]?.attachments, [], 'a text follow-up does not reload or resend the prior image/document');
+  assert.deepEqual(requests[1]?.attachments?.map(({ messageId, attachmentId, fileId }) => ({ messageId, attachmentId, fileId })), [
+    { messageId: second.turn.messageId, attachmentId: localAttachmentId, fileId: 'remote_attachment_one' },
+  ], 'the follow-up references the already-owned remote upload at its current user message');
   const secondWire = JSON.parse(serializeProviderTurnRequest(requests[1]!).body) as { messages: Array<Record<string, unknown>> };
-  assert.equal(secondWire.messages.some((message) => Array.isArray(message.content)
-    && (message.content as Array<Record<string, unknown>>).some((part) => 'files' in part)), false);
-  const detail = await store.getChat(chat.id);
+  const secondWireUsers = secondWire.messages.filter((message) => message.role === 'user');
+  assert.equal(secondWireUsers.length, 2);
+  assert.deepEqual(secondWireUsers[0]?.content, [{ text: 'Прочитай этот файл' }],
+    'the historical user remains text-only in the follow-up provider request');
+  assert.deepEqual(secondWireUsers[1]?.content, [
+    { text: 'Продолжи без повторной отправки файла' }, { files: [{ id: 'remote_attachment_one' }] },
+  ], 'the same remote file is placed beside the current question');
+  const reopened = await openStore(directory);
+  const detail = await reopened.getChat(chat.id);
   assert.deepEqual(detail.messages.find((message) => message.id === first.turn.messageId)?.attachmentIds, [localAttachmentId]);
+  assert.equal(detail.messages.find((message) => message.id === second.turn.messageId)?.attachmentIds, undefined);
   assert.equal(detail.artifacts.find((artifact) => artifact.id === localAttachmentId)?.messageId, first.turn.messageId);
 });
 
