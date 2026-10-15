@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import type { AcceptedTurnInput, ChatToolReceipt, CompactSnapshot, GigaChatProvider, HookDispatchInput, HookRunResult, ProviderEvent, ProviderTurnRequest, RuntimeTurnSnapshot, UsageReceipt } from './contracts';
-import type { LocalTools } from './local-tools';
-import { LocalToolError } from './local-tools';
-import { HookDispatchAbortError } from './hooks';
+import type { AcceptedTurnInput, ChatToolReceipt, CompactSnapshot, GigaChatProvider, HookDispatchInput, HookRunResult, Project, ProviderEvent, ProviderTurnRequest, RuntimeTurnSnapshot, UsageReceipt } from './contracts';
+import type { CustomPolicy } from './custom-permissions';
+import type { LocalTools, LocalToolsOptions, PowerShellRequest } from './local-tools';
+import { createLocalTools, LocalToolError } from './local-tools';
+import { createHookApprovalGate, createHookDispatcher, createHookRegistry, HookDispatchAbortError, type HookExecutionContext } from './hooks';
 import { createTurnRuntime, queueAcceptedTurnOrMarkNotSent, type PreparedTurn, type ToolReceiptInput, type ToolReceiptStart, type TurnRuntimeOptions } from './runtime';
 import { mergeUsageReceipt } from './usage';
 import { createBalanceScopeGuard } from './usage-view';
@@ -2862,6 +2863,168 @@ test('blocks a tool when its before-hook fails and stores a completed non-side-e
   const receipt = [...receipts.receipts.values()][0];
   assert.equal(receipt?.status, 'completed');
   assert.equal(JSON.parse(receipt?.result ?? '{}').error, 'hook_blocked');
+});
+
+test('PowerShell approval hooks receive the accepted Skill and can block both runtime access modes', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-runtime-powershell-skill-context-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const userDataPath = join(directory, 'user-data');
+  const projectPath = join(directory, 'project');
+  await mkdir(userDataPath);
+  await mkdir(projectPath);
+  const project: Project = {
+    id: 'runtime-skill-context-project', name: 'Runtime Skill context fixture', pinned: false, archived: false,
+    createdAt: '2026-10-15T00:00:00.000Z', updatedAt: '2026-10-15T00:00:00.000Z', workingFolder: projectPath,
+  };
+  const hookId = `project/${project.id}/skill-guard`;
+  const hookDirectory = join(userDataPath, 'hooks', 'projects', project.id, 'skill-guard');
+  const hookAction = `Write-Output '{"decision":"block"}'`;
+  await mkdir(hookDirectory, { recursive: true });
+  await writeFile(join(hookDirectory, 'hook.json'), JSON.stringify({
+    schemaVersion: 1, name: 'Skill context guard', description: 'Blocks the approved fixture command.',
+    event: 'permission-request', actionFile: 'action.ps1',
+  }), 'utf8');
+  await writeFile(join(hookDirectory, 'action.ps1'), hookAction, 'utf8');
+  const registry = createHookRegistry({
+    userDataPath,
+    listProjects: async () => [project],
+    listSkills: async () => [],
+  });
+  const inspected = await registry.inspect(hookId);
+  await registry.trust(hookId, inspected.contentHash);
+  await registry.setEnabled(hookId, true);
+  const customPolicy: CustomPolicy = {
+    project: { list: 'allow', search: 'allow', read: 'allow', write: 'ask', open: 'ask', execute: 'ask' },
+    roots: [],
+  };
+
+  for (const externalAccess of [false, true]) {
+    const skillId = 'global/accepted-runtime-skill';
+    const chatId = `chat-powershell-skill-${externalAccess ? 'external' : 'ordinary'}`;
+    const script = `Write-Output 'runtime-command-${externalAccess ? 'external' : 'ordinary'}'`;
+    const permissionProfile: AcceptedTurnInput['permissionProfile'] = externalAccess ? 'ask' : 'custom';
+    const turn: AcceptedTurnInput = {
+      ...turnFor(chatId, 'Run the approved PowerShell fixture.'),
+      projectId: project.id, projectWorkingFolder: projectPath, skillId, permissionProfile,
+    };
+    const providerRequests: ProviderTurnRequest[] = [];
+    const provider = makeProvider(async function* (request) {
+      providerRequests.push(structuredClone(request));
+      if (!request.protocolHistory?.length) {
+        yield functionCall('powershell', { script, ...(externalAccess ? { external_access: true } : {}) });
+      } else {
+        yield { type: 'text-delta', text: 'The command was checked.' };
+        yield { type: 'completed' };
+      }
+    });
+    const runtimeToolCalls: Array<{
+      projectId: unknown; profile: unknown; script: unknown;
+      options: Parameters<LocalTools['runPowerShell']>[3];
+    }> = [];
+    type ApprovalDetails = Parameters<NonNullable<LocalToolsOptions['requestApproval']>>[0];
+    const approvalRequests: Array<{
+      details: ApprovalDetails;
+      signal: AbortSignal | undefined;
+      context: { projectId: string | null; profile: string; skillId: string | null; workingFolder: string } | undefined;
+    }> = [];
+    const runnerRequests: PowerShellRequest[] = [];
+    const hookResults: HookRunResult[] = [];
+    let modelCommandApprovals = 0;
+    let hookActionApprovals = 0;
+    let acceptedExecution: HookExecutionContext | null = null;
+    let gate: ReturnType<typeof createHookApprovalGate<ApprovalDetails>> | null = null;
+    const baseTools = createLocalTools({
+      resolveProject: async (id) => id === project.id ? project : null,
+      getCustomPolicy: async () => customPolicy,
+      protectedDirectory: userDataPath,
+      requestApproval: async (details, signal, context) => {
+        approvalRequests.push({ details, signal, context });
+        if (!gate) throw new Error('The approval gate was not initialized.');
+        const gateContext = acceptedExecution && context ? { execution: acceptedExecution, ...context } : undefined;
+        return gate.request(details, signal, gateContext);
+      },
+      runPowerShell: async (request) => {
+        runnerRequests.push(request);
+        if (request.script === hookAction) {
+          return { exitCode: 0, stdout: '{"decision":"block"}\r\n', stderr: '', timedOut: false, outputLimited: false };
+        }
+        return { exitCode: 0, stdout: '', stderr: '', timedOut: false, outputLimited: false };
+      },
+    });
+    const dispatcher = createHookDispatcher({
+      registry,
+      tools: baseTools,
+      isAvailable: () => true,
+      onResult: (result) => registry.recordResult(result),
+    });
+    gate = createHookApprovalGate({
+      dispatch: dispatcher,
+      isSuppressed: () => false,
+      requestApproval: async (details) => {
+        if (details.target.endsWith(`PowerShell:\n${hookAction}`)) hookActionApprovals += 1;
+        else modelCommandApprovals += 1;
+        return true;
+      },
+      onResult: (result) => hookResults.push(result),
+    });
+    const tools: LocalTools = {
+      ...baseTools,
+      runPowerShell: async (projectIdInput, profileInput, scriptInput, options) => {
+        runtimeToolCalls.push({ projectId: projectIdInput, profile: profileInput, script: scriptInput, options });
+        return baseTools.runPowerShell(projectIdInput, profileInput, scriptInput, options);
+      },
+    };
+    const receipts = makeReceiptStore();
+    const runtime = makeRuntime(provider, {
+      tools,
+      beginToolReceipt: receipts.begin,
+      completeToolReceipt: receipts.complete,
+      runHooks: async (acceptedTurn, input, signal) => {
+        acceptedExecution = {
+          projectId: acceptedTurn.projectId,
+          projectWorkingFolder: acceptedTurn.projectWorkingFolder,
+          permissionProfile: acceptedTurn.permissionProfile,
+          skillId: acceptedTurn.skillId,
+        };
+        return dispatcher(acceptedExecution, input, signal ?? new AbortController().signal);
+      },
+    });
+    assert.ok(runtime.enqueue(turn));
+    await runtime.whenIdle();
+
+    const modelCall = runtimeToolCalls.find((call) => call.script === script);
+    assert.ok(modelCall, 'runtime forwards the original model command to LocalTools');
+    assert.equal(modelCall.projectId, project.id);
+    assert.equal(modelCall.profile, permissionProfile);
+    assert.equal(modelCall.options?.expectedWorkingFolder, projectPath);
+    assert.equal(modelCall.options?.skillId, skillId);
+    assert.ok(modelCall.options?.signal instanceof AbortSignal);
+    assert.equal(modelCall.options?.signal.aborted, false);
+    assert.equal(modelCall.options?.fullAccessOnce, externalAccess ? true : undefined);
+    const modelApproval = approvalRequests.find((item) => item.details.target.includes(script));
+    assert.ok(modelApproval, 'LocalTools requests approval for the original command');
+    assert.equal(modelApproval.details.resource, 'process');
+    assert.equal(modelApproval.details.action, 'execute');
+    assert.equal(modelApproval.context?.projectId, project.id);
+    assert.equal(modelApproval.context?.profile, permissionProfile);
+    assert.equal(modelApproval.context?.skillId, skillId);
+    assert.equal(modelApproval.context?.workingFolder, projectPath);
+    assert.ok(modelApproval.signal instanceof AbortSignal);
+    assert.equal(modelApproval.signal.aborted, false);
+    assert.equal(modelApproval.details.target, externalAccess
+      ? `PowerShell без AppContainer\nРабочая папка: ${projectPath}\nКоманда:\n${script}`
+      : `${projectPath}\n\nPowerShell:\n${script}`);
+    assert.equal(hookResults.filter((result) => result.event === 'permission-request' && result.status === 'blocked'
+      && result.decision === 'block').length, 1, 'the accepted-Skill permission Hook vetoes the command');
+    assert.equal(modelCommandApprovals, 0, 'a blocking Hook prevents ordinary approval of the model command');
+    assert.equal(hookActionApprovals, externalAccess ? 0 : 1,
+      'the Hook action uses Custom approval when required; project-scoped Ask remains automatic');
+    assert.equal(runnerRequests.filter((request) => request.script === hookAction).length, 1);
+    assert.equal(runnerRequests.filter((request) => request.script === script).length, 0,
+      'the fake command runner never receives the model command');
+    assert.equal(providerRequests.length, 2);
+    assert.equal(runtime.list(chatId)[0]?.status, 'completed');
+  }
 });
 
 test('after-hook failure records the real tool outcome and does not repeat a completed write', async () => {

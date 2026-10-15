@@ -851,8 +851,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         case 'write': return options.tools.write(turn.input.projectId, turn.input.permissionProfile, args.path, args.contents, scope);
         case 'open': return options.tools.open(turn.input.projectId, turn.input.permissionProfile, args.path ?? '', scope);
         case 'powershell': return options.tools.runPowerShell(turn.input.projectId, turn.input.permissionProfile, args.script, {
-          signal: controller.signal,
-          expectedWorkingFolder: turn.input.projectWorkingFolder,
+          ...scope,
           ...(args.external_access === true ? { fullAccessOnce: true } : {}),
         });
         default: return { ok: false, error: 'unknown_function', message: 'Эта функция недоступна в текущем приложении.' };
