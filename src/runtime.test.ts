@@ -3126,6 +3126,143 @@ test('holds FIFO until a timed-out protocol result save settles after the write'
   assert.equal([...receipts.receipts.values()][0]?.status, 'completed');
 });
 
+test('keeps FIFO blocked until nested persistence and a cancelled tool receipt both retire', { timeout: 5000 }, async () => {
+  const receipts = makeReceiptStore();
+  const allowSearchReceipt = deferred();
+  const searchReceiptStarted = deferred();
+  const allowAfterToolSave = deferred();
+  const searchAfterToolSaveStarted = deferred();
+  const searchAfterToolSaveDrained = deferred();
+  const terminalPersisted = new Set<string>();
+  const persisted: RuntimeTurnSnapshot[] = [];
+  const usage = new Map<string, UsageReceipt>();
+  const providerStarts: string[] = [];
+  let firstTurnId = '';
+  let afterToolSaveCount = 0;
+  let reads = 0;
+  let searches = 0;
+  let writes = 0;
+  let idleOutcome: 'resolved' | 'rejected' | undefined;
+
+  const provider = makeProvider(async function* (request) {
+    const chat = request.messages[0]?.text ?? '';
+    const round = request.protocolHistory?.length ?? 0;
+    providerStarts.push(`${chat}:${round}`);
+    if (chat === 'first') {
+      if (round === 0) {
+        yield { type: 'usage', promptTokens: 8, completionTokens: 3, totalTokens: 11, precachedPromptTokens: 0 };
+        yield functionCall('read', { path: 'input.txt' }, 'state-read');
+      } else {
+        yield { type: 'usage', promptTokens: 17, completionTokens: 5, totalTokens: 22, precachedPromptTokens: 0 };
+        yield functionCall('search', { query: 'needle' }, 'state-search');
+      }
+      return;
+    }
+    assert.equal(terminalPersisted.has(firstTurnId), true, 'terminal persistence must retire before the next provider starts');
+    yield { type: 'usage', promptTokens: 4, completionTokens: 2, totalTokens: 6, precachedPromptTokens: 0 };
+    yield { type: 'text-delta', text: 'second chat completed' };
+    yield { type: 'completed' };
+  });
+
+  const runtime = createTurnRuntime({
+    provider,
+    tools: {
+      read: async () => { reads += 1; return 'needle is present'; },
+      search: async (_projectId: unknown, _permission: unknown, query: unknown, path: unknown) => {
+        searches += 1;
+        if (query !== 'needle' || path !== '') throw new Error('Unexpected search arguments.');
+        if (!runtime.cancel(firstTurnId)) throw new Error('Controlled cancellation was not accepted.');
+        const error = new Error('controlled search cancellation');
+        error.name = 'AbortError';
+        throw error;
+      },
+      write: async () => { writes += 1; return { bytes: 0 }; },
+    } as unknown as LocalTools,
+    prepareTurn: async (turn) => requestFor(turn),
+    consumeTurn: async () => undefined,
+    releaseTurn: () => undefined,
+    persistTurnRecord: async (snapshot) => {
+      const lastActivity = snapshot.activity[snapshot.activity.length - 1];
+      if (snapshot.status === 'running' && lastActivity?.kind === 'hook' && lastActivity.event === 'after-tool') {
+        afterToolSaveCount += 1;
+        if (afterToolSaveCount === 2) {
+          searchAfterToolSaveStarted.resolve();
+          await allowAfterToolSave.promise;
+          persisted.push(structuredClone(snapshot));
+          setImmediate(() => searchAfterToolSaveDrained.resolve());
+          return;
+        }
+      }
+      persisted.push(structuredClone(snapshot));
+      if (snapshot.status === 'cancelled') terminalPersisted.add(snapshot.id);
+    },
+    appendAssistant: async () => undefined,
+    recordUsageReceipt: async (receipt) => saveUsageReceipt(usage, receipt),
+    beginToolReceipt: receipts.begin,
+    completeToolReceipt: async (turn, receiptId, status, result) => {
+      const receipt = receipts.receipts.get(`${receiptId}:${turn.messageId}`);
+      if (receipt?.name === 'search') {
+        searchReceiptStarted.resolve();
+        await allowSearchReceipt.promise;
+      }
+      await receipts.complete(turn, receiptId, status, result);
+    },
+    runHooks: async (_turn, input) => input.event === 'after-tool'
+      ? [{ hookId: 'fixture/after-tool', hookName: 'after-tool', event: input.event, status: 'completed' }]
+      : [],
+    timeouts: { operationMs: 500, toolMs: 1000, stopMs: 500 },
+  });
+
+  const firstTurn = turnFor('retirement-first', 'first');
+  firstTurnId = firstTurn.turnId;
+  const secondTurn = turnFor('retirement-next', 'second');
+  assert.equal(runtime.enqueue(firstTurn), firstTurnId);
+
+  try {
+    const milestones = await Promise.race([
+      Promise.all([searchReceiptStarted.promise, searchAfterToolSaveStarted.promise]).then(() => 'ready' as const),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 500)),
+    ]);
+    assert.equal(milestones, 'ready', 'tool receipt and nested after-tool persistence must both reach their controlled gates');
+    const searchReceipt = [...receipts.receipts.values()].find((receipt) => receipt.name === 'search');
+    assert.equal(searchReceipt?.status, 'pending');
+    assert.equal(reads, 1);
+    assert.equal(searches, 1);
+
+    allowAfterToolSave.resolve();
+    await searchAfterToolSaveDrained.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    void runtime.whenIdle().then(() => { idleOutcome = 'resolved'; }, () => { idleOutcome = 'rejected'; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(searchReceipt?.status, 'pending');
+    assert.notEqual(idleOutcome, 'resolved');
+    assert.equal(runtime.enqueue(secondTurn), secondTurn.turnId);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(providerStarts, ['first:0', 'first:1']);
+    assert.equal(runtime.list(secondTurn.chatId)[0]?.status, 'queued');
+    assert.equal(runtime.list(firstTurn.chatId)[0]?.retryEligible, undefined);
+    assert.equal(terminalPersisted.has(firstTurnId), false);
+  } finally {
+    allowAfterToolSave.resolve();
+    allowSearchReceipt.resolve();
+  }
+
+  await waitUntil(() => terminalPersisted.has(firstTurnId));
+  await waitUntil(() => runtime.list(secondTurn.chatId)[0]?.status === 'completed');
+  await runtime.whenIdle();
+  assert.deepEqual(providerStarts, ['first:0', 'first:1', 'second:0']);
+  assert.equal(runtime.list(firstTurn.chatId)[0]?.status, 'cancelled');
+  assert.equal(runtime.list(secondTurn.chatId)[0]?.status, 'completed');
+  assert.equal(terminalPersisted.has(firstTurnId), true);
+  assert.equal([...receipts.receipts.values()].filter((receipt) => receipt.anchorMessageId === firstTurn.messageId)
+    .every((receipt) => receipt.status === 'completed'), true);
+  assert.equal([...usage.values()].filter((receipt) => receipt.chatId === firstTurn.chatId)
+    .reduce((total, receipt) => total + (receipt.totalTokens ?? 0), 0), 33);
+  assert.deepEqual({ reads, searches, writes }, { reads: 1, searches: 1, writes: 0 });
+  assert.ok(persisted.some((snapshot) => snapshot.id === firstTurnId && snapshot.status === 'cancelled'));
+});
+
 test('blocks a tool when its before-hook fails and stores a completed non-side-effect receipt', async () => {
   const receipts = makeReceiptStore();
   const requests: ProviderTurnRequest[] = [];

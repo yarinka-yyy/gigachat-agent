@@ -137,7 +137,7 @@ interface StopState {
   streamStop: Promise<boolean> | null;
   pendingToolIds: Set<string>;
   waiters: Set<() => void>;
-  pendingOperation: boolean;
+  pendingOperationCount: number;
   pendingOutcome: { status: 'completed' | 'failed' | 'cancelled'; error?: string; errorCategory?: ProviderErrorCategory } | null;
   terminalRecordSaved?: boolean;
 }
@@ -523,7 +523,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
   };
   const maybeUnblock = (turnId: string): void => {
     const state = stopStates.get(turnId);
-    if (!state || !stopConfirmed(state) || state.pendingOperation) return;
+    if (!state || !stopConfirmed(state) || state.pendingOperationCount > 0) return;
     if (blockedTurnId !== turnId) return;
     const turn = turns.get(turnId);
     if (turn && state.pendingOutcome) {
@@ -547,14 +547,14 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       delete turn.pendingTerminal;
       publish(turn);
       if (state.pendingOutcome.status !== 'completed' && options.persistTurnRecord && !state.terminalRecordSaved) {
-        state.pendingOperation = true;
+        state.pendingOperationCount += 1;
         const savingTerminal = scheduleTurnRecord(turn);
         void savingTerminal.then(() => {
           state.terminalRecordSaved = true;
-          state.pendingOperation = false;
+          state.pendingOperationCount -= 1;
           maybeUnblock(turnId);
         }, () => {
-          state.pendingOperation = false;
+          state.pendingOperationCount -= 1;
           blockedTurnId = turnId;
           turn.errorCategory = 'storage';
           turn.error = 'Состояние остановленного хода не сохранено; очередь приостановлена.';
@@ -664,7 +664,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     outcome: Promise<{ status: 'completed' | 'failed' | 'cancelled'; error?: string; errorCategory?: ProviderErrorCategory }>,
     message: string,
   ): void => {
-    state.pendingOperation = true;
+    state.pendingOperationCount += 1;
     blockedTurnId = turn.id;
     turn.status = 'running';
     turn.error = message;
@@ -672,7 +672,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     refreshRetryEligibility();
     finishIdleWaiters();
     void outcome.then((result) => {
-      state.pendingOperation = false;
+      state.pendingOperationCount -= 1;
       state.pendingOutcome = result;
       if (stopConfirmed(state)) maybeUnblock(turn.id);
     });
@@ -700,7 +700,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     const controller = new AbortController();
     const stopState: StopState = {
       streamConfirmed: false, streamStop: null, pendingToolIds: new Set(), waiters: new Set(),
-      pendingOperation: false, pendingOutcome: null,
+      pendingOperationCount: 0, pendingOutcome: null,
     };
     stopStates.set(turn.id, stopState);
     turn.controller = controller;
@@ -911,7 +911,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       for (;;) {
         await flushTurnPersistence();
         if (controller.signal.aborted) throw abortError();
-        if (stopState.pendingToolIds.size || stopState.pendingOperation) throw new Error('TOOL_STOP_STATE');
+        if (stopState.pendingToolIds.size || stopState.pendingOperationCount > 0) throw new Error('TOOL_STOP_STATE');
         stopState.streamConfirmed = true;
         stopState.streamStop = null;
         naturallyDone = false;
@@ -1258,7 +1258,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         controller.abort();
         flushDraft();
         markStopUnconfirmed(turn);
-      } else if (stopState.pendingOperation) {
+      } else if (stopState.pendingOperationCount > 0) {
         if (blockedTurnId !== turn.id) holdForPendingOperation(turn, stopState, Promise.resolve({
           status: 'failed', error: 'Ожидание локальной операции не завершено.',
           ...(runtimeErrorCategory(error, turnTimedOut) ? { errorCategory: runtimeErrorCategory(error, turnTimedOut) } : {}),
@@ -1271,8 +1271,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         let terminalError: unknown = error;
         try { await finishActiveUsage(cancelled ? 'cancelled' : 'failed', terminalSignal); }
         catch (usageError) { terminalError = usageError; }
-        if (stopState.pendingOperation || stopState.pendingOutcome || blockedTurnId === turn.id) {
-          if (!stopState.pendingOperation) maybeUnblock(turn.id);
+        if (stopState.pendingOperationCount > 0 || stopState.pendingOutcome || blockedTurnId === turn.id) {
+          if (stopState.pendingOperationCount === 0) maybeUnblock(turn.id);
           return;
         }
         if (cancelled && !interruptHooksRan) {
@@ -1346,7 +1346,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       if (draftTimer) clearTimeout(draftTimer);
       draftTimer = null;
       if (!reservationConsumed) options.releaseTurn(turn.input);
-      if (!stopState.pendingOperation && blockedTurnId !== turn.id) turn.controller = undefined;
+      if (stopState.pendingOperationCount === 0 && blockedTurnId !== turn.id) turn.controller = undefined;
       if (blockedTurnId !== turn.id && stopConfirmed(stopState)) {
         stopStates.delete(turn.id);
         updateRetryEligibility(turn);
