@@ -882,6 +882,7 @@ export function createGigaChatProvider(options: {
       let terminalFunctionsStateId: string | null = null;
       let terminalFunctionCall: ProviderFunctionCallForStream | null = null;
       let deltaText = '';
+      let sawDeltaContent = false;
       let responseId: string | undefined;
       let providerModel: string | undefined;
       let receivedDone = false;
@@ -930,6 +931,7 @@ export function createGigaChatProvider(options: {
         if (frame.event === 'response.message.delta') {
           if (isRecord(payload) && Object.prototype.hasOwnProperty.call(payload, 'finish_reason')) throw new GigaChatProviderError('protocol');
           const message = parseV2AssistantMessage(payload);
+          if (message.text !== null || message.functionCall !== null) sawDeltaContent = true;
           if (message.functionCall) {
             if (terminalFunctionCall || deltaText.length > 0) throw new GigaChatProviderError('protocol');
             terminalFunctionCall = message.functionCall;
@@ -951,7 +953,10 @@ export function createGigaChatProvider(options: {
         if (finishReason === 'context' || finishReason === 'model') throw new GigaChatProviderError(finishReason);
         const terminalMessage = getV2TerminalMessage(payload, requestedModelId);
         if (terminalMessage) {
-          if (terminalMessage.functionCall) {
+          if (!terminalMessage.contentPresent) {
+            if (!sawDeltaContent) throw new GigaChatProviderError('protocol');
+            if (terminalFunctionCall) terminalFunctionCall = mergeTerminalFunctionMetadata(terminalFunctionCall, terminalMessage);
+          } else if (terminalMessage.functionCall) {
             if (terminalFunctionCall && !sameProviderFunctionCall(terminalFunctionCall, terminalMessage.functionCall)) {
               throw new GigaChatProviderError('protocol');
             }
@@ -1199,6 +1204,8 @@ type ProviderFunctionCallForStream = ProviderFunctionCall;
 type V2FinishReason = 'stop' | 'function_call' | 'context' | 'model' | null;
 interface V2SseFrame { event: string | null; data: string }
 interface ParsedV2AssistantMessage {
+  contentPresent: boolean;
+  messageId: string | null;
   text: string | null;
   functionsStateId: string | null;
   functionCall: ProviderFunctionCall | null;
@@ -1404,25 +1411,38 @@ function parseV2FinishReason(value: unknown): V2FinishReason {
 function getV2TerminalMessage(value: unknown, requestedModelId: string): ParsedV2AssistantMessage | null {
   parseV2Metadata(value, requestedModelId);
   if (!isRecord(value) || value.messages === undefined) return null;
-  return parseV2AssistantMessage(value);
+  return parseV2AssistantMessage(value, true);
 }
 
-function parseV2AssistantMessage(value: unknown): ParsedV2AssistantMessage {
+function parseV2AssistantMessage(value: unknown, allowMissingContent = false): ParsedV2AssistantMessage {
   if (!isRecord(value) || !Array.isArray(value.messages) || value.messages.length !== 1 || !isRecord(value.messages[0])) {
     throw new GigaChatProviderError('protocol');
   }
   const message = value.messages[0];
   const allowedMessageKeys = new Set(['role', 'content', 'message_id', 'tool_state_id']);
-  if (message.role !== 'assistant' || !Array.isArray(message.content)
-    || Object.keys(message).some((key) => !allowedMessageKeys.has(key))) throw new GigaChatProviderError('protocol');
+  if (message.role !== 'assistant' || Object.keys(message).some((key) => !allowedMessageKeys.has(key))) {
+    throw new GigaChatProviderError('protocol');
+  }
+  let content: unknown[] | null = null;
+  if (Object.prototype.hasOwnProperty.call(message, 'content')) {
+    if (!Array.isArray(message.content)) throw new GigaChatProviderError('protocol');
+    content = message.content;
+  } else if (!allowMissingContent) throw new GigaChatProviderError('protocol');
   const messageId = message.message_id;
   const stateId = message.tool_state_id;
   if (messageId !== undefined && !safeProviderIdentity(messageId)) throw new GigaChatProviderError('protocol');
   if (stateId !== undefined && !isProviderStateId(stateId)) throw new GigaChatProviderError('protocol');
+  if (content === null) return {
+    contentPresent: false,
+    messageId: typeof messageId === 'string' ? messageId : null,
+    text: null,
+    functionsStateId: typeof stateId === 'string' ? stateId : null,
+    functionCall: null,
+  };
   let text = '';
   let hasText = false;
   let rawFunctionCall: Record<string, unknown> | null = null;
-  for (const part of message.content) {
+  for (const part of content) {
     if (!isRecord(part)) throw new GigaChatProviderError('protocol');
     if (Object.prototype.hasOwnProperty.call(part, 'text') && Object.keys(part).length === 1) {
       if (typeof part.text !== 'string') throw new GigaChatProviderError('protocol');
@@ -1435,7 +1455,13 @@ function parseV2AssistantMessage(value: unknown): ParsedV2AssistantMessage {
     rawFunctionCall = part.function_call;
   }
   const normalizedText = hasText ? text : null;
-  if (!rawFunctionCall) return { text: normalizedText, functionsStateId: typeof stateId === 'string' ? stateId : null, functionCall: null };
+  if (!rawFunctionCall) return {
+    contentPresent: true,
+    messageId: typeof messageId === 'string' ? messageId : null,
+    text: normalizedText,
+    functionsStateId: typeof stateId === 'string' ? stateId : null,
+    functionCall: null,
+  };
   const rawArguments = rawFunctionCall.arguments;
   let argumentsValue: unknown = rawArguments;
   if (typeof rawArguments === 'string') {
@@ -1449,7 +1475,7 @@ function parseV2AssistantMessage(value: unknown): ParsedV2AssistantMessage {
   catch { throw new GigaChatProviderError('protocol'); }
   if (typeof rawFunctionCall.name !== 'string') throw new GigaChatProviderError('protocol');
   const wire = validateProviderV2FunctionWire({
-    content: message.content,
+    content,
     ...(messageId === undefined ? {} : { messageId }),
     ...(stateId === undefined ? {} : { toolStateId: stateId }),
   }, {
@@ -1460,6 +1486,8 @@ function parseV2AssistantMessage(value: unknown): ParsedV2AssistantMessage {
   });
   if (!wire) throw new GigaChatProviderError('protocol');
   return {
+    contentPresent: true,
+    messageId: typeof messageId === 'string' ? messageId : null,
     text: normalizedText,
     functionsStateId: typeof stateId === 'string' ? stateId : null,
     functionCall: {
@@ -1525,6 +1553,30 @@ function mergeStateId(current: string | null, next: string | null): string | nul
   if (next === null) return current;
   if (!isProviderStateId(next) || current !== null && current !== next) throw new GigaChatProviderError('protocol');
   return next;
+}
+
+function mergeTerminalFunctionMetadata(
+  call: ProviderFunctionCall,
+  terminal: ParsedV2AssistantMessage,
+): ProviderFunctionCall {
+  const wire = call.wire;
+  if (!wire || wire.messageId !== undefined && terminal.messageId !== null && wire.messageId !== terminal.messageId) {
+    throw new GigaChatProviderError('protocol');
+  }
+  const functionsStateId = mergeStateId(call.functionsStateId, terminal.functionsStateId);
+  const messageId = terminal.messageId ?? wire.messageId;
+  const mergedWire = validateProviderV2FunctionWire({
+    content: wire.content,
+    ...(messageId ? { messageId } : {}),
+    ...(functionsStateId ? { toolStateId: functionsStateId } : {}),
+  }, {
+    name: call.name,
+    arguments: call.arguments,
+    content: call.content,
+    functionsStateId,
+  });
+  if (!mergedWire) throw new GigaChatProviderError('protocol');
+  return { ...call, functionsStateId, wire: mergedWire };
 }
 
 function sameProviderFunctionCall(left: ProviderFunctionCall, right: ProviderFunctionCall): boolean {

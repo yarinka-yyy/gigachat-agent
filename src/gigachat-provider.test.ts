@@ -859,6 +859,51 @@ test('streams V2 SSE across split UTF-8, split CRLF, and a CR-only final delimit
   assert.equal(requestBody.messages.filter((message) => message.role === 'system').length, 1);
 });
 
+test('accepts terminal-only V2 assistant metadata after validated text deltas', async () => {
+  const stateId = '018f47b2-6c10-7a21-8f2b-1fd4d0470c13';
+  const provider = createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => request.url === GIGACHAT_OAUTH_URL
+      ? jsonResponse(200, token('synthetic-token'))
+      : request.url.endsWith('/models')
+        ? jsonResponse(200, { data: [{ id: 'GigaChat-3-Lightning' }] })
+        : eventStreamResponse([
+          v2Frame('response.message.delta', { model: 'GigaChat-3-Lightning', messages: [
+            { role: 'assistant', content: [{ text: 'Прочитано. ' }] },
+          ] }),
+          v2Frame('response.message.delta', { model: 'GigaChat-3-Lightning', messages: [
+            { role: 'assistant', content: [{ text: 'SYNTHETIC_A' }] },
+          ] }),
+          v2Frame('response.message.done', {
+            model: 'GigaChat-3-Lightning', finish_reason: 'stop',
+            messages: [{ role: 'assistant', tool_state_id: stateId }],
+            usage: {
+              input_tokens: 1838, input_tokens_details: { prompt_tokens: 1838, cached_tokens: 13 },
+              output_tokens: 19, total_tokens: 1857,
+            },
+          }),
+        ])),
+  });
+
+  assert.equal((await provider.connect()).state, 'connected');
+  const events: ProviderEvent[] = [];
+  for await (const event of provider.stream({
+    system: [], messages: [{ id: 'message-terminal-metadata', role: 'user', text: 'Задача', createdAt: '2026-10-09T00:00:00.000Z' }],
+    permissionProfile: 'ask', modelId: 'GigaChat-3-Lightning',
+  }, new AbortController().signal)) events.push(event);
+
+  assert.deepEqual(events, [
+    { type: 'activity', activity: 'receiving' },
+    { type: 'text-delta', text: 'Прочитано. ' },
+    { type: 'text-delta', text: 'SYNTHETIC_A' },
+    { type: 'usage', promptTokens: 1838, completionTokens: 19, totalTokens: 1857, precachedPromptTokens: 13,
+      providerModel: 'GigaChat-3-Lightning' },
+    { type: 'completed', functionsStateId: stateId },
+  ]);
+  assert.equal(events.filter((event) => event.type === 'completed').length, 1);
+});
+
 test('retains known V2 usage from a nonterminal delta when the stream ends before message.done', async () => {
   const provider = createGigaChatProvider({
     loadAuthorizationKey: async () => 'synthetic-key',
@@ -967,6 +1012,73 @@ test('normalizes one unknown bounded V2 function call only after its terminal ev
   ]);
 });
 
+test('merges terminal-only V2 function metadata without changing the validated call wire', async (t) => {
+  const callId = '018f47b2-6c10-4a21-8f2b-1fd4d0470c13';
+  const stateA = '018f47b2-6c10-7a21-8f2b-1fd4d0470c13';
+  const stateB = '018f47b2-6c10-7b21-8f2b-1fd4d0470c13';
+  const args = { path: 'fixture.txt' };
+  const cases = [
+    { name: 'object arguments', rawArguments: args, terminalMessageId: 'terminal-object', terminalStateId: stateA, accepted: true },
+    { name: 'string arguments', rawArguments: JSON.stringify(args), terminalMessageId: 'terminal-string', terminalStateId: stateA, accepted: true },
+    { name: 'conflicting terminal state', rawArguments: args, deltaStateId: stateA,
+      terminalMessageId: 'terminal-state-conflict', terminalStateId: stateB, accepted: false },
+    { name: 'conflicting terminal message identity', rawArguments: args, deltaMessageId: 'delta-message',
+      terminalMessageId: 'terminal-message', terminalStateId: stateA, accepted: false },
+    { name: 'stop cannot confirm a function call', rawArguments: args, terminalMessageId: 'terminal-stop',
+      terminalStateId: stateA, finishReason: 'stop', accepted: false },
+  ];
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const callContent = [{ function_call: { id: callId, name: 'read', arguments: item.rawArguments } }];
+      const deltaMessage = {
+        role: 'assistant', content: callContent,
+        ...(item.deltaMessageId === undefined ? {} : { message_id: item.deltaMessageId }),
+        ...(item.deltaStateId === undefined ? {} : { tool_state_id: item.deltaStateId }),
+      };
+      const provider = createGigaChatProvider({
+        loadAuthorizationKey: async () => 'synthetic-key',
+        now: () => FIXED_NOW,
+        transport: fakeTransport((request) => request.url === GIGACHAT_OAUTH_URL
+          ? jsonResponse(200, token('synthetic-token'))
+          : request.url.endsWith('/models')
+            ? jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }] })
+            : eventStreamResponse([
+              v2Frame('response.message.delta', { model: 'GigaChat-3-Ultra', messages: [deltaMessage] }),
+              v2Frame('response.message.done', {
+                model: 'GigaChat-3-Ultra', finish_reason: item.finishReason ?? 'function_call',
+                messages: [{ role: 'assistant', message_id: item.terminalMessageId, tool_state_id: item.terminalStateId }],
+              }),
+            ])),
+      });
+      assert.equal((await provider.connect()).state, 'connected');
+      const events: ProviderEvent[] = [];
+      for await (const event of provider.stream({
+        system: [], messages: [{ id: 'message-terminal-function-metadata', role: 'user', text: 'Задача', createdAt: '2026-10-09T00:00:00.000Z' }],
+        permissionProfile: 'ask', modelId: 'GigaChat-3-Ultra',
+      }, new AbortController().signal)) events.push(event);
+
+      const functionEvents = events.filter((event) => event.type === 'function-call');
+      if (!item.accepted) {
+        assert.equal(functionEvents.length, 0);
+        assert.deepEqual(events[events.length - 1], { type: 'error', category: 'protocol', retryable: false });
+        return;
+      }
+      assert.equal(functionEvents.length, 1);
+      const functionEvent = functionEvents[0];
+      assert.ok(functionEvent && functionEvent.type === 'function-call');
+      assert.equal(functionEvent.functionCall.name, 'read');
+      assert.deepEqual(functionEvent.functionCall.arguments, args);
+      assert.equal(functionEvent.functionCall.functionsStateId, stateA);
+      assert.deepEqual(functionEvent.functionCall.wire, {
+        content: callContent,
+        messageId: item.terminalMessageId,
+        toolStateId: stateA,
+      });
+    });
+  }
+});
+
 test('accepts terminal-only V2 calls over 32 KiB and rejects model, state, or UTF-8 mismatches before a call', async (t) => {
   const callId = '018f47b2-6c10-4a21-8f2b-1fd4d0470c13';
   const stateId = '018f47b2-6c10-7a21-8f2b-1fd4d0470c13';
@@ -1068,6 +1180,74 @@ test('rejects malformed, incomplete, oversized, and unsupported terminal SSE eve
       name: 'message.done without finish reason', response: eventStreamResponse([v2Frame('response.message.done', { model: 'GigaChat-3-Ultra' })]), category: 'protocol',
     },
     {
+      name: 'terminal-only metadata cannot complete without preceding assistant content', response: eventStreamResponse([
+        v2Frame('response.message.done', { model: 'GigaChat-3-Ultra', finish_reason: 'stop',
+          messages: [{ role: 'assistant', tool_state_id: '018f47b2-6c10-7a21-8f2b-1fd4d0470c13' }] }),
+      ]), category: 'protocol',
+    },
+    {
+      name: 'metadata-only delta remains invalid', response: eventStreamResponse([
+        v2Frame('response.message.delta', { model: 'GigaChat-3-Ultra',
+          messages: [{ role: 'assistant', tool_state_id: '018f47b2-6c10-7a21-8f2b-1fd4d0470c13' }] }),
+        v2Frame('response.message.done', { model: 'GigaChat-3-Ultra', finish_reason: 'stop' }),
+      ]), category: 'protocol',
+    },
+    {
+      name: 'null terminal content is not missing metadata', response: eventStreamResponse([
+        v2Frame('response.message.delta', { model: 'GigaChat-3-Ultra',
+          messages: [{ role: 'assistant', content: [{ text: 'часть' }] }] }),
+        v2Frame('response.message.done', { model: 'GigaChat-3-Ultra', finish_reason: 'stop',
+          messages: [{ role: 'assistant', content: null, tool_state_id: '018f47b2-6c10-7a21-8f2b-1fd4d0470c13' }] }),
+      ]), category: 'protocol',
+    },
+    {
+      name: 'wrong role in terminal metadata', response: eventStreamResponse([
+        v2Frame('response.message.delta', { model: 'GigaChat-3-Ultra',
+          messages: [{ role: 'assistant', content: [{ text: 'часть' }] }] }),
+        v2Frame('response.message.done', { model: 'GigaChat-3-Ultra', finish_reason: 'stop',
+          messages: [{ role: 'user', tool_state_id: '018f47b2-6c10-7a21-8f2b-1fd4d0470c13' }] }),
+      ]), category: 'protocol',
+    },
+    {
+      name: 'invalid state in terminal metadata', response: eventStreamResponse([
+        v2Frame('response.message.delta', { model: 'GigaChat-3-Ultra',
+          messages: [{ role: 'assistant', content: [{ text: 'часть' }] }] }),
+        v2Frame('response.message.done', { model: 'GigaChat-3-Ultra', finish_reason: 'stop',
+          messages: [{ role: 'assistant', tool_state_id: 'invalid-state' }] }),
+      ]), category: 'protocol',
+    },
+    {
+      name: 'conflicting state in terminal metadata', response: eventStreamResponse([
+        v2Frame('response.message.delta', { model: 'GigaChat-3-Ultra', messages: [{ role: 'assistant',
+          tool_state_id: '018f47b2-6c10-7a21-8f2b-1fd4d0470c13', content: [{ text: 'часть' }] }] }),
+        v2Frame('response.message.done', { model: 'GigaChat-3-Ultra', finish_reason: 'stop',
+          messages: [{ role: 'assistant', tool_state_id: '018f47b2-6c10-7b21-8f2b-1fd4d0470c13' }] }),
+      ]), category: 'protocol',
+    },
+    {
+      name: 'metadata-only terminal cannot create a function call', response: eventStreamResponse([
+        v2Frame('response.message.done', { model: 'GigaChat-3-Ultra', finish_reason: 'function_call',
+          messages: [{ role: 'assistant', tool_state_id: '018f47b2-6c10-7a21-8f2b-1fd4d0470c13' }] }),
+      ]), category: 'protocol',
+    },
+    {
+      name: 'text cannot be confirmed as a function call by metadata alone', response: eventStreamResponse([
+        v2Frame('response.message.delta', { model: 'GigaChat-3-Ultra',
+          messages: [{ role: 'assistant', content: [{ text: 'часть' }] }] }),
+        v2Frame('response.message.done', { model: 'GigaChat-3-Ultra', finish_reason: 'function_call',
+          messages: [{ role: 'assistant', tool_state_id: '018f47b2-6c10-7a21-8f2b-1fd4d0470c13' }] }),
+      ]), category: 'protocol',
+    },
+    {
+      name: 'stop cannot confirm a preceding function call', response: eventStreamResponse([
+        v2Frame('response.message.delta', { model: 'GigaChat-3-Ultra', messages: [{ role: 'assistant', content: [
+          { function_call: { name: 'read', arguments: { path: 'fixture.txt' } } },
+        ] }] }),
+        v2Frame('response.message.done', { model: 'GigaChat-3-Ultra', finish_reason: 'stop',
+          messages: [{ role: 'assistant', tool_state_id: '018f47b2-6c10-7a21-8f2b-1fd4d0470c13' }] }),
+      ]), category: 'protocol',
+    },
+    {
       name: 'conflicting terminal content', response: eventStreamResponse([
         v2Frame('response.message.delta', { model: 'GigaChat-3-Ultra', messages: [{ role: 'assistant', content: [{ text: 'часть' }] }] }),
         v2Frame('response.message.done', { model: 'GigaChat-3-Ultra', finish_reason: 'stop', messages: [{ role: 'assistant', content: [{ text: 'другое' }] }] }),
@@ -1116,7 +1296,7 @@ test('rejects malformed, incomplete, oversized, and unsupported terminal SSE eve
       }, new AbortController().signal)) events.push(event);
       assert.deepEqual(events[events.length - 1], { type: 'error', category: item.category, retryable: false });
       assert.equal(events.some((event) => event.type === 'completed'), false);
-      if (item.name === 'function call missing terminal') assert.equal(events.some((event) => event.type === 'function-call'), false);
+      assert.equal(events.some((event) => event.type === 'function-call'), false);
       if (item.category === 'context') assert.ok(events.some((event) => event.type === 'text-delta' && event.text === 'часть'));
     });
   }
