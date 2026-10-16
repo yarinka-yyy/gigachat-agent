@@ -325,6 +325,249 @@ test('provider upload ledger keeps app-owned file references durable and account
   assert.deepEqual(await restored.getProviderUploadEntries(accountScope), []);
 });
 
+test('generated image ledger migrates with uploads, records truthful progress, and retains cleanup ownership', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-generated-image-ledger-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const accountScope = 'a'.repeat(64);
+  const otherScope = 'b'.repeat(64);
+  const uploadIntent: import('./contracts').ProviderUploadLedgerEntry = {
+    accountScope, attachmentId: 'attachment-existing',
+    uploadFilename: 'gcagent_123e4567-e89b-42d3-a456-426614174000.txt',
+    name: 'source.txt', contentType: 'text/plain', kind: 'document', sizeBytes: 4,
+    sha256: createHash('sha256').update('data').digest('hex'), state: 'intent', remoteFileId: null, createdAt: timestamp,
+  };
+  const ledgerPath = join(directory, 'provider-uploads.json');
+  await writeFile(ledgerPath, JSON.stringify({ schemaVersion: 1, entries: [uploadIntent] }), 'utf8');
+  let store = await openStore(directory);
+  let ledger = store as typeof store & {
+    getProviderUploadEntries(scope: string): Promise<import('./contracts').ProviderUploadLedgerEntry[]>;
+    putProviderUploadEntry(value: unknown): Promise<import('./contracts').ProviderUploadLedgerEntry>;
+    getProviderGeneratedImageEntries(scope: string): Promise<import('./contracts').ProviderGeneratedImageLedgerEntry[]>;
+    putProviderGeneratedImageEntry(value: unknown): Promise<import('./contracts').ProviderGeneratedImageLedgerEntry>;
+    removeProviderGeneratedImageEntry(scope: string, artifactId: string, remoteFileId: string): Promise<void>;
+  };
+  const migrated = JSON.parse(await readFile(ledgerPath, 'utf8')) as Record<string, unknown>;
+  assert.equal(migrated.schemaVersion, 2);
+  assert.deepEqual(migrated.entries, [uploadIntent]);
+  assert.deepEqual(migrated.generatedEntries, []);
+  assert.deepEqual(await ledger.getProviderUploadEntries(accountScope), [uploadIntent]);
+  assert.deepEqual(await ledger.getProviderGeneratedImageEntries(otherScope), []);
+
+  const chat = await store.createChat(undefined, 'image');
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Ultra' });
+  const accepted = await store.acceptLocalMessage(chat.id, 'Create a picture.', 'generated-image-turn');
+  assert.ok(accepted.turn.assistantMessageId);
+  assert.equal(accepted.turn.modelId, 'GigaChat-3-Ultra');
+  const intent: import('./contracts').ProviderGeneratedImageLedgerEntry = {
+    accountScope, chatId: chat.id, turnId: accepted.turn.turnId,
+    anchorMessageId: accepted.turn.messageId, assistantMessageId: accepted.turn.assistantMessageId!,
+    artifactId: 'generated-artifact-one', modelId: accepted.turn.modelId!, createdAt: timestamp,
+    state: 'intent', remoteFileId: null, contentType: null, sizeBytes: null, sha256: null,
+  };
+  assert.deepEqual(await ledger.putProviderGeneratedImageEntry(intent), intent);
+  assert.deepEqual(await ledger.putProviderGeneratedImageEntry(intent), intent);
+  const unknown = { ...intent, state: 'unknown' as const };
+  assert.deepEqual(await ledger.putProviderGeneratedImageEntry(unknown), unknown);
+  const queued = (await store.getChat(chat.id)).turns.find((turn) => turn.turnId === accepted.turn.turnId);
+  assert.ok(queued);
+  await store.updateRuntimeTurn({
+    id: accepted.turn.turnId, chatId: chat.id, anchorMessageId: accepted.turn.messageId,
+    assistantMessageId: accepted.turn.assistantMessageId!, modelId: accepted.turn.modelId,
+    status: 'cancelled', createdAt: queued.createdAt, endedAt: timestamp, activity: [],
+  });
+  store = await openStore(directory);
+  ledger = store as typeof ledger;
+  assert.deepEqual(await ledger.getProviderGeneratedImageEntries(accountScope), [unknown]);
+  await assert.rejects(ledger.putProviderGeneratedImageEntry(intent));
+  await assert.rejects(ledger.removeProviderGeneratedImageEntry(accountScope, intent.artifactId, 'generated-file-one'));
+  assert.deepEqual(await ledger.getProviderGeneratedImageEntries(accountScope), [unknown]);
+
+  const oldUploaded = { ...uploadIntent, state: 'uploaded' as const, remoteFileId: 'provider-file-one' };
+  await ledger.putProviderUploadEntry(oldUploaded);
+  const conflictingRemote = {
+    ...unknown, state: 'generated' as const, remoteFileId: oldUploaded.remoteFileId, contentType: 'image/png' as const,
+  };
+  await assert.rejects(ledger.putProviderGeneratedImageEntry(conflictingRemote));
+  assert.deepEqual(await ledger.getProviderGeneratedImageEntries(accountScope), [unknown]);
+
+  const generated = { ...unknown, state: 'generated' as const, remoteFileId: 'generated-file-one', contentType: 'image/jpeg' as const };
+  assert.deepEqual(await ledger.putProviderGeneratedImageEntry(generated), generated);
+  assert.deepEqual(await ledger.putProviderGeneratedImageEntry(generated), generated);
+  const downloadedBytes = Buffer.from('synthetic generated image bytes');
+  const downloaded = {
+    ...generated, state: 'downloaded' as const, sizeBytes: downloadedBytes.byteLength,
+    sha256: createHash('sha256').update(downloadedBytes).digest('hex'),
+  };
+  assert.deepEqual(await ledger.putProviderGeneratedImageEntry(downloaded), downloaded);
+  assert.deepEqual(await ledger.putProviderGeneratedImageEntry(downloaded), downloaded);
+
+  const secondImageChat = await store.createChat(undefined, 'image');
+  await store.updateChat(secondImageChat.id, { modelId: 'GigaChat-3-Ultra' });
+  const secondImageTurn = await store.acceptLocalMessage(secondImageChat.id, 'Create another picture.', 'generated-image-turn-two');
+  await assert.rejects(ledger.putProviderGeneratedImageEntry({
+    ...intent, accountScope: otherScope, chatId: secondImageChat.id, turnId: secondImageTurn.turn.turnId,
+    anchorMessageId: secondImageTurn.turn.messageId, assistantMessageId: secondImageTurn.turn.assistantMessageId!,
+    artifactId: generated.artifactId,
+  }), /идентификатор созданного изображения уже принадлежит другой записи/i);
+  const invalidFirstDownload = {
+    ...downloaded, chatId: secondImageChat.id, turnId: secondImageTurn.turn.turnId,
+    anchorMessageId: secondImageTurn.turn.messageId, assistantMessageId: secondImageTurn.turn.assistantMessageId!,
+    artifactId: 'generated-artifact-two',
+  };
+  await assert.rejects(ledger.putProviderGeneratedImageEntry(invalidFirstDownload));
+  await assert.rejects(ledger.putProviderGeneratedImageEntry({
+    ...intent, turnId: secondImageTurn.turn.turnId, chatId: secondImageChat.id,
+    anchorMessageId: secondImageTurn.turn.messageId, assistantMessageId: secondImageTurn.turn.assistantMessageId!,
+    artifactId: 'attachment-existing',
+  }));
+
+  const textChat = await store.createChat();
+  await store.updateChat(textChat.id, { modelId: 'GigaChat-3-Ultra' });
+  const textTurn = await store.acceptLocalMessage(textChat.id, 'Not an image chat.', 'generated-image-text-turn');
+  await assert.rejects(ledger.putProviderGeneratedImageEntry({
+    ...intent, chatId: textChat.id, turnId: textTurn.turn.turnId,
+    anchorMessageId: textTurn.turn.messageId, assistantMessageId: textTurn.turn.assistantMessageId!,
+    artifactId: 'generated-artifact-text',
+  }));
+  const compaction = await store.acceptCompactionTurn(chat.id, 'generated-image-compaction-turn');
+  await assert.rejects(ledger.putProviderGeneratedImageEntry({
+    ...intent, turnId: compaction.turn.turnId, anchorMessageId: compaction.turn.messageId,
+    assistantMessageId: 'compaction-assistant', artifactId: 'generated-artifact-compaction',
+  }));
+  await assert.rejects(ledger.putProviderGeneratedImageEntry({
+    ...intent, anchorMessageId: 'wrong-anchor', artifactId: 'generated-artifact-wrong-anchor',
+  }));
+  await assert.rejects(ledger.putProviderGeneratedImageEntry({
+    ...intent, chatId: 'missing-image-chat', artifactId: 'generated-artifact-missing-chat',
+  }));
+  assert.throws(() => ledger.putProviderGeneratedImageEntry({ ...intent, sha256: '0'.repeat(64) }));
+  assert.throws(() => ledger.putProviderGeneratedImageEntry({ ...intent, contentType: 'image/gif' }));
+  assert.throws(() => ledger.putProviderGeneratedImageEntry({ ...intent, state: 'downloaded', remoteFileId: 'file-two', contentType: 'image/png', sizeBytes: 0, sha256: '0'.repeat(64) }));
+  await assert.rejects(ledger.putProviderGeneratedImageEntry({ ...downloaded, remoteFileId: 'replacement-file' }));
+  await assert.rejects(ledger.putProviderGeneratedImageEntry({ ...downloaded, state: 'generated', sizeBytes: null, sha256: null }));
+  assert.deepEqual(await ledger.getProviderGeneratedImageEntries(accountScope), [downloaded]);
+
+  const visible = JSON.stringify({
+    chat: await store.getChat(chat.id), chats: await store.listChats(), usage: await store.getUsageLedger(),
+    profile: await store.getUsageProfileView(0, accountScope),
+  });
+  assert.doesNotMatch(visible, /generated-file-one|accountScope|remoteFileId|generatedEntries/);
+
+  await store.deleteChat(chat.id);
+  const restored = await openStore(directory) as typeof ledger;
+  assert.deepEqual(await restored.getProviderUploadEntries(accountScope), [oldUploaded]);
+  assert.deepEqual(await restored.getProviderGeneratedImageEntries(accountScope), [downloaded]);
+  await restored.putProviderUploadEntry({ ...oldUploaded, state: 'cleanup-pending' });
+  const cleanup = { ...downloaded, state: 'cleanup-pending' as const };
+  assert.deepEqual(await restored.putProviderGeneratedImageEntry(cleanup), cleanup);
+  await assert.rejects(restored.removeProviderGeneratedImageEntry(accountScope, cleanup.artifactId, 'wrong-generated-file'));
+  await restored.removeProviderGeneratedImageEntry(otherScope, cleanup.artifactId, cleanup.remoteFileId!);
+  assert.deepEqual(await restored.getProviderGeneratedImageEntries(accountScope), [cleanup]);
+  await restored.removeProviderGeneratedImageEntry(accountScope, cleanup.artifactId, cleanup.remoteFileId!);
+  assert.deepEqual(await restored.getProviderGeneratedImageEntries(accountScope), []);
+  assert.deepEqual(await restored.getProviderUploadEntries(accountScope), [{ ...oldUploaded, state: 'cleanup-pending' }]);
+});
+
+test('generated image ownership rejects later upload collisions without corrupting the ledger', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-generated-upload-collision-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const accountScope = 'd'.repeat(64);
+  const store = await openStore(directory);
+  const chat = await store.createChat(undefined, 'image');
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Ultra' });
+  const accepted = await store.acceptLocalMessage(chat.id, 'Create a picture.', 'generated-upload-collision-turn');
+  const ledgerPath = join(directory, 'provider-uploads.json');
+  const ledger = store as typeof store & {
+    putProviderUploadEntry(value: unknown): Promise<import('./contracts').ProviderUploadLedgerEntry>;
+    putProviderGeneratedImageEntry(value: unknown): Promise<import('./contracts').ProviderGeneratedImageLedgerEntry>;
+    getProviderGeneratedImageEntries(scope: string): Promise<import('./contracts').ProviderGeneratedImageLedgerEntry[]>;
+    getProviderUploadEntries(scope: string): Promise<import('./contracts').ProviderUploadLedgerEntry[]>;
+  };
+  const generatedIntent: import('./contracts').ProviderGeneratedImageLedgerEntry = {
+    accountScope, chatId: chat.id, turnId: accepted.turn.turnId,
+    anchorMessageId: accepted.turn.messageId, assistantMessageId: accepted.turn.assistantMessageId!,
+    artifactId: 'generated-artifact-shared', modelId: accepted.turn.modelId!, createdAt: timestamp,
+    state: 'intent', remoteFileId: null, contentType: null, sizeBytes: null, sha256: null,
+  };
+  await ledger.putProviderGeneratedImageEntry(generatedIntent);
+  const generated = {
+    ...generatedIntent, state: 'generated' as const,
+    remoteFileId: 'generated-file-shared', contentType: 'image/png' as const,
+  };
+  await ledger.putProviderGeneratedImageEntry(generated);
+
+  const uploadBase: import('./contracts').ProviderUploadLedgerEntry = {
+    accountScope, attachmentId: 'upload-distinct-artifact',
+    uploadFilename: 'gcagent_123e4567-e89b-42d3-a456-426614174099.txt',
+    name: 'source.txt', contentType: 'text/plain', kind: 'document', sizeBytes: 4,
+    sha256: createHash('sha256').update('data').digest('hex'), state: 'intent', remoteFileId: null,
+    createdAt: timestamp,
+  };
+  const beforeArtifactConflict = await readFile(ledgerPath);
+  await assert.rejects(ledger.putProviderUploadEntry({
+    ...uploadBase, attachmentId: generated.artifactId,
+    uploadFilename: 'gcagent_123e4567-e89b-42d3-a456-426614174098.txt',
+  }));
+  assert.deepEqual(await readFile(ledgerPath), beforeArtifactConflict);
+
+  await ledger.putProviderUploadEntry(uploadBase);
+  const beforeRemoteConflict = await readFile(ledgerPath);
+  await assert.rejects(ledger.putProviderUploadEntry({
+    ...uploadBase, state: 'uploaded', remoteFileId: generated.remoteFileId,
+  }));
+  assert.deepEqual(await readFile(ledgerPath), beforeRemoteConflict);
+
+  const reopened = await openStore(directory) as typeof ledger;
+  assert.deepEqual(await reopened.getProviderGeneratedImageEntries(accountScope), [generated]);
+  assert.deepEqual(await reopened.getProviderUploadEntries(accountScope), [uploadBase]);
+});
+
+test('schema v1 cannot discard generated image ownership fields', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-provider-ledger-v1-generated-field-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const ledgerPath = join(directory, 'provider-uploads.json');
+  const bytes = Buffer.from(JSON.stringify({ schemaVersion: 1, entries: [], generatedEntries: [] }), 'utf8');
+  await writeFile(ledgerPath, bytes);
+
+  await assert.rejects(openStore(directory));
+  assert.deepEqual(await readFile(ledgerPath), bytes);
+});
+
+test('generated image ledger enforces the combined entry cap without changing prior rows', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-generated-image-ledger-limit-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const accountScope = 'c'.repeat(64);
+  const initial = await openStore(directory);
+  const chat = await initial.createChat(undefined, 'image');
+  await initial.updateChat(chat.id, { modelId: 'GigaChat-3-Ultra' });
+  const accepted = await initial.acceptLocalMessage(chat.id, 'Create a picture.', 'generated-image-limit-turn');
+  const uploads = Array.from({ length: 10_000 }, (_, index): import('./contracts').ProviderUploadLedgerEntry => {
+    const suffix = index.toString(16).padStart(12, '0');
+    return {
+      accountScope, attachmentId: `upload-${index}`,
+      uploadFilename: `gcagent_00000000-0000-4000-8000-${suffix}.txt`,
+      name: 'source.txt', contentType: 'text/plain', kind: 'document', sizeBytes: 1,
+      sha256: 'a'.repeat(64), state: 'intent', remoteFileId: null, createdAt: timestamp,
+    };
+  });
+  const ledgerPath = join(directory, 'provider-uploads.json');
+  await writeFile(ledgerPath, JSON.stringify({ schemaVersion: 2, entries: uploads, generatedEntries: [] }), 'utf8');
+  const store = await openStore(directory);
+  const ledger = store as typeof store & {
+    putProviderGeneratedImageEntry(value: unknown): Promise<import('./contracts').ProviderGeneratedImageLedgerEntry>;
+    getProviderUploadEntries(scope: string): Promise<import('./contracts').ProviderUploadLedgerEntry[]>;
+  };
+  const before = await readFile(ledgerPath);
+  assert.equal((await ledger.getProviderUploadEntries(accountScope)).length, 10_000);
+  await assert.rejects(ledger.putProviderGeneratedImageEntry({
+    accountScope, chatId: chat.id, turnId: accepted.turn.turnId,
+    anchorMessageId: accepted.turn.messageId, assistantMessageId: accepted.turn.assistantMessageId!,
+    artifactId: 'generated-artifact-at-limit', modelId: accepted.turn.modelId!, createdAt: timestamp,
+    state: 'intent', remoteFileId: null, contentType: null, sizeBytes: null, sha256: null,
+  }));
+  assert.deepEqual(await readFile(ledgerPath), before);
+});
+
 test('files-only home send preserves an empty user message and binds files to the accepted turn', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-home-files-only-'));
   t.after(() => rm(directory, { recursive: true, force: true }));

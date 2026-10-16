@@ -3,7 +3,7 @@ import { Buffer } from 'node:buffer';
 import { constants } from 'node:fs';
 import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { DEFAULT_NOTIFICATION_SETTINGS, PROVIDER_ERROR_CATEGORIES, type AcceptedTurnInput, type BalanceFamilyId, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type ChatTurnRecord, type CompactSnapshot, type CompactionPrefix, type HomeDraftAttachment, type HomeDraftInput, type HomeDraftRecord, type HookEvent, type HookRunResult, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderBalanceFamily, type ProviderBalanceObservation, type ProviderErrorCategory, type ProviderProtocolExchange, type ProviderToolName, type ProviderUploadLedgerEntry, type ProviderV2FunctionWire, type RuntimeActivity, type RuntimeTurnSnapshot, type Settings, type SettingsPatch, type StudioBalanceAnchorInput, type Theme, type UsageLedgerSummary, type UsageProfileView, type UsageReceipt } from './contracts';
+import { DEFAULT_NOTIFICATION_SETTINGS, PROVIDER_ERROR_CATEGORIES, type AcceptedTurnInput, type BalanceFamilyId, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type ChatTurnRecord, type CompactSnapshot, type CompactionPrefix, type HomeDraftAttachment, type HomeDraftInput, type HomeDraftRecord, type HookEvent, type HookRunResult, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderBalanceFamily, type ProviderBalanceObservation, type ProviderErrorCategory, type ProviderGeneratedImageLedgerEntry, type ProviderProtocolExchange, type ProviderToolName, type ProviderUploadLedgerEntry, type ProviderV2FunctionWire, type RuntimeActivity, type RuntimeTurnSnapshot, type Settings, type SettingsPatch, type StudioBalanceAnchorInput, type Theme, type UsageLedgerSummary, type UsageProfileView, type UsageReceipt } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { requireModelId } from './models';
 import { isSkillId } from './skills';
@@ -25,7 +25,7 @@ type ProfileBalanceAnchor = Omit<UsageBalanceAnchorViewInput, 'baselineMatches'>
   baselineReceiptDigest: string;
 };
 type ProfileBalanceFile = { schemaVersion: 1; anchors: ProfileBalanceAnchor[] };
-type ProviderUploadFile = { schemaVersion: 1; entries: ProviderUploadLedgerEntry[] };
+type ProviderUploadFile = { schemaVersion: 2; entries: ProviderUploadLedgerEntry[]; generatedEntries: ProviderGeneratedImageLedgerEntry[] };
 type ProviderProtocolVersion = 'v1' | 'v2';
 type ProviderStateOwnerBinding = { accountScope: string; protocolVersion: ProviderProtocolVersion };
 type ProviderStateMessageBinding = ProviderStateOwnerBinding & { messageId: string; stateIdHash: string };
@@ -177,6 +177,9 @@ export interface LocalStore {
   getProviderUploadEntries(accountScope: unknown): Promise<ProviderUploadLedgerEntry[]>;
   putProviderUploadEntry(value: unknown): Promise<ProviderUploadLedgerEntry>;
   removeProviderUploadEntry(accountScope: unknown, attachmentId: unknown, remoteFileId: unknown): Promise<void>;
+  getProviderGeneratedImageEntries(accountScope: unknown): Promise<ProviderGeneratedImageLedgerEntry[]>;
+  putProviderGeneratedImageEntry(value: unknown): Promise<ProviderGeneratedImageLedgerEntry>;
+  removeProviderGeneratedImageEntry(accountScope: unknown, artifactId: unknown, remoteFileId: unknown): Promise<void>;
   getStorageIssues(): Promise<string[]>;
   readGlobalInstructions(): Promise<string>;
   readGlobalInstructionDocument(): Promise<InstructionDocument>;
@@ -1278,22 +1281,93 @@ function extensionsForContentType(contentType: string): string[] {
   }
 }
 
-function parseProviderUploadFile(value: unknown): Loaded<ProviderUploadFile> {
-  if (!isRecord(value) || value.schemaVersion !== 1 || !Array.isArray(value.entries)
-    || value.entries.length > MAX_PROVIDER_UPLOAD_ENTRIES) throw new Error('Invalid provider upload ledger.');
-  const entries = value.entries.map(validateProviderUploadEntry);
+function validateProviderGeneratedImageEntry(value: unknown): ProviderGeneratedImageLedgerEntry {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    'accountScope', 'chatId', 'turnId', 'anchorMessageId', 'assistantMessageId', 'artifactId', 'modelId', 'createdAt',
+    'state', 'remoteFileId', 'contentType', 'sizeBytes', 'sha256',
+  ]) || (value.state !== 'intent' && value.state !== 'unknown' && value.state !== 'generated'
+    && value.state !== 'downloaded' && value.state !== 'cleanup-pending')
+    || (value.remoteFileId !== null && (typeof value.remoteFileId !== 'string' || !/^[A-Za-z0-9_-]{1,256}$/.test(value.remoteFileId)))
+    || (value.contentType !== null && value.contentType !== 'image/jpeg' && value.contentType !== 'image/png')
+    || (value.sizeBytes !== null && (!Number.isSafeInteger(value.sizeBytes) || (value.sizeBytes as number) < 1
+      || (value.sizeBytes as number) > Math.min(LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES)))
+    || (value.sha256 !== null && (typeof value.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(value.sha256)))) {
+    throw new Error('Некорректная запись созданного изображения.');
+  }
+  const allResultFieldsNull = value.remoteFileId === null && value.contentType === null && value.sizeBytes === null && value.sha256 === null;
+  const remoteMetadataKnown = value.remoteFileId !== null && value.contentType !== null;
+  const sizeMetadataPaired = (value.sizeBytes === null) === (value.sha256 === null);
+  if ((value.state === 'intent' || value.state === 'unknown') && !allResultFieldsNull
+    || value.state === 'generated' && (!remoteMetadataKnown || value.sizeBytes !== null || value.sha256 !== null)
+    || value.state === 'downloaded' && (!remoteMetadataKnown || value.sizeBytes === null || value.sha256 === null)
+    || value.state === 'cleanup-pending' && (!remoteMetadataKnown || !sizeMetadataPaired)) {
+    throw new Error('Поля результата не соответствуют состоянию созданного изображения.');
+  }
+  return {
+    accountScope: requireProviderAccountScope(value.accountScope),
+    chatId: requireId(value.chatId),
+    turnId: requireId(value.turnId),
+    anchorMessageId: requireId(value.anchorMessageId),
+    assistantMessageId: requireId(value.assistantMessageId),
+    artifactId: requireId(value.artifactId),
+    modelId: requireModelId(value.modelId),
+    createdAt: requireTimestamp(value.createdAt),
+    state: value.state,
+    remoteFileId: value.remoteFileId as string | null,
+    contentType: value.contentType as ProviderGeneratedImageLedgerEntry['contentType'],
+    sizeBytes: value.sizeBytes as number | null,
+    sha256: value.sha256 as string | null,
+  };
+}
+
+function validateProviderUploadEntries(value: unknown): ProviderUploadLedgerEntry[] {
+  if (!Array.isArray(value) || value.length > MAX_PROVIDER_UPLOAD_ENTRIES) throw new Error('Invalid provider upload ledger.');
+  const entries = value.map(validateProviderUploadEntry);
   if (new Set(entries.map((entry) => `${entry.accountScope}\0${entry.attachmentId}`)).size !== entries.length
     || new Set(entries.map((entry) => `${entry.accountScope}\0${entry.uploadFilename}`)).size !== entries.length) {
     throw new Error('Duplicate provider upload identity.');
   }
-  return { value: { schemaVersion: 1, entries }, needsWrite: false };
+  return entries;
+}
+
+function validateProviderGeneratedImageEntries(
+  value: unknown,
+  uploadEntries: readonly ProviderUploadLedgerEntry[],
+): ProviderGeneratedImageLedgerEntry[] {
+  if (!Array.isArray(value)) throw new Error('Invalid generated image ledger.');
+  const entries = value.map(validateProviderGeneratedImageEntry);
+  if (new Set(entries.map((entry) => entry.artifactId)).size !== entries.length
+    || new Set(entries.map((entry) => entry.turnId)).size !== entries.length
+    || new Set(entries.filter((entry) => entry.remoteFileId !== null)
+      .map((entry) => `${entry.accountScope}\0${entry.remoteFileId}`)).size !== entries.filter((entry) => entry.remoteFileId !== null).length
+    || entries.some((entry) => uploadEntries.some((upload) => upload.attachmentId === entry.artifactId
+      || upload.accountScope === entry.accountScope && upload.remoteFileId !== null && upload.remoteFileId === entry.remoteFileId))) {
+    throw new Error('Duplicate generated image ownership.');
+  }
+  return entries;
+}
+
+function parseProviderUploadFile(value: unknown): Loaded<ProviderUploadFile> {
+  if (!isRecord(value)) throw new Error('Invalid provider upload ledger.');
+  if (value.schemaVersion === 1) {
+    if (Object.prototype.hasOwnProperty.call(value, 'generatedEntries')) throw new Error('Invalid provider upload ledger.');
+    const entries = validateProviderUploadEntries(value.entries);
+    return { value: { schemaVersion: 2, entries, generatedEntries: [] }, needsWrite: true };
+  }
+  if (value.schemaVersion !== 2 || !hasExactKeys(value, ['schemaVersion', 'entries', 'generatedEntries'])) {
+    throw new Error('Invalid provider upload ledger.');
+  }
+  const entries = validateProviderUploadEntries(value.entries);
+  const generatedEntries = validateProviderGeneratedImageEntries(value.generatedEntries, entries);
+  if (entries.length + generatedEntries.length > MAX_PROVIDER_UPLOAD_ENTRIES) throw new Error('Invalid provider upload ledger.');
+  return { value: { schemaVersion: 2, entries, generatedEntries }, needsWrite: false };
 }
 
 async function loadProviderUploadLedger(filePath: string): Promise<Loaded<ProviderUploadFile>> {
   let info;
   try { info = await lstat(filePath); }
   catch (error) {
-    if (isMissingFile(error)) return { value: { schemaVersion: 1, entries: [] }, needsWrite: true };
+    if (isMissingFile(error)) return { value: { schemaVersion: 2, entries: [], generatedEntries: [] }, needsWrite: true };
     throw error;
   }
   if (!info.isFile() || info.size > MAX_PROVIDER_UPLOAD_LEDGER_BYTES) throw storageError(filePath);
@@ -2316,6 +2390,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
   let usageReceipts = usageFile.value.receipts;
   let profileBalanceAnchors = profileBalanceFile.value.anchors;
   let providerUploadEntries = providerUploadFile.value.entries;
+  let providerGeneratedImageEntries = providerUploadFile.value.generatedEntries;
   let homeDraft = initialHomeDraft;
   const selectionRevisions = new Map(chats.map((chat) => [chat.id, { permissionProfile: 0, skill: 0 }]));
   const turnReservations = new Map<string, {
@@ -2375,15 +2450,25 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     await writeOwnedAtomic(profileBalancePath, value);
     profileBalanceAnchors = next;
   };
-  const saveProviderUploadEntries = async (next: ProviderUploadLedgerEntry[]): Promise<void> => {
-    if (next.length > MAX_PROVIDER_UPLOAD_ENTRIES) throw new Error('Лимит записей загрузки достигнут; история не сокращена.');
-    const value: ProviderUploadFile = { schemaVersion: 1, entries: next };
+  const saveProviderUploadLedger = async (
+    nextUploads: ProviderUploadLedgerEntry[],
+    nextGenerated: ProviderGeneratedImageLedgerEntry[],
+  ): Promise<void> => {
+    if (nextUploads.length + nextGenerated.length > MAX_PROVIDER_UPLOAD_ENTRIES) {
+      throw new Error('Лимит записей файлового журнала достигнут; история не сокращена.');
+    }
+    const value: ProviderUploadFile = { schemaVersion: 2, entries: nextUploads, generatedEntries: nextGenerated };
     if (Buffer.byteLength(`${JSON.stringify(value, null, 2)}\n`, 'utf8') > MAX_PROVIDER_UPLOAD_LEDGER_BYTES) {
       throw new Error('Журнал загрузок превысил безопасный размер; существующие записи сохранены.');
     }
     await writeOwnedAtomic(providerUploadPath, value);
-    providerUploadEntries = next;
+    providerUploadEntries = nextUploads;
+    providerGeneratedImageEntries = nextGenerated;
   };
+  const saveProviderUploadEntries = (next: ProviderUploadLedgerEntry[]): Promise<void> =>
+    saveProviderUploadLedger(next, providerGeneratedImageEntries);
+  const saveProviderGeneratedImageEntries = (next: ProviderGeneratedImageLedgerEntry[]): Promise<void> =>
+    saveProviderUploadLedger(providerUploadEntries, next);
   const chatFolder = (id: string): string => join(chatsDirectory, requireId(id));
   const saveChat = async (chat: ChatDetail, signal?: AbortSignal, nextOwnership?: ProviderStateOwnership): Promise<void> => {
     const providerStateOwnership = validateProviderStateOwnership(
@@ -2418,6 +2503,38 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       throw new Error('Исходное сообщение принятого хода отсутствует.');
     }
     return chat;
+  };
+  const validateGeneratedImageTurnBinding = (entry: ProviderGeneratedImageLedgerEntry): void => {
+    const chat = chats.find((item) => item.id === entry.chatId);
+    const turn = chat?.turns.find((item) => item.turnId === entry.turnId);
+    if (!chat || chat.kind !== 'image' || !turn || turn.operation !== undefined
+      || (turn.status !== 'queued' && turn.status !== 'running')
+      || turn.anchorMessageId !== entry.anchorMessageId || turn.assistantMessageId !== entry.assistantMessageId
+      || turn.modelId !== entry.modelId
+      || !chat.messages.some((message) => message.id === entry.anchorMessageId && message.role === 'user')) {
+      throw new Error('Созданное изображение должно быть привязано к принятому ходу чата изображений.');
+    }
+  };
+  const assertGeneratedImageIdentityAvailable = (
+    entry: ProviderGeneratedImageLedgerEntry,
+    previous: ProviderGeneratedImageLedgerEntry | null,
+  ): void => {
+    if (providerGeneratedImageEntries.some((row) => row !== previous
+      && (row.artifactId === entry.artifactId || row.turnId === entry.turnId
+        || entry.remoteFileId !== null && row.accountScope === entry.accountScope && row.remoteFileId === entry.remoteFileId))
+      || providerUploadEntries.some((row) => row.attachmentId === entry.artifactId
+        || entry.remoteFileId !== null && row.accountScope === entry.accountScope && row.remoteFileId === entry.remoteFileId)) {
+      throw new Error('Идентификатор созданного изображения уже принадлежит другой записи.');
+    }
+    for (const chat of chats) {
+      for (const artifact of chat.artifacts) {
+        if (artifact.id !== entry.artifactId) continue;
+        const isOwnDownloadedArtifact = previous !== null && chat.id === entry.chatId
+          && artifact.messageId === entry.assistantMessageId && entry.sizeBytes !== null && entry.sha256 !== null
+          && artifact.size === entry.sizeBytes && artifact.sha256 === entry.sha256;
+        if (!isOwnDownloadedArtifact) throw new Error('Идентификатор созданного изображения уже занят локальным файлом.');
+      }
+    }
   };
   const createStoredChat = async (projectId: string | null, kind: ChatKind): Promise<ChatDetail> => {
     const now = new Date().toISOString();
@@ -3754,6 +3871,10 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     putProviderUploadEntry: (value) => {
       const entry = validateProviderUploadEntry(value);
       return serialize(async () => {
+        if (providerGeneratedImageEntries.some((row) => row.artifactId === entry.attachmentId
+          || entry.remoteFileId !== null && row.accountScope === entry.accountScope && row.remoteFileId === entry.remoteFileId)) {
+          throw new Error('Идентификатор загрузки уже принадлежит созданному изображению.');
+        }
         const index = providerUploadEntries.findIndex((row) => row.accountScope === entry.accountScope && row.attachmentId === entry.attachmentId);
         const previous = index < 0 ? null : providerUploadEntries[index]!;
         if (!previous) {
@@ -3796,6 +3917,68 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         throw new Error('Удаляется только подтверждённая app-owned облачная копия.');
       }
       await saveProviderUploadEntries(providerUploadEntries.filter((row) => row !== entry));
+    }),
+    getProviderGeneratedImageEntries: (scopeInput) => serialize(async () => {
+      const accountScope = requireProviderAccountScope(scopeInput);
+      return structuredClone(providerGeneratedImageEntries.filter((entry) => entry.accountScope === accountScope));
+    }),
+    putProviderGeneratedImageEntry: (value) => {
+      const entry = validateProviderGeneratedImageEntry(value);
+      return serialize(async () => {
+        const index = providerGeneratedImageEntries.findIndex((row) => row.accountScope === entry.accountScope && row.artifactId === entry.artifactId);
+        const previous = index < 0 ? null : providerGeneratedImageEntries[index]!;
+        if (!previous) {
+          if (entry.state !== 'intent') throw new Error('Созданное изображение должно начинаться с сохранённого намерения.');
+          validateGeneratedImageTurnBinding(entry);
+        } else {
+          const sameIdentity = previous.accountScope === entry.accountScope && previous.chatId === entry.chatId
+            && previous.turnId === entry.turnId && previous.anchorMessageId === entry.anchorMessageId
+            && previous.assistantMessageId === entry.assistantMessageId && previous.artifactId === entry.artifactId
+            && previous.modelId === entry.modelId && previous.createdAt === entry.createdAt;
+          const stateCanAdvance = previous.state === 'intent'
+            ? entry.state === 'intent' || entry.state === 'unknown' || entry.state === 'generated'
+            : previous.state === 'unknown'
+              ? entry.state === 'unknown' || entry.state === 'generated'
+              : previous.state === 'generated'
+                ? entry.state === 'generated' || entry.state === 'downloaded' || entry.state === 'cleanup-pending'
+                : previous.state === 'downloaded'
+                  ? entry.state === 'downloaded' || entry.state === 'cleanup-pending'
+                  : entry.state === 'cleanup-pending';
+          const previousResults = [previous.remoteFileId, previous.contentType, previous.sizeBytes, previous.sha256];
+          const nextResults = [entry.remoteFileId, entry.contentType, entry.sizeBytes, entry.sha256];
+          const sameResults = previousResults.every((value, resultIndex) => value === nextResults[resultIndex]);
+          const recordingRemote = (previous.state === 'intent' || previous.state === 'unknown') && entry.state === 'generated'
+            && previous.remoteFileId === null && previous.contentType === null && previous.sizeBytes === null && previous.sha256 === null;
+          const recordingBytes = previous.state === 'generated' && entry.state === 'downloaded'
+            && previous.remoteFileId === entry.remoteFileId && previous.contentType === entry.contentType
+            && previous.sizeBytes === null && previous.sha256 === null && entry.sizeBytes !== null && entry.sha256 !== null;
+          if (!sameIdentity || !stateCanAdvance
+            || !(sameResults || recordingRemote && previous.sizeBytes === entry.sizeBytes && previous.sha256 === entry.sha256
+              || recordingBytes && previous.remoteFileId === entry.remoteFileId && previous.contentType === entry.contentType)) {
+            throw new Error('Состояние созданного изображения изменилось; владение не будет переиспользовано.');
+          }
+          if (sameJson(previous, entry)) return structuredClone(previous);
+        }
+        assertGeneratedImageIdentityAvailable(entry, previous);
+        const next = [...providerGeneratedImageEntries];
+        if (index < 0) next.push(entry);
+        else next[index] = entry;
+        await saveProviderGeneratedImageEntries(next);
+        return structuredClone(entry);
+      });
+    },
+    removeProviderGeneratedImageEntry: (scopeInput, artifactIdInput, remoteFileIdInput) => serialize(async () => {
+      const accountScope = requireProviderAccountScope(scopeInput);
+      const artifactId = requireId(artifactIdInput);
+      if (typeof remoteFileIdInput !== 'string' || !/^[A-Za-z0-9_-]{1,256}$/.test(remoteFileIdInput)) {
+        throw new Error('Удаление созданного файла не подтверждено.');
+      }
+      const entry = providerGeneratedImageEntries.find((row) => row.accountScope === accountScope && row.artifactId === artifactId);
+      if (!entry) return;
+      if (entry.state !== 'cleanup-pending' || entry.remoteFileId !== remoteFileIdInput) {
+        throw new Error('Удаляется только подтверждённый файл созданного изображения.');
+      }
+      await saveProviderGeneratedImageEntries(providerGeneratedImageEntries.filter((row) => row !== entry));
     }),
     getStorageIssues: () => serialize(async () => [...instructionIssues, ...storageIssues]),
     readGlobalInstructions: () => serialize(() => readOwnedInstructions(join(storageRoot, 'GIGACHAT.md'))),

@@ -452,6 +452,22 @@ export interface ProviderUploadLedgerEntry {
   createdAt: string;
 }
 
+export interface ProviderGeneratedImageLedgerEntry {
+  accountScope: string;
+  chatId: string;
+  turnId: string;
+  anchorMessageId: string;
+  assistantMessageId: string;
+  artifactId: string;
+  modelId: GigaChatModelId;
+  createdAt: string;
+  state: 'intent' | 'unknown' | 'generated' | 'downloaded' | 'cleanup-pending';
+  remoteFileId: string | null;
+  contentType: 'image/jpeg' | 'image/png' | null;
+  sizeBytes: number | null;
+  sha256: string | null;
+}
+
 export type RuntimeTurnStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
 
 export type RuntimeActivity =
