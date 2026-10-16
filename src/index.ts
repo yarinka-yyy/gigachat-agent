@@ -29,6 +29,7 @@ import { getCopyableUserMessageText } from './chat-transcript';
 import { createVoiceRuntime, VOICE_MAX_OUTPUT_BYTES, type VoiceRuntime } from './voice';
 import { prepareVoiceModelCache } from './voice-model-cache';
 import { createBalanceScopeGuard } from './usage-view';
+import { imageChatAttachmentBlocker, imageChatHistoryBlocker, imageChatRequestBlocker } from './image-mode';
 import {
   assertAuthorizationKeyMatchesOwner,
   assertProviderStateOwner,
@@ -1466,11 +1467,14 @@ async function registerIpcHandlers(
   handle('chats:update', async (idInput, patchInput) => {
     const id = requireId(idInput);
     const patch = requireChatPatch(patchInput);
+    const existing = await store.getChat(id);
+    if (existing.kind === 'image' && patch.modelId !== undefined && patch.modelId !== IMAGE_GENERATION_MODEL_ID) {
+      throw new Error('Для чата изображений можно выбрать только GigaChat Ultra.');
+    }
     if (patch.modelId !== undefined && patch.modelId !== null) {
       const modelError = chatModelUnavailableReason(providerConnection.getModelRegistry(), patch.modelId);
       if (modelError) throw new Error(`Нельзя выбрать эту модель для следующих ходов: ${modelError}`);
     }
-    const existing = await store.getChat(id);
     const nextProjectId = patch.projectId === undefined ? existing.projectId : patch.projectId;
     if (patch.projectId !== undefined && patch.nextTurnSkillId === undefined && existing.nextTurnSkillId) {
       const projectSkill = /^project\/([^/]+)\//.exec(existing.nextTurnSkillId);
@@ -1491,6 +1495,15 @@ async function registerIpcHandlers(
     const selectedAttachments = selectChatDraftAttachments(before, attachmentIds);
     const settings = await store.getSettings();
     const expectedModelId = before.modelId ?? settings.defaultModelId;
+    const imageBlocker = imageChatRequestBlocker(before.kind, expectedModelId, typeof text === 'string' ? text : '',
+      Math.max(selectedAttachments.length, before.draftAttachments.length));
+    if (imageBlocker) throw new Error(imageBlocker);
+    const imageHistoryBlocker = imageChatHistoryBlocker(before.kind, before.messages);
+    if (imageHistoryBlocker) throw new Error(imageHistoryBlocker);
+    if (before.kind === 'image') {
+      const modelError = chatModelUnavailableReason(providerConnection.getModelRegistry(), expectedModelId);
+      if (modelError) throw new Error(`GigaChat Ultra пока недоступен: ${modelError}`);
+    }
     await validateAttachmentSelection(expectedModelId, typeof text === 'string' ? text : '', selectedAttachments,
       (attachmentId) => store.getChatDraftAttachmentPath(chatId, attachmentId));
     const validateBeforeCommit = selectedAttachments.length
@@ -1511,13 +1524,18 @@ async function registerIpcHandlers(
   });
   handle('chats:pick-draft-files', async (idInput) => {
     const id = requireId(idInput);
-    await store.getChat(id);
+    const chat = await store.getChat(id);
+    const imageBlocker = imageChatAttachmentBlocker(chat.kind, 1);
+    if (imageBlocker) throw new Error(imageBlocker);
     const paths = await pickAttachmentPaths();
     if (!paths) return null;
     return stageAttachmentPaths(paths, () => store.getChat(id), (path) => store.stageChatDraftFile(id, path));
   });
-  handle('chats:stage-draft-files', (idInput, paths) => {
+  handle('chats:stage-draft-files', async (idInput, paths) => {
     const id = requireId(idInput);
+    const chat = await store.getChat(id);
+    const imageBlocker = imageChatAttachmentBlocker(chat.kind, 1);
+    if (imageBlocker) throw new Error(imageBlocker);
     return stageAttachmentPaths(paths, () => store.getChat(id), (path) => store.stageChatDraftFile(id, path));
   });
   handle('chats:draft-attachment-preview', async (idInput, attachmentIdInput) => {
@@ -1592,7 +1610,13 @@ async function registerIpcHandlers(
     const detail = await store.getChat(id);
     await clipboard.writeText(getCopyableUserMessageText(detail.messages, messageId));
   });
-  handle('chats:import-file', async (id, projectId) => {
+  handle('chats:import-file', async (idInput, projectId) => {
+    const id = idInput === null ? null : requireId(idInput);
+    if (id !== null) {
+      const chat = await store.getChat(id);
+      const imageBlocker = imageChatAttachmentBlocker(chat.kind, 1);
+      if (imageBlocker) throw new Error(imageBlocker);
+    }
     const options = { properties: ['openFile'] as Array<'openFile'> };
     const selected = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);
     if (selected.canceled || !selected.filePaths[0]) return null;

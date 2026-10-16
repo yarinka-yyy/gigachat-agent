@@ -100,7 +100,9 @@ import { hookEventLabel, mergeRuntimeTurnSnapshots, mergeTranscriptTurns } from 
 import type { TranscriptTurn } from './chat-transcript';
 import { isNearChatScrollEnd, preserveChatScrollAnchor } from './chat-navigation';
 import ChatTranscript from './components/ChatTranscript';
+import GeneratedImageResult from './components/GeneratedImageResult';
 import UsageProfile from './components/UsageProfile';
+import { IMAGE_GENERATION_MODEL_ID, imageChatAttachmentBlocker, imageChatHistoryBlocker, imageChatModelBlocker, imageChatRequestBlocker } from './image-mode';
 
 type Page = 'home' | 'chat' | 'settings' | 'onboarding' | 'images' | 'video' | 'podcasts' | 'archive' | 'profile';
 type Route = { page: Page; id?: string };
@@ -1633,6 +1635,7 @@ export default function App() {
   const composerAttachments = route.page === 'home'
     ? activeHomeDraftRecord?.attachments ?? []
     : route.page === 'chat' && chatDetail && chatDetail.id === route.id ? chatDetail.draftAttachments : [];
+  const composerIsImageChat = route.page === 'chat' && selectedChat?.kind === 'image';
   const composerCanSend = Boolean(draft.trim() || composerAttachments.length);
   const composerPermissionProfile = selectedChat && chatDetail?.id === selectedChat.id
     ? chatDetail.nextTurnPermissionProfile ?? (pendingPermissionChatIdRef.current === selectedChat.id ? pendingPermissionProfile : null) ?? settings.defaultPermissionProfile
@@ -1643,17 +1646,29 @@ export default function App() {
   const composerModelId = selectedChat && chatDetail?.id === selectedChat.id
     ? chatDetail.modelId ?? settings.defaultModelId
     : activeHomeDraftRecord?.modelId ?? settings.defaultModelId;
-  const composerAttachmentBlocker = composerAttachments.length
-    ? attachmentSendBlocker(composerModelId, draft, composerAttachments)
+  const availableChatModelOptions = chatModelOptions(modelRegistry);
+  const composerImageModelBlocker = composerIsImageChat ? imageChatModelBlocker('image', composerModelId) : null;
+  const composerImageAttachmentBlocker = composerIsImageChat ? imageChatAttachmentBlocker('image', composerAttachments.length) : null;
+  const composerUltraOption = availableChatModelOptions.find((option) => option.currentId === IMAGE_GENERATION_MODEL_ID) ?? null;
+  const composerImageCatalogBlocker = composerIsImageChat ? chatModelUnavailableReason(modelRegistry, IMAGE_GENERATION_MODEL_ID) : null;
+  const composerImageHistoryBlocker = composerIsImageChat && chatDetail?.id === selectedChat?.id
+    ? imageChatHistoryBlocker('image', chatDetail.messages) : null;
+  const composerAttachmentBlocker = composerIsImageChat
+    ? composerImageHistoryBlocker ?? composerImageModelBlocker ?? composerImageAttachmentBlocker
+    : composerAttachments.length
+      ? attachmentSendBlocker(composerModelId, draft, composerAttachments)
       ?? (chatModelUnavailableReason(modelRegistry, composerModelId)
         ? `Выбранная модель недоступна для нового запроса: ${chatModelUnavailableReason(modelRegistry, composerModelId)} Файлы останутся в черновике.`
         : null)
     : null;
-  const availableChatModelOptions = chatModelOptions(modelRegistry);
+  const composerSendBlocker = composerAttachmentBlocker ?? composerImageCatalogBlocker;
+  const composerModelOptions = composerIsImageChat
+    ? availableChatModelOptions.filter((option) => option.currentId === IMAGE_GENERATION_MODEL_ID)
+    : availableChatModelOptions;
   const composerModelAvailable = isChatModelAvailable(modelRegistry, composerModelId);
   const composerModelFamily = modelFamilyForId(composerModelId);
-  const composerModelUnknown = Boolean(composerModelId && !composerModelFamily);
-  const composerLegacyUpgrade = legacyModelUpgrade(composerModelId);
+  const composerModelUnknown = !composerIsImageChat && Boolean(composerModelId && !composerModelFamily);
+  const composerLegacyUpgrade = composerIsImageChat ? null : legacyModelUpgrade(composerModelId);
   const composerUpgradeOption = composerLegacyUpgrade
     ? availableChatModelOptions.find((option) => option.currentId === composerLegacyUpgrade.currentId) ?? null
     : null;
@@ -1924,6 +1939,21 @@ export default function App() {
       ? structuredClone(homeDraftRef.current) : null;
     const initialChatAttachments = sourceRoute.page === 'chat' && chatDetail && chatDetail.id === sourceRoute.id
       ? structuredClone(chatDetail.draftAttachments) : [];
+    const currentSelectedChat = selectedChat;
+    const selectedImageChat = sourceRoute.page === 'chat'
+      && currentSelectedChat != null && currentSelectedChat.id === sourceRoute.id
+      && currentSelectedChat.kind === 'image' ? currentSelectedChat : null;
+    if (selectedImageChat) {
+      const currentImageDetail = chatDetail?.id === selectedImageChat.id ? chatDetail : null;
+      const modelId = currentImageDetail?.modelId ?? settingsRef.current.defaultModelId;
+      const blocker = imageChatHistoryBlocker('image', currentImageDetail?.messages ?? [])
+        ?? imageChatRequestBlocker('image', modelId, value, initialChatAttachments.length)
+        ?? chatModelUnavailableReason(modelRegistry, modelId);
+      if (blocker) {
+        setNotice(blocker);
+        return;
+      }
+    }
     if ((!value && !(initialHomeDraft?.attachments.length || initialChatAttachments.length))
       || sending || sendInProgress.current || homeDraftImportInFlight.current
       || (sourceRoute.page === 'chat' && Boolean(sourceRoute.id) && chatDraftImportInFlight.current.has(sourceRoute.id!))) return;
@@ -2050,6 +2080,10 @@ export default function App() {
   async function attachFileOperation(files?: File[]): Promise<void> {
     const sourceRoute = routeRef.current;
     const sourceRouteGeneration = routeGeneration.current;
+    if (sourceRoute.page === 'chat' && sourceRoute.id && selectedChat?.id === sourceRoute.id && selectedChat.kind === 'image') {
+      setNotice(imageChatAttachmentBlocker('image', 1) ?? 'В чат изображений нельзя прикрепить файл.');
+      return;
+    }
     if (sourceRoute.page === 'home') {
       if (homeDraftImportInFlight.current) return;
       const sourceHomeDraftGeneration = homeDraftSaveGeneration.current;
@@ -2576,7 +2610,13 @@ export default function App() {
   }
 
   async function changeComposerModel(modelId: ChatModelId): Promise<void> {
-    if (route.page === 'chat' && selectedChat) await updateChat(selectedChat, { modelId });
+    if (route.page === 'chat' && selectedChat) {
+      if (selectedChat.kind === 'image' && modelId !== IMAGE_GENERATION_MODEL_ID) {
+        setNotice('В чате изображений доступен только следующий ход с GigaChat Ultra.');
+        return;
+      }
+      await updateChat(selectedChat, { modelId });
+    }
     else if (route.page === 'home') {
       try { await persistHomeDraftPatch({ modelId }); }
       catch (error) { setNotice(getErrorMessage(error)); }
@@ -3409,13 +3449,19 @@ export default function App() {
                 const linkedAttachments = (message.attachmentIds ?? []).map((id) =>
                   chatDetail.artifacts.find((artifact) => artifact.id === id && artifact.messageId === message.id) ?? null);
                 return linkedAttachments.length > 0 ? <div className="message-attachments" aria-label="Вложения этого сообщения">
-                  {linkedAttachments.map((artifact, index) => artifact
-                    ? <button type="button" className="message-attachment" key={artifact.id}
+                  {linkedAttachments.map((artifact, index) => {
+                    if (!artifact) return <span className="message-attachment attachment-missing" key={`${message.id}-missing-${index}`}>Файл недоступен</span>;
+                    if (selectedChat.kind === 'image' && message.role === 'assistant' && message.source === 'runtime'
+                      && attachmentContentType(artifact.name)?.kind === 'image') {
+                      return <GeneratedImageResult key={`${chatDetail.id}:${artifact.id}`} chatId={chatDetail.id} artifact={artifact}
+                        runOperation={trackRendererOperation} disabled={closePending || Boolean(closeFailure)} />;
+                    }
+                    return <button type="button" className="message-attachment" key={artifact.id}
                       aria-label={`Открыть ${artifact.name}`} onClick={() => void window.gigaChat.chats.openArtifact(chatDetail.id, artifact.id).catch((error: unknown) => setNotice(getErrorMessage(error)))}>
                       <AttachmentThumbnail source="artifact" chatId={chatDetail.id} attachmentId={artifact.id} image={attachmentContentType(artifact.name)?.kind === 'image'} />
                       <span className="message-attachment-copy"><strong>{artifact.name}</strong><small>{attachmentFormatLabel(artifact.name)} · {attachmentSizeLabel(artifact.size)}</small></span>
-                    </button>
-                    : <span className="message-attachment attachment-missing" key={`${message.id}-missing-${index}`}>Файл недоступен</span>)}
+                    </button>;
+                  })}
                 </div> : null;
               }}
               renderTurnActions={(turn: TranscriptTurn) => {
@@ -3469,7 +3515,27 @@ export default function App() {
           </section>
         );
       case 'images':
-        return <section className="content-page"><div className="page-heading"><span className="eyebrow">Локальная оболочка</span><h1>Изображения</h1></div><EmptyState title="Генерация пока недоступна" description="Чат изображений сохраняется локально; отправка и генерация пока не подтверждены." icon="image" /><button type="button" className="primary-button" onClick={() => void createChat(null, 'image')}>Создать чат изображений</button></section>;
+        return <section className="content-page image-start-page">
+          <div className="page-heading"><span className="eyebrow">Отдельная история</span><h1>Изображения</h1></div>
+          <section className="image-start-panel" aria-labelledby="image-start-title">
+            <ImageIcon className="image-start-icon" aria-hidden="true" />
+            <div><h2 id="image-start-title">От описания к изображению</h2>
+              <p>Создайте чат, опишите результат и продолжайте в той же истории. Для новых ходов используется GigaChat Ultra.</p>
+              {chatModelUnavailableReason(modelRegistry, IMAGE_GENERATION_MODEL_ID)
+                ? <p className="image-start-status" role="status">{chatModelUnavailableReason(modelRegistry, IMAGE_GENERATION_MODEL_ID)} Подключите GigaChat и обновите список моделей, когда будете готовы.</p>
+                : <p className="image-start-status" role="status">GigaChat Ultra доступен в текущем списке моделей.</p>}
+            </div>
+            <div className="image-start-actions">
+              <button type="button" className="primary-button" onClick={() => void createChat(null, 'image')}>Создать чат изображений</button>
+              {chatModelUnavailableReason(modelRegistry, IMAGE_GENERATION_MODEL_ID) && <>
+                <button type="button" className="secondary-button" onClick={() => openSettings('browser')}>Проверить подключение</button>
+                <button type="button" className="quiet-button" disabled={modelRegistryLoading} onClick={() => void refreshModelRegistry()}>
+                  {modelRegistryLoading ? 'Обновление…' : 'Обновить список моделей'}
+                </button>
+              </>}
+            </div>
+          </section>
+        </section>;
       case 'video':
         return <section className="content-page"><div className="page-heading"><span className="eyebrow">Будущая функция</span><h1>Создание видео</h1></div><EmptyState title="Раздел подготовлен" description="Генерация видео появится после отдельной проверки возможностей API." icon="video" /><span className="future-badge">FUTURE</span></section>;
       case 'podcasts':
@@ -3617,12 +3683,26 @@ export default function App() {
 
         <main ref={mainPanelRef} className={route.page === 'settings' ? 'main-panel settings-panel' : 'main-panel'}
           onDragEnter={(event: ReactDragEvent<HTMLElement>) => {
+            if (composerIsImageChat && Array.from(event.dataTransfer.types).includes('Files')) {
+              event.preventDefault();
+              event.stopPropagation();
+              event.dataTransfer.dropEffect = 'none';
+              setAttachmentDropActive(false);
+              return;
+            }
             const chatColumn = event.target instanceof Element ? event.target.closest('.chat-column') : null;
             if (!chatColumn || !['home', 'chat'].includes(route.page) || !Array.from(event.dataTransfer.types).includes('Files')) return;
             event.preventDefault();
             setAttachmentDropActive(true);
           }}
           onDragOver={(event: ReactDragEvent<HTMLElement>) => {
+            if (composerIsImageChat && Array.from(event.dataTransfer.types).includes('Files')) {
+              event.preventDefault();
+              event.stopPropagation();
+              event.dataTransfer.dropEffect = 'none';
+              setAttachmentDropActive(false);
+              return;
+            }
             const chatColumn = event.target instanceof Element ? event.target.closest('.chat-column') : null;
             if (!chatColumn || !['home', 'chat'].includes(route.page) || !Array.from(event.dataTransfer.types).includes('Files')) return;
             event.preventDefault();
@@ -3636,6 +3716,13 @@ export default function App() {
             setAttachmentDropActive(false);
           }}
           onDrop={(event: ReactDragEvent<HTMLElement>) => {
+            if (composerIsImageChat && Array.from(event.dataTransfer.types).includes('Files')) {
+              event.preventDefault();
+              event.stopPropagation();
+              event.dataTransfer.dropEffect = 'none';
+              setAttachmentDropActive(false);
+              return;
+            }
             const chatColumn = event.target instanceof Element ? event.target.closest('.chat-column') : null;
             if (!chatColumn || !['home', 'chat'].includes(route.page) || !Array.from(event.dataTransfer.types).includes('Files')) return;
             event.preventDefault();
@@ -3706,6 +3793,25 @@ export default function App() {
                 <button type="button" className="secondary-button" disabled={sendingOnCurrentRoute || homeDraftImporting} onClick={() => void retryHomeDraftSave()}>Повторить сохранение</button>
               </div>}
               <div className="composer">
+                {composerIsImageChat && <div className="image-composer-guidance">
+                  <p>Изображения создаёт GigaChat Ultra. Пока можно отправить только текстовое описание.</p>
+                  {composerImageHistoryBlocker && <p className="attachment-blocker" role="alert">{composerImageHistoryBlocker}</p>}
+                  {composerImageAttachmentBlocker && <p className="attachment-blocker" role="alert">{composerImageAttachmentBlocker}</p>}
+                  {composerImageModelBlocker && <div className="image-model-upgrade" role="status">
+                    <span>{composerImageModelBlocker}</span>
+                    {composerUltraOption?.selectable && <button type="button" className="quiet-button"
+                      disabled={sendingOnCurrentRoute || chatDraftBusy} onClick={() => void changeComposerModel(IMAGE_GENERATION_MODEL_ID)}>
+                      Использовать GigaChat Ultra
+                    </button>}
+                  </div>}
+                  {composerImageCatalogBlocker && <div className="image-model-unavailable" role="status">
+                    <span>{composerImageCatalogBlocker}</span>
+                    <button type="button" className="quiet-button" onClick={() => openSettings('browser')}>Проверить подключение</button>
+                    <button type="button" className="quiet-button" disabled={modelRegistryLoading} onClick={() => void refreshModelRegistry()}>
+                      {modelRegistryLoading ? 'Обновление…' : 'Обновить модели'}
+                    </button>
+                  </div>}
+                </div>}
                 {composerAttachments.length > 0 && <section className="attachment-tray" aria-label="Подготовленные вложения">
                   <div className="attachment-tray-heading"><strong>Вложения</strong><span>Локальные копии · проверка перед отправкой</span></div>
                   <div className="attachment-tray-items">
@@ -3718,7 +3824,7 @@ export default function App() {
                         onClick={() => void (route.page === 'home' ? removeHomeDraftFile(attachment.id) : removeChatDraftFile(attachment.id))}>Убрать</button>
                     </div>)}
                   </div>
-                  {composerAttachmentBlocker && <p className="attachment-blocker" role="alert">{composerAttachmentBlocker}</p>}
+                  {composerAttachmentBlocker && !composerIsImageChat && <p className="attachment-blocker" role="alert">{composerAttachmentBlocker}</p>}
                 </section>}
                 <label className="sr-only" htmlFor="chat-draft">Черновик сообщения</label>
                 <textarea
@@ -3742,7 +3848,7 @@ export default function App() {
                 </div>}
                 <div className="composer-toolbar">
                   <div className="toolbar-leading">
-                  <button type="button" className="attach-button" disabled={sendingOnCurrentRoute || homeDraftBusy || chatDraftBusy || !chatComposerReady || (route.page === 'home' && !homeDraftRecord)} aria-label="Прикрепить файл" title="Прикрепить файл" onClick={() => void attachFile()}><Icon name="plus" /></button>
+                  <button type="button" className="attach-button" disabled={composerIsImageChat || sendingOnCurrentRoute || homeDraftBusy || chatDraftBusy || !chatComposerReady || (route.page === 'home' && !homeDraftRecord)} aria-label={composerIsImageChat ? 'Файлы недоступны в чате изображений' : 'Прикрепить файл'} title={composerIsImageChat ? 'В чате изображений можно отправить только описание' : 'Прикрепить файл'} onClick={() => void attachFile()}><Icon name="plus" /></button>
                   <ActionMenu className="composer-permission-menu" placement="below-start" onVisibilityChange={trackNativeOverlay}
                     label={`Разрешения: ${AVAILABLE_PERMISSION_PROFILES.find((profile) => profile.id === composerPermissionProfile)?.name ?? 'Спросить'}`}
                     disabled={!canChangeComposerPermissionProfile || (sendingOnCurrentRoute && route.page === 'home') || homeDraftBusy || (route.page === 'home' && !homeDraftRecord)}
@@ -3774,10 +3880,12 @@ export default function App() {
                       ? `${composerModelAvailable ? '' : 'Недоступна · '}${composerModelFamily?.displayName ?? 'Сохранённая модель'}`
                       : 'Выбрать модель'}</span><Icon name="chevron" /> </>}>
                     <div className="model-picker-popup"><p className="picker-heading">Модель для следующих ходов</p>
-                      <p className="picker-caption">{modelRegistry.state === 'ready'
+                      <p className="picker-caption">{composerIsImageChat
+                        ? 'Для чата изображений используется только GigaChat Ultra.'
+                        : modelRegistry.state === 'ready'
                         ? 'Показаны четыре текущие модели. Доступность зависит от проверки и ответов API; старый выбор не подменяется.'
                         : 'Подключите API и обновите список. Сохранённый выбор не заменяется автоматически.'}</p>
-                      {availableChatModelOptions.map((option) => {
+                      {composerModelOptions.map((option) => {
                         const description = chatModelOptionStatus(option);
                         const familyBalance = modelPickerBalance?.families.find((item) => item.family === option.family);
                         const remaining = modelPickerBalance?.state === 'available' && familyBalance?.state === 'known'
@@ -3824,13 +3932,15 @@ export default function App() {
                     onError={setNotice}
                     onSuccess={showSuccess}
                   />
-                  <span className="send-button-wrap" title={composerCanSend ? 'Отправить текст и подготовленные вложения' : 'Введите сообщение или прикрепите файл'}><button type="button" className="send-button" disabled={!composerCanSend || Boolean(composerAttachmentBlocker) || sending || homeDraftBusy || chatDraftBusy || !chatComposerReady || (route.page === 'home' && !homeDraftRecord)} aria-label={draft.trim() ? 'Отправить сообщение' : 'Отправить вложения'} onClick={() => void submitMessage()}><Icon name="send" /></button></span>
+                  <span className="send-button-wrap" title={composerSendBlocker ?? (composerCanSend
+                    ? (composerIsImageChat ? 'Отправить описание' : 'Отправить текст и подготовленные вложения')
+                    : (composerIsImageChat ? 'Введите описание изображения' : 'Введите сообщение или прикрепите файл'))}><button type="button" className="send-button" disabled={!composerCanSend || Boolean(composerSendBlocker) || sending || homeDraftBusy || chatDraftBusy || !chatComposerReady || (route.page === 'home' && !homeDraftRecord)} aria-label={draft.trim() ? 'Отправить сообщение' : 'Отправить вложения'} onClick={() => void submitMessage()}><Icon name="send" /></button></span>
                   </div>
                 </div>
               </div>
             </div>
           )}
-          {attachmentDropActive && ['home', 'chat'].includes(route.page) && <div className="attachment-drop-overlay" role="status" aria-live="polite"><span className="attachment-drop-hint">Отпустите, чтобы прикрепить</span></div>}
+          {attachmentDropActive && !composerIsImageChat && ['home', 'chat'].includes(route.page) && <div className="attachment-drop-overlay" role="status" aria-live="polite"><span className="attachment-drop-hint">Отпустите, чтобы прикрепить</span></div>}
             </>;
             if (route.page === 'chat') return <BrowserPanel
               chatHeading={<>

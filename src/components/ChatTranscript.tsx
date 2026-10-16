@@ -65,7 +65,7 @@ export default function ChatTranscript({
             data-message-id={message.id} aria-label={isUser ? 'Сообщение пользователя' : example ? 'Пример ответа' : 'Ответ'}>
             <div className="transcript-bubble">
               {example && <span className="transcript-example-label">Пример</span>}
-              <p>{message.text}</p>
+              {(isUser || message.text.length > 0) && <p>{message.text}</p>}
               {renderAttachments?.(message)}
             </div>
             {isUser && <div className="transcript-message-meta">

@@ -9,8 +9,28 @@ import type { AcceptedTurnInput, ChatMessage, CompactSnapshot, GigaChatProvider,
 import { COMPACTION_TASK_INSTRUCTION, buildNextTurnContext, hashCompactionPrefix } from './context';
 import { instructionFileHash } from './instruction-documents';
 import { createTurnRuntime, type PreparedTurn } from './runtime';
+import { IMAGE_GENERATION_MODEL_ID } from './image-mode';
 
 const timestamp = '2026-09-24T10:00:00.000Z';
+
+test('new image chats default to Ultra without changing the text model default', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-image-chat-default-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+
+  const store = await openStore(directory);
+  await store.updateSettings({ defaultModelId: 'GigaChat-3-Lightning' });
+  const imageChat = await store.createChat(undefined, 'image');
+  const textChat = await store.createChat();
+  const imageDetail = await store.getChat(imageChat.id);
+  const textDetail = await store.getChat(textChat.id);
+
+  assert.equal(imageDetail.modelId, IMAGE_GENERATION_MODEL_ID);
+  assert.equal(textDetail.modelId, 'GigaChat-3-Lightning');
+  const reopened = await openStore(directory);
+  assert.equal((await reopened.getChat(imageChat.id)).modelId, IMAGE_GENERATION_MODEL_ID);
+  assert.equal((await reopened.getChat(textChat.id)).modelId, 'GigaChat-3-Lightning');
+  assert.equal((await reopened.getSettings()).defaultModelId, 'GigaChat-3-Lightning');
+});
 
 const syntheticInstructionCommitter = async (request: InstructionCommitRequest): Promise<InstructionCommitResult> => {
   const target = join(request.workingFolder, request.relativePath);

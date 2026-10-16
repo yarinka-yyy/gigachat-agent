@@ -20,7 +20,8 @@ import { GigaChatProviderError } from './gigachat-provider';
 import type { ProviderStateOwner } from './provider-state';
 import type { LocalStore } from './store';
 
-export const IMAGE_GENERATION_MODEL_ID = 'GigaChat-3-Ultra';
+import { IMAGE_GENERATION_MODEL_ID } from './image-mode';
+export { IMAGE_GENERATION_MODEL_ID } from './image-mode';
 const MAX_IMAGE_BYTES = Math.min(PROVIDER_IMAGE_LIMIT_BYTES, LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES);
 const MAX_IMAGE_EDGE = 8_192;
 const MAX_IMAGE_PIXELS = 32_000_000;

@@ -35,6 +35,9 @@ function capturedText(state) {
 async function runNodeDriver() {
   const nativeWorkspaceMode = process.argv.includes('--native-browser-workspace');
   const holdForReview = process.argv.includes('--hold-for-review');
+  const imageGenerationSmoke = process.argv.includes('--image-generation-smoke');
+  assert.equal(imageGenerationSmoke && nativeWorkspaceMode, false, 'image-generation smoke is an isolated renderer fixture');
+  assert.equal(imageGenerationSmoke && holdForReview, false, 'image-generation smoke must remain hidden and unattended');
   const { register } = await import('tsx/esm/api');
   register();
   require('tsx/cjs/api').register();
@@ -48,7 +51,8 @@ async function runNodeDriver() {
     await mkdir(join(repo, '.qa'), { recursive: true });
     return realpath(join(repo, '.qa'));
   });
-  const fixturePrefix = nativeWorkspaceMode ? 'plan009-browser-workspace-native-' : 'plan009-browser-workspace-renderer-';
+  const fixturePrefix = imageGenerationSmoke ? 'plan011-image-generation-smoke-'
+    : nativeWorkspaceMode ? 'plan009-browser-workspace-native-' : 'plan009-browser-workspace-renderer-';
   const fixture = await import('node:fs/promises').then(({ mkdtemp }) => mkdtemp(join(qaDirectory, fixturePrefix)));
   assert.equal(dirname(fixture), qaDirectory, 'fixture must be a direct child of ignored app/.qa');
   console.log(`Renderer QA fixture: ${fixture}`);
@@ -270,10 +274,31 @@ async function runNodeDriver() {
 
 async function runElectronHost() {
   console.log('Electron host entry reached');
-  const { app, BrowserWindow, WebContentsView, ipcMain, screen, session } = require('electron');
+  const { app, BrowserWindow, WebContentsView, ipcMain, nativeImage, screen, session } = require('electron');
   console.log('Electron API loaded');
   const nativeWorkspaceMode = process.argv.includes('--native-browser-workspace');
   const holdForReview = process.argv.includes('--hold-for-review');
+  const imageGenerationSmoke = process.argv.includes('--image-generation-smoke');
+  assert.equal(imageGenerationSmoke && nativeWorkspaceMode, false, 'image-generation smoke cannot load the native browser fixture');
+  assert.equal(imageGenerationSmoke && holdForReview, false, 'image-generation smoke must remain hidden and unattended');
+  let generatedImagePreview = null;
+  if (imageGenerationSmoke) {
+    const width = 16;
+    const height = 9;
+    const bitmap = Buffer.alloc(width * height * 4);
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const offset = (y * width + x) * 4;
+        const upper = y < 5;
+        bitmap[offset] = upper ? 184 : 38;
+        bitmap[offset + 1] = upper ? 129 : 92;
+        bitmap[offset + 2] = upper ? 62 : 148;
+        bitmap[offset + 3] = 255;
+      }
+    }
+    generatedImagePreview = nativeImage.createFromBitmap(bitmap, { width, height })
+      .resize({ width: 1024, height: 576 }).toDataURL();
+  }
   const skipSidebarPointerCapture = process.argv.includes('--skip-sidebar-pointer-capture');
   const fixture = process.env.GIGACHAT_AUDIT_ROOT;
   assert.ok(fixture, 'synthetic GIGACHAT_AUDIT_ROOT is required');
@@ -290,10 +315,11 @@ async function runElectronHost() {
 
   const timestamp = '2026-10-03T00:00:00.000Z';
   const makeProject = (id, name, workingFolder = null) => ({ id, name, pinned: false, archived: false, createdAt: timestamp, updatedAt: timestamp, workingFolder });
-  const makeChat = (id, title, projectId = null) => ({ id, title, projectId, pinned: false, archived: false, createdAt: timestamp, updatedAt: timestamp, kind: 'text' });
+  const makeChat = (id, title, projectId = null, kind = 'text') => ({ id, title, projectId, pinned: false, archived: false, createdAt: timestamp, updatedAt: timestamp, kind });
   const makeDetail = (summary, text, draft = '') => ({
-    ...summary, draft, nextTurnPermissionProfile: null, modelId: null, nextTurnSkillId: null,
-    messages: [{ id: `${summary.id}-message`, role: 'assistant', text, createdAt: timestamp }], turns: [], toolReceipts: [], artifacts: [], draftAttachments: [], compactSnapshot: null,
+    ...summary, draft, nextTurnPermissionProfile: null, modelId: summary.kind === 'image' ? 'GigaChat-3-Ultra' : null, nextTurnSkillId: null,
+    messages: imageGenerationSmoke && summary.kind === 'image' ? [] : [{ id: `${summary.id}-message`, role: 'assistant', text, createdAt: timestamp }],
+    turns: [], toolReceipts: [], artifacts: [], draftAttachments: [], compactSnapshot: null,
   });
   const makeBrowserTab = (id, title, url) => ({ id, title, url, canGoBack: false, canGoForward: false, loading: false, error: null });
   const projects = [
@@ -307,12 +333,42 @@ async function runElectronHost() {
   ];
   const chatA = makeChat('chat-a', 'Chat A');
   const chatB = makeChat('chat-b', 'Chat B');
+  const imageLegacy = makeChat('image-legacy', 'Legacy image chat', null, 'image');
+  const imageHistory = makeChat('image-history', 'Image chat with old file', null, 'image');
   const chats = [
     chatA,
     chatB,
+    ...(imageGenerationSmoke ? [imageLegacy, imageHistory] : []),
     ...Array.from({ length: 24 }, (_, index) => makeChat(`history-${index + 1}`, `History chat ${String(index + 1).padStart(2, '0')}`)),
   ];
   const details = new Map(chats.map((chat, index) => [chat.id, makeDetail(chat, index === 0 ? 'A baseline' : index === 1 ? 'B baseline' : 'History baseline')]));
+  if (imageGenerationSmoke) {
+    const legacy = details.get(imageLegacy.id);
+    legacy.modelId = 'GigaChat-3-Pro';
+    legacy.messages = [
+      { id: 'image-legacy-user', role: 'user', text: 'Старое описание.', createdAt: timestamp },
+      { id: 'image-legacy-assistant', role: 'assistant', source: 'runtime', text: '', createdAt: timestamp, attachmentIds: ['image-legacy-artifact'] },
+    ];
+    legacy.turns = [{
+      turnId: 'image-legacy-turn', anchorMessageId: 'image-legacy-user', assistantMessageId: 'image-legacy-assistant',
+      modelId: 'GigaChat-3-Pro', status: 'completed', createdAt: timestamp, startedAt: timestamp, endedAt: timestamp,
+      activity: [{ kind: 'provider', at: timestamp, activity: 'receiving' }],
+    }];
+    legacy.artifacts = [{ id: 'image-legacy-artifact', name: 'Изображение.png', storedName: 'image-legacy-artifact.png', size: 2048,
+      sha256: 'c'.repeat(64), createdAt: timestamp, messageId: 'image-legacy-assistant' }];
+    legacy.draftAttachments = [{ id: 'image-legacy-draft', name: 'pending.txt', storedName: 'image-legacy-draft.txt', size: 24,
+      sha256: 'd'.repeat(64), createdAt: timestamp }];
+    const history = details.get(imageHistory.id);
+    history.messages = [{ id: 'image-history-user', role: 'user', text: 'См. приложенный файл.', createdAt: timestamp, attachmentIds: ['image-history-file'] }];
+    history.artifacts = [{ id: 'image-history-file', name: 'old-notes.txt', storedName: 'old-notes.txt', size: 128,
+      sha256: 'e'.repeat(64), createdAt: timestamp, messageId: 'image-history-user' }];
+    const textDetail = details.get(chatA.id);
+    textDetail.modelId = 'GigaChat-3-Lightning';
+    textDetail.messages = [];
+    textDetail.draftAttachments = [{ id: 'text-chat-draft', name: 'notes.txt', storedName: 'text-chat-draft.txt', size: 32,
+      sha256: 'f'.repeat(64), createdAt: timestamp }];
+  }
+  const smokeModelIds = ['GigaChat-3-Ultra', 'GigaChat-2-Max', 'GigaChat-3-Pro', 'GigaChat-3-Lightning'];
   const state = {
     projects, chats, details,
     homeDraft: { revision: 1, text: '', projectId: null, permissionProfile: null, skillId: null, modelId: null, attachments: [], lastAcceptance: null },
@@ -320,15 +376,21 @@ async function runElectronHost() {
     deferHomeDraftSaves: false, pendingHomeDraftSaves: [], homeDraftSaveCalls: [], rejectNextHomeDraftSave: false,
     deferHomeDraftImports: false, pendingHomeDraftImports: [], homeDraftImportCalls: 0,
     homeDraftStageCalls: [], chatDraftStageCalls: [], attachmentPreviewCalls: [], chatDraftAttachmentSequence: 0,
+    chatDraftPickCalls: 0, imageGenerationCalls: 0, imageGeneratedArtifacts: 0, generatedImagePreviewCalls: [],
+    deferGeneratedImagePreview: false, pendingGeneratedImagePreviews: [],
+    generatedImageSaveCalls: [], generatedImageSaveResults: ['saved', 'cancelled', 'error', 'saved'], generatedImageOpenCalls: [],
     nextHomePickedFile: null, nextChatPickedFile: null,
     deferChatDraftImports: false, pendingChatDraftImports: [],
     deferChatDraftRemovals: false, pendingChatDraftRemovals: [],
     deferHomeDraftSendResponse: false, pendingHomeDraftSends: [], homeDraftSendCalls: [], rejectNextHomeDraftSend: false,
     homeDraftAttachmentSequence: 0, homeDraftAcceptanceSequence: 0,
     runtimeTurns: new Map(), retryCalls: [], runtimeCancelCalls: [], copyMessageCalls: [], rejectNextCopyMessage: false,
-    modelRegistry: { state: 'unavailable', modelIds: [], errorCategory: null }, modelRegistryCalls: [],
-    connectionStatus: { state: 'not-configured', errorCategory: null }, connectionCalls: [], nextConnectionFailure: null,
-    keyStatus: { available: true, saved: false, usable: false },
+    modelRegistry: imageGenerationSmoke
+      ? { state: 'ready', modelIds: smokeModelIds, errorCategory: null, exhaustedModelIds: [] }
+      : { state: 'unavailable', modelIds: [], errorCategory: null }, modelRegistryCalls: [],
+    connectionStatus: imageGenerationSmoke ? { state: 'connected', errorCategory: null } : { state: 'not-configured', errorCategory: null },
+    connectionCalls: [], nextConnectionFailure: null,
+    keyStatus: { available: true, saved: imageGenerationSmoke, usable: imageGenerationSmoke },
     hookRegistry: { hooks: [], issues: [] }, hookCalls: [],
     profileFixtures,
     profileView: profileFixtures.empty, profileViewCalls: 0, profileRefreshCalls: 0, profileAnchorSaveCalls: [],
@@ -668,10 +730,10 @@ async function runElectronHost() {
       return undefined;
     }
     if (group === 'chats' && method === 'create') {
-      const [projectId] = args;
-      const record = { projectId, index: state.createCalls.length + 1 };
+      const [projectId, kind = 'text'] = args;
+      const record = { projectId, kind, index: state.createCalls.length + 1 };
       state.createCalls.push(clone(record));
-      const summary = makeChat(`chat-new-${record.index}`, `New chat ${record.index}`, projectId);
+      const summary = makeChat(`chat-new-${record.index}`, kind === 'image' ? 'New image chat' : `New chat ${record.index}`, projectId, kind);
       state.chats.unshift(summary);
       state.details.set(summary.id, makeDetail(summary, '', ''));
       return clone(summary);
@@ -710,6 +772,7 @@ async function runElectronHost() {
     }
     if (group === 'chats' && method === 'pickDraftFiles') {
       const [chatId] = args;
+      state.chatDraftPickCalls += 1;
       const nextFile = state.nextChatPickedFile ?? { name: 'picked-chat.txt', size: 24 };
       state.nextChatPickedFile = null;
       if (!state.deferChatDraftImports) return { record: stageChatDraftAttachment(chatId, nextFile.name, nextFile.size), failures: [] };
@@ -734,6 +797,30 @@ async function runElectronHost() {
       const [chatId, artifactId] = args;
       state.attachmentPreviewCalls.push({ group, chatId, artifactId });
       return state.details.get(chatId)?.artifacts.some((artifact) => artifact.id === artifactId) ? SYNTHETIC_IMAGE_PREVIEW : null;
+    }
+    if (group === 'chats' && method === 'getGeneratedImagePreview') {
+      const [chatId, artifactId] = args;
+      state.generatedImagePreviewCalls.push({ chatId, artifactId });
+      const artifact = state.details.get(chatId)?.artifacts.find((item) => item.id === artifactId && item.messageId);
+      if (!artifact) return null;
+      if (artifactId === 'image-legacy-artifact') return 'data:image/png;base64,not-a-png';
+      if (state.deferGeneratedImagePreview) {
+        const request = deferred();
+        state.pendingGeneratedImagePreviews.push(request);
+        return request.promise;
+      }
+      return generatedImagePreview;
+    }
+    if (group === 'chats' && method === 'saveGeneratedImage') {
+      const [chatId, artifactId] = args;
+      state.generatedImageSaveCalls.push({ chatId, artifactId });
+      const outcome = state.generatedImageSaveResults.shift() ?? 'saved';
+      if (outcome === 'error') throw new Error('Synthetic image save failure');
+      return outcome;
+    }
+    if (group === 'chats' && method === 'openArtifact') {
+      state.generatedImageOpenCalls.push({ chatId: args[0], artifactId: args[1] });
+      return true;
     }
     if (group === 'chats' && method === 'removeDraftFile') {
       const [chatId, attachmentId] = args;
@@ -763,6 +850,31 @@ async function runElectronHost() {
       detail.draftAttachments = detail.draftAttachments.filter((attachment) => !attachmentIds.includes(attachment.id));
       detail.draft = '';
       updateSummary(id, { draft: '' });
+      if (imageGenerationSmoke && detail.kind === 'image') {
+        state.imageGenerationCalls += 1;
+        if (state.imageGenerationCalls === 1) {
+          const assistantId = `${id}-generated-assistant`;
+          const artifactId = `${id}-generated-image`;
+          detail.messages.push({ id: assistantId, role: 'assistant', source: 'runtime', text: 'Готово — изображение создано по описанию.', createdAt: timestamp, attachmentIds: [artifactId] });
+          detail.turns.push({
+            turnId: `${id}-generation-turn-1`, anchorMessageId: messageId, assistantMessageId: assistantId,
+            modelId: 'GigaChat-3-Ultra', status: 'completed', createdAt: timestamp, startedAt: timestamp, endedAt: timestamp,
+            activity: [{ kind: 'provider', at: timestamp, activity: 'receiving' }],
+          });
+          detail.artifacts.push({ id: artifactId, name: 'Изображение.png', storedName: `${artifactId}.png`, size: 24_000,
+            sha256: '9'.repeat(64), createdAt: timestamp, messageId: assistantId });
+          state.imageGeneratedArtifacts += 1;
+        } else {
+          const turn = {
+            id: `${id}-pending-image-turn`, chatId: id, anchorMessageId: messageId, assistantMessageId: `${id}-pending-assistant`,
+            status: 'running', createdAt: timestamp, startedAt: timestamp, activity: [], draft: 'Создаю изображение…',
+          };
+          state.runtimeTurns.set(id, [...(state.runtimeTurns.get(id) ?? []), turn]);
+          setTimeout(() => {
+            if (!window?.isDestroyed()) window.webContents.send('audit:runtime', turn);
+          }, 80);
+        }
+      }
       return clone(detail);
     }
     if (group === 'settings' && method === 'get') return clone(state.appSettings);
@@ -1351,7 +1463,7 @@ async function runElectronHost() {
     return true;
   })()`);
   const capture = async (name) => {
-    if (!window.isVisible()) window.showInactive();
+    if (!imageGenerationSmoke && !window.isVisible()) window.showInactive();
     if (name === 'close-pending-import-settings-config') {
       console.log(`MIXED_CLOSE capture before RAF ${JSON.stringify({
         visible: window.isVisible(),
@@ -1366,15 +1478,254 @@ async function runElectronHost() {
       })}`);
     }
     let image = await window.webContents.capturePage();
-    if (image.isEmpty()) {
+    if (image.isEmpty() && !imageGenerationSmoke) {
       window.showInactive();
       await sleep(120);
       image = await window.webContents.capturePage();
     }
-    assert.equal(image.isEmpty(), false, `screenshot is empty: ${name}`);
+    assert.equal(image.isEmpty(), false, `screenshot is empty while the fixture window stays hidden: ${name}`);
     const screenshotPath = join(fixturePath, `${name}.png`);
     await writeFile(screenshotPath, image.toPNG());
     console.log(`SCREENSHOT ${screenshotPath}`);
+  };
+
+  const runImageGenerationSmoke = async () => {
+    const chatTitle = (value) => waitDom(`image smoke opens ${value}`, `document.querySelector('.chat-header-title')?.textContent === ${JSON.stringify(value)}`);
+    const appendCount = () => state.appendCalls.length;
+    const setPrompt = (value) => fillTextarea('.composer textarea', value);
+    const send = () => click('.send-button');
+    const clickDisabledSend = async () => evaluate(`(() => {
+      const button = document.querySelector('.send-button');
+      if (!button?.disabled) return false;
+      button.click();
+      return true;
+    })()`);
+    const assertImageBounds = async (label) => {
+      const geometry = JSON.parse(await evaluate(`JSON.stringify((() => {
+        const image = document.querySelector('.generated-image-result-preview');
+        const frame = document.querySelector('.generated-image-result');
+        const actions = document.querySelector('.generated-image-result-actions');
+        const composer = document.querySelector('.composer');
+        const box = (element) => {
+          if (!element) return null;
+          const rect = element.getBoundingClientRect();
+          return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width, height: rect.height };
+        };
+        const imageBox = box(image);
+        return { viewport: innerWidth, documentWidth: document.documentElement.scrollWidth, image: imageBox, frame: box(frame), actions: box(actions), composer: box(composer),
+          naturalWidth: image?.naturalWidth ?? 0, naturalHeight: image?.naturalHeight ?? 0,
+          renderedRatio: imageBox && imageBox.height > 0 ? imageBox.width / imageBox.height : 0 };
+      })())`));
+      assert.ok(geometry.image && geometry.frame && geometry.actions, `${label}: image result/actions must remain visible`);
+      for (const [name, rect] of [['image', geometry.image], ['frame', geometry.frame], ['actions', geometry.actions]]) {
+        assert.ok(rect.width > 0 && rect.height > 0, `${label}: ${name} has a positive rendered box`);
+      }
+      assert.equal(geometry.naturalWidth, 1024, `${label}: synthetic preview decodes at its natural width`);
+      assert.equal(geometry.naturalHeight, 576, `${label}: synthetic preview keeps its aspect ratio`);
+      assert.ok(Math.abs(geometry.renderedRatio - (geometry.naturalWidth / geometry.naturalHeight)) < 0.02,
+        `${label}: rendered image keeps its source aspect ratio`);
+      assert.ok(geometry.image.left >= geometry.frame.left - 1 && geometry.image.right <= geometry.frame.right + 1
+        && geometry.image.top >= geometry.frame.top - 1 && geometry.image.bottom <= geometry.frame.bottom + 1,
+      `${label}: image remains inside its result frame`);
+      assert.ok(geometry.image.left >= 0 && geometry.image.right <= geometry.viewport + 1
+        && geometry.actions.left >= 0 && geometry.actions.right <= geometry.viewport + 1,
+      `${label}: image and actions remain inside the visible viewport`);
+      if (label === 'narrow' || label === 'browser-split') {
+        assert.ok(geometry.image.width < geometry.naturalWidth, `${label}: preview shrinks within the available chat width`);
+      }
+      assert.ok(geometry.documentWidth <= geometry.viewport + 1, `${label}: image chat has no horizontal page overflow: ${JSON.stringify(geometry)}`);
+      assert.ok(geometry.actions.right <= geometry.viewport + 1, `${label}: image actions remain inside the viewport: ${JSON.stringify(geometry)}`);
+      console.log(`IMAGE_LAYOUT ${label} ${JSON.stringify(geometry)}`);
+      return geometry;
+    };
+
+    assert.equal(window.isVisible(), false, 'image renderer smoke starts in a hidden BrowserWindow');
+    assert.equal(window.webContents.isOffscreen(), true, 'image renderer smoke uses offscreen web contents');
+    await clickChat('Legacy image chat');
+    await chatTitle('Legacy image chat');
+    await waitDom('legacy generated preview failure uses a readable fallback', `document.querySelector('.generated-image-result-placeholder')?.textContent.includes('Предпросмотр недоступен')`);
+    assert.deepEqual(state.generatedImagePreviewCalls, [{ chatId: 'image-legacy', artifactId: 'image-legacy-artifact' }],
+      'legacy generated result is loaded through the preview API exactly once');
+    await capture('image-chat-preview-fallback');
+    assert.equal(await evaluate(`document.querySelectorAll('.transcript-message p:empty').length`), 0,
+      'empty generated-image assistant text does not render a blank paragraph');
+    await setPrompt('Старый ход должен остаться в редакторе.');
+    const beforeBlockedSend = appendCount();
+    assert.equal(await evaluate(`document.querySelector('.send-button')?.disabled`), true,
+      'legacy image chat with a staged file cannot submit');
+    const generationsBeforeBlockedSend = state.imageGenerationCalls;
+    assert.equal(await clickDisabledSend(), true, 'the disabled Send control is exercised without waiting for an enabled-action helper');
+    assert.equal(appendCount(), beforeBlockedSend, 'blocked image submission does not append a message');
+    assert.equal(state.imageGenerationCalls, generationsBeforeBlockedSend, 'blocked image submission does not start generation');
+    assert.equal(await evaluate(`document.querySelector('.composer textarea')?.value`), 'Старый ход должен остаться в редакторе.');
+    const stageCallsBeforeDrop = state.chatDraftStageCalls.length;
+    const dropResult = await evaluate(`(() => {
+      const target = document.querySelector('.main-panel');
+      const transfer = new DataTransfer();
+      transfer.items.add(new File(['synthetic'], 'blocked.txt', { type: 'text/plain' }));
+      const enter = new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: transfer });
+      const over = new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: transfer });
+      const drop = new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: transfer });
+      target.dispatchEvent(enter); target.dispatchEvent(over); target.dispatchEvent(drop);
+      return JSON.stringify({ enter: enter.defaultPrevented, over: over.defaultPrevented, drop: drop.defaultPrevented,
+        dropEffect: transfer.dropEffect, overlay: Boolean(document.querySelector('.attachment-drop-overlay')) });
+    })()`);
+    const rejectedDrop = JSON.parse(dropResult);
+    assert.equal(rejectedDrop.enter, true);
+    assert.equal(rejectedDrop.over, true);
+    assert.equal(rejectedDrop.drop, true);
+    assert.equal(rejectedDrop.dropEffect, 'none');
+    assert.equal(rejectedDrop.overlay, false, 'image mode does not show the release-to-attach overlay');
+    assert.equal(state.chatDraftStageCalls.length, stageCallsBeforeDrop, 'rejected file drop never reaches the stage-files API');
+    assert.equal(await evaluate(`document.querySelector('.attach-button')?.disabled`), true, 'image mode disables the file picker affordance');
+    await clickText('.attachment-card-copy + button', 'Убрать');
+    await waitUntil('legacy image draft file removed locally', () => state.details.get('image-legacy').draftAttachments.length === 0);
+    await clickText('.image-model-upgrade button', 'Использовать GigaChat Ultra');
+    await waitUntil('legacy image chat explicitly upgrades only its next-turn model', () => state.details.get('image-legacy').modelId === 'GigaChat-3-Ultra');
+    assert.equal(state.appSettings.defaultModelId, null, 'upgrading an image chat does not change the text default model');
+
+    await clickChat('Image chat with old file');
+    await chatTitle('Image chat with old file');
+    await setPrompt('Не использовать прежнее вложение.');
+    const beforeHistorySend = appendCount();
+    assert.equal(await evaluate(`document.querySelector('.image-composer-guidance')?.textContent.includes('Создайте новый чат изображений')`), true,
+      'historical user files explain why a new image chat is required');
+    const historyGenerationsBeforeSend = state.imageGenerationCalls;
+    assert.equal(await clickDisabledSend(), true, 'historical-file Send remains disabled');
+    const historyEnter = await evaluate(`(() => {
+      const textarea = document.querySelector('.composer textarea');
+      const event = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+      textarea?.dispatchEvent(event);
+      return { prevented: event.defaultPrevented, value: textarea?.value ?? null };
+    })()`);
+    assert.equal(historyEnter.prevented, true, 'Enter uses the shared guarded submit path');
+    assert.equal(historyEnter.value, 'Не использовать прежнее вложение.');
+    assert.equal(appendCount(), beforeHistorySend, 'historical user file blocker stops before append');
+    assert.equal(state.imageGenerationCalls, historyGenerationsBeforeSend, 'historical-file Send does not start generation');
+    assert.equal(await evaluate(`document.querySelector('.composer textarea')?.value`), 'Не использовать прежнее вложение.',
+      'the rejected historical-file prompt stays in the composer');
+    await clickText('.nav-action', 'Сгенерировать изображение');
+    await chatTitle('New image chat');
+    await waitUntil('new image chat is created with the verified Ultra model', () => state.details.get('chat-new-1')?.modelId === 'GigaChat-3-Ultra');
+    assert.equal(state.createCalls.at(-1)?.kind, 'image', 'image action creates a dedicated image chat');
+    assert.equal(state.appSettings.defaultModelId, null, 'creating an image chat does not change the text default');
+    assert.equal(await evaluate(`document.querySelector('.attach-button')?.disabled`), true);
+    await setPrompt('Небольшой маяк у моря на закате.');
+    state.deferGeneratedImagePreview = true;
+    const previewCallsBeforeResult = state.generatedImagePreviewCalls.length;
+    await send();
+    await waitUntil('one synthetic image turn is accepted', () => state.imageGenerationCalls === 1 && state.imageGeneratedArtifacts === 1);
+    await waitUntil('the new result starts one deferred preview request', () => state.generatedImagePreviewCalls.length === previewCallsBeforeResult + 1
+      && state.pendingGeneratedImagePreviews.length === 1);
+    assert.deepEqual(state.generatedImagePreviewCalls.at(-1), { chatId: 'chat-new-1', artifactId: 'chat-new-1-generated-image' },
+      'new assistant result requests its own preview exactly once');
+    await waitDom('generated-image loading state is visible', `document.querySelector('.generated-image-result-placeholder')?.textContent.includes('Загружаем изображение')`);
+    await capture('image-chat-preview-loading');
+    const pendingPreview = state.pendingGeneratedImagePreviews.shift();
+    state.deferGeneratedImagePreview = false;
+    pendingPreview.resolve(generatedImagePreview);
+    await waitDom('generated image preview decodes', `document.querySelector('.generated-image-result-preview')?.naturalWidth === 1024`);
+    assert.equal(state.generatedImagePreviewCalls.length, previewCallsBeforeResult + 1, 'assistant image result uses one preview request');
+    const orderedResult = await evaluate(`(() => {
+      const activity = document.querySelector('[data-turn-id="chat-new-1-generation-turn-1"]');
+      const answer = document.querySelector('[data-message-id="chat-new-1-generated-assistant"]');
+      return Boolean(activity && answer && (activity.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING));
+    })()`);
+    assert.equal(orderedResult, true, 'the completed activity appears before its linked generated result');
+    const resultArtifactId = 'chat-new-1-generated-image';
+    const acceptedAppendCount = appendCount();
+    const previewCallsBeforeResultActions = state.generatedImagePreviewCalls.length;
+    await capture('image-chat-dark-wide');
+    await assertImageBounds('wide');
+
+    const focusResult = await evaluate(`(() => { const action = document.querySelector('.generated-image-result-actions button'); action?.focus(); return document.activeElement === action; })()`);
+    assert.equal(focusResult, true, 'result actions can receive keyboard focus');
+    await capture('image-chat-result-focused');
+    for (const [expected, status] of [['saved', 'Сохранено'], ['cancelled', 'Сохранение отменено'], ['error', 'Не удалось сохранить'], ['saved', 'Сохранено']]) {
+      await click('.generated-image-result-actions button');
+      if (expected === 'saved') await waitDom(`save result ${status}`, `document.querySelector('.generated-image-result-actions button')?.textContent.includes(${JSON.stringify(status)})`);
+      else await waitDom(`save outcome ${status}`, `document.querySelector('.generated-image-result-actions')?.textContent.includes(${JSON.stringify(status)})`);
+      if (expected === 'error') await capture('image-chat-save-error');
+    }
+    await clickText('.generated-image-result-actions button', 'Открыть');
+    assert.equal(state.generatedImageSaveCalls.length, 4, 'save success, cancellation, error and retry use only the save API');
+    assert.equal(state.generatedImageOpenCalls.length, 1, 'Open uses the existing artifact API');
+    assert.ok(state.generatedImageSaveCalls.every((call) => call.chatId === 'chat-new-1' && call.artifactId === resultArtifactId));
+    assert.equal(state.generatedImageOpenCalls[0].artifactId, resultArtifactId);
+    assert.equal(state.generatedImagePreviewCalls.length, previewCallsBeforeResultActions, 'save and open do not refetch the result preview');
+    assert.equal(appendCount(), acceptedAppendCount, 'save/open never append a chat message');
+    assert.equal(state.imageGenerationCalls, 1, 'save/open never start another image generation');
+    await waitDom('save and open leave the rendered result in history', `document.querySelector('.generated-image-result-preview')?.naturalWidth === 1024`);
+
+    window.setSize(620, 740);
+    await sleep(180);
+    await assertImageBounds('narrow');
+    await capture('image-chat-narrow');
+    window.setSize(1260, 760);
+    await sleep(180);
+    await click('button[aria-label="Показать браузер"]');
+    await waitDom('synthetic browser split opens without a native workspace', `document.querySelector('.browser-workspace.browser-open')`);
+    await assertImageBounds('browser-split');
+    await capture('image-chat-browser-split');
+    await click('button[aria-label="Скрыть браузер"]');
+
+    await click('button[aria-label="Настройки"]');
+    await waitDom('appearance settings open from image chat', `document.querySelector('.settings-panel')`);
+    await clickText('.settings-nav-item', 'Оформление');
+    await clickText('.theme-option', 'Светлая');
+    await waitDom('light theme applies to the image workspace', `document.querySelector('.app-frame')?.classList.contains('theme-light')`);
+    await click('button[aria-label="Назад"]');
+    await chatTitle('New image chat');
+    await capture('image-chat-light');
+    await assertImageBounds('light');
+
+    await click('button[aria-label="Настройки"]');
+    await waitDom('appearance settings reopen from image chat', `document.querySelector('.settings-panel')`);
+    await clickText('.settings-nav-item', 'Оформление');
+    await clickText('.theme-option', 'Тёплая');
+    await waitDom('warm theme applies to the image workspace', `document.querySelector('.app-frame')?.classList.contains('theme-warm')`);
+    await click('button[aria-label="Назад"]');
+    await chatTitle('New image chat');
+    await capture('image-chat-warm');
+    await assertImageBounds('warm');
+    window.webContents.setZoomFactor(1.25);
+    await sleep(180);
+    await assertImageBounds('zoom-125');
+    await capture('image-chat-zoom-125');
+    window.webContents.setZoomFactor(1);
+    await sleep(180);
+
+    await setPrompt('Проверь сохранённое изображение во время следующего хода.');
+    await send();
+    await waitUntil('next image turn remains pending beside the saved result', () => state.imageGenerationCalls === 2
+      && (state.runtimeTurns.get('chat-new-1') ?? []).length === 1);
+    await waitDom('previous image remains visible while a later image turn is running', `document.querySelector('.generated-image-result-preview')?.naturalWidth === 1024
+      && document.querySelector('.transcript-draft')?.textContent.includes('Создаю изображение')`);
+    await capture('image-chat-next-turn-running');
+    await assertImageBounds('running-next-turn');
+
+    await clickChat('Chat A');
+    await chatTitle('Chat A');
+    await waitDom('ordinary text attachment chip remains visible', `document.querySelector('.attachment-card-copy strong')?.textContent === 'notes.txt'`);
+    assert.equal(await evaluate(`document.querySelector('.attach-button')?.disabled`), false, 'ordinary text chat keeps its attachment picker');
+    await setPrompt('Обычный текстовый вопрос.');
+    assert.equal(await evaluate(`document.querySelector('.send-button-wrap')?.title`), 'Отправить текст и подготовленные вложения',
+      'text chat retains its original send guidance');
+    const pickCallsBefore = state.chatDraftPickCalls;
+    await click('.attach-button');
+    await waitUntil('ordinary text chat can still pick a file', () => state.chatDraftPickCalls === pickCallsBefore + 1);
+    await waitDom('picked text file appears in ordinary chat draft', `document.querySelectorAll('.attachment-card').length === 2`);
+    assert.equal(state.imageGenerationCalls, 2, 'ordinary text UI tests do not create image requests');
+    assert.equal(state.appendCalls.length, acceptedAppendCount + 1, 'only the two valid image prompts append; the final +1 is the pending second turn already recorded');
+    assert.equal(state.generatedImageSaveCalls.length, 4);
+    await clickText('.nav-action', 'Новый чат');
+    await waitDom('ordinary Home composer stays available', `document.querySelector('.empty-state h1')?.textContent === 'Что будем создавать?'`);
+    assert.equal(state.appSettings.defaultModelId, null, 'ordinary Home model default remains unchanged');
+    assert.equal(window.isVisible(), false, 'image-generation smoke never reveals or focuses the BrowserWindow');
+    console.log(`IMAGE_SMOKE_COUNTS ${JSON.stringify({ passCount, imageGenerationCalls: state.imageGenerationCalls, generatedImageArtifacts: state.imageGeneratedArtifacts,
+      appends: state.appendCalls.length, saves: state.generatedImageSaveCalls.length, opens: state.generatedImageOpenCalls.length,
+      previews: state.generatedImagePreviewCalls.length, stagedDrops: state.chatDraftStageCalls.length, pickerCalls: state.chatDraftPickCalls })}`);
+    process.stdout.write('Plan011 image-generation renderer smoke: PASS\n', () => app.exit(0));
   };
 
   const runNativeBrowserWorkspace = async () => {
@@ -1806,6 +2157,7 @@ async function runElectronHost() {
       width: 1120,
       height: 760,
       webPreferences: {
+        ...(imageGenerationSmoke ? { offscreen: true } : {}),
         preload: join(fixturePath, 'preload.cjs'),
         contextIsolation: true,
         sandbox: true,
@@ -1887,6 +2239,11 @@ async function runElectronHost() {
         }
         throw error;
       }
+      return;
+    }
+
+    if (imageGenerationSmoke) {
+      await runImageGenerationSmoke();
       return;
     }
 
@@ -5563,7 +5920,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 const methods = {
   homeDraft: ['get','save','importFile','pickFiles','stageFiles','getAttachmentPreview','removeFile','send'],
   projects: ['list','create','pickFolder','instructionsBackupPath','update','remove','chooseFolder','openFolder','readInstructions','saveInstructions','saveInstructionsCopy'],
-  chats: ['list','get','create','update','appendLocalMessage','importFile','pickDraftFiles','stageDraftFiles','getDraftAttachmentPreview','getArtifactPreview','removeDraftFile','copyMessage','openArtifact','openFolder','remove'],
+  chats: ['list','get','create','update','appendLocalMessage','importFile','pickDraftFiles','stageDraftFiles','getDraftAttachmentPreview','getArtifactPreview','getGeneratedImagePreview','saveGeneratedImage','removeDraftFile','copyMessage','openArtifact','openFolder','remove'],
   runtime: ['getStatus','list','cancel','retry'],
   permissions: ['readConfig','saveConfig','respond'],
   skills: ['list','readSource','setEnabled','openFolder'],

@@ -5,6 +5,7 @@ import { copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, 
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { DEFAULT_NOTIFICATION_SETTINGS, PROVIDER_ERROR_CATEGORIES, type AcceptedTurnInput, type BalanceFamilyId, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type ChatTurnRecord, type CompactSnapshot, type CompactionPrefix, type HomeDraftAttachment, type HomeDraftInput, type HomeDraftRecord, type HookEvent, type HookRunResult, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderBalanceFamily, type ProviderBalanceObservation, type ProviderErrorCategory, type ProviderGeneratedImageLedgerEntry, type ProviderProtocolExchange, type ProviderToolName, type ProviderUploadLedgerEntry, type ProviderV2FunctionWire, type RuntimeActivity, type RuntimeTurnSnapshot, type Settings, type SettingsPatch, type StudioBalanceAnchorInput, type Theme, type UsageLedgerSummary, type UsageProfileView, type UsageReceipt } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
+import { IMAGE_GENERATION_MODEL_ID } from './image-mode';
 import { requireModelId } from './models';
 import { isSkillId } from './skills';
 import { validateProjectFolder, validateProjectInstructionsPath } from './project-paths';
@@ -2611,7 +2612,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     const chat: ChatDetail = {
       id: randomUUID(), title: kind === 'image' ? 'Новое изображение' : 'Новый чат', projectId,
       pinned: false, archived: false, createdAt: now, updatedAt: now, draft: '', kind,
-      nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: settings.defaultModelId, messages: [], turns: [], toolReceipts: [], artifacts: [], draftAttachments: [],
+      nextTurnPermissionProfile: null, nextTurnSkillId: null, modelId: kind === 'image' ? IMAGE_GENERATION_MODEL_ID : settings.defaultModelId, messages: [], turns: [], toolReceipts: [], artifacts: [], draftAttachments: [],
       compactSnapshot: null,
     };
     await saveChat(chat);
