@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import { constants } from 'node:fs';
-import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { DEFAULT_NOTIFICATION_SETTINGS, PROVIDER_ERROR_CATEGORIES, type AcceptedTurnInput, type BalanceFamilyId, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type ChatTurnRecord, type CompactSnapshot, type CompactionPrefix, type HomeDraftAttachment, type HomeDraftInput, type HomeDraftRecord, type HookEvent, type HookRunResult, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderBalanceFamily, type ProviderBalanceObservation, type ProviderErrorCategory, type ProviderGeneratedImageLedgerEntry, type ProviderProtocolExchange, type ProviderToolName, type ProviderUploadLedgerEntry, type ProviderV2FunctionWire, type RuntimeActivity, type RuntimeTurnSnapshot, type Settings, type SettingsPatch, type StudioBalanceAnchorInput, type Theme, type UsageLedgerSummary, type UsageProfileView, type UsageReceipt } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
@@ -111,6 +111,7 @@ const MAX_HOME_DRAFT_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_HOME_DRAFT_TOTAL_BYTES = 100 * 1024 * 1024;
 const MAX_CHAT_DRAFT_FILES = 32;
 const MAX_CHAT_DRAFT_TOTAL_BYTES = 100 * 1024 * 1024;
+const MAX_GENERATED_IMAGE_BYTES = Math.min(LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES);
 const SIDE_EFFECT_TOOLS = new Set(['write', 'powershell', 'open']);
 const UNKNOWN_TOOL_RESULT = JSON.stringify({
   ok: false,
@@ -158,7 +159,7 @@ export interface LocalStore {
   consumeTurnReservation(turn: AcceptedTurnInput, signal?: AbortSignal): Promise<void>;
   validateAcceptedTurn(turn: AcceptedTurnInput): Promise<void>;
   updateRuntimeTurn(turn: RuntimeTurnSnapshot): Promise<void>;
-  appendAssistantMessageFromRuntime(turn: AcceptedTurnInput, text: unknown, terminalTurn: RuntimeTurnSnapshot, signal?: AbortSignal, functionsStateId?: unknown, accountScope?: unknown): Promise<ChatDetail>;
+  appendAssistantMessageFromRuntime(turn: AcceptedTurnInput, text: unknown, terminalTurn: RuntimeTurnSnapshot, signal?: AbortSignal, functionsStateId?: unknown, accountScope?: unknown, generatedArtifactId?: unknown): Promise<ChatDetail>;
   commitCompactSnapshot(id: unknown, snapshot: CompactSnapshot, expectedSnapshotId: string | null, signal?: AbortSignal, terminalTurn?: RuntimeTurnSnapshot, providerState?: unknown): Promise<ChatDetail>;
   importFile(id: unknown, sourcePath: string, projectId?: unknown): Promise<ChatDetail>;
   getArtifactPath(id: unknown, artifactId: unknown): Promise<string>;
@@ -179,6 +180,7 @@ export interface LocalStore {
   removeProviderUploadEntry(accountScope: unknown, attachmentId: unknown, remoteFileId: unknown): Promise<void>;
   getProviderGeneratedImageEntries(accountScope: unknown): Promise<ProviderGeneratedImageLedgerEntry[]>;
   putProviderGeneratedImageEntry(value: unknown): Promise<ProviderGeneratedImageLedgerEntry>;
+  stageGeneratedImage(accountScope: unknown, artifactId: unknown, bytes: Uint8Array, signal?: AbortSignal): Promise<ProviderGeneratedImageLedgerEntry>;
   removeProviderGeneratedImageEntry(accountScope: unknown, artifactId: unknown, remoteFileId: unknown): Promise<void>;
   getStorageIssues(): Promise<string[]>;
   readGlobalInstructions(): Promise<string>;
@@ -358,14 +360,14 @@ function validateStoredChat(value: unknown): Loaded<StoredChat> {
     if (Object.prototype.hasOwnProperty.call(value, 'providerStateOwnership')) throw new Error('Legacy chat contains unversioned private state.');
     return { value: { detail: loaded.value, providerStateOwnership: emptyProviderStateOwnership() }, needsWrite: true };
   }
-  if (version !== 12 && version !== 13) throw new Error('Unknown stored chat schema.');
+  if (version !== 12 && version !== 13 && version !== 14) throw new Error('Unknown stored chat schema.');
   if (!isRecord(value.providerStateOwnership)
     || (version === 12 && value.providerStateOwnership.schemaVersion !== 1)
-    || (version === 13 && value.providerStateOwnership.schemaVersion !== 2)) {
+    || (version >= 13 && value.providerStateOwnership.schemaVersion !== 2)) {
     throw new Error('Stored chat and provider-state ownership versions do not match.');
   }
   const providerStateOwnership = validateProviderStateOwnership(value.providerStateOwnership, loaded.value);
-  if (version === 13 && loaded.value.compactSnapshot) {
+  if (version >= 13 && loaded.value.compactSnapshot) {
     const prefix = buildCompactionPrefix(loaded.value, loaded.value.compactSnapshot.boundaryMessageId,
       loaded.value.compactSnapshot.coveredThroughMessageId, providerStateOwnership);
     if (prefix.coveredThroughMessageId !== loaded.value.compactSnapshot.coveredThroughMessageId
@@ -373,7 +375,7 @@ function validateStoredChat(value: unknown): Loaded<StoredChat> {
       throw new Error('Invalid compact prefix hash.');
     }
   }
-  return { value: { detail: loaded.value, providerStateOwnership }, needsWrite: version === 12 || loaded.needsWrite };
+  return { value: { detail: loaded.value, providerStateOwnership }, needsWrite: version < 14 || loaded.needsWrite };
 }
 
 function hashProviderWire(wire: ProviderV2FunctionWire): string {
@@ -1007,7 +1009,7 @@ function recordFromRuntimeTurn(turn: RuntimeTurnSnapshot): ChatTurnRecord {
 }
 
 function validateChatDetail(value: unknown): Loaded<ChatDetail> {
-  if (!isRecord(value) || (value.schemaVersion !== 3 && value.schemaVersion !== 4 && value.schemaVersion !== 5 && value.schemaVersion !== 6 && value.schemaVersion !== 7 && value.schemaVersion !== 8 && value.schemaVersion !== 9 && value.schemaVersion !== 10 && value.schemaVersion !== 11 && value.schemaVersion !== 12 && value.schemaVersion !== 13)
+  if (!isRecord(value) || (value.schemaVersion !== 3 && value.schemaVersion !== 4 && value.schemaVersion !== 5 && value.schemaVersion !== 6 && value.schemaVersion !== 7 && value.schemaVersion !== 8 && value.schemaVersion !== 9 && value.schemaVersion !== 10 && value.schemaVersion !== 11 && value.schemaVersion !== 12 && value.schemaVersion !== 13 && value.schemaVersion !== 14)
     || !Array.isArray(value.messages) || !Array.isArray(value.artifacts)
     || (value.schemaVersion >= 7 && !Array.isArray(value.toolReceipts))
     || (value.schemaVersion >= 8 && !('compactSnapshot' in value))
@@ -1031,10 +1033,12 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
       throw new Error('Invalid assistant function state.');
     }
     const attachmentIds = entry.attachmentIds === undefined ? [] : entry.attachmentIds;
+    const hasRuntimeImageLink = version === 14 && chat.kind === 'image' && entry.role === 'assistant'
+      && entry.source === 'runtime' && Array.isArray(attachmentIds) && attachmentIds.length === 1;
     if (!Array.isArray(attachmentIds) || attachmentIds.length > MAX_CHAT_DRAFT_FILES
       || attachmentIds.some((id) => typeof id !== 'string')
       || new Set(attachmentIds).size !== attachmentIds.length
-      || (attachmentIds.length > 0 && entry.role !== 'user')) {
+      || (attachmentIds.length > 0 && entry.role !== 'user' && !hasRuntimeImageLink)) {
       throw new Error('Invalid chat message attachments.');
     }
     return {
@@ -1115,11 +1119,26 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
     };
   });
   const turns = (version >= 10 ? value.turns as unknown[] : []).map(validateChatTurnRecord);
+  const invalidAssistantImageLink = messages.some((message) => {
+    if (message.role !== 'assistant' || !message.attachmentIds?.length) return false;
+    if (version !== 14 || chat.kind !== 'image' || message.source !== 'runtime' || message.attachmentIds.length !== 1) return true;
+    const artifact = artifacts.find((item) => item.id === message.attachmentIds![0]);
+    const displayType = artifact ? attachmentContentType(artifact.name) : null;
+    const storedType = artifact ? attachmentContentType(artifact.storedName) : null;
+    const extension = artifact ? extname(artifact.storedName).slice(1).toLowerCase() : '';
+    const expectedExtension = storedType?.contentType === 'image/png' ? 'png' : storedType?.contentType === 'image/jpeg' ? 'jpg' : '';
+    return !artifact || artifact.messageId !== message.id || artifact.size <= 0 || artifact.size > MAX_GENERATED_IMAGE_BYTES || !artifact.sha256
+      || basename(artifact.name) !== artifact.name || displayType?.kind !== 'image'
+      || displayType.contentType !== storedType?.contentType || storedType?.kind !== 'image'
+      || extension !== expectedExtension || artifact.storedName !== `${artifact.id}.${expectedExtension}`
+      || !turns.some((turn) => turn.assistantMessageId === message.id && turn.status === 'completed');
+  });
   if (new Set(messages.map((message) => message.id)).size !== messages.length
     || new Set(artifacts.map((artifact) => artifact.id)).size !== artifacts.length
     || artifacts.some((artifact) => artifact.messageId && !messages.some((message) => message.id === artifact.messageId))
     || new Set([...draftAttachments.map((attachment) => attachment.id), ...artifacts.map((artifact) => artifact.id)]).size !== draftAttachments.length + artifacts.length
     || new Set([...draftAttachments.map((attachment) => attachment.storedName), ...artifacts.map((artifact) => artifact.storedName)]).size !== draftAttachments.length + artifacts.length
+    || invalidAssistantImageLink
     || messages.some((message) => message.attachmentIds?.some((attachmentId) => !artifacts.some((artifact) => artifact.id === attachmentId && artifact.messageId === message.id)))
     || artifacts.some((artifact) => artifact.messageId && !messages.find((message) => message.id === artifact.messageId)?.attachmentIds?.includes(artifact.id))
     || toolReceipts.length > MAX_TOOL_RECEIPTS_PER_CHAT
@@ -1163,7 +1182,7 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
     value: { ...chat, messages, artifacts, draftAttachments, toolReceipts, turns, nextTurnPermissionProfile, nextTurnSkillId,
       modelId: version >= 6 && value.modelId !== null ? requireModelId(value.modelId) : null,
       compactSnapshot },
-    needsWrite: version < 13,
+    needsWrite: version < 14,
   };
 }
 
@@ -1175,7 +1194,7 @@ function summary(chat: ChatDetail): ChatSummary {
 }
 
 function detailFile(chat: ChatDetail, providerStateOwnership = emptyProviderStateOwnership()): Record<string, unknown> {
-  return { schemaVersion: 13, ...chat, providerStateOwnership: validateProviderStateOwnership(providerStateOwnership, chat) };
+  return { schemaVersion: 14, ...chat, providerStateOwnership: validateProviderStateOwnership(providerStateOwnership, chat) };
 }
 
 function preserveSkillInvocation(existing: ChatTurnRecord | null, next: ChatTurnRecord): ChatTurnRecord {
@@ -1377,7 +1396,11 @@ async function loadProviderUploadLedger(filePath: string): Promise<Loaded<Provid
   catch { throw storageError(filePath); }
 }
 
-function validateAcceptedTurnRecord(value: unknown, allowLegacyAssistantId = true): AcceptedTurnInput {
+function validateAcceptedTurnRecord(
+  value: unknown,
+  allowLegacyAssistantId = true,
+  allowImageAssistantAttachments = false,
+): AcceptedTurnInput {
   if (!isRecord(value) || !Array.isArray(value.messages) || !Number.isSafeInteger(value.historyBoundary)
     || (value.historyBoundary as number) < 1 || value.historyBoundary !== value.messages.length || !isRecord(value.reservation)) {
     throw new Error('Некорректный принятый ход домашнего черновика.');
@@ -1393,7 +1416,10 @@ function validateAcceptedTurnRecord(value: unknown, allowLegacyAssistantId = tru
     if (!Array.isArray(attachmentIds) || attachmentIds.length > MAX_CHAT_DRAFT_FILES
       || attachmentIds.some((id) => typeof id !== 'string')
       || new Set(attachmentIds).size !== attachmentIds.length
-      || (attachmentIds.length > 0 && entry.role !== 'user')) throw new Error('Некорректные вложения принятого сообщения.');
+      || (attachmentIds.length > 0 && entry.role !== 'user'
+        && !(allowImageAssistantAttachments && entry.role === 'assistant' && entry.source === 'runtime' && attachmentIds.length === 1))) {
+      throw new Error('Некорректные вложения принятого сообщения.');
+    }
     return {
       id: requireId(entry.id), role: entry.role, text: entry.text, createdAt: requireTimestamp(entry.createdAt),
       ...(entry.source === undefined ? {} : { source: entry.source }),
@@ -1658,7 +1684,7 @@ function validateProjectDeleteJournal(value: unknown): ProjectDeleteJournal {
     const chats = input.chats.map((chat) => {
       if (!isRecord(chat) || (journalVersion === 1
         ? typeof chat.schemaVersion !== 'number' || chat.schemaVersion > 11
-        : journalVersion === 2 ? chat.schemaVersion !== 12 : chat.schemaVersion !== 13)) {
+        : journalVersion === 2 ? chat.schemaVersion !== 12 : chat.schemaVersion !== 13 && chat.schemaVersion !== 14)) {
         throw new Error('Invalid project deletion chat snapshot.');
       }
       return validateStoredChat(chat).value;
@@ -2453,6 +2479,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
   const saveProviderUploadLedger = async (
     nextUploads: ProviderUploadLedgerEntry[],
     nextGenerated: ProviderGeneratedImageLedgerEntry[],
+    signal?: AbortSignal,
   ): Promise<void> => {
     if (nextUploads.length + nextGenerated.length > MAX_PROVIDER_UPLOAD_ENTRIES) {
       throw new Error('Лимит записей файлового журнала достигнут; история не сокращена.');
@@ -2461,14 +2488,14 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     if (Buffer.byteLength(`${JSON.stringify(value, null, 2)}\n`, 'utf8') > MAX_PROVIDER_UPLOAD_LEDGER_BYTES) {
       throw new Error('Журнал загрузок превысил безопасный размер; существующие записи сохранены.');
     }
-    await writeOwnedAtomic(providerUploadPath, value);
+    await writeOwnedAtomic(providerUploadPath, value, signal);
     providerUploadEntries = nextUploads;
     providerGeneratedImageEntries = nextGenerated;
   };
   const saveProviderUploadEntries = (next: ProviderUploadLedgerEntry[]): Promise<void> =>
     saveProviderUploadLedger(next, providerGeneratedImageEntries);
-  const saveProviderGeneratedImageEntries = (next: ProviderGeneratedImageLedgerEntry[]): Promise<void> =>
-    saveProviderUploadLedger(providerUploadEntries, next);
+  const saveProviderGeneratedImageEntries = (next: ProviderGeneratedImageLedgerEntry[], signal?: AbortSignal): Promise<void> =>
+    saveProviderUploadLedger(providerUploadEntries, next, signal);
   const chatFolder = (id: string): string => join(chatsDirectory, requireId(id));
   const saveChat = async (chat: ChatDetail, signal?: AbortSignal, nextOwnership?: ProviderStateOwnership): Promise<void> => {
     const providerStateOwnership = validateProviderStateOwnership(
@@ -2487,6 +2514,49 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
   };
   const validateAcceptedTurnBinding = (turn: AcceptedTurnInput): ChatDetail => {
     const chat = findChat(turn.chatId);
+    if (turn.messages.some((message) => message.role === 'assistant' && message.attachmentIds?.length)) {
+      if (chat.kind !== 'image' || turn.historyBoundary !== turn.messages.length) {
+        throw new Error('История изображения принятого хода не совпадает с сохранённым чатом.');
+      }
+      const sameImageHistoryMessage = (left: ChatMessage | undefined, right: ChatMessage): boolean => left !== undefined
+        && left.id === right.id && left.role === right.role && left.text === right.text && left.createdAt === right.createdAt
+        && left.source === right.source && left.functionsStateId === right.functionsStateId
+        && (left.attachmentIds ?? []).length === (right.attachmentIds ?? []).length
+        && (left.attachmentIds ?? []).every((id, index) => id === right.attachmentIds?.[index]);
+      const storedIndices = new Map<string, number>(chat.messages.map((message, index): [string, number] => [message.id, index]));
+      const acceptedAnchorIndex = storedIndices.get(turn.messageId);
+      const acceptedAnchor = turn.messages[turn.messages.length - 1];
+      if (acceptedAnchorIndex === undefined || acceptedAnchor?.role !== 'user' || acceptedAnchor.id !== turn.messageId
+        || !sameImageHistoryMessage(chat.messages[acceptedAnchorIndex], acceptedAnchor)) {
+        throw new Error('История изображения принятого хода не совпадает с сохранённым чатом.');
+      }
+      const completedAssistantAnchors = new Map<string, string>(chat.turns
+        .filter((record) => record.status === 'completed' && record.operation === undefined && record.assistantMessageId !== null)
+        .map((record): [string, string] => [record.assistantMessageId!, record.anchorMessageId]));
+      let actualIndex = 0;
+      for (const expected of turn.messages) {
+        // A reply completed after this queue snapshot may sit between captured messages.
+        while (actualIndex <= acceptedAnchorIndex && !sameImageHistoryMessage(chat.messages[actualIndex], expected)) {
+          const actual = chat.messages[actualIndex]!;
+          const priorAnchorIndex = actual.role === 'assistant' && actual.source === 'runtime'
+            ? storedIndices.get(completedAssistantAnchors.get(actual.id) ?? '')
+            : undefined;
+          if (actual.role !== 'assistant' || actual.source !== 'runtime'
+            || priorAnchorIndex === undefined || priorAnchorIndex >= actualIndex) {
+            throw new Error('История изображения принятого хода не совпадает с сохранённым чатом.');
+          }
+          actualIndex += 1;
+        }
+        if (actualIndex > acceptedAnchorIndex || !sameImageHistoryMessage(chat.messages[actualIndex], expected)
+          || storedIndices.get(expected.id) !== actualIndex) {
+          throw new Error('История изображения принятого хода не совпадает с сохранённым чатом.');
+        }
+        actualIndex += 1;
+      }
+      if (actualIndex - 1 !== acceptedAnchorIndex) {
+        throw new Error('История изображения принятого хода не совпадает с сохранённым чатом.');
+      }
+    }
     if (turn.operation === 'compaction'
       && (turn.compactBoundaryMessageId !== turn.messageId
         || (chat.compactSnapshot?.id ?? null) !== (turn.compactExpectedSnapshotId ?? null))) {
@@ -3334,7 +3404,10 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       if (typeof turnIdInput === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(turnIdInput)) turnReservations.delete(turnIdInput);
     },
     markQueuedTurnNotSent: (turnInput, reasonInput) => serialize(async () => {
-      const accepted = validateAcceptedTurnRecord(structuredClone(turnInput), false);
+      const rawTurn = structuredClone(turnInput);
+      const existingChat = isRecord(rawTurn) && typeof rawTurn.chatId === 'string'
+        ? chats.find((item) => item.id === rawTurn.chatId) : undefined;
+      const accepted = validateAcceptedTurnRecord(rawTurn, false, existingChat?.kind === 'image');
       if (accepted.operation || accepted.assistantMessageId === null || typeof reasonInput !== 'string'
         || !reasonInput.trim() || reasonInput.length > 500) {
         throw new Error('Некорректная запись хода, который не был отправлен.');
@@ -3491,7 +3564,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       else turns.push(record);
       await saveChat({ ...chat, turns, updatedAt: new Date().toISOString() });
     }),
-    appendAssistantMessageFromRuntime: (turnInput, textInput, terminalTurnInput, signal, functionsStateIdInput, accountScopeInput) => serialize(async () => {
+    appendAssistantMessageFromRuntime: (turnInput, textInput, terminalTurnInput, signal, functionsStateIdInput, accountScopeInput, generatedArtifactIdInput) => serialize(async () => {
       if (signal?.aborted) throw createAbortError();
       const acceptedTurn = structuredClone(turnInput);
       validateAcceptedTurnBinding(acceptedTurn);
@@ -3505,14 +3578,19 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       const messageId = requireId(acceptedTurn.messageId);
       const anchor = chat.messages.findIndex((message) => message.id === messageId && message.role === 'user');
       if (anchor < 0) throw new Error('Ответ не привязан к принятому сообщению чата.');
-      if (typeof textInput !== 'string' || !textInput.trim() || textInput.length > 100_000) {
+      const generatedArtifactId = generatedArtifactIdInput === undefined ? null : requireId(generatedArtifactIdInput);
+      const isGeneratedImage = generatedArtifactId !== null;
+      if (typeof textInput !== 'string' || (!textInput.trim() && !isGeneratedImage) || textInput.length > 100_000) {
         throw new Error('Ответ должен содержать от 1 до 100 000 символов.');
       }
       const functionsStateId = functionsStateIdInput === undefined ? null : requireProviderStateId(functionsStateIdInput);
       const requestedOwner = accountScopeInput === undefined
         ? null
         : requireProviderAccountScope(accountScopeInput);
-      if (requestedOwner && functionsStateId === null) throw new Error('Нельзя привязать учётную запись к пустому состоянию ответа.');
+      if (requestedOwner && functionsStateId === null && !isGeneratedImage) throw new Error('Нельзя привязать учётную запись к пустому состоянию ответа.');
+      if (isGeneratedImage && (chat.kind !== 'image' || requestedOwner === null)) {
+        throw new Error('Созданное изображение должно принадлежать текущему чату и аккаунту.');
+      }
       const now = terminalTurn.endedAt ?? new Date().toISOString();
       const currentTurnIndex = chat.turns.findIndex((item) => item.turnId === acceptedTurn.turnId);
       const currentTurn = currentTurnIndex >= 0 ? chat.turns[currentTurnIndex] : null;
@@ -3525,16 +3603,49 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       const existingMessage = chat.messages.find((message) => message.id === acceptedTurn.assistantMessageId);
       const currentOwnership = providerStateOwnershipByChatId.get(chat.id) ?? emptyProviderStateOwnership();
       const previousBinding = currentOwnership.messages.find((binding) => binding.messageId === acceptedTurn.assistantMessageId);
+      const verifyGeneratedArtifact = async (artifact: ChatArtifact): Promise<void> => {
+        const extension = artifact.storedName.endsWith('.png') ? 'png' : artifact.storedName.endsWith('.jpg') ? 'jpg' : '';
+        const expectedContentType = extension === 'png' ? 'image/png' : extension === 'jpg' ? 'image/jpeg' : null;
+        if (!expectedContentType || artifact.id !== generatedArtifactId || artifact.messageId !== acceptedTurn.assistantMessageId
+          || artifact.storedName !== `${generatedArtifactId}.${extension}` || artifact.size <= 0
+          || artifact.size > MAX_GENERATED_IMAGE_BYTES || !artifact.sha256 || !/^[a-f0-9]{64}$/.test(artifact.sha256)
+          || attachmentContentType(artifact.name)?.contentType !== expectedContentType) {
+          throw new Error('Сохранённое изображение не совпадает с подтверждённым ответом.');
+        }
+        const filePath = join(chatFolder(chat.id), 'files', artifact.storedName);
+        await assertOwnedPath(storageRoot, filePath);
+        const info = await lstat(filePath);
+        if (!info.isFile() || info.isSymbolicLink() || info.size !== artifact.size || info.size > MAX_GENERATED_IMAGE_BYTES) {
+          throw new Error('Сохранённые байты изображения недоступны.');
+        }
+        const bytes = await readFile(filePath);
+        if (bytes.byteLength !== artifact.size || bytes.byteLength > MAX_GENERATED_IMAGE_BYTES
+          || !inspectLocalAttachmentContent(artifact.storedName, bytes)
+          || createHash('sha256').update(bytes).digest('hex') !== artifact.sha256) {
+          throw new Error('Сохранённые байты изображения изменились.');
+        }
+      };
       if (existingMessage) {
         const savedTurn = currentTurn;
+        const existingArtifact = isGeneratedImage
+          ? chat.artifacts.find((artifact) => artifact.id === generatedArtifactId && artifact.messageId === existingMessage.id)
+          : null;
         if (existingMessage.role === 'assistant' && existingMessage.source === 'runtime'
           && existingMessage.text === textInput.trim()
-          && existingMessage.functionsStateId === functionsStateIdInput
+          && (functionsStateId === null ? existingMessage.functionsStateId === undefined : existingMessage.functionsStateId === functionsStateId)
+          && (isGeneratedImage
+            ? existingMessage.attachmentIds?.length === 1 && existingMessage.attachmentIds[0] === generatedArtifactId
+              && existingArtifact !== undefined
+            : !existingMessage.attachmentIds?.length)
           && savedTurn?.status === 'completed') {
           if (requestedOwner && functionsStateId !== null && (!previousBinding || previousBinding.protocolVersion !== 'v2'
             || previousBinding.accountScope !== requestedOwner || previousBinding.stateIdHash !== hashProviderStateId(functionsStateId))) {
             throw new Error('Зарезервированный ответ уже сохранён без совпадающего владельца.');
           }
+          if (isGeneratedImage && functionsStateId === null && previousBinding) {
+            throw new Error('Зарезервированный ответ уже сохранён с неожиданным владельцем.');
+          }
+          if (isGeneratedImage) await verifyGeneratedArtifact(existingArtifact!);
           return structuredClone(chat);
         }
         throw new Error('Зарезервированный ответ уже сохранён с другими данными.');
@@ -3542,9 +3653,34 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       if (currentTurn && ['failed', 'cancelled', 'interrupted'].includes(currentTurn.status)) {
         throw new Error('Завершённый ход уже был остановлен.');
       }
+      let generatedArtifact: ChatArtifact | null = null;
+      if (isGeneratedImage) {
+        const generated = providerGeneratedImageEntries.find((entry) => entry.artifactId === generatedArtifactId
+          && entry.accountScope === requestedOwner);
+        if (!generated || generated.state !== 'downloaded' || generated.chatId !== chat.id
+          || generated.turnId !== acceptedTurn.turnId || generated.anchorMessageId !== acceptedTurn.messageId
+          || generated.assistantMessageId !== acceptedTurn.assistantMessageId || generated.modelId !== acceptedTurn.modelId
+          || generated.sizeBytes === null || generated.sha256 === null || generated.contentType === null) {
+          throw new Error('Сохранённые байты созданного изображения не подтверждены текущим ходом.');
+        }
+        validateGeneratedImageTurnBinding(generated);
+        assertGeneratedImageIdentityAvailable(generated, generated);
+        const extension = generated.contentType === 'image/png' ? 'png' : 'jpg';
+        const storedName = `${generated.artifactId}.${extension}`;
+        if (chat.artifacts.some((artifact) => artifact.id === generated.artifactId || artifact.storedName === storedName)
+          || chat.draftAttachments.some((attachment) => attachment.id === generated.artifactId || attachment.storedName === storedName)) {
+          throw new Error('Идентификатор созданного изображения уже занят локальным файлом.');
+        }
+        generatedArtifact = {
+          id: generated.artifactId, name: `Изображение.${extension}`, storedName,
+          size: generated.sizeBytes, sha256: generated.sha256, createdAt: now, messageId: acceptedTurn.assistantMessageId,
+        };
+        await verifyGeneratedArtifact(generatedArtifact);
+      }
       const message: ChatMessage = {
         id: acceptedTurn.assistantMessageId, role: 'assistant', source: 'runtime', text: textInput.trim(), createdAt: now,
         ...(functionsStateId === null ? {} : { functionsStateId }),
+        ...(generatedArtifact === null ? {} : { attachmentIds: [generatedArtifact.id] }),
       };
       const messages = [...chat.messages];
       messages.splice(anchor + 1, 0, message);
@@ -3552,7 +3688,8 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       const turns = [...chat.turns];
       if (currentTurnIndex >= 0) turns[currentTurnIndex] = completedRecord;
       else turns.push(completedRecord);
-      const updated = { ...chat, updatedAt: now, messages, turns };
+      const updated = { ...chat, updatedAt: now, messages,
+        artifacts: generatedArtifact === null ? chat.artifacts : [...chat.artifacts, generatedArtifact], turns };
       const nextOwnership = structuredClone(currentOwnership);
       if (requestedOwner && functionsStateId !== null) {
         if (previousBinding) throw new Error('Владелец сохранённого ответа не может быть заменён.');
@@ -3922,6 +4059,117 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       const accountScope = requireProviderAccountScope(scopeInput);
       return structuredClone(providerGeneratedImageEntries.filter((entry) => entry.accountScope === accountScope));
     }),
+    stageGeneratedImage: (scopeInput, artifactIdInput, bytesInput, signal) => {
+      const accountScope = requireProviderAccountScope(scopeInput);
+      const artifactId = requireId(artifactIdInput);
+      if (!(bytesInput instanceof Uint8Array)) throw new Error('Данные созданного изображения недоступны.');
+      if (bytesInput.byteLength === 0 || bytesInput.byteLength > MAX_GENERATED_IMAGE_BYTES) {
+        throw new Error('Размер созданного изображения выходит за безопасный предел.');
+      }
+      const bytes = Buffer.from(bytesInput);
+      return serialize(async () => {
+        if (signal?.aborted) throw createAbortError();
+        const index = providerGeneratedImageEntries.findIndex((row) => row.accountScope === accountScope && row.artifactId === artifactId);
+        const entry = index < 0 ? null : providerGeneratedImageEntries[index]!;
+        if (!entry || (entry.state !== 'generated' && entry.state !== 'downloaded')
+          || !entry.remoteFileId || !entry.contentType) {
+          throw new Error('Загрузить можно только подтверждённое созданное изображение.');
+        }
+        validateGeneratedImageTurnBinding(entry);
+        assertGeneratedImageIdentityAvailable(entry, entry);
+        const extension = entry.contentType === 'image/png' ? 'png' : 'jpg';
+        const storedName = `${entry.artifactId}.${extension}`;
+        const inspected = inspectLocalAttachmentContent(storedName, bytes);
+        if (!inspected || inspected.kind !== 'image' || inspected.contentType !== entry.contentType) {
+          throw new Error('Созданное изображение не совпадает с его подтверждённым форматом.');
+        }
+        const digest = createHash('sha256').update(bytes).digest('hex');
+        if (entry.state === 'downloaded' && (entry.sizeBytes !== bytes.byteLength || entry.sha256 !== digest)) {
+          throw new Error('Сохранённые байты созданного изображения нельзя заменить.');
+        }
+
+        const filesDirectory = join(chatFolder(entry.chatId), 'files');
+        const filePath = join(filesDirectory, storedName);
+        await assertOwnedPath(storageRoot, filesDirectory);
+        await mkdir(filesDirectory, { recursive: true });
+        await assertOwnedPath(storageRoot, filePath);
+        const verifyStagedFile = async (): Promise<void> => {
+          await assertOwnedPath(storageRoot, filePath);
+          const info = await lstat(filePath);
+          if (!info.isFile() || info.isSymbolicLink() || info.size !== bytes.byteLength
+            || info.size > MAX_GENERATED_IMAGE_BYTES || !samePath(await realpath(filePath), filePath)) {
+            throw new Error('Копия созданного изображения недоступна.');
+          }
+          const actual = await hashFile(filePath);
+          if (actual.size !== bytes.byteLength || actual.sha256 !== digest) {
+            throw new Error('Существующие байты созданного изображения не совпадают.');
+          }
+        };
+        const existing = await lstat(filePath).catch((error: unknown) => {
+          if (isMissingFile(error)) return null;
+          throw error;
+        });
+        if (existing) {
+          await verifyStagedFile();
+        } else {
+          let fileHandle: Awaited<ReturnType<typeof open>> | null = null;
+          let createdIdentity: { dev: number; ino: number } | null = null;
+          try {
+            fileHandle = await open(filePath, 'wx');
+            const created = await fileHandle.stat();
+            createdIdentity = { dev: created.dev, ino: created.ino };
+            await fileHandle.writeFile(bytes);
+            await fileHandle.sync();
+            await fileHandle.close();
+            fileHandle = null;
+          } catch (error) {
+            await fileHandle?.close().catch(() => undefined);
+            if (createdIdentity) {
+              const current = await lstat(filePath).catch((cleanupError: unknown) => {
+                if (isMissingFile(cleanupError)) return null;
+                throw cleanupError;
+              });
+              if (current?.isFile() && !current.isSymbolicLink()
+                && current.dev === createdIdentity.dev && current.ino === createdIdentity.ino) {
+              let incomplete = current.size !== bytes.byteLength || current.size > MAX_GENERATED_IMAGE_BYTES;
+              if (!incomplete) {
+                try {
+                  await assertOwnedPath(storageRoot, filePath);
+                  const currentBytes = await readFile(filePath);
+                  incomplete = currentBytes.byteLength !== bytes.byteLength
+                    || !inspectLocalAttachmentContent(storedName, currentBytes)
+                    || createHash('sha256').update(currentBytes).digest('hex') !== digest;
+                } catch {
+                  incomplete = false;
+                }
+              }
+              if (incomplete) {
+                await assertOwnedPath(storageRoot, filePath);
+                await unlink(filePath).catch((cleanupError: unknown) => {
+                  if (!isMissingFile(cleanupError)) throw cleanupError;
+                });
+              }
+              }
+            }
+            if (isRecord(error) && error.code === 'EEXIST') {
+              await verifyStagedFile();
+            } else {
+              throw error;
+            }
+          }
+          await verifyStagedFile();
+        }
+        if (signal?.aborted) throw createAbortError();
+        if (entry.state === 'downloaded') return structuredClone(entry);
+        const downloaded: ProviderGeneratedImageLedgerEntry = {
+          ...entry, state: 'downloaded', sizeBytes: bytes.byteLength, sha256: digest,
+        };
+        const next = [...providerGeneratedImageEntries];
+        next[index] = downloaded;
+        await saveProviderGeneratedImageEntries(next, signal);
+        return structuredClone(downloaded);
+      });
+    },
     putProviderGeneratedImageEntry: (value) => {
       const entry = validateProviderGeneratedImageEntry(value);
       return serialize(async () => {

@@ -772,7 +772,7 @@ test('schema 8 home-send journal recovers linked local files without inventing a
   assert.equal(accepted?.turn.messages[0]?.attachmentIds, undefined);
   assert.deepEqual(await readFile(await recovered.getArtifactPath(detail.id, staged.attachments[0]!.id)), Buffer.from('local bytes from schema 8'));
   const savedChat = JSON.parse(await readFile(join(directory, 'chats', detail.id, 'chat.json'), 'utf8')) as Record<string, unknown>;
-  assert.equal(savedChat.schemaVersion, 13);
+  assert.equal(savedChat.schemaVersion, 14);
 });
 
 test('schema 8 compact snapshot validates against its original linked-file prefix then upgrades the hash', async (t) => {
@@ -811,7 +811,7 @@ test('schema 8 compact snapshot validates against its original linked-file prefi
   assert.equal(detail.compactSnapshot?.coveredPrefixHash, hashCompactionPrefix(detail.messages, []));
   assert.equal(await readFile(await restored.getArtifactPath(chat.id, pendingId), 'utf8'), 'local attachment bytes');
   const saved = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown>;
-  assert.equal(saved.schemaVersion, 13);
+  assert.equal(saved.schemaVersion, 14);
   assert.deepEqual((saved.compactSnapshot as CompactSnapshot).coveredPrefixHash, detail.compactSnapshot?.coveredPrefixHash);
 });
 
@@ -1554,7 +1554,7 @@ test('migrates v1 projects, chats, drafts, and theme without losing data', async
   assert.equal(JSON.parse(await readFile(join(directory, 'projects.json'), 'utf8')).schemaVersion, 2);
   assert.equal(JSON.parse(await readFile(join(directory, 'chats.json'), 'utf8')).schemaVersion, 1);
   assert.equal(await readFile(join(directory, 'chats.json.bak'), 'utf8'), await readFile(join(directory, 'chats.json'), 'utf8'));
-  assert.equal(JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')).schemaVersion, 13);
+  assert.equal(JSON.parse(await readFile(join(directory, 'chats', chat.id, 'chat.json'), 'utf8')).schemaVersion, 14);
   assert.equal(JSON.parse(await readFile(join(directory, 'settings.json'), 'utf8')).schemaVersion, 10);
   await store.deleteChat(chat.id);
   assert.deepEqual(await (await openStore(directory)).listChats(), []);
@@ -1612,7 +1612,7 @@ test('unfinished legacy migration preserves existing invalid chat details', asyn
         assert.deepEqual(restored.messages, kind === 'valid' ? detail.messages : []);
         if (validUnmarkedLegacyDetail) {
           const migratedDetail = JSON.parse(await readFile(detailPath, 'utf8')) as Record<string, unknown>;
-          assert.equal(migratedDetail.schemaVersion, 13);
+          assert.equal(migratedDetail.schemaVersion, 14);
           assert.equal(migratedDetail.compactSnapshot, null);
           assert.equal(migratedDetail.draft, 'newer draft');
         }
@@ -1864,6 +1864,286 @@ test('trusted runtime assistant append preserves draft and final provider state 
   assert.deepEqual(restored.turns, detail.turns);
 });
 
+test('generated image bytes, assistant artifact, ownership, and completed turn survive reopen and queue insertion', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-generated-image-result-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const scope = 'c'.repeat(64);
+  const artifactId = 'generated-image-result-one';
+  const imageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jHfQAAAAASUVORK5CYII=', 'base64');
+  const store = await openStore(directory);
+  const chat = await store.createChat(undefined, 'image');
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Ultra' });
+  const accepted = await store.acceptLocalMessage(chat.id, 'Create a picture.', 'generated-image-result-turn');
+  const queued = await store.getChat(chat.id);
+  const queuedRecord = queued.turns.find((turn) => turn.turnId === accepted.turn.turnId);
+  assert.ok(queuedRecord);
+  const intent: import('./contracts').ProviderGeneratedImageLedgerEntry = {
+    accountScope: scope, chatId: chat.id, turnId: accepted.turn.turnId,
+    anchorMessageId: accepted.turn.messageId, assistantMessageId: accepted.turn.assistantMessageId!,
+    artifactId, modelId: accepted.turn.modelId!, createdAt: timestamp,
+    state: 'intent', remoteFileId: null, contentType: null, sizeBytes: null, sha256: null,
+  };
+  await store.putProviderGeneratedImageEntry(intent);
+  const generated = { ...intent, state: 'generated' as const, remoteFileId: 'generated-result-file', contentType: 'image/png' as const };
+  await store.putProviderGeneratedImageEntry(generated);
+
+  await assert.rejects(store.stageGeneratedImage('d'.repeat(64), artifactId, imageBytes), /подтверждённое созданное изображение/i);
+  await assert.rejects(store.stageGeneratedImage(scope, artifactId, Buffer.from('not a PNG')), /PNG/i);
+  assert.throws(() => store.stageGeneratedImage(scope, artifactId, Buffer.alloc(15_000_001)), /безопасный предел/i);
+  assert.deepEqual(await store.getProviderGeneratedImageEntries(scope), [generated]);
+
+  const downloaded = await store.stageGeneratedImage(scope, artifactId, imageBytes);
+  assert.equal(downloaded.state, 'downloaded');
+  assert.equal(downloaded.sizeBytes, imageBytes.byteLength);
+  assert.equal(downloaded.sha256, createHash('sha256').update(imageBytes).digest('hex'));
+  assert.deepEqual(await store.stageGeneratedImage(scope, artifactId, imageBytes), downloaded, 'repeating the exact staging is idempotent');
+  const imagePath = join(await store.getChatFolder(chat.id), 'files', `${artifactId}.png`);
+  assert.deepEqual(await readFile(imagePath), imageBytes);
+  const changedBytes = Buffer.from(imageBytes);
+  changedBytes[changedBytes.length - 5]! ^= 1;
+  await assert.rejects(store.stageGeneratedImage(scope, artifactId, changedBytes), /нельзя заменить/i);
+  assert.deepEqual(await readFile(imagePath), imageBytes, 'a conflicting retry never replaces owned image bytes');
+
+  const completed: RuntimeTurnSnapshot = {
+    id: accepted.turn.turnId, chatId: chat.id, anchorMessageId: accepted.turn.messageId,
+    assistantMessageId: accepted.turn.assistantMessageId!, modelId: accepted.turn.modelId,
+    status: 'completed', createdAt: queuedRecord.createdAt, endedAt: timestamp, activity: [],
+  };
+  const completedDetail = await store.appendAssistantMessageFromRuntime(
+    accepted.turn, '', completed, undefined, undefined, scope, artifactId,
+  );
+  const assistant = completedDetail.messages.find((message) => message.id === accepted.turn.assistantMessageId);
+  assert.equal(assistant?.text, '');
+  assert.equal(assistant?.source, 'runtime');
+  assert.equal(assistant?.functionsStateId, undefined, 'missing provider state remains absent');
+  assert.deepEqual(assistant?.attachmentIds, [artifactId]);
+  assert.equal(completedDetail.artifacts.find((artifact) => artifact.id === artifactId)?.name, 'Изображение.png');
+  assert.equal(completedDetail.artifacts.find((artifact) => artifact.id === artifactId)?.messageId, assistant?.id);
+  assert.equal(completedDetail.turns.find((turn) => turn.turnId === accepted.turn.turnId)?.status, 'completed');
+  const persistedChat = JSON.parse(await readFile(join(await store.getChatFolder(chat.id), 'chat.json'), 'utf8')) as Record<string, unknown>;
+  assert.equal(persistedChat.schemaVersion, 14);
+  assert.equal((persistedChat.providerStateOwnership as { messages: unknown[] }).messages.length, 0);
+
+  const firstLater = await store.acceptLocalMessage(chat.id, 'First queued follow-up.', 'generated-image-followup-one');
+  const secondLater = await store.acceptLocalMessage(chat.id, 'Second queued follow-up.', 'generated-image-followup-two');
+  const firstLaterRecord = (await store.getChat(chat.id)).turns.find((turn) => turn.turnId === firstLater.turn.turnId);
+  assert.ok(firstLaterRecord);
+  const firstLaterCompleted: RuntimeTurnSnapshot = {
+    id: firstLater.turn.turnId, chatId: chat.id, anchorMessageId: firstLater.turn.messageId,
+    assistantMessageId: firstLater.turn.assistantMessageId!, modelId: firstLater.turn.modelId,
+    status: 'completed', createdAt: firstLaterRecord.createdAt, endedAt: timestamp, activity: [],
+  };
+  await store.appendAssistantMessageFromRuntime(firstLater.turn, 'Follow-up complete.', firstLaterCompleted);
+  const historicalImageIndex = secondLater.turn.messages.findIndex((message) => message.id === assistant?.id);
+  assert.ok(historicalImageIndex >= 0);
+  const changedImageText = structuredClone(secondLater.turn);
+  changedImageText.messages[historicalImageIndex]!.text = 'Modified captured image reply.';
+  await assert.rejects(store.validateAcceptedTurn(changedImageText), /история изображения принятого хода не совпадает/i);
+  const changedImageLink = structuredClone(secondLater.turn);
+  changedImageLink.messages[historicalImageIndex]!.attachmentIds = ['different-generated-image-id'];
+  await assert.rejects(store.validateAcceptedTurn(changedImageLink), /история изображения принятого хода не совпадает/i);
+  const reorderedHistory = structuredClone(secondLater.turn);
+  assert.ok(reorderedHistory.messages.length > 1);
+  [reorderedHistory.messages[0], reorderedHistory.messages[1]] = [reorderedHistory.messages[1]!, reorderedHistory.messages[0]!];
+  await assert.rejects(store.validateAcceptedTurn(reorderedHistory), /история изображения принятого хода не совпадает/i);
+  await store.validateAcceptedTurn(secondLater.turn);
+  const notSent = await store.markQueuedTurnNotSent(secondLater.turn, 'Synthetic queued-stop check.');
+  assert.equal(notSent.marked, true, 'a completed earlier reply may be inserted before a later accepted image turn');
+
+  await store.putProviderGeneratedImageEntry({ ...downloaded, state: 'cleanup-pending' });
+  await store.removeProviderGeneratedImageEntry(scope, artifactId, downloaded.remoteFileId!);
+  const reopened = await openStore(directory);
+  const beforeAck = await reopened.getChat(chat.id);
+  const repeatedAck = await reopened.appendAssistantMessageFromRuntime(
+    accepted.turn, '', completed, undefined, undefined, scope, artifactId,
+  );
+  assert.deepEqual(repeatedAck, beforeAck, 'the exact local ACK remains idempotent after remote ownership cleanup');
+  assert.deepEqual(await readFile(await reopened.getArtifactPath(chat.id, artifactId)), imageBytes);
+  assert.deepEqual(await reopened.getProviderGeneratedImageEntries(scope), []);
+});
+
+test('schema 14 accepts only truthful runtime image links and preserves rejected chat bytes', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-generated-image-invalid-link-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const scope = 'f'.repeat(64);
+  const artifactId = 'generated-image-invalid-link';
+  const imageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jHfQAAAAASUVORK5CYII=', 'base64');
+  const store = await openStore(directory);
+  const chat = await store.createChat(undefined, 'image');
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Ultra' });
+  const accepted = await store.acceptLocalMessage(chat.id, 'Create a picture.', 'generated-image-invalid-link-turn');
+  const queued = await store.getChat(chat.id);
+  const queuedRecord = queued.turns.find((turn) => turn.turnId === accepted.turn.turnId);
+  assert.ok(queuedRecord);
+  const intent: import('./contracts').ProviderGeneratedImageLedgerEntry = {
+    accountScope: scope, chatId: chat.id, turnId: accepted.turn.turnId,
+    anchorMessageId: accepted.turn.messageId, assistantMessageId: accepted.turn.assistantMessageId!,
+    artifactId, modelId: accepted.turn.modelId!, createdAt: timestamp,
+    state: 'intent', remoteFileId: null, contentType: null, sizeBytes: null, sha256: null,
+  };
+  await store.putProviderGeneratedImageEntry(intent);
+  const generated = { ...intent, state: 'generated' as const, remoteFileId: 'generated-invalid-link-remote', contentType: 'image/png' as const };
+  await store.putProviderGeneratedImageEntry(generated);
+  await store.stageGeneratedImage(scope, artifactId, imageBytes);
+  const completed: RuntimeTurnSnapshot = {
+    id: accepted.turn.turnId, chatId: chat.id, anchorMessageId: accepted.turn.messageId,
+    assistantMessageId: accepted.turn.assistantMessageId!, modelId: accepted.turn.modelId,
+    status: 'completed', createdAt: queuedRecord.createdAt, endedAt: timestamp, activity: [],
+  };
+  await store.appendAssistantMessageFromRuntime(accepted.turn, '', completed, undefined, undefined, scope, artifactId);
+  const chatPath = join(directory, 'chats', chat.id, 'chat.json');
+  const validBytes = await readFile(chatPath);
+  const validRecord = JSON.parse(validBytes.toString('utf8')) as Record<string, unknown>;
+  const cases = [
+    ['wrong-chat-kind', (raw: Record<string, unknown>) => { raw.kind = 'text'; }],
+    ['non-runtime-assistant', (raw: Record<string, unknown>) => {
+      const message = (raw.messages as Array<Record<string, unknown>>).find((item) => item.id === accepted.turn.assistantMessageId)!;
+      message.source = 'example';
+    }],
+    ['wrong-stored-extension', (raw: Record<string, unknown>) => {
+      (raw.artifacts as Array<Record<string, unknown>>)[0]!.storedName = `${artifactId}.jpeg`;
+    }],
+    ['wrong-stored-id', (raw: Record<string, unknown>) => {
+      (raw.artifacts as Array<Record<string, unknown>>)[0]!.storedName = 'another-image.png';
+    }],
+    ['oversized-artifact', (raw: Record<string, unknown>) => {
+      (raw.artifacts as Array<Record<string, unknown>>)[0]!.size = 15_000_001;
+    }],
+    ['missing-hash', (raw: Record<string, unknown>) => {
+      delete (raw.artifacts as Array<Record<string, unknown>>)[0]!.sha256;
+    }],
+    ['missing-assistant-link', (raw: Record<string, unknown>) => {
+      const message = (raw.messages as Array<Record<string, unknown>>).find((item) => item.id === accepted.turn.assistantMessageId)!;
+      delete message.attachmentIds;
+    }],
+    ['mismatched-assistant-link', (raw: Record<string, unknown>) => {
+      const message = (raw.messages as Array<Record<string, unknown>>).find((item) => item.id === accepted.turn.assistantMessageId)!;
+      message.attachmentIds = ['different-generated-image-id'];
+    }],
+    ['schema-13-image-link', (raw: Record<string, unknown>) => { raw.schemaVersion = 13; }],
+  ] as const;
+
+  for (const [name, corrupt] of cases) {
+    await t.test(name, async () => {
+      const raw = structuredClone(validRecord);
+      corrupt(raw);
+      const corruptBytes = Buffer.from(JSON.stringify(raw), 'utf8');
+      await writeFile(chatPath, corruptBytes);
+      const reopened = await openStore(directory);
+      assert.deepEqual(await reopened.listChats(), [], 'invalid image metadata is not exposed as a healthy chat');
+      assert.ok((await reopened.getStorageIssues()).some((issue) => issue.includes(chat.id) && /файл истории повреждён/.test(issue)));
+      assert.deepEqual(await readFile(chatPath), corruptBytes, 'reopen keeps rejected image metadata byte-for-byte');
+      await writeFile(chatPath, validBytes);
+    });
+  }
+  assert.deepEqual((await (await openStore(directory)).listChats()).map((item) => item.id), [chat.id]);
+});
+
+test('generated image ledger and chat write failures retain complete staged bytes for safe retry', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-generated-image-write-failure-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const scope = 'e'.repeat(64);
+  const imageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jHfQAAAAASUVORK5CYII=', 'base64');
+  const store = await openStore(directory);
+  const chat = await store.createChat(undefined, 'image');
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Ultra' });
+  const accepted = await store.acceptLocalMessage(chat.id, 'Preserve this generated image.', 'generated-image-write-failure');
+  const queued = await store.getChat(chat.id);
+  const queuedRecord = queued.turns.find((turn) => turn.turnId === accepted.turn.turnId);
+  assert.ok(queuedRecord);
+  const artifactId = 'generated-image-write-failure-file';
+  const intent: import('./contracts').ProviderGeneratedImageLedgerEntry = {
+    accountScope: scope, chatId: chat.id, turnId: accepted.turn.turnId,
+    anchorMessageId: accepted.turn.messageId, assistantMessageId: accepted.turn.assistantMessageId!,
+    artifactId, modelId: accepted.turn.modelId!, createdAt: timestamp,
+    state: 'intent', remoteFileId: null, contentType: null, sizeBytes: null, sha256: null,
+  };
+  await store.putProviderGeneratedImageEntry(intent);
+  const generated = { ...intent, state: 'generated' as const, remoteFileId: 'generated-write-failure-remote', contentType: 'image/png' as const };
+  await store.putProviderGeneratedImageEntry(generated);
+
+  const ledgerPath = join(directory, 'provider-uploads.json');
+  const ledgerBytes = await readFile(ledgerPath);
+  await rm(ledgerPath);
+  await mkdir(ledgerPath);
+  await assert.rejects(store.stageGeneratedImage(scope, artifactId, imageBytes));
+  const imagePath = join(await store.getChatFolder(chat.id), 'files', `${artifactId}.png`);
+  assert.deepEqual(await readFile(imagePath), imageBytes, 'a complete downloaded image survives a ledger write failure');
+  await rm(ledgerPath, { recursive: true, force: true });
+  await writeFile(ledgerPath, ledgerBytes);
+  const downloaded = await store.stageGeneratedImage(scope, artifactId, imageBytes);
+  assert.equal(downloaded.state, 'downloaded', 'retry adopts the exact retained image bytes');
+  assert.deepEqual(await readFile(imagePath), imageBytes);
+
+  const completed: RuntimeTurnSnapshot = {
+    id: accepted.turn.turnId, chatId: chat.id, anchorMessageId: accepted.turn.messageId,
+    assistantMessageId: accepted.turn.assistantMessageId!, modelId: accepted.turn.modelId,
+    status: 'completed', createdAt: queuedRecord.createdAt, endedAt: timestamp, activity: [],
+  };
+  const chatPath = join(await store.getChatFolder(chat.id), 'chat.json');
+  const originalChatBytes = await readFile(chatPath);
+  await rm(chatPath);
+  await mkdir(chatPath);
+  await assert.rejects(store.appendAssistantMessageFromRuntime(
+    accepted.turn, '', completed, undefined, undefined, scope, artifactId,
+  ));
+  assert.deepEqual(await readFile(imagePath), imageBytes, 'a failed chat commit never deletes the paid image');
+  assert.deepEqual(await store.getProviderGeneratedImageEntries(scope), [downloaded]);
+  assert.equal((await store.getChat(chat.id)).turns[0]?.status, 'queued', 'failed atomic append does not mutate in-memory chat state');
+  await rm(chatPath, { recursive: true, force: true });
+  await writeFile(chatPath, originalChatBytes);
+
+  const completedDetail = await store.appendAssistantMessageFromRuntime(
+    accepted.turn, '', completed, undefined, undefined, scope, artifactId,
+  );
+  assert.deepEqual(completedDetail.messages.find((message) => message.id === accepted.turn.assistantMessageId)?.attachmentIds, [artifactId]);
+  assert.equal(completedDetail.turns[0]?.status, 'completed');
+  const reopened = await openStore(directory);
+  assert.deepEqual(await readFile(await reopened.getArtifactPath(chat.id, artifactId)), imageBytes);
+  assert.equal((await reopened.getChat(chat.id)).turns[0]?.status, 'completed');
+});
+
+test('generated image staging rejects cancelled, deleted, and mismatched-format ownership', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-generated-image-stage-guards-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const scope = 'f'.repeat(64);
+  const imageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jHfQAAAAASUVORK5CYII=', 'base64');
+  const store = await openStore(directory);
+  const makeGenerated = async (artifactId: string, turnId: string, remoteFileId: string, contentType: 'image/png' | 'image/jpeg') => {
+    const chat = await store.createChat(undefined, 'image');
+    await store.updateChat(chat.id, { modelId: 'GigaChat-3-Ultra' });
+    const accepted = await store.acceptLocalMessage(chat.id, 'Create a guarded image.', turnId);
+    const intent: import('./contracts').ProviderGeneratedImageLedgerEntry = {
+      accountScope: scope, chatId: chat.id, turnId: accepted.turn.turnId,
+      anchorMessageId: accepted.turn.messageId, assistantMessageId: accepted.turn.assistantMessageId!,
+      artifactId, modelId: accepted.turn.modelId!, createdAt: timestamp,
+      state: 'intent', remoteFileId: null, contentType: null, sizeBytes: null, sha256: null,
+    };
+    await store.putProviderGeneratedImageEntry(intent);
+    await store.putProviderGeneratedImageEntry({ ...intent, state: 'generated', remoteFileId, contentType });
+    return { chat, accepted };
+  };
+
+  const cancelled = await makeGenerated('generated-cancelled', 'generated-cancelled-turn', 'generated-cancelled-remote', 'image/png');
+  const cancelledRecord = (await store.getChat(cancelled.chat.id)).turns[0]!;
+  await store.updateRuntimeTurn({
+    id: cancelled.accepted.turn.turnId, chatId: cancelled.chat.id, anchorMessageId: cancelled.accepted.turn.messageId,
+    assistantMessageId: cancelled.accepted.turn.assistantMessageId!, modelId: cancelled.accepted.turn.modelId,
+    status: 'cancelled', createdAt: cancelledRecord.createdAt, endedAt: timestamp, activity: [],
+  });
+  await assert.rejects(store.stageGeneratedImage(scope, 'generated-cancelled', imageBytes), /принятому ходу/i);
+  await assert.rejects(readFile(join(await store.getChatFolder(cancelled.chat.id), 'files', 'generated-cancelled.png')));
+
+  const deleted = await makeGenerated('generated-deleted', 'generated-deleted-turn', 'generated-deleted-remote', 'image/png');
+  await store.deleteChat(deleted.chat.id);
+  await assert.rejects(store.stageGeneratedImage(scope, 'generated-deleted', imageBytes), /принятому ходу/i);
+
+  const wrongMime = await makeGenerated('generated-wrong-mime', 'generated-wrong-mime-turn', 'generated-wrong-mime-remote', 'image/jpeg');
+  await assert.rejects(store.stageGeneratedImage(scope, 'generated-wrong-mime', imageBytes), /JPEG/i);
+  await assert.rejects(readFile(join(await store.getChatFolder(wrongMime.chat.id), 'files', 'generated-wrong-mime.jpg')));
+  assert.equal((await store.getProviderGeneratedImageEntries(scope)).length, 3);
+});
+
 test('schema 11 provider states migrate as unowned without changing public history or compact hashes', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-provider-state-schema11-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -1904,7 +2184,7 @@ test('schema 11 provider states migrate as unowned without changing public histo
     compact: { snapshotId: snapshot.id, owned: false, functionsStateId: null },
   });
   const migrated = JSON.parse(await readFile(filePath, 'utf8')) as Record<string, unknown>;
-  assert.equal(migrated.schemaVersion, 13);
+  assert.equal(migrated.schemaVersion, 14);
   assert.deepEqual(migrated.providerStateOwnership, {
     schemaVersion: 2, messages: [], receipts: [], compact: null,
   });
@@ -1968,7 +2248,7 @@ test('schema 12 accepts only private schema 1 and migrates it as legacy V1 state
 
   const migratedStore = await openStore(directory);
   const migrated = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  assert.equal(migrated.schemaVersion, 13);
+  assert.equal(migrated.schemaVersion, 14);
   const migratedOwnership = migrated.providerStateOwnership as {
     schemaVersion: number; messages: Array<Record<string, unknown>>; receipts: Array<Record<string, unknown>>;
     compact: Record<string, unknown> | null;
@@ -1987,6 +2267,25 @@ test('schema 12 accepts only private schema 1 and migrates it as legacy V1 state
     receipts: [{ receiptId: receipt.receiptId, anchorMessageId: accepted.turn.messageId, owned: false, wireOwned: false }],
     compact: { snapshotId: snapshot.id, owned: false, functionsStateId: null },
   });
+
+  const schema13 = { ...migrated, schemaVersion: 13 };
+  await writeFile(path, JSON.stringify(schema13), 'utf8');
+  const reopenedSchema13 = await openStore(directory);
+  const upgradedSchema13 = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+  assert.equal(upgradedSchema13.schemaVersion, 14);
+  assert.deepEqual((upgradedSchema13.providerStateOwnership as { schemaVersion: number }).schemaVersion, 2);
+  assert.deepEqual((await reopenedSchema13.getChat(chat.id)).messages, before.messages);
+
+  const invalidSchema13 = {
+    ...schema13,
+    providerStateOwnership: { schemaVersion: 1, messages: [], receipts: [], compact: null },
+  };
+  const invalidSchema13Bytes = JSON.stringify(invalidSchema13);
+  await writeFile(path, invalidSchema13Bytes, 'utf8');
+  const rejectedSchema13 = await openStore(directory);
+  assert.ok((await rejectedSchema13.getStorageIssues()).some((issue) => issue.includes('файл истории повреждён')),
+    'schema 13 must not accept private schema 1 as an upgrade signal');
+  assert.equal(await readFile(path, 'utf8'), invalidSchema13Bytes, 'rejected schema 13 bytes remain untouched');
 
   const mismatched = { ...migrated, schemaVersion: 12 };
   const mismatchedBytes = JSON.stringify(mismatched);
@@ -2317,7 +2616,7 @@ test('rejects malformed schema 13 provider-state metadata without rewriting corr
         case 'unbound-receipt': ownership.receipts[0]!.anchorMessageId = 'not-a-user-anchor'; break;
         case 'compact-snapshot': ownership.compact!.snapshotId = 'not-the-current-snapshot'; break;
         case 'compact-hash': ownership.compact!.stateIdHash = 'f'.repeat(64); break;
-        case 'unknown-schema': raw.schemaVersion = 14; break;
+        case 'unknown-schema': raw.schemaVersion = 15; break;
       }
       const corruptBytes = JSON.stringify(raw);
       await writeFile(path, corruptBytes, 'utf8');
@@ -2453,7 +2752,7 @@ test('schema 9 compact metadata survives turn-record migration without invented 
   assert.deepEqual(migrated.compactSnapshot, snapshot);
   assert.deepEqual(migrated.turns, [], 'schema 9 history has no reliable turn metadata to invent');
   const saved = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  assert.equal(saved.schemaVersion, 13);
+  assert.equal(saved.schemaVersion, 14);
   assert.deepEqual(saved.compactSnapshot, snapshot);
 });
 
@@ -2520,7 +2819,7 @@ test('migrates a schema 10 chat to 11 without rewriting attachment links, raw us
   assert.equal((await restored.getUsageProfileView(0)).skills.unknownTurnCount, 1,
     'legacy completed turn remains unknown rather than being migrated to known-no-Skill');
   const saved = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown>;
-  assert.equal(saved.schemaVersion, 13);
+  assert.equal(saved.schemaVersion, 14);
   assert.equal(((saved.turns as Array<Record<string, unknown>>)[0])?.invokedSkillId, undefined);
 });
 
@@ -2572,7 +2871,7 @@ test('schema 9 home-send journal recovers a stable interrupted turn without repl
   assert.equal(detail.messages.some((message) => message.role === 'assistant'), false);
   assert.deepEqual(accepted?.turn.messages.map((message) => message.id), [detail.messages[0]?.id]);
   assert.equal(await readFile(source, 'utf8'), 'preserved local source');
-  assert.equal((JSON.parse(await readFile(join(directory, 'chats', detail.id, 'chat.json'), 'utf8')) as Record<string, unknown>).schemaVersion, 13);
+  assert.equal((JSON.parse(await readFile(join(directory, 'chats', detail.id, 'chat.json'), 'utf8')) as Record<string, unknown>).schemaVersion, 14);
 });
 
 test('persists each provider pairing while reusing a completed side effect for a new state ID', async (t) => {
@@ -2688,7 +2987,7 @@ test('migrates existing chat detail schema 3 and preserves its draft', async (t)
   assert.equal((await restored.getChat(chat.id)).draft, 'Сохранённый черновик');
   assert.equal((await restored.getChat(chat.id)).nextTurnPermissionProfile, null);
   const migrated = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  assert.equal(migrated.schemaVersion, 13);
+  assert.equal(migrated.schemaVersion, 14);
   assert.equal(migrated.nextTurnPermissionProfile, null);
   assert.equal(migrated.nextTurnSkillId, null);
 });
@@ -2716,7 +3015,7 @@ test('migrates schema 8 with an empty pending list and preserves legacy messageI
   assert.equal(detail.artifacts[0]?.messageId, null);
   assert.deepEqual(detail.draftAttachments, []);
   const saved = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  assert.equal(saved.schemaVersion, 13);
+  assert.equal(saved.schemaVersion, 14);
   assert.deepEqual(saved.draftAttachments, []);
 });
 
@@ -2741,7 +3040,7 @@ test('migrates chat detail schema 4 to 5 without changing history or artifacts',
   assert.equal(detail.nextTurnSkillId, null);
   assert.equal(detail.draft, 'Черновик');
   assert.equal(detail.messages[0]?.text, 'Сохранённая история');
-  assert.equal(JSON.parse(await readFile(path, 'utf8')).schemaVersion, 13);
+  assert.equal(JSON.parse(await readFile(path, 'utf8')).schemaVersion, 14);
 });
 
 test('migrates previous settings and chat schemas with an empty model choice', async (t) => {
@@ -2765,7 +3064,7 @@ test('migrates previous settings and chat schemas with an empty model choice', a
   assert.equal((await restored.getChat(chat.id)).modelId, null);
   assert.equal((await restored.getSettings()).defaultModelId, null);
   assert.equal((await restored.getSettings()).microphoneConsent, 'unasked');
-  assert.equal(JSON.parse(await readFile(chatPath, 'utf8')).schemaVersion, 13);
+  assert.equal(JSON.parse(await readFile(chatPath, 'utf8')).schemaVersion, 14);
   assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).schemaVersion, 10);
 });
 
