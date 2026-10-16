@@ -820,10 +820,12 @@ export interface AppApi {
     stageDraftFiles(id: string, files: File[]): Promise<AttachmentImportBatchResult<ChatDetail>>;
     getDraftAttachmentPreview(id: string, attachmentId: string): Promise<string | null>;
     getArtifactPreview(id: string, artifactId: string): Promise<string | null>;
+    getGeneratedImagePreview(id: string, artifactId: string): Promise<string | null>;
     removeDraftFile(id: string, attachmentId: string): Promise<ChatDetail>;
     importFile(id: string | null, projectId?: string | null): Promise<ChatDetail | null>;
     copyMessage(id: string, messageId: string): Promise<void>;
     openArtifact(id: string, artifactId: string): Promise<void>;
+    saveGeneratedImage(id: string, artifactId: string): Promise<'saved' | 'cancelled'>;
     openFolder(id: string): Promise<void>;
     remove(id: string): Promise<void>;
   };

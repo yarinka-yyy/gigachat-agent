@@ -21,6 +21,7 @@ import { createGigaChatProvider, createHttpsTransport, GIGACHAT_ROOT_CA_SHA256, 
 import { prepareTurnAttachments } from './attachments';
 import { attachmentConnectionBlocker, attachmentContentType, attachmentSendBlocker, inspectLocalAttachmentContent, PROVIDER_IMAGE_LIMIT_BYTES } from './attachment-policy';
 import { createImageGenerationStream, IMAGE_GENERATION_MODEL_ID, IMAGE_RECOVERY_REQUIRED_MESSAGE, type GeneratedImageDimensions } from './image-generation';
+import { loadGeneratedImageArtifact, writeGeneratedImageCopy } from './image-artifacts';
 import { createOnboardingBrowser, type BrowserBounds } from './onboarding-browser';
 import { createEmbeddedBrowser } from './embedded-browser';
 import { createNumberedProjectFolder, prepareProjectFolders, removeEmptyCreatedFolder } from './project-folders';
@@ -116,7 +117,7 @@ function titleBarColors(): { color: string; symbolColor: string } {
 function validateGeneratedImageWithNativeImage(
   bytes: Uint8Array,
   dimensions: GeneratedImageDimensions,
-): void {
+): ReturnType<typeof nativeImage.createFromBuffer> {
   const image = nativeImage.createFromBuffer(Buffer.from(bytes), { scaleFactor: 1 });
   if (image.isEmpty()) throw new Error('IMAGE_NATIVE_DECODE');
   const decodedSize = image.getSize();
@@ -125,6 +126,7 @@ function validateGeneratedImageWithNativeImage(
   }
   const bitmap = image.toBitmap();
   if (bitmap.byteLength !== dimensions.width * dimensions.height * 4) throw new Error('IMAGE_NATIVE_BITMAP');
+  return image;
 }
 
 function syncTitleBarOverlay(): void {
@@ -907,7 +909,7 @@ async function createMainRuntime(
             request: context.request,
             signal,
             assertCurrent: (currentSignal) => assertProviderStateOwner(providerStateOwner, providerStateScopeGuard, currentSignal),
-            validateDecodedImage: (bytes, _contentType, dimensions) => validateGeneratedImageWithNativeImage(bytes, dimensions),
+            validateDecodedImage: (bytes, _contentType, dimensions) => { validateGeneratedImageWithNativeImage(bytes, dimensions); },
           }),
         };
       }
@@ -1082,6 +1084,7 @@ async function registerIpcHandlers(
   userBrowser: ReturnType<typeof createEmbeddedBrowser>,
   customPermissions: Awaited<ReturnType<typeof openCustomPermissions>>,
   approvals: ReturnType<typeof createPermissionApprovals>,
+  userDataDirectory: string,
 ): Promise<void> {
   const { runtime, availability, providerConnection, voiceRuntime, voiceAvailability, skills, hooks, providerStateScopeGuard: balanceScopeGuard } = mainRuntime;
   let balanceOperationActive = false;
@@ -1157,7 +1160,7 @@ async function registerIpcHandlers(
   };
   const nonCriticalChannels = new Set([
     'projects:list', 'projects:pick-folder', 'projects:open-folder', 'projects:read-instructions', 'projects:instructions-backup-path',
-    'chats:list', 'chats:get', 'chats:open-artifact', 'chats:open-folder', 'chats:draft-attachment-preview', 'chats:artifact-preview',
+    'chats:list', 'chats:get', 'chats:open-artifact', 'chats:open-folder', 'chats:draft-attachment-preview', 'chats:artifact-preview', 'chats:generated-image-preview',
     'runtime:list', 'runtime:status', 'context:preview', 'permissions:read-config', 'permissions:respond',
     'voice:status', 'voice:cancel', 'skills:list', 'skills:read-source', 'skills:open-folder', 'hooks:list', 'hooks:inspect',
     'onboarding:key-status', 'onboarding:browser-status', 'onboarding:browser-open', 'onboarding:browser-close',
@@ -1170,7 +1173,7 @@ async function registerIpcHandlers(
   ]);
   const readOnlyChannels = new Set([
     'projects:list', 'projects:read-instructions', 'projects:instructions-backup-path', 'context:preview',
-    'chats:list', 'chats:get', 'chats:draft-attachment-preview', 'chats:artifact-preview', 'home-draft:get', 'home-draft:attachment-preview', 'runtime:list', 'runtime:status', 'permissions:read-config',
+    'chats:list', 'chats:get', 'chats:draft-attachment-preview', 'chats:artifact-preview', 'chats:generated-image-preview', 'home-draft:get', 'home-draft:attachment-preview', 'runtime:list', 'runtime:status', 'permissions:read-config',
     'voice:status', 'skills:list', 'skills:read-source', 'hooks:list', 'hooks:inspect', 'onboarding:key-status', 'onboarding:connection-status', 'models:get-registry',
     'onboarding:browser-status', 'browser:status', 'settings:get', 'usage:local-stats', 'usage:get-ledger', 'usage:get-profile-view',
     'settings:list-openers', 'settings:app-info', 'settings:get-auto-start', 'settings:read-instructions',
@@ -1528,6 +1531,58 @@ async function registerIpcHandlers(
     const artifactId = requireId(artifactIdInput);
     const artifact = (await store.getChat(id)).artifacts.find((item) => item.id === artifactId);
     return artifact ? getAttachmentPreview(await store.getArtifactPath(id, artifactId), artifact) : null;
+  });
+  handle('chats:generated-image-preview', async (idInput, artifactIdInput) => {
+    const id = requireId(idInput);
+    const artifactId = requireId(artifactIdInput);
+    try {
+      const decodedImage: { value: ReturnType<typeof nativeImage.createFromBuffer> | null } = { value: null };
+      await loadGeneratedImageArtifact(store, id, artifactId, (bytes, _contentType, dimensions) => {
+        decodedImage.value = validateGeneratedImageWithNativeImage(bytes, dimensions);
+      });
+      const decoded = decodedImage.value;
+      if (!decoded || decoded.isEmpty()) return null;
+      const size = decoded.getSize();
+      if (size.width <= 0 || size.height <= 0) return null;
+      const scale = Math.min(1, 1024 / size.width, 1024 / size.height);
+      const preview = scale < 1
+        ? decoded.resize({ width: Math.max(1, Math.floor(size.width * scale)), height: Math.max(1, Math.floor(size.height * scale)), quality: 'best' })
+        : decoded;
+      const previewSize = preview.getSize();
+      if (preview.isEmpty() || previewSize.width <= 0 || previewSize.height <= 0
+        || previewSize.width > 1024 || previewSize.height > 1024) return null;
+      const dataUrl = preview.toDataURL();
+      return dataUrl.startsWith('data:image/png;base64,') && Buffer.byteLength(dataUrl, 'utf8') <= 6 * 1024 * 1024
+        ? dataUrl
+        : null;
+    } catch {
+      return null;
+    }
+  });
+  handle('chats:save-generated-image', async (idInput, artifactIdInput) => {
+    const id = requireId(idInput);
+    const artifactId = requireId(artifactIdInput);
+    try {
+      const image = await loadGeneratedImageArtifact(store, id, artifactId, (bytes, _contentType, dimensions) => {
+        validateGeneratedImageWithNativeImage(bytes, dimensions);
+      });
+      const isPng = image.contentType === 'image/png';
+      const options = {
+        title: 'Сохранить изображение',
+        defaultPath: image.suggestedFileName,
+        filters: [{ name: isPng ? 'Изображение PNG' : 'Изображение JPEG', extensions: isPng ? ['png'] : ['jpg', 'jpeg'] }],
+        properties: ['showOverwriteConfirmation', 'dontAddToRecent'] as Array<'showOverwriteConfirmation' | 'dontAddToRecent'>,
+      };
+      const selected = mainWindow && !mainWindow.isDestroyed()
+        ? await dialog.showSaveDialog(mainWindow, options)
+        : await dialog.showSaveDialog(options);
+      if (selected.canceled) return 'cancelled';
+      if (!selected.filePath) throw new Error('Save destination unavailable.');
+      await writeGeneratedImageCopy(image, selected.filePath, { protectedRoots: [userDataDirectory] });
+      return 'saved';
+    } catch {
+      throw new Error('Не удалось безопасно сохранить изображение.');
+    }
   });
   handle('chats:remove-draft-file', (idInput, attachmentId) =>
     withLocalFailureNotification(store, () => store.removeChatDraftFile(requireId(idInput), requireId(attachmentId))));
@@ -2038,7 +2093,7 @@ if (isPrimaryInstance) void app.whenReady().then(async () => {
     currentTheme = initialSettings.theme;
     nativeTheme.on('updated', syncTitleBarOverlay);
     const mainRuntime = await createMainRuntime(store, customPermissions, approvals, helperCandidate, secureStore);
-    await registerIpcHandlers(store, mainRuntime, secureStore, onboardingBrowser, embeddedBrowser, customPermissions, approvals);
+    await registerIpcHandlers(store, mainRuntime, secureStore, onboardingBrowser, embeddedBrowser, customPermissions, approvals, userDataDirectory);
     await mainRuntime.startSessionHooks();
     createMainWindow = createWindow;
     createWindow();
