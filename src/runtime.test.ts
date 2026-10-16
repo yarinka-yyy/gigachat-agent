@@ -63,6 +63,9 @@ function requestFor(turn: AcceptedTurnInput): ProviderTurnRequest {
 
 function makeRuntime(provider: GigaChatProvider | null, options: {
   appendAssistant?: (chatId: string, text: string, signal: AbortSignal, functionsStateId?: string, acceptedTurn?: AcceptedTurnInput, terminalTurn?: RuntimeTurnSnapshot) => Promise<void>;
+  appendAssistantPrepared?: TurnRuntimeOptions['appendAssistant'];
+  prepareTurn?: TurnRuntimeOptions['prepareTurn'];
+  prepareProviderRequest?: TurnRuntimeOptions['prepareProviderRequest'];
   tools?: LocalTools;
   beginToolReceipt?: TurnRuntimeOptions['beginToolReceipt'];
   completeToolReceipt?: TurnRuntimeOptions['completeToolReceipt'];
@@ -78,12 +81,13 @@ function makeRuntime(provider: GigaChatProvider | null, options: {
   const runtime = createTurnRuntime({
     provider,
     tools: options.tools ?? testTools,
-    prepareTurn: async (turn) => requestFor(turn),
+    prepareTurn: options.prepareTurn ?? (async (turn) => requestFor(turn)),
+    ...(options.prepareProviderRequest ? { prepareProviderRequest: options.prepareProviderRequest } : {}),
     consumeTurn: async () => undefined,
     releaseTurn: options.releaseTurn ?? (() => undefined),
-    appendAssistant: options.appendAssistant
+    appendAssistant: options.appendAssistantPrepared ?? (options.appendAssistant
       ? async (turn, text, signal, functionsStateId, terminalTurn) => options.appendAssistant?.(turn.chatId, text, signal, functionsStateId, turn, terminalTurn)
-      : async () => undefined,
+      : async () => undefined),
     recordUsageReceipt: options.recordUsageReceipt ?? (async (receipt) => {
       const index = usageReceipts.findIndex((item) => item.localRequestId === receipt.localRequestId);
       if (index < 0) usageReceipts.push(structuredClone(receipt));
@@ -3277,6 +3281,142 @@ test('keeps FIFO blocked until nested persistence and a cancelled tool receipt b
     .reduce((total, receipt) => total + (receipt.totalTokens ?? 0), 0), 33);
   assert.deepEqual({ reads, searches, writes }, { reads: 1, searches: 1, writes: 0 });
   assert.ok(persisted.some((snapshot) => snapshot.id === firstTurnId && snapshot.status === 'cancelled'));
+});
+
+test('image provider result completes an empty-text Runtime turn once and keeps usage and hooks', async () => {
+  const turn = turnFor('image-runtime-result', 'Create an image.');
+  turn.modelId = 'GigaChat-3-Ultra';
+  const usageReceipts: UsageReceipt[] = [];
+  const hookEvents: string[] = [];
+  const appended: Array<{ text: string; artifactId: string | undefined }> = [];
+  let attachmentPreparationCalls = 0;
+  const imageGeneration = (async function* () {
+    yield { type: 'usage', promptTokens: 31, completionTokens: 0, totalTokens: 31, precachedPromptTokens: 0 } satisfies ProviderEvent;
+    yield { type: 'image-result', artifactId: 'local-image-result-1' } satisfies ProviderEvent;
+    yield { type: 'completed' } satisfies ProviderEvent;
+  })();
+  const runtime = makeRuntime(makeProvider(() => {
+    throw new Error('The ordinary text stream must not be used for image generation.');
+  }), {
+    usageReceipts,
+    prepareTurn: async (input) => ({ request: requestFor(input), imageGeneration }),
+    prepareProviderRequest: async (_input, request) => { attachmentPreparationCalls += 1; return request; },
+    appendAssistantPrepared: async (_input, text, _signal, _stateId, _terminal, _owner, generatedArtifactId) => {
+      appended.push({ text, artifactId: generatedArtifactId });
+    },
+    runHooks: async (_input, hook) => { hookEvents.push(hook.event); return []; },
+  });
+
+  assert.equal(runtime.enqueue(turn), turn.turnId);
+  await runtime.whenIdle();
+  assert.equal(runtime.list(turn.chatId)[0]?.status, 'completed');
+  assert.deepEqual(appended, [{ text: '', artifactId: 'local-image-result-1' }]);
+  assert.equal(usageReceipts.length, 1);
+  assert.equal(usageReceipts[0]?.totalTokens, 31);
+  assert.equal(usageReceipts[0]?.status, 'completed');
+  assert.deepEqual(hookEvents, ['user-prompt-submitted', 'stop']);
+  assert.equal(attachmentPreparationCalls, 0);
+});
+
+test('image mode rejects missing, duplicate, malformed, ordinary-text, and function-call results before append or tools', async () => {
+  const cases: Array<{ name: string; imageMode: boolean; events: ProviderEvent[] }> = [
+    { name: 'missing result', imageMode: true, events: [{ type: 'completed' }] },
+    { name: 'missing terminal', imageMode: true, events: [{ type: 'image-result', artifactId: 'image-result' }] },
+    { name: 'duplicate result', imageMode: true, events: [
+      { type: 'image-result', artifactId: 'image-result-one' },
+      { type: 'image-result', artifactId: 'image-result-two' },
+      { type: 'completed' },
+    ] },
+    { name: 'invalid identifier', imageMode: true, events: [{ type: 'image-result', artifactId: '../outside' }] },
+    { name: 'function call', imageMode: true, events: [functionCall('read', { path: 'input.txt' })] },
+    { name: 'ordinary text stream injection', imageMode: false, events: [
+      { type: 'image-result', artifactId: 'image-result' },
+      { type: 'completed' },
+    ] },
+  ];
+
+  for (const [index, scenario] of cases.entries()) {
+    const turn = turnFor(`image-result-invalid-${index}`, 'Create an image.');
+    if (scenario.imageMode) turn.modelId = 'GigaChat-3-Ultra';
+    let appends = 0;
+    let toolCalls = 0;
+    const tools = { read: async () => { toolCalls += 1; return 'should not execute'; } } as unknown as LocalTools;
+    const provider = makeProvider(async function* () {
+      for (const event of scenario.events) yield event;
+    });
+    const runtime = makeRuntime(provider, {
+      tools,
+      prepareTurn: async (input) => ({
+        request: requestFor(input),
+        ...(scenario.imageMode ? { imageGeneration: (async function* () { yield* scenario.events; })() } : {}),
+      }),
+      appendAssistantPrepared: async () => { appends += 1; },
+    });
+    assert.equal(runtime.enqueue(turn), turn.turnId, scenario.name);
+    await runtime.whenIdle();
+    assert.equal(runtime.list(turn.chatId)[0]?.status, 'failed', scenario.name);
+    assert.equal(appends, 0, scenario.name);
+    assert.equal(toolCalls, 0, scenario.name);
+  }
+
+  const emptyTextTurn = turnFor('image-result-empty-text-ordinary', 'Ordinary empty answer.');
+  let emptyTextAppends = 0;
+  const emptyTextRuntime = makeRuntime(makeProvider(async function* () {
+    yield { type: 'completed' };
+  }), { appendAssistant: async () => { emptyTextAppends += 1; } });
+  assert.equal(emptyTextRuntime.enqueue(emptyTextTurn), emptyTextTurn.turnId);
+  await emptyTextRuntime.whenIdle();
+  assert.equal(emptyTextRuntime.list(emptyTextTurn.chatId)[0]?.status, 'failed');
+  assert.equal(emptyTextAppends, 0);
+});
+
+test('Runtime holds the image FIFO until a cancelled image iterator actually settles', { timeout: 5000 }, async () => {
+  const first = turnFor('image-cancel-first', 'first image');
+  first.modelId = 'GigaChat-3-Ultra';
+  const second = turnFor('image-cancel-second', 'second text');
+  const iteratorStarted = deferred();
+  const allowIteratorSettle = deferred();
+  let iteratorClosed = false;
+  let secondProviderStarts = 0;
+  let appends = 0;
+  const imageGeneration = (async function* () {
+    try {
+      iteratorStarted.resolve();
+      await allowIteratorSettle.promise;
+      yield { type: 'image-result', artifactId: 'cancelled-image-result' } satisfies ProviderEvent;
+      yield { type: 'completed' } satisfies ProviderEvent;
+    } finally {
+      iteratorClosed = true;
+    }
+  })();
+  const provider = makeProvider(async function* (request) {
+    secondProviderStarts += 1;
+    yield { type: 'text-delta', text: `completed ${request.messages[0]?.text ?? ''}` };
+    yield { type: 'completed' };
+  });
+  const runtime = makeRuntime(provider, {
+    prepareTurn: async (turn) => turn.turnId === first.turnId
+      ? { request: requestFor(turn), imageGeneration }
+      : requestFor(turn),
+    appendAssistant: async () => { appends += 1; },
+    timeouts: { nextMs: 1200, stopMs: 1500, turnMs: 4000 },
+  });
+  assert.equal(runtime.enqueue(first), first.turnId);
+  await iteratorStarted.promise;
+  assert.equal(runtime.cancel(first.turnId), true);
+  assert.equal(runtime.enqueue(second), second.turnId);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(iteratorClosed, false);
+  assert.equal(secondProviderStarts, 0);
+  assert.equal(appends, 0);
+
+  allowIteratorSettle.resolve();
+  await runtime.whenIdle();
+  assert.equal(iteratorClosed, true);
+  assert.equal(secondProviderStarts, 1);
+  assert.equal(runtime.list(first.chatId)[0]?.status, 'cancelled');
+  assert.equal(runtime.list(second.chatId)[0]?.status, 'completed');
+  assert.equal(appends, 1, 'only the later ordinary text turn is appended');
 });
 
 test('blocks a tool when its before-hook fails and stores a completed non-side-effect receipt', async () => {

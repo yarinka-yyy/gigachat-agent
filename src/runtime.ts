@@ -62,6 +62,7 @@ export interface PreparedTurn {
   request: ProviderTurnRequest;
   compaction?: PreparedCompactionContext;
   providerStateOwner?: ProviderStateOwner;
+  imageGeneration?: AsyncIterable<ProviderEvent>;
 }
 
 export interface TurnRuntimeOptions {
@@ -75,7 +76,7 @@ export interface TurnRuntimeOptions {
   releaseTurn(turn: AcceptedTurnInput): void;
   persistTurnRecord?(turn: RuntimeTurnSnapshot): Promise<void>;
   appendAssistant(turn: AcceptedTurnInput, text: string, signal: AbortSignal, functionsStateId: string | undefined,
-    terminalTurn: RuntimeTurnSnapshot, providerStateOwner?: ProviderStateOwner): Promise<void>;
+    terminalTurn: RuntimeTurnSnapshot, providerStateOwner?: ProviderStateOwner, generatedArtifactId?: string): Promise<void>;
   appendCompaction?(turn: AcceptedTurnInput, text: string, signal: AbortSignal, context: PreparedCompactionContext,
     terminalTurn: RuntimeTurnSnapshot, functionsStateId?: string, providerStateOwner?: ProviderStateOwner): Promise<void>;
   compactionEnabled?: boolean;
@@ -273,6 +274,8 @@ function assertProviderEvent(value: unknown): asserts value is ProviderEvent {
     return;
   }
   if (event.type === 'text-delta' && typeof event.text === 'string') return;
+  if (event.type === 'image-result' && typeof event.artifactId === 'string'
+    && /^[A-Za-z0-9_-]{1,128}$/.test(event.artifactId)) return;
   if (event.type === 'usage'
     && ['promptTokens', 'completionTokens', 'totalTokens', 'precachedPromptTokens'].every((field) => {
       const count = event[field];
@@ -877,11 +880,16 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       let request: ProviderTurnRequest;
       let compactionContext: PreparedCompactionContext | null = null;
       let providerStateOwner: ProviderStateOwner | undefined;
+      let imageGeneration: AsyncIterable<ProviderEvent> | null = null;
       if (typeof prepared === 'object' && prepared !== null && 'request' in prepared) {
         request = prepared.request;
         compactionContext = prepared.compaction ?? null;
         providerStateOwner = prepared.providerStateOwner;
+        imageGeneration = prepared.imageGeneration ?? null;
       } else request = prepared;
+      if (imageGeneration && (compactionContext || turn.input.operation === 'compaction')) {
+        throw Object.assign(new Error('IMAGE_GENERATION_PROTOCOL'), { category: 'protocol' as const });
+      }
       if (controller.signal.aborted) throw abortError();
       options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
       if (!request.modelId) throw new Error('MODEL_NOT_SELECTED');
@@ -892,7 +900,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         if (rejected) throw new Error(rejected.reason ?? 'Проверка Hook остановила сжатие контекста.');
       } else await runHookEvent({ event: 'user-prompt-submitted', projectId: turn.input.projectId });
 
-      if (turn.input.operation !== 'compaction' && options.prepareProviderRequest) {
+      if (!imageGeneration && turn.input.operation !== 'compaction' && options.prepareProviderRequest) {
         options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
         const attachmentPreparation = Promise.resolve().then(() =>
           options.prepareProviderRequest!(turn.input, request, controller.signal, providerStateOwner));
@@ -908,6 +916,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
 
       let toolRounds = 0;
       let totalToolResultBytes = 0;
+      let generatedArtifactId: string | undefined;
       for (;;) {
         await flushTurnPersistence();
         if (controller.signal.aborted) throw abortError();
@@ -958,7 +967,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         }
         options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
         stopState.streamConfirmed = false;
-        iterator = options.provider.stream(request, controller.signal)[Symbol.asyncIterator]();
+        iterator = (imageGeneration ?? options.provider.stream(request, controller.signal))[Symbol.asyncIterator]();
         let completed = false;
         let completedFunctionsStateId: string | undefined;
         let functionCall: ProviderFunctionCall | null = null;
@@ -1040,8 +1049,14 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
             if (rawEvent.category === 'cancel') throw abortError();
             throw Object.assign(new Error('PROVIDER_ERROR'), { category: rawEvent.category });
           } else if (rawEvent.type === 'function-call') {
+            if (imageGeneration) throw Object.assign(new Error('IMAGE_GENERATION_FUNCTION_CALL'), { category: 'protocol' as const });
             if (completed || functionCall) throw new Error('PROVIDER_PROTOCOL');
             functionCall = rawEvent.functionCall;
+          } else if (rawEvent.type === 'image-result') {
+            if (!imageGeneration || generatedArtifactId !== undefined) {
+              throw Object.assign(new Error('IMAGE_GENERATION_RESULT_INVALID'), { category: 'protocol' as const });
+            }
+            generatedArtifactId = rawEvent.artifactId;
           } else {
             completed = true;
             if (rawEvent.functionsStateId) completedFunctionsStateId = rawEvent.functionsStateId;
@@ -1191,7 +1206,9 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           continue;
         }
 
-        if (!completed || !answer.trim()) throw new Error('INCOMPLETE_PROVIDER_RESPONSE');
+        if (!completed || (imageGeneration ? generatedArtifactId === undefined : !answer.trim())) {
+          throw Object.assign(new Error('INCOMPLETE_PROVIDER_RESPONSE'), { category: 'protocol' as const });
+        }
         if (!(await confirmStop(turn, iterator, pendingNext, naturallyDone))) {
           controller.abort();
           flushDraft();
@@ -1223,7 +1240,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
                 await runHookEvent({ event: 'after-compaction', projectId: turn.input.projectId }, new AbortController().signal, turn.input, terminalTurn).catch(() => undefined);
               })
             : Promise.reject(new Error('COMPACTION_SAVE_UNAVAILABLE'))
-          : options.appendAssistant(turn.input, answer, controller.signal, completedFunctionsStateId, terminalTurn, providerStateOwner);
+          : options.appendAssistant(turn.input, answer, controller.signal, completedFunctionsStateId, terminalTurn,
+            providerStateOwner, generatedArtifactId);
         const appending = appendOperation.catch((error: unknown) => {
           if (isAbortError(error)) throw error;
           throw Object.assign(new Error('ASSISTANT_SAVE_FAILED'), { category: 'storage' as const });

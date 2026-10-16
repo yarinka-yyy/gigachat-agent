@@ -417,6 +417,7 @@ export type ProviderEvent =
   | { type: 'activity'; activity: 'connecting' | 'receiving' | 'waiting-for-tool' | 'tool-started' | 'tool-finished' | 'function-progress'; tool?: ProviderToolName; functionName?: 'get_file_content' | 'text2image'; detail?: string }
   | ({ type: 'usage' } & ProviderUsageValues)
   | { type: 'text-delta'; text: string }
+  | { type: 'image-result'; artifactId: string }
   | { type: 'function-call'; functionCall: ProviderFunctionCall }
   | { type: 'completed'; responseId?: string; functionsStateId?: string }
   | { type: 'error'; category: ProviderErrorCategory; retryable: boolean };

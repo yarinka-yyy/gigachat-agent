@@ -20,6 +20,7 @@ import { createSecureStore } from './secure-store';
 import { createGigaChatProvider, createHttpsTransport, GIGACHAT_ROOT_CA_SHA256, GigaChatProviderError, type GigaChatProviderConnection, type ProviderTransport } from './gigachat-provider';
 import { prepareTurnAttachments } from './attachments';
 import { attachmentConnectionBlocker, attachmentContentType, attachmentSendBlocker, inspectLocalAttachmentContent, PROVIDER_IMAGE_LIMIT_BYTES } from './attachment-policy';
+import { createImageGenerationStream, IMAGE_GENERATION_MODEL_ID, IMAGE_RECOVERY_REQUIRED_MESSAGE, type GeneratedImageDimensions } from './image-generation';
 import { createOnboardingBrowser, type BrowserBounds } from './onboarding-browser';
 import { createEmbeddedBrowser } from './embedded-browser';
 import { createNumberedProjectFolder, prepareProjectFolders, removeEmptyCreatedFolder } from './project-folders';
@@ -110,6 +111,20 @@ function titleBarColors(): { color: string; symbolColor: string } {
   if (theme === 'dark') return { color: '#151719', symbolColor: '#e9ebed' };
   if (theme === 'warm') return { color: '#f3ead7', symbolColor: '#382f20' };
   return { color: '#dce5e7', symbolColor: '#18343b' };
+}
+
+function validateGeneratedImageWithNativeImage(
+  bytes: Uint8Array,
+  dimensions: GeneratedImageDimensions,
+): void {
+  const image = nativeImage.createFromBuffer(Buffer.from(bytes), { scaleFactor: 1 });
+  if (image.isEmpty()) throw new Error('IMAGE_NATIVE_DECODE');
+  const decodedSize = image.getSize();
+  if (decodedSize.width !== dimensions.width || decodedSize.height !== dimensions.height) {
+    throw new Error('IMAGE_NATIVE_DIMENSIONS');
+  }
+  const bitmap = image.toBitmap();
+  if (bitmap.byteLength !== dimensions.width * dimensions.height * 4) throw new Error('IMAGE_NATIVE_BITMAP');
 }
 
 function syncTitleBarOverlay(): void {
@@ -758,6 +773,16 @@ async function createMainRuntime(
     validateRetry: async (turn, original) => {
       await store.validateAcceptedTurn(turn);
       await store.getMessagesThrough(turn.chatId, turn.messageId);
+      const retryChat = await store.getChat(original.chatId);
+      if (retryChat.kind === 'image') {
+        const owner = await captureProviderStateOwner(providerStateScopeGuard, () => secureStore.load(), new AbortController().signal);
+        assertProviderStateOwner(owner, providerStateScopeGuard);
+        const imageRows = await store.getProviderGeneratedImageEntries(owner.accountScope);
+        assertProviderStateOwner(owner, providerStateScopeGuard);
+        if (imageRows.some((row) => row.chatId === original.chatId && row.anchorMessageId === original.messageId)) {
+          throw new Error(IMAGE_RECOVERY_REQUIRED_MESSAGE);
+        }
+      }
       if (providerConnection.getConnectionStatus().state !== 'connected') {
         throw new Error('Подключите GigaChat перед повтором этого хода.');
       }
@@ -807,11 +832,21 @@ async function createMainRuntime(
       if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
       await store.validateAcceptedTurn(turn);
       const detail = await store.getChat(turn.chatId);
+      const imageChat = detail.kind === 'image';
+      if (imageChat) {
+        if (turn.operation || turn.modelId !== IMAGE_GENERATION_MODEL_ID) {
+          throw new Error('Для генерации изображения выберите GigaChat Ultra. Выбор модели не изменён.');
+        }
+      }
       const compactionPrefix = turn.operation === 'compaction'
         ? await store.getCompactionPrefix(turn.chatId, turn.compactBoundaryMessageId)
         : null;
       const messages = compactionPrefix?.messages ?? await store.getMessagesThrough(turn.chatId, turn.messageId);
       const protocolHistory = compactionPrefix?.protocolHistory ?? await store.getToolProtocolThrough(turn.chatId, turn.messageId);
+      if (imageChat && (turn.attachmentIds?.length
+        || messages.some((message) => message.role === 'user' && message.attachmentIds?.length))) {
+        throw new Error('Генерация изображения не использует вложения этого хода или предыдущих сообщений.');
+      }
       if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
       assertProviderStateOwner(providerStateOwner, providerStateScopeGuard, signal);
       const providerStateOwnership = await store.getProviderStateOwnership(turn.chatId, providerStateOwner.accountScope);
@@ -834,6 +869,7 @@ async function createMainRuntime(
           usageKind: 'compaction' as const,
           functionCallMode: 'none' as const,
         } : {}),
+        ...(imageChat ? { functionCallMode: 'none' as const } : {}),
       }, {
         providerStateFilter: {
           detail,
@@ -856,6 +892,25 @@ async function createMainRuntime(
         };
       }
       assertProviderStateOwner(providerStateOwner, providerStateScopeGuard, signal);
+      if (imageChat) {
+        if (context.request.protocolHistory?.length || context.request.attachments?.length) {
+          throw new Error('Генерация изображения не поддерживает историю локальных инструментов или вложений.');
+        }
+        return {
+          request: context.request,
+          providerStateOwner,
+          imageGeneration: createImageGenerationStream({
+            store,
+            provider: providerConnection,
+            owner: providerStateOwner,
+            turn,
+            request: context.request,
+            signal,
+            assertCurrent: (currentSignal) => assertProviderStateOwner(providerStateOwner, providerStateScopeGuard, currentSignal),
+            validateDecodedImage: (bytes, _contentType, dimensions) => validateGeneratedImageWithNativeImage(bytes, dimensions),
+          }),
+        };
+      }
       return { request: context.request, providerStateOwner };
     },
     assertProviderStateOwner: (owner, signal) => assertProviderStateOwner(owner, providerStateScopeGuard, signal),
@@ -883,10 +938,10 @@ async function createMainRuntime(
         wire || receipt.functionsStateId ? owner.accountScope : undefined, wire);
     },
     completeToolReceipt: (turn, receiptId, status, result) => store.completeToolReceipt(turn.chatId, turn.messageId, receiptId, status, result),
-    appendAssistant: async (turn, text, signal, functionsStateId, terminalTurn, owner) => {
+    appendAssistant: async (turn, text, signal, functionsStateId, terminalTurn, owner, generatedArtifactId) => {
       assertProviderStateOwner(owner, providerStateScopeGuard, signal);
       await store.appendAssistantMessageFromRuntime(turn, text, terminalTurn, signal, functionsStateId,
-        functionsStateId ? owner.accountScope : undefined);
+        functionsStateId || generatedArtifactId ? owner?.accountScope : undefined, generatedArtifactId);
     },
     appendCompaction: async (turn, text, signal, context: PreparedCompactionContext, terminalTurn,
       functionsStateId, owner) => {
