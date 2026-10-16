@@ -115,12 +115,13 @@ const MODEL_CAPABILITIES: Readonly<Record<string, Readonly<ModelCapabilities>>> 
     functionCalls: 'verified',
     localRead: 'verified',
     txt: 'verified',
+    md: 'verified',
     usage: 'verified',
     png: 'unavailable',
     evidence: {
-      source: 'app/.qa/post-api-011/results-04c31349-0b7a-416b-8d67-49863e200376.jsonl; plans/011-model-evidence.md',
-      verifiedAt: '2026-10-12',
-      details: 'Реальная проверка: ответ, локальное чтение, TXT и расход токенов подтверждены. PDF и PNG этим запуском не подтверждены; PNG-запрос отклонён с HTTP 422.',
+      source: 'app/.qa/post-api-011/results-04c31349-0b7a-416b-8d67-49863e200376.jsonl; plans/011-model-evidence.md; app/.qa/post-api-011/stage3-v2-production-md-current-probe.cjs (7DAC9DACEA7E38BB; 2026-10-16)',
+      verifiedAt: '2026-10-16',
+      details: 'Реальная проверка подтвердила ответ, локальное чтение, TXT и расход токенов. Отдельный Markdown text/plain probe подтвердил первый ответ и продолжение после сохранения и повторного открытия чата. PDF, JPEG и несколько изображений не проверялись; PNG недоступен после HTTP 422.',
     },
   },
 };

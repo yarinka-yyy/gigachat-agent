@@ -97,11 +97,14 @@ test('keeps document and JPEG capability evidence separate and per-model', () =>
   const ultra = getModelCapabilities('GigaChat-3-Ultra');
   assert.equal(ultra.md, 'verified', 'the real Ultra probe semantically read the Markdown text/plain fixture');
   assert.equal(ultra.jpeg, 'verified', 'the supplemental real Ultra probe identified the JPEG fixture');
-  for (const modelId of ['GigaChat-2-Max', 'GigaChat-3-Pro', 'GigaChat-3-Lightning']) {
+  for (const modelId of ['GigaChat-2-Max', 'GigaChat-3-Pro']) {
     const capabilities = getModelCapabilities(modelId);
     assert.equal(capabilities.md, 'unverified', `${modelId} has no separate Markdown proof`);
     assert.equal(capabilities.jpeg, 'unverified', `${modelId} has no separate JPEG proof`);
   }
+  const lite = getModelCapabilities('GigaChat-3-Lightning');
+  assert.equal(lite.md, 'verified', 'the current Lite probe passed Markdown first-turn and persisted follow-up reading');
+  assert.equal(lite.jpeg, 'unverified', 'the Markdown probe does not verify JPEG reading');
   assert.equal('multipleImages' in ultra, false, 'a single-image proof does not establish grouped multi-image capability');
 });
 
@@ -181,16 +184,27 @@ test('real Stage1 evidence gates file formats independently from the verified ch
   const max = getModelCapabilities('GigaChat-2-Max');
   const pro = getModelCapabilities('GigaChat-3-Pro');
   const lite = getModelCapabilities('GigaChat-3-Lightning');
-  for (const capabilities of [max, pro, lite]) {
+  for (const capabilities of [max, pro]) {
     assert.equal(basicAgentWorkflowStatus(capabilities), 'verified');
     assert.equal(capabilities.txt, 'verified');
     assert.equal(capabilities.pdf, 'unverified', 'HTTP 200 with an ambiguous OCR marker does not verify PDF reading');
-  }
-  assert.equal(max.png, 'unverified', 'a rectangle answer does not match the square image check');
-  assert.equal(pro.png, 'unverified', 'a rectangle answer does not match the square image check');
-  assert.equal(lite.png, 'unavailable', 'this PNG request was rejected with HTTP 422');
-  for (const capabilities of [max, pro, lite]) {
+    assert.equal(capabilities.md, 'unverified');
+    assert.equal(capabilities.jpeg, 'unverified');
     assert.match(capabilities.evidence.source, /results-04c31349-0b7a-416b-8d67-49863e200376\.jsonl/);
     assert.equal(capabilities.evidence.verifiedAt, '2026-10-12');
   }
+  assert.equal(max.png, 'unverified', 'a rectangle answer does not match the square image check');
+  assert.equal(pro.png, 'unverified', 'a rectangle answer does not match the square image check');
+  assert.equal(basicAgentWorkflowStatus(lite), 'verified');
+  assert.equal(lite.txt, 'verified');
+  assert.equal(lite.md, 'verified');
+  assert.equal(lite.jpeg, 'unverified');
+  assert.equal(lite.pdf, 'unverified', 'the Markdown probe does not establish PDF reading');
+  assert.equal(lite.png, 'unavailable', 'this PNG request was rejected with HTTP 422');
+  assert.match(lite.evidence.source, /results-04c31349-0b7a-416b-8d67-49863e200376\.jsonl/);
+  assert.match(lite.evidence.source, /stage3-v2-production-md-current-probe\.cjs \(7DAC9DACEA7E38BB; 2026-10-16\)/);
+  assert.equal(lite.evidence.verifiedAt, '2026-10-16');
+  assert.match(lite.evidence.details, /Markdown text\/plain.*первый ответ и продолжение/i);
+  assert.match(lite.evidence.details, /PDF, JPEG.*несколько изображений не проверялись/i);
+  assert.match(lite.evidence.details, /PNG недоступен.*HTTP 422/i);
 });

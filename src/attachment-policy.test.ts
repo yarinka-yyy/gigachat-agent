@@ -54,6 +54,27 @@ test('main send gate requires per-model evidence and keeps unsupported attachmen
   assert.match(attachmentSendBlocker(null, 'Прочитай', [file('notes.txt')]) ?? '', /выберите модель/i);
 });
 
+test('Lite Markdown is enabled by its own probe while other document and image gates stay closed', () => {
+  const hash = 'c'.repeat(64);
+  const file = (name: string, size = 10, sha256 = hash) => ({ name, size, sha256 });
+  const markdown = file('notes.md');
+  assert.equal(attachmentSendBlocker('GigaChat-3-Lightning', 'Прочитай', [markdown]), null);
+  for (const modelId of ['GigaChat-2-Max', 'GigaChat-3-Pro']) {
+    assert.match(attachmentSendBlocker(modelId, 'Прочитай', [markdown]) ?? '', /ещё не прошёл проверку/i);
+  }
+  assert.notEqual(attachmentSendBlocker('future/model-v5', 'Прочитай', [markdown]), null,
+    'an unknown model remains blocked without a verified basic workflow');
+  assert.match(attachmentSendBlocker('GigaChat-3-Lightning', 'Прочитай', [file('report.pdf')]) ?? '', /ещё не прошёл проверку/i);
+  assert.match(attachmentSendBlocker('GigaChat-3-Lightning', 'Опиши', [file('photo.jpeg')]) ?? '', /ещё не прошёл проверку/i);
+  assert.match(attachmentSendBlocker('GigaChat-3-Lightning', 'Опиши', [file('image.png')]) ?? '', /не поддерживает/i);
+  assert.match(attachmentSendBlocker('GigaChat-3-Lightning', 'Прочитай', [file('empty.md', 0)]) ?? '', /пуст/i);
+  assert.match(attachmentSendBlocker('GigaChat-3-Lightning', 'Прочитай',
+    [file('oversize.md', LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES + 1)]) ?? '', /изменилась или не прошла проверку/i);
+  assert.match(attachmentSendBlocker('GigaChat-3-Lightning', 'Прочитай', [file('corrupt.md', 10, 'invalid')]) ?? '',
+    /изменилась или не прошла проверку/i);
+  assert.throws(() => inspectLocalAttachmentContent('corrupt.md', Uint8Array.from([0xff])), /UTF-8/i);
+});
+
 test('empty files remain staged instead of being accepted before upload rejects them', () => {
   const empty = { name: 'empty.txt', size: 0, sha256: 'c'.repeat(64) };
   assert.match(attachmentSendBlocker('GigaChat-2-Max', '', [empty]) ?? '', /пуст/i);
