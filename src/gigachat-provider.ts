@@ -4,7 +4,7 @@ import { type ClientRequest, type IncomingHttpHeaders, type IncomingMessage } fr
 import { Agent, request as httpsRequest } from 'node:https';
 import { isDeepStrictEqual } from 'node:util';
 import * as tls from 'node:tls';
-import type { BalanceFamilyId, GigaChatProvider, ModelRegistrySnapshot, ProviderAttachmentReference, ProviderBalanceObservation, ProviderConnectionSnapshot, ProviderErrorCategory, ProviderEvent, ProviderFileRecord, ProviderFileUploadInput, ProviderFunctionCall, ProviderProtocolExchange, ProviderTurnRequest, ProviderUsageValues, ProviderV2FunctionWire } from './contracts';
+import type { BalanceFamilyId, GigaChatProvider, InstructionLayer, ModelRegistrySnapshot, ProviderAttachmentReference, ProviderBalanceObservation, ProviderConnectionSnapshot, ProviderErrorCategory, ProviderEvent, ProviderFileRecord, ProviderFileUploadInput, ProviderFunctionCall, ProviderProtocolExchange, ProviderTurnRequest, ProviderUsageValues, ProviderV2FunctionWire } from './contracts';
 import { discoveredModelRegistry, failedModelRegistry, isModelAvailable, requireModelId, unavailableModelRegistry, type GigaChatModelId } from './models';
 import { billingFamilyForUsageLabel, CHAT_MODEL_FAMILIES, isChatModelAvailable } from './model-catalog';
 import { attachmentContentType, inspectLocalAttachmentContent, LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES, PROVIDER_MEDIA_LIMIT_BYTES, PROVIDER_REQUEST_LIMIT_BYTES } from './attachment-policy';
@@ -21,7 +21,12 @@ const MAX_TOKEN_CHARS = 16 * 1024;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_RESPONSE_EVENT_COUNT = 4096;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const MAX_REQUEST_TIMEOUT_MS = 90_000;
 const MAX_FUNCTION_ARGUMENT_BYTES = 1_900_000;
+const IMAGE_GENERATION_MODEL_ID = 'GigaChat-3-Ultra';
+const IMAGE_GENERATION_TIMEOUT_MS = 90_000;
+const MAX_GENERATED_IMAGE_BYTES = Math.min(LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES);
+const MAX_GENERATED_IMAGE_TEXT_BYTES = 16_000;
 export const MAX_PROVIDER_REQUEST_BYTES = PROVIDER_REQUEST_LIMIT_BYTES;
 
 const GIGACHAT_FUNCTIONS: readonly Record<string, unknown>[] = [
@@ -40,6 +45,7 @@ export interface ProviderTransportRequest {
   body?: string | Uint8Array;
   signal: AbortSignal;
   streaming?: boolean;
+  timeoutMs?: number;
 }
 
 export interface ProviderTransportResponse {
@@ -60,6 +66,26 @@ export interface SerializedProviderTurnRequest {
   textInputs: string[];
   functionSchemaBytes: number;
 }
+
+export interface ProviderImageGenerationRequest {
+  modelId: GigaChatModelId;
+  system: InstructionLayer[];
+  messages: Array<{ role: 'user' | 'assistant'; text: string }>;
+}
+
+export interface ProviderGeneratedImage {
+  fileId: string;
+  contentType: 'image/jpeg' | 'image/png';
+  assistantText?: string;
+  functionsStateId?: string;
+  responseId?: string;
+}
+
+export type ProviderImageGenerationEvent =
+  | { type: 'usage'; usage: ProviderUsageValues }
+  | { type: 'generated-image'; image: ProviderGeneratedImage }
+  | { type: 'completed' }
+  | { type: 'error'; category: ProviderErrorCategory; retryable: boolean };
 
 export function serializeProviderTurnRequest(request: ProviderTurnRequest): SerializedProviderTurnRequest {
   let modelId: string;
@@ -249,6 +275,8 @@ export interface GigaChatProviderConnection extends GigaChatProvider {
   uploadFile(input: ProviderFileUploadInput, signal: AbortSignal): Promise<ProviderFileRecord>;
   listFiles(signal: AbortSignal): Promise<ProviderFileRecord[]>;
   deleteFile(id: string, signal: AbortSignal): Promise<void>;
+  generateImage(request: ProviderImageGenerationRequest, signal: AbortSignal): AsyncIterable<ProviderImageGenerationEvent>;
+  downloadGeneratedImage(fileId: string, contentType: 'image/jpeg' | 'image/png', signal: AbortSignal): Promise<Uint8Array>;
   countTokens(modelId: GigaChatModelId, input: readonly string[], signal: AbortSignal): Promise<ProviderTokenCount[]>;
 }
 
@@ -314,10 +342,16 @@ export function createHttpsTransport(options: {
     keepAlive: true,
     ...(authorities.length ? { ca: [...new Set(authorities)] } : {}),
   });
-  const timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const defaultTimeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
   return {
     request(requestOptions) {
+      const requestTimeoutMs = requestOptions.timeoutMs;
+      if (requestTimeoutMs !== undefined && (!Number.isSafeInteger(requestTimeoutMs)
+        || requestTimeoutMs < 1 || requestTimeoutMs > MAX_REQUEST_TIMEOUT_MS)) {
+        return Promise.reject(new GigaChatProviderError('protocol'));
+      }
+      const timeoutMs = requestTimeoutMs ?? defaultTimeoutMs;
       let url: URL;
       try { url = new URL(requestOptions.url); }
       catch { return Promise.reject(new GigaChatProviderError('protocol')); }
@@ -753,6 +787,105 @@ export function createGigaChatProvider(options: {
     } finally { operation.dispose(); }
   };
 
+  const generateImage = async function* (
+    request: ProviderImageGenerationRequest,
+    signal: AbortSignal,
+  ): AsyncGenerator<ProviderImageGenerationEvent> {
+    const operationGeneration = generation;
+    const operation = linkAbortSignals(sessionController.signal, signal);
+    let response: ProviderTransportResponse | null = null;
+    let cancelResponseOnAbort: (() => void) | null = null;
+    try {
+      assertCurrent(operationGeneration, operation.controller.signal);
+      const body = serializeImageGenerationRequest(request);
+      if (connectionStatus.state !== 'connected') throw new GigaChatProviderError('auth');
+      if (exhaustedModelIds.has(IMAGE_GENERATION_MODEL_ID)) throw new GigaChatProviderError('quota');
+      if (!isChatModelAvailable(getModelRegistry(), IMAGE_GENERATION_MODEL_ID)) throw new GigaChatProviderError('model');
+      response = await requestWithAuthRetry((tokenValue) => ({
+        url: GIGACHAT_V2_CHAT_COMPLETIONS_URL,
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${tokenValue}`,
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body,
+        signal: operation.controller.signal,
+        timeoutMs: IMAGE_GENERATION_TIMEOUT_MS,
+      }), operation.controller.signal, operationGeneration);
+      if (response.statusCode !== 200) throw statusError(response.statusCode);
+      if (!isJsonContentType(response.headers)) throw new GigaChatProviderError('protocol');
+      cancelResponseOnAbort = () => response?.cancel();
+      operation.controller.signal.addEventListener('abort', cancelResponseOnAbort, { once: true });
+
+      const value = await readJsonResponse(response, operation.controller.signal);
+      assertCurrent(operationGeneration, operation.controller.signal);
+      const usage = parseProviderUsage(value);
+      if (usage.values && hasKnownProviderUsage(usage.values)) yield { type: 'usage', usage: usage.values };
+
+      const parsed = parseImageGenerationResponse(value, IMAGE_GENERATION_MODEL_ID);
+      yield { type: 'generated-image', image: parsed.image };
+      if (parsed.finishReason === 'context' || parsed.finishReason === 'model') {
+        throw new GigaChatProviderError(parsed.finishReason);
+      }
+      if (parsed.toolFailed) throw new GigaChatProviderError('tool');
+      if (usage.invalid) throw new GigaChatProviderError('protocol');
+      if (parsed.finishReason !== 'stop') throw new GigaChatProviderError('protocol');
+      assertCurrent(operationGeneration, operation.controller.signal);
+      yield { type: 'completed' };
+    } catch (error) {
+      const normalized = error instanceof GigaChatProviderError
+        ? error : transportError(error, operation.controller.signal);
+      yield { type: 'error', category: normalized.category, retryable: normalized.retryable };
+    } finally {
+      if (cancelResponseOnAbort) operation.controller.signal.removeEventListener('abort', cancelResponseOnAbort);
+      response?.cancel();
+      operation.dispose();
+    }
+  };
+
+  const downloadGeneratedImage = async (
+    fileId: string,
+    contentType: 'image/jpeg' | 'image/png',
+    signal: AbortSignal,
+  ): Promise<Uint8Array> => {
+    const operationGeneration = generation;
+    const operation = linkAbortSignals(sessionController.signal, signal);
+    let response: ProviderTransportResponse | null = null;
+    let cancelResponseOnAbort: (() => void) | null = null;
+    try {
+      if (connectionStatus.state !== 'connected' || !isSafeRemoteFileId(fileId)
+        || (contentType !== 'image/jpeg' && contentType !== 'image/png')) throw new GigaChatProviderError('protocol');
+      assertCurrent(operationGeneration, operation.controller.signal);
+      response = await requestWithAuthRetry((tokenValue) => ({
+        url: `${GIGACHAT_API_BASE_URL}/files/${encodeURIComponent(fileId)}/content`,
+        method: 'GET',
+        headers: { Authorization: `Bearer ${tokenValue}`, Accept: 'application/jpg' },
+        signal: operation.controller.signal,
+      }), operation.controller.signal, operationGeneration);
+      if (response.statusCode !== 200) throw statusError(response.statusCode);
+      if (!isCompatibleImageContentType(response.headers, contentType)) throw new GigaChatProviderError('protocol');
+
+      const length = readContentLength(response.headers);
+      if (length !== null && length > MAX_GENERATED_IMAGE_BYTES) throw new GigaChatProviderError('context');
+      cancelResponseOnAbort = () => response?.cancel();
+      operation.controller.signal.addEventListener('abort', cancelResponseOnAbort, { once: true });
+      const bytes = await readGeneratedImageBytes(response, operation.controller.signal,
+        () => assertCurrent(operationGeneration, operation.controller.signal));
+      if (bytes.byteLength === 0 || length !== null && length !== bytes.byteLength) throw new GigaChatProviderError('protocol');
+      const inspected = inspectGeneratedImageContent(contentType, bytes);
+      if (!inspected) throw new GigaChatProviderError('protocol');
+      assertCurrent(operationGeneration, operation.controller.signal);
+      return bytes;
+    } catch (error) {
+      throw error instanceof GigaChatProviderError ? error : transportError(error, operation.controller.signal);
+    } finally {
+      if (cancelResponseOnAbort) operation.controller.signal.removeEventListener('abort', cancelResponseOnAbort);
+      response?.cancel();
+      operation.dispose();
+    }
+  };
+
   const getBalance = async (signal?: AbortSignal): Promise<ProviderBalanceObservation> => {
     const operationGeneration = generation;
     const operation = linkAbortSignals(sessionController.signal, ...(signal ? [signal] : []));
@@ -1018,6 +1151,8 @@ export function createGigaChatProvider(options: {
     uploadFile,
     listFiles,
     deleteFile,
+    generateImage,
+    downloadGeneratedImage,
     listModels: async (signal) => {
       const discoveryGeneration = ++modelRegistryGeneration;
       const operationGeneration = generation;
@@ -1120,6 +1255,206 @@ async function readJsonResponse(response: ProviderTransportResponse, signal: Abo
   } finally {
     signal.removeEventListener('abort', cancelOnAbort);
   }
+}
+
+function serializeImageGenerationRequest(value: unknown): string {
+  try {
+    if (!isRecord(value) || Object.keys(value).some((key) => !['modelId', 'system', 'messages'].includes(key))) {
+      throw new GigaChatProviderError('protocol');
+    }
+    let modelId: string;
+    try { modelId = requireModelId(value.modelId); }
+    catch { throw new GigaChatProviderError('model'); }
+    if (modelId !== IMAGE_GENERATION_MODEL_ID) throw new GigaChatProviderError('model');
+    if (!Array.isArray(value.system) || !Array.isArray(value.messages) || value.messages.length < 1) {
+      throw new GigaChatProviderError('protocol');
+    }
+
+    const systemPrompt = value.system.map((layer: unknown) => {
+      if (!isRecord(layer) || Object.keys(layer).some((key) => !['source', 'label', 'scope', 'text'].includes(key))
+        || !['runtime', 'global', 'project', 'skill', 'summary'].includes(String(layer.source))
+        || typeof layer.label !== 'string' || layer.label.length < 1 || hasControlCharacters(layer.label)
+        || typeof layer.text !== 'string'
+        || layer.scope !== undefined && (typeof layer.scope !== 'string' || hasControlCharacters(layer.scope))) {
+        throw new GigaChatProviderError('protocol');
+      }
+      return `[${layer.label}]\n${layer.text}`;
+    }).join('\n\n');
+
+    let hasUser = false;
+    const messages = value.messages.map((message: unknown) => {
+      if (!isRecord(message) || Object.keys(message).some((key) => !['role', 'text'].includes(key))
+        || (message.role !== 'user' && message.role !== 'assistant') || typeof message.text !== 'string') {
+        throw new GigaChatProviderError('protocol');
+      }
+      if (message.role === 'user') hasUser = true;
+      return { role: message.role, content: [{ text: message.text }] };
+    });
+    const lastMessage = value.messages[value.messages.length - 1];
+    if (!hasUser || !isRecord(lastMessage) || lastMessage.role !== 'user'
+      || typeof lastMessage.text !== 'string' || !lastMessage.text.trim()) throw new GigaChatProviderError('protocol');
+
+    const body = JSON.stringify({
+      model: IMAGE_GENERATION_MODEL_ID,
+      messages: [
+        ...(systemPrompt ? [{ role: 'system', content: [{ text: systemPrompt }] }] : []),
+        ...messages,
+      ],
+      tools: [{ image_generate: {} }],
+      tool_config: { mode: 'forced', tool_name: 'image_generate' },
+      model_options: { parallel_tool_calls: false, max_tokens: 128 },
+      stream: false,
+    });
+    if (Buffer.byteLength(body, 'utf8') > MAX_PROVIDER_REQUEST_BYTES) throw new GigaChatProviderError('context');
+    return body;
+  } catch (error) {
+    if (error instanceof GigaChatProviderError) throw error;
+    throw new GigaChatProviderError('protocol');
+  }
+}
+
+interface ParsedImageGenerationResponse {
+  image: ProviderGeneratedImage;
+  finishReason: string | null | undefined;
+  toolFailed: boolean;
+}
+
+function parseImageGenerationResponse(value: unknown, requestedModelId: string): ParsedImageGenerationResponse {
+  if (!isRecord(value)) throw new GigaChatProviderError('protocol');
+  const withoutUsage = { ...value, usage: undefined };
+  const metadata = parseV2Metadata(withoutUsage, requestedModelId);
+  if (!metadata.model || value.thread_id !== undefined && value.id !== undefined && value.thread_id !== value.id) {
+    throw new GigaChatProviderError('protocol');
+  }
+  if (!Array.isArray(value.messages) || value.messages.length !== 1 || !isRecord(value.messages[0])) {
+    throw new GigaChatProviderError('protocol');
+  }
+  const message = value.messages[0];
+  if (message.role !== 'assistant' || !Array.isArray(message.content) || message.content.length < 1 || message.content.length > 16
+    || Object.keys(message).some((key) => !['role', 'message_id', 'tool_state_id', 'content'].includes(key))) {
+    throw new GigaChatProviderError('protocol');
+  }
+  if (message.message_id !== undefined && !safeProviderIdentity(message.message_id)) throw new GigaChatProviderError('protocol');
+  if (message.tool_state_id !== undefined && !isProviderStateId(message.tool_state_id)) throw new GigaChatProviderError('protocol');
+
+  let file: ProviderGeneratedImage | null = null;
+  let text = '';
+  let toolExecutionSeen = false;
+  let toolFailed = false;
+  for (const part of message.content) {
+    if (!isRecord(part) || Object.keys(part).length === 0
+      || Object.keys(part).some((key) => !['text', 'files', 'tool_execution'].includes(key))) {
+      throw new GigaChatProviderError('protocol');
+    }
+    if (Object.prototype.hasOwnProperty.call(part, 'text')) {
+      if (typeof part.text !== 'string') throw new GigaChatProviderError('protocol');
+      text += part.text;
+      if (Buffer.byteLength(text, 'utf8') > MAX_GENERATED_IMAGE_TEXT_BYTES) throw new GigaChatProviderError('protocol');
+    }
+    if (Object.prototype.hasOwnProperty.call(part, 'files')) {
+      if (!Array.isArray(part.files) || part.files.length !== 1 || file !== null || !isRecord(part.files[0])) {
+        throw new GigaChatProviderError('protocol');
+      }
+      const row = part.files[0];
+      if (Object.keys(row).some((key) => !['id', 'mime', 'target'].includes(key))
+        || !isSafeRemoteFileId(row.id) || (row.mime !== 'image/jpeg' && row.mime !== 'image/png') || row.target !== 'image') {
+        throw new GigaChatProviderError('protocol');
+      }
+      file = {
+        fileId: row.id,
+        contentType: row.mime,
+        ...(text ? { assistantText: text } : {}),
+        ...(typeof message.tool_state_id === 'string' ? { functionsStateId: message.tool_state_id } : {}),
+        ...(metadata.threadId ? { responseId: metadata.threadId } : {}),
+      };
+    }
+    if (Object.prototype.hasOwnProperty.call(part, 'tool_execution')) {
+      if (toolExecutionSeen || !isRecord(part.tool_execution)) throw new GigaChatProviderError('protocol');
+      toolExecutionSeen = true;
+      const execution = part.tool_execution;
+      if (Object.keys(execution).some((key) => !['name', 'status', 'seconds_left', 'censored'].includes(key))
+        || execution.name !== undefined && !safeProviderIdentity(execution.name)
+        || execution.status !== undefined && execution.status !== 'success' && execution.status !== 'fail'
+        || execution.seconds_left !== undefined && (!Number.isSafeInteger(execution.seconds_left)
+          || (execution.seconds_left as number) < 0 || (execution.seconds_left as number) > 3600)
+        || execution.censored !== undefined && typeof execution.censored !== 'boolean') {
+        throw new GigaChatProviderError('protocol');
+      }
+      toolFailed = execution.status === 'fail' || execution.censored === true;
+    }
+  }
+  if (!file) throw new GigaChatProviderError('protocol');
+  if (text) file.assistantText = text;
+  return { image: file, finishReason: value.finish_reason as string | null | undefined, toolFailed };
+}
+
+function responseHeaderValue(headers: ProviderTransportResponse['headers'], name: string): string | null {
+  const source = headers as Record<string, string | string[] | undefined>;
+  const value = source[name.toLowerCase()] ?? source[name];
+  if (value === undefined) return null;
+  if (Array.isArray(value)) {
+    if (value.length !== 1 || typeof value[0] !== 'string') throw new GigaChatProviderError('protocol');
+    return value[0];
+  }
+  if (typeof value !== 'string') throw new GigaChatProviderError('protocol');
+  return value;
+}
+
+function responseMediaType(headers: ProviderTransportResponse['headers']): string | null {
+  const value = responseHeaderValue(headers, 'content-type');
+  return value === null ? null : value.split(';', 1)[0]!.trim().toLowerCase();
+}
+
+function isJsonContentType(headers: ProviderTransportResponse['headers']): boolean {
+  return responseMediaType(headers) === 'application/json';
+}
+
+function isCompatibleImageContentType(headers: ProviderTransportResponse['headers'], expected: string): boolean {
+  const mediaType = responseMediaType(headers);
+  return mediaType === expected || mediaType === 'application/octet-stream';
+}
+
+function readContentLength(headers: ProviderTransportResponse['headers']): number | null {
+  const value = responseHeaderValue(headers, 'content-length');
+  if (value === null) return null;
+  if (!/^\d{1,16}$/.test(value)) throw new GigaChatProviderError('protocol');
+  const length = Number(value);
+  if (!Number.isSafeInteger(length)) throw new GigaChatProviderError('protocol');
+  return length;
+}
+
+async function readGeneratedImageBytes(
+  response: ProviderTransportResponse,
+  signal: AbortSignal,
+  assertCurrentOperation: () => void,
+): Promise<Uint8Array> {
+  const read = async (): Promise<Buffer> => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    try {
+      for await (const chunk of response.body) {
+        assertCurrentOperation();
+        if (!(chunk instanceof Uint8Array)) throw new GigaChatProviderError('protocol');
+        if (chunk.byteLength === 0) continue;
+        if (size + chunk.byteLength > MAX_GENERATED_IMAGE_BYTES) {
+          throw new GigaChatProviderError('context');
+        }
+        size += chunk.byteLength;
+        chunks.push(Buffer.from(chunk));
+      }
+    } catch (error) {
+      if (error instanceof GigaChatProviderError) throw error;
+      throw transportError(error, signal);
+    }
+    return Buffer.concat(chunks, size);
+  };
+  return awaitWithAbort(read(), signal);
+}
+
+function inspectGeneratedImageContent(contentType: string, bytes: Uint8Array): boolean {
+  const name = contentType === 'image/png' ? 'generated.png' : 'generated.jpg';
+  try { return inspectLocalAttachmentContent(name, bytes)?.contentType === contentType; }
+  catch { return false; }
 }
 
 function isSafeUploadInput(value: ProviderFileUploadInput): boolean {

@@ -12,6 +12,7 @@ import {
   GIGACHAT_API_BASE_URL,
   GIGACHAT_OAUTH_URL,
   GigaChatProviderError,
+  type ProviderImageGenerationRequest,
   type ProviderTransport,
   type ProviderTransportRequest,
   type ProviderTransportResponse,
@@ -112,11 +113,11 @@ T0OO/HYhTy6JI6COBlRjAZauK9D8PUMR/UCKn0BI9Sg0WEbry2WrsmIBcbJ4izLK
 -----END CERTIFICATE-----`;
 
 
-function jsonResponse(statusCode: number, value: unknown): ProviderTransportResponse {
+function jsonResponse(statusCode: number, value: unknown, contentType = 'application/json'): ProviderTransportResponse {
   const bytes = Buffer.from(JSON.stringify(value), 'utf8');
   return {
     statusCode,
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': contentType },
     body: (async function* () { yield bytes; }()),
     cancel() {},
   };
@@ -145,6 +146,526 @@ function v2TextResponse(model: string): ProviderTransportResponse {
 function fakeTransport(handler: (request: ProviderTransportRequest) => Promise<ProviderTransportResponse> | ProviderTransportResponse): ProviderTransport {
   return { request: async (request) => handler(request), close() {} };
 }
+
+const imageGenerationRequestFixture: ProviderImageGenerationRequest = {
+  modelId: 'GigaChat-3-Ultra',
+  system: [{ source: 'runtime', label: 'Runtime rules', text: 'Keep the request exact.' }],
+  messages: [
+    { role: 'assistant', text: 'Earlier text.' },
+    { role: 'user', text: ' Нарисуй небольшой маяк.\n' },
+  ],
+};
+
+function imageGenerationPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 'image-response-fixture',
+    model: 'GigaChat-3-Ultra:3.0.1',
+    finish_reason: 'stop',
+    usage: { input_tokens: 100, output_tokens: 5, total_tokens: 105, input_tokens_details: { cached_tokens: 12 } },
+    messages: [{ role: 'assistant', message_id: 'image-message-fixture',
+      tool_state_id: '018f47b2-6c10-7a21-8f2b-1fd4d0470c13',
+      content: [{ text: 'Готово.' }, { files: [{ id: 'image-file-fixture', mime: 'image/jpeg', target: 'image' }] }] }],
+    ...overrides,
+  };
+}
+
+function createImageTestProvider(
+  handler: (request: ProviderTransportRequest) => Promise<ProviderTransportResponse> | ProviderTransportResponse,
+  modelIds: string[] = ['GigaChat-3-Ultra'],
+) {
+  return createGigaChatProvider({
+    loadAuthorizationKey: async () => 'synthetic-image-test-key',
+    now: () => FIXED_NOW,
+    transport: fakeTransport((request) => {
+      if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token('synthetic-image-test-token'));
+      if (request.url.endsWith('/models')) return jsonResponse(200, { data: modelIds.map((id) => ({ id })) });
+      return handler(request);
+    }),
+  });
+}
+
+function binaryImageResponse(
+  chunks: readonly Uint8Array[],
+  options: { statusCode?: number; contentType?: string; contentLength?: string; onCancel?: () => void } = {},
+): ProviderTransportResponse {
+  return {
+    statusCode: options.statusCode ?? 200,
+    headers: {
+      ...(options.contentType === undefined ? {} : { 'content-type': options.contentType }),
+      ...(options.contentLength === undefined ? {} : { 'content-length': options.contentLength }),
+    },
+    body: (async function* () { for (const chunk of chunks) yield chunk; }()),
+    cancel: options.onCancel ?? (() => undefined),
+  };
+}
+
+async function collectImageEvents(
+  provider: ReturnType<typeof createImageTestProvider>,
+  request: ProviderImageGenerationRequest = imageGenerationRequestFixture,
+  signal = new AbortController().signal,
+) {
+  const events = [];
+  for await (const event of provider.generateImage(request, signal)) events.push(event);
+  return events;
+}
+
+test('image generation sends the exact Ultra builtin request and yields usage, descriptor, then completion', async () => {
+  const requests: ProviderTransportRequest[] = [];
+  const provider = createImageTestProvider((request) => {
+    requests.push(request);
+    return jsonResponse(200, imageGenerationPayload());
+  });
+  assert.equal((await provider.connect()).state, 'connected');
+
+  const events = await collectImageEvents(provider);
+
+  assert.deepEqual(events, [
+    { type: 'usage', usage: {
+      promptTokens: 100, completionTokens: 5, totalTokens: 105, precachedPromptTokens: 12,
+      providerRequestId: 'image-response-fixture', providerModel: 'GigaChat-3-Ultra:3.0.1',
+    } },
+    { type: 'generated-image', image: {
+      fileId: 'image-file-fixture', contentType: 'image/jpeg', assistantText: 'Готово.',
+      functionsStateId: '018f47b2-6c10-7a21-8f2b-1fd4d0470c13', responseId: 'image-response-fixture',
+    } },
+    { type: 'completed' },
+  ]);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.url, 'https://api.giga.chat/v2/chat/completions');
+  assert.equal(requests[0]?.method, 'POST');
+  assert.equal(requests[0]?.headers.Accept, 'application/json');
+  assert.equal(requests[0]?.headers['Content-Type'], 'application/json');
+  assert.equal(requests[0]?.timeoutMs, 90_000);
+  const body = JSON.parse(requests[0]?.body as string) as Record<string, unknown>;
+  assert.deepEqual(body, {
+    model: 'GigaChat-3-Ultra',
+    messages: [
+      { role: 'system', content: [{ text: '[Runtime rules]\nKeep the request exact.' }] },
+      { role: 'assistant', content: [{ text: 'Earlier text.' }] },
+      { role: 'user', content: [{ text: ' Нарисуй небольшой маяк.\n' }] },
+    ],
+    tools: [{ image_generate: {} }],
+    tool_config: { mode: 'forced', tool_name: 'image_generate' },
+    model_options: { parallel_tool_calls: false, max_tokens: 128 },
+    stream: false,
+  });
+});
+
+test('image request validation and connection/model gates stop before completion transport', async () => {
+  let requests = 0;
+  const provider = createImageTestProvider(() => {
+    requests += 1;
+    return jsonResponse(200, imageGenerationPayload());
+  });
+  const disconnected = await collectImageEvents(provider);
+  assert.deepEqual(disconnected, [{ type: 'error', category: 'auth', retryable: false }]);
+
+  assert.equal((await provider.connect()).state, 'connected');
+  const wrongModel = { ...imageGenerationRequestFixture, modelId: 'GigaChat-3-Lite' as ProviderImageGenerationRequest['modelId'] };
+  assert.deepEqual(await collectImageEvents(provider, wrongModel), [
+    { type: 'error', category: 'model', retryable: false },
+  ]);
+  const blankPrompt: ProviderImageGenerationRequest = {
+    ...imageGenerationRequestFixture,
+    messages: [{ role: 'user', text: ' \n\t' }],
+  };
+  assert.deepEqual(await collectImageEvents(provider, blankPrompt), [
+    { type: 'error', category: 'protocol', retryable: false },
+  ]);
+  const oversized: ProviderImageGenerationRequest = {
+    ...imageGenerationRequestFixture,
+    messages: [{ role: 'user', text: 'x'.repeat(2 * 1024 * 1024) }],
+  };
+  assert.deepEqual(await collectImageEvents(provider, oversized), [
+    { type: 'error', category: 'context', retryable: false },
+  ]);
+  assert.equal(requests, 0);
+
+  const longHistory: ProviderImageGenerationRequest = {
+    modelId: 'GigaChat-3-Ultra', system: [],
+    messages: Array.from({ length: 257 }, (_, index) => ({
+      role: index === 256 ? 'user' as const : 'assistant' as const,
+      text: `history-${index}`,
+    })),
+  };
+  const longHistoryEvents = await collectImageEvents(provider, longHistory);
+  assert.equal(longHistoryEvents[longHistoryEvents.length - 1]?.type, 'completed');
+  assert.equal(requests, 1, 'history is bounded by the serialized 2 MiB request limit, not a new message-count cap');
+
+  const unavailable = createImageTestProvider(() => {
+    requests += 1;
+    return jsonResponse(200, imageGenerationPayload());
+  }, ['GigaChat-3-Lite']);
+  assert.equal((await unavailable.connect()).state, 'connected');
+  assert.deepEqual(await collectImageEvents(unavailable), [
+    { type: 'error', category: 'model', retryable: false },
+  ]);
+  assert.equal(requests, 1);
+});
+
+test('image-only 402 does not exhaust text Ultra; text-side quota still blocks image preflight', async () => {
+  let imageRequests = 0;
+  const provider = createImageTestProvider((request) => {
+    if (request.url === 'https://api.giga.chat/v2/chat/completions') {
+      const body = JSON.parse(request.body as string) as { stream?: boolean };
+      if (body.stream === false) {
+        imageRequests += 1;
+        return jsonResponse(402, { message: 'private quota detail' });
+      }
+      return v2TextResponse('GigaChat-3-Ultra');
+    }
+    throw new Error('unexpected-image-test-route');
+  });
+  assert.equal((await provider.connect()).state, 'connected');
+
+  assert.deepEqual(await collectImageEvents(provider), [{ type: 'error', category: 'quota', retryable: false }]);
+  assert.equal(provider.getModelRegistry().exhaustedModelIds, undefined);
+  const textEvents: ProviderEvent[] = [];
+  for await (const event of provider.stream({
+    system: [], messages: [{ id: 'quota-text', role: 'user', text: 'synthetic text request', createdAt: '2026-10-09T00:00:00.000Z' }],
+    permissionProfile: 'ask', modelId: 'GigaChat-3-Ultra',
+  }, new AbortController().signal)) textEvents.push(event);
+  assert.deepEqual(textEvents, [{ type: 'activity', activity: 'receiving' }, { type: 'completed' }]);
+  assert.equal(imageRequests, 1);
+
+  let quotaImageRequests = 0;
+  const quotaProvider = createImageTestProvider((request) => {
+    if (request.url === 'https://api.giga.chat/v2/chat/completions') {
+      const body = JSON.parse(request.body as string) as { stream?: boolean };
+      if (body.stream === false) {
+        quotaImageRequests += 1;
+        return jsonResponse(200, imageGenerationPayload());
+      }
+      return jsonResponse(402, { message: 'private quota detail' });
+    }
+    throw new Error('unexpected-image-test-route');
+  });
+  assert.equal((await quotaProvider.connect()).state, 'connected');
+  const textError: ProviderEvent[] = [];
+  for await (const event of quotaProvider.stream({
+    system: [], messages: [{ id: 'quota-text-2', role: 'user', text: 'synthetic text request', createdAt: '2026-10-09T00:00:00.000Z' }],
+    permissionProfile: 'ask', modelId: 'GigaChat-3-Ultra',
+  }, new AbortController().signal)) textError.push(event);
+  assert.deepEqual(textError, [{ type: 'error', category: 'quota', retryable: false }]);
+  assert.deepEqual(await collectImageEvents(quotaProvider), [{ type: 'error', category: 'quota', retryable: false }]);
+  assert.equal(quotaImageRequests, 0, 'text exhaustion blocks a later image request before another completion call');
+});
+
+test('image responses keep known usage and an owned descriptor on tool failure or invalid accounting', async (t) => {
+  const baseMessage = imageGenerationPayload().messages as Array<Record<string, unknown>>;
+  const message = baseMessage[0]!;
+  const filePart = (message.content as unknown[])[1];
+  const cases: Array<{ label: string; payload: Record<string, unknown>; tail: Array<Record<string, unknown>> }> = [
+    {
+      label: 'valid alternate builtin execution name',
+      payload: imageGenerationPayload({ messages: [{ ...message, content: [filePart, {
+        tool_execution: { name: 'image_generation_worker', status: 'success', seconds_left: 3, censored: false },
+      }] }] }),
+      tail: [{ type: 'completed' }],
+    },
+    {
+      label: 'provider reports a failed builtin execution',
+      payload: imageGenerationPayload({ messages: [{ ...message, content: [filePart, {
+        tool_execution: { name: 'image_generation_worker', status: 'fail', seconds_left: 3, censored: false },
+      }] }] }),
+      tail: [{ type: 'error', category: 'tool', retryable: false }],
+    },
+    {
+      label: 'provider marks output censored',
+      payload: imageGenerationPayload({ messages: [{ ...message, content: [filePart, {
+        tool_execution: { name: 'image_generation_worker', status: 'success', censored: true },
+      }] }] }),
+      tail: [{ type: 'error', category: 'tool', retryable: false }],
+    },
+    {
+      label: 'invalid usage preserves its valid numeric fields and image identity',
+      payload: imageGenerationPayload({ usage: {
+        input_tokens: -1, output_tokens: 5, total_tokens: 105,
+        input_tokens_details: { cached_tokens: 12, prompt_tokens: 88 },
+      } }),
+      tail: [{ type: 'generated-image', image: {
+        fileId: 'image-file-fixture', contentType: 'image/jpeg', assistantText: 'Готово.',
+        functionsStateId: '018f47b2-6c10-7a21-8f2b-1fd4d0470c13', responseId: 'image-response-fixture',
+      } }, { type: 'error', category: 'protocol', retryable: false }],
+    },
+  ];
+
+  await t.test('valid alternate builtin execution name', async () => {
+    const provider = createImageTestProvider(() => jsonResponse(200, cases[0]!.payload));
+    assert.equal((await provider.connect()).state, 'connected');
+    const events = await collectImageEvents(provider);
+    assert.equal(events[1]?.type, 'generated-image');
+    assert.deepEqual(events.slice(-1), [{ type: 'completed' }]);
+  });
+  for (const scenario of cases.slice(1)) {
+    await t.test(scenario.label, async () => {
+      const provider = createImageTestProvider(() => jsonResponse(200, scenario.payload));
+      assert.equal((await provider.connect()).state, 'connected');
+      const events = await collectImageEvents(provider);
+      assert.equal(events[0]?.type, 'usage');
+      if (scenario.label === 'invalid usage preserves its valid numeric fields and image identity') {
+        assert.deepEqual(events[0], { type: 'usage', usage: {
+          promptTokens: null, completionTokens: 5, totalTokens: 105, precachedPromptTokens: 12,
+          providerRequestId: 'image-response-fixture', providerModel: 'GigaChat-3-Ultra:3.0.1',
+        } });
+        assert.deepEqual(events.slice(1), scenario.tail);
+      } else {
+        assert.equal(events[1]?.type, 'generated-image');
+        assert.deepEqual(events.slice(-1), scenario.tail);
+      }
+      assert.equal(events.some((event) => event.type === 'completed'), false);
+    });
+  }
+});
+
+test('image response rejects malformed roles, function calls, file rows, state, finish, and tool metadata', async (t) => {
+  const valid = imageGenerationPayload();
+  const goodMessage = (valid.messages as Array<Record<string, unknown>>)[0]!;
+  const goodContent = goodMessage.content as unknown[];
+  const filePart = goodContent[1];
+  const baseFile = { id: 'image-file-fixture', mime: 'image/jpeg', target: 'image' };
+  const badToolNameMessage = (name: unknown) => ({
+    role: 'assistant', content: [{ files: [baseFile] }, { tool_execution: { name, status: 'success' } }],
+  });
+  const cases: Array<{ label: string; payload: Record<string, unknown> }> = [
+    { label: 'wrong model', payload: imageGenerationPayload({ model: 'GigaChat-3-Lite' }) },
+    { label: 'wrong role', payload: imageGenerationPayload({ messages: [{ ...goodMessage, role: 'user' }] }) },
+    { label: 'invalid state', payload: imageGenerationPayload({ messages: [{ ...goodMessage, tool_state_id: 'bad-state' }] }) },
+    { label: 'non-stop finish', payload: imageGenerationPayload({ finish_reason: 'function_call' }) },
+    { label: 'more than sixteen content parts', payload: imageGenerationPayload({
+      messages: [{ role: 'assistant', content: Array.from({ length: 17 }, () => ({ text: 'x' })) }],
+    }) },
+    { label: 'ordinary text has no generated file', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [{ text: 'image URL: https://example.invalid/x.png' }] }] }) },
+    { label: 'custom function call is rejected', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [{ function_call: { name: 'read', arguments: { path: 'x' } } }] }] }) },
+    { label: 'multiple files are rejected', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [filePart, filePart] }] }) },
+    { label: 'wrong file MIME is rejected', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [{ files: [{ ...baseFile, mime: 'text/plain' }] }] }] }) },
+    { label: 'wrong file target is rejected', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [{ files: [{ ...baseFile, target: 'document' }] }] }] }) },
+    { label: 'unsafe file ID is rejected', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [{ files: [{ ...baseFile, id: '../private' }] }] }] }) },
+    { label: 'control-bearing tool name is rejected', payload: imageGenerationPayload({ messages: [badToolNameMessage('image\nworker')] }) },
+    { label: 'non-string tool name is rejected', payload: imageGenerationPayload({ messages: [badToolNameMessage(42)] }) },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.label, async () => {
+      const provider = createImageTestProvider(() => jsonResponse(200, scenario.payload));
+      assert.equal((await provider.connect()).state, 'connected');
+      const events = await collectImageEvents(provider);
+      assert.equal(events[0]?.type, 'usage', 'safe known usage is reported before image-shape rejection');
+      assert.equal(events.some((event) => event.type === 'completed'), false);
+      assert.deepEqual(events[events.length - 1], { type: 'error', category: 'protocol', retryable: false });
+    });
+  }
+
+  await t.test('optional tool name may be absent when the image file is valid', async () => {
+    const provider = createImageTestProvider(() => jsonResponse(200, imageGenerationPayload({
+      messages: [badToolNameMessage(undefined)],
+    })));
+    assert.equal((await provider.connect()).state, 'connected');
+    const events = await collectImageEvents(provider);
+    assert.equal(events[1]?.type, 'generated-image');
+    assert.deepEqual(events[events.length - 1], { type: 'completed' });
+  });
+
+  await t.test('state and response identity remain absent when provider omitted them', async () => {
+    const withoutId = { ...valid };
+    delete withoutId.id;
+    const message = { ...goodMessage };
+    delete message.message_id;
+    delete message.tool_state_id;
+    const provider = createImageTestProvider(() => jsonResponse(200, {
+      ...withoutId,
+      messages: [{ ...message, content: goodContent }],
+      usage: { output_tokens: 5 },
+    }));
+    assert.equal((await provider.connect()).state, 'connected');
+    const events = await collectImageEvents(provider);
+    assert.deepEqual(events, [
+      { type: 'usage', usage: {
+        promptTokens: null, completionTokens: 5, totalTokens: null, precachedPromptTokens: null,
+        providerModel: 'GigaChat-3-Ultra:3.0.1',
+      } },
+      { type: 'generated-image', image: { fileId: 'image-file-fixture', contentType: 'image/jpeg', assistantText: 'Готово.' } },
+      { type: 'completed' },
+    ]);
+  });
+});
+
+test('image generation retries one completion 401, maps 429/network, and never repeats generation', async (t) => {
+  await t.test('one 401 refresh', async () => {
+    let oauthRequests = 0;
+    let completionRequests = 0;
+    const provider = createGigaChatProvider({
+      loadAuthorizationKey: async () => 'synthetic-image-refresh-key', now: () => FIXED_NOW,
+      transport: fakeTransport((request) => {
+        if (request.url === GIGACHAT_OAUTH_URL) return jsonResponse(200, token(`synthetic-image-token-${++oauthRequests}`));
+        if (request.url.endsWith('/models')) return jsonResponse(200, { data: [{ id: 'GigaChat-3-Ultra' }] });
+        completionRequests += 1;
+        return completionRequests === 1 ? jsonResponse(401, { error: 'private auth detail' }) : jsonResponse(200, imageGenerationPayload());
+      }),
+    });
+    assert.equal((await provider.connect()).state, 'connected');
+    const events = await collectImageEvents(provider);
+    assert.equal(events[events.length - 1]?.type, 'completed');
+    assert.equal(oauthRequests, 2);
+    assert.equal(completionRequests, 2);
+  });
+
+  for (const [label, response, expected] of [
+    ['429', jsonResponse(429, { error: 'private rate detail' }), { type: 'error', category: 'rate-limit', retryable: true }],
+  ] as const) {
+    await t.test(label, async () => {
+      let completions = 0;
+      const provider = createImageTestProvider(() => { completions += 1; return response; });
+      assert.equal((await provider.connect()).state, 'connected');
+      assert.deepEqual(await collectImageEvents(provider), [expected]);
+      assert.equal(completions, 1);
+    });
+  }
+  await t.test('network failure', async () => {
+    let completions = 0;
+    const provider = createImageTestProvider(() => {
+      completions += 1;
+      throw Object.assign(new Error('private transport message'), { code: 'ECONNRESET' });
+    });
+    assert.equal((await provider.connect()).state, 'connected');
+    assert.deepEqual(await collectImageEvents(provider), [{ type: 'error', category: 'network', retryable: true }]);
+    assert.equal(completions, 1);
+  });
+});
+
+test('binary image download preserves exact chunked bytes and rejects invalid type, length, content, and size', async (t) => {
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jHfQAAAAASUVORK5CYII=', 'base64');
+  const requests: ProviderTransportRequest[] = [];
+  let response: ProviderTransportResponse = binaryImageResponse([png.subarray(0, 19), png.subarray(19)], {
+    contentType: 'application/octet-stream', contentLength: String(png.byteLength),
+  });
+  const provider = createImageTestProvider((request) => { requests.push(request); return response; });
+  assert.equal((await provider.connect()).state, 'connected');
+  const bytes = await provider.downloadGeneratedImage('image-file-fixture', 'image/png', new AbortController().signal);
+  assert.deepEqual(bytes, png);
+  assert.equal(requests[0]?.url, `${GIGACHAT_API_BASE_URL}/files/image-file-fixture/content`);
+  assert.equal(requests[0]?.method, 'GET');
+  assert.equal(requests[0]?.headers.Accept, 'application/jpg');
+
+  const jpegSignature = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+  response = binaryImageResponse([jpegSignature], { contentType: 'image/jpeg', contentLength: '4' });
+  assert.deepEqual(await provider.downloadGeneratedImage('jpeg-fixture', 'image/jpeg', new AbortController().signal), jpegSignature);
+  assert.equal(requests[1]?.url, `${GIGACHAT_API_BASE_URL}/files/jpeg-fixture/content`);
+
+  await t.test('invalid ID/MIME blocked before transport', async () => {
+    let calls = 0;
+    const guarded = createImageTestProvider(() => { calls += 1; return binaryImageResponse([png]); });
+    assert.equal((await guarded.connect()).state, 'connected');
+    await assert.rejects(guarded.downloadGeneratedImage('../bad', 'image/png', new AbortController().signal),
+      (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
+    await assert.rejects(guarded.downloadGeneratedImage('safe', 'image/gif' as 'image/png', new AbortController().signal),
+      (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
+    assert.equal(calls, 0);
+  });
+  for (const [label, responseValue] of [
+    ['conflicting MIME', binaryImageResponse([png], { contentType: 'image/jpeg' })],
+    ['JSON body', binaryImageResponse([Buffer.from('{"error":"private"}')], { contentType: 'application/json' })],
+    ['empty body', binaryImageResponse([], { contentType: 'image/png', contentLength: '0' })],
+    ['length mismatch', binaryImageResponse([png], { contentType: 'image/png', contentLength: '1' })],
+    ['malformed length', binaryImageResponse([png], { contentType: 'image/png', contentLength: '1e2' })],
+    ['non-image bytes', binaryImageResponse([Buffer.from('<html>bad</html>')], { contentType: 'image/png' })],
+    ['oversized declared length', binaryImageResponse([], { contentType: 'image/png', contentLength: '15000001' })],
+    ['oversized streamed body', binaryImageResponse([Buffer.alloc(15_000_001)], { contentType: 'application/octet-stream' })],
+  ] as const) {
+    await t.test(label, async () => {
+      let cancelled = 0;
+      responseValue.cancel = () => { cancelled += 1; };
+      response = responseValue;
+      await assert.rejects(provider.downloadGeneratedImage('image-file-fixture', 'image/png', new AbortController().signal),
+        (error: unknown) => error instanceof GigaChatProviderError
+          && (error.category === 'protocol' || error.category === 'context'));
+      assert.ok(cancelled > 0);
+    });
+  }
+  await t.test('non-success status maps safely and closes response', async () => {
+    let cancelled = 0;
+    response = binaryImageResponse([], { statusCode: 404, onCancel: () => { cancelled += 1; } });
+    await assert.rejects(provider.downloadGeneratedImage('image-file-fixture', 'image/png', new AbortController().signal),
+      (error: unknown) => error instanceof GigaChatProviderError && error.category === 'model');
+    assert.ok(cancelled > 0);
+  });
+});
+
+test('generation and binary download cancellation close their response without a completion', async (t) => {
+  await t.test('abort while reading generation JSON', async () => {
+    const pending = deferred<Uint8Array>();
+    let bodyStarted = false;
+    let cancelled = 0;
+    const provider = createImageTestProvider(() => ({
+      statusCode: 200, headers: { 'content-type': 'application/json' },
+      body: (async function* () { bodyStarted = true; yield await pending.promise; }()),
+      cancel() { cancelled += 1; },
+    }));
+    assert.equal((await provider.connect()).state, 'connected');
+    const controller = new AbortController();
+    const collect = collectImageEvents(provider, imageGenerationRequestFixture, controller.signal);
+    await waitFor(() => bodyStarted);
+    controller.abort();
+    const events = await collect;
+    assert.deepEqual(events, [{ type: 'error', category: 'cancel', retryable: false }]);
+    assert.ok(cancelled > 0);
+    pending.resolve(Buffer.from(JSON.stringify(imageGenerationPayload())));
+  });
+
+  await t.test('abort while reading binary image', async () => {
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jHfQAAAAASUVORK5CYII=', 'base64');
+    const pending = deferred<Uint8Array>();
+    let bodyStarted = false;
+    let cancelled = 0;
+    const provider = createImageTestProvider(() => ({
+      statusCode: 200, headers: { 'content-type': 'image/png' },
+      body: (async function* () { bodyStarted = true; yield await pending.promise; }()),
+      cancel() { cancelled += 1; },
+    }));
+    assert.equal((await provider.connect()).state, 'connected');
+    const controller = new AbortController();
+    const download = provider.downloadGeneratedImage('image-file-fixture', 'image/png', controller.signal);
+    await waitFor(() => bodyStarted);
+    controller.abort();
+    await assert.rejects(download, (error: unknown) => error instanceof GigaChatProviderError && error.category === 'cancel');
+    assert.ok(cancelled > 0);
+    pending.resolve(png);
+  });
+
+  await t.test('early iterator return cancels the image response and never emits descriptor/completion', async () => {
+    let cancelled = 0;
+    const provider = createImageTestProvider(() => {
+      const response = jsonResponse(200, imageGenerationPayload());
+      return { ...response, cancel() { cancelled += 1; } };
+    });
+    assert.equal((await provider.connect()).state, 'connected');
+    const iterator = provider.generateImage(imageGenerationRequestFixture, new AbortController().signal)[Symbol.asyncIterator]();
+    assert.equal((await iterator.next()).value?.type, 'usage');
+    await iterator.return?.();
+    assert.ok(cancelled > 0);
+  });
+
+  await t.test('saved-key invalidation cancels a pending generation and closes a late response', async () => {
+    const pendingResponse = deferred<ProviderTransportResponse>();
+    let requestStarted = false;
+    let cancelled = 0;
+    const provider = createImageTestProvider(() => {
+      requestStarted = true;
+      return pendingResponse.promise;
+    });
+    assert.equal((await provider.connect()).state, 'connected');
+    const eventsPromise = collectImageEvents(provider);
+    await waitFor(() => requestStarted);
+    provider.invalidateSavedKey();
+    assert.deepEqual(await eventsPromise, [{ type: 'error', category: 'cancel', retryable: false }]);
+    pendingResponse.resolve({
+      statusCode: 200, headers: { 'content-type': 'application/json' },
+      body: (async function* () { yield Buffer.from(JSON.stringify(imageGenerationPayload())); }()),
+      cancel() { cancelled += 1; },
+    });
+    await delay(0);
+    assert.ok(cancelled > 0, 'a late response is closed instead of being parsed or emitted');
+  });
+});
 
 function token(accessToken: string, expiresAt = FIXED_NOW + 30 * 60 * 1000): unknown {
   return { access_token: accessToken, expires_at: expiresAt };
@@ -1725,6 +2246,50 @@ test('bounds the TLS handshake with an absolute request deadline', async () => {
   } finally {
     transport.close();
     for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test('applies a validated per-request HTTPS deadline without changing the transport default', async () => {
+  let requests = 0;
+  const server = createHttpsServer({ key: TEST_SERVER_KEY, cert: TEST_SERVER_CA }, (_request, response) => {
+    requests += 1;
+    setTimeout(() => {
+      if (!response.destroyed) {
+        response.writeHead(200, { 'content-type': 'text/plain' });
+        response.end('done');
+      }
+    }, 140);
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address() as AddressInfo;
+  const transport = createHttpsTransport({ additionalCa: TEST_SERVER_CA, timeoutMs: 1_000 });
+  const request = (timeoutMs?: number): ProviderTransportRequest => ({
+    url: `https://127.0.0.1:${address.port}/bounded`, method: 'GET', headers: {},
+    signal: new AbortController().signal,
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
+  });
+
+  try {
+    await assert.rejects(transport.request(request(0)),
+      (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
+    await assert.rejects(transport.request(request(90_001)),
+      (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
+    assert.equal(requests, 0, 'invalid overrides are rejected before opening a socket');
+
+    const start = Date.now();
+    await assert.rejects(transport.request(request(35)),
+      (error: unknown) => error instanceof GigaChatProviderError && error.category === 'network');
+    assert.ok(Date.now() - start < 500, 'the per-request deadline terminates the delayed response');
+
+    const response = await transport.request(request());
+    let body = '';
+    for await (const chunk of response.body) body += Buffer.from(chunk).toString('utf8');
+    assert.equal(body, 'done', 'requests without an override retain the transport default');
+    assert.equal(requests, 2);
+  } finally {
+    transport.close();
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
 });
