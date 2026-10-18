@@ -8,7 +8,7 @@ import type {
   ProviderTurnRequest,
   ProviderUsageValues,
 } from './contracts';
-import { PROVIDER_ERROR_CATEGORIES } from './contracts';
+import { isImageProtocolDiagnostic, PROVIDER_ERROR_CATEGORIES } from './contracts';
 import { LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES } from './attachment-policy';
 import type {
   GigaChatProviderConnection,
@@ -112,7 +112,12 @@ function eventError(error: unknown, signal: AbortSignal, fallback: 'protocol' | 
       : fallback;
   const retryable = typeof error === 'object' && error !== null && 'retryable' in error
     && (error as { retryable?: unknown }).retryable === true;
-  return { type: 'error', category, retryable };
+  const diagnosticValue = typeof error === 'object' && error !== null && 'imageProtocolDiagnostic' in error
+    ? (error as { imageProtocolDiagnostic?: unknown }).imageProtocolDiagnostic : undefined;
+  const imageProtocolDiagnostic = category === 'protocol' && isImageProtocolDiagnostic(diagnosticValue)
+    ? diagnosticValue : undefined;
+  return { type: 'error', category, retryable,
+    ...(imageProtocolDiagnostic ? { imageProtocolDiagnostic } : {}) };
 }
 
 function dimensionsAreSafe(dimensions: GeneratedImageDimensions): boolean {
@@ -392,7 +397,10 @@ export function createImageGenerationStream(options: ImageGenerationStreamOption
             usageForwarded = true;
             yield usageEvent(usage);
           }
-          yield { type: 'error', category: event.category, retryable: event.retryable };
+          const imageProtocolDiagnostic = event.category === 'protocol' && isImageProtocolDiagnostic(event.imageProtocolDiagnostic)
+            ? event.imageProtocolDiagnostic : undefined;
+          yield { type: 'error', category: event.category, retryable: event.retryable,
+            ...(imageProtocolDiagnostic ? { imageProtocolDiagnostic } : {}) };
           return;
         } else throw protocolError();
       }

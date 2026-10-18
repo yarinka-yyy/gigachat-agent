@@ -335,6 +335,15 @@ export const PROVIDER_ERROR_CATEGORIES = [
 ] as const;
 export type ProviderErrorCategory = typeof PROVIDER_ERROR_CATEGORIES[number];
 
+export const IMAGE_PROTOCOL_DIAGNOSTICS = [
+  'response-json', 'metadata', 'message', 'content', 'text', 'file', 'tool-execution', 'missing-image', 'finish-reason', 'usage',
+] as const;
+export type ImageProtocolDiagnostic = typeof IMAGE_PROTOCOL_DIAGNOSTICS[number];
+
+export function isImageProtocolDiagnostic(value: unknown): value is ImageProtocolDiagnostic {
+  return typeof value === 'string' && (IMAGE_PROTOCOL_DIAGNOSTICS as readonly string[]).includes(value);
+}
+
 export type ProviderConnectionState = 'not-configured' | 'connecting' | 'connected' | 'error';
 
 export interface ProviderConnectionSnapshot {
@@ -420,7 +429,7 @@ export type ProviderEvent =
   | { type: 'image-result'; artifactId: string }
   | { type: 'function-call'; functionCall: ProviderFunctionCall }
   | { type: 'completed'; responseId?: string; functionsStateId?: string }
-  | { type: 'error'; category: ProviderErrorCategory; retryable: boolean };
+  | { type: 'error'; category: ProviderErrorCategory; retryable: boolean; imageProtocolDiagnostic?: ImageProtocolDiagnostic };
 
 export interface GigaChatProvider {
   stream(request: ProviderTurnRequest, signal: AbortSignal): AsyncIterable<ProviderEvent>;
@@ -497,6 +506,7 @@ export interface RuntimeTurnSnapshot {
   draft?: string;
   error?: string;
   errorCategory?: ProviderErrorCategory;
+  imageProtocolDiagnostic?: ImageProtocolDiagnostic;
   retryEligible?: boolean;
 }
 
@@ -519,6 +529,7 @@ export interface ChatTurnRecord {
   activity: RuntimeActivity[];
   error?: string;
   errorCategory?: ProviderErrorCategory;
+  imageProtocolDiagnostic?: ImageProtocolDiagnostic;
 }
 
 export interface RuntimeAvailability {

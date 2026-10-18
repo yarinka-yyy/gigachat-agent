@@ -5,7 +5,7 @@ import { createServer as createHttpsServer } from 'node:https';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createServer as createTcpServer, type AddressInfo, type Socket } from 'node:net';
 import { test } from 'node:test';
-import type { AcceptedTurnInput, ProviderEvent, ProviderTurnRequest } from './contracts';
+import type { AcceptedTurnInput, ImageProtocolDiagnostic, ProviderEvent, ProviderTurnRequest } from './contracts';
 import {
   createGigaChatProvider,
   createHttpsTransport,
@@ -251,6 +251,74 @@ test('image generation sends the exact Ultra builtin request and yields usage, d
   });
 });
 
+test('image generation allows empty per-part file arrays while requiring one safe image overall', async (t) => {
+  const valid = imageGenerationPayload();
+  const message = (valid.messages as Array<Record<string, unknown>>)[0]!;
+  const content = message.content as unknown[];
+  const filePart = content[1];
+  const provider = createImageTestProvider(() => jsonResponse(200, imageGenerationPayload({
+    messages: [{ ...message, content: [{ files: [] }, content[0], filePart, { files: [] }] }],
+  })));
+  assert.equal((await provider.connect()).state, 'connected');
+  const events = await collectImageEvents(provider);
+  assert.deepEqual(events.map((event) => event.type), ['usage', 'generated-image', 'completed']);
+  assert.deepEqual(events[1], { type: 'generated-image', image: {
+    fileId: 'image-file-fixture', contentType: 'image/jpeg', assistantText: 'Готово.',
+    functionsStateId: '018f47b2-6c10-7a21-8f2b-1fd4d0470c13', responseId: 'image-response-fixture',
+  } });
+
+  await t.test('empty file arrays without an image remain a fixed missing-image protocol failure', async () => {
+    const emptyOnly = createImageTestProvider(() => jsonResponse(200, imageGenerationPayload({
+      messages: [{ role: 'assistant', content: [{ files: [] }, { files: [] }] }],
+    })));
+    assert.equal((await emptyOnly.connect()).state, 'connected');
+    const rejected = await collectImageEvents(emptyOnly);
+    assert.deepEqual(rejected[rejected.length - 1], {
+      type: 'error', category: 'protocol', retryable: false, imageProtocolDiagnostic: 'missing-image',
+    });
+  });
+});
+
+test('image protocol diagnostics expose only fixed codes for malformed JSON and metadata', async (t) => {
+  const privateMarker = 'private-image-response-detail';
+  const malformedJsonProvider = createImageTestProvider(() => ({
+    statusCode: 200,
+    headers: { 'content-type': 'application/json' },
+    body: (async function* () { yield Buffer.from(`{"detail":"${privateMarker}"`, 'utf8'); }()),
+    cancel() {},
+  }));
+  assert.equal((await malformedJsonProvider.connect()).state, 'connected');
+  const malformedJson = await collectImageEvents(malformedJsonProvider);
+  assert.deepEqual(malformedJson[malformedJson.length - 1], {
+    type: 'error', category: 'protocol', retryable: false, imageProtocolDiagnostic: 'response-json',
+  });
+  assert.equal(JSON.stringify(malformedJson).includes(privateMarker), false);
+
+  await t.test('ambiguous response content type maps to the fixed JSON diagnostic', async () => {
+    const ambiguousHeaderProvider = createImageTestProvider(() => ({
+      statusCode: 200,
+      headers: { 'content-type': ['application/json', 'application/json'] },
+      body: (async function* () { yield Buffer.from(JSON.stringify(imageGenerationPayload()), 'utf8'); }()),
+      cancel() {},
+    }));
+    assert.equal((await ambiguousHeaderProvider.connect()).state, 'connected');
+    const events = await collectImageEvents(ambiguousHeaderProvider);
+    assert.deepEqual(events, [{
+      type: 'error', category: 'protocol', retryable: false, imageProtocolDiagnostic: 'response-json',
+    }]);
+  });
+
+  await t.test('unknown private metadata is not copied into the diagnostic', async () => {
+    const metadataProvider = createImageTestProvider(() => jsonResponse(200, imageGenerationPayload({ private_metadata: privateMarker })));
+    assert.equal((await metadataProvider.connect()).state, 'connected');
+    const events = await collectImageEvents(metadataProvider);
+    assert.deepEqual(events[events.length - 1], {
+      type: 'error', category: 'protocol', retryable: false, imageProtocolDiagnostic: 'metadata',
+    });
+    assert.equal(JSON.stringify(events).includes(privateMarker), false);
+  });
+});
+
 test('image request validation and connection/model gates stop before completion transport', async () => {
   let requests = 0;
   const provider = createImageTestProvider(() => {
@@ -386,7 +454,7 @@ test('image responses keep known usage and an owned descriptor on tool failure o
       tail: [{ type: 'generated-image', image: {
         fileId: 'image-file-fixture', contentType: 'image/jpeg', assistantText: 'Готово.',
         functionsStateId: '018f47b2-6c10-7a21-8f2b-1fd4d0470c13', responseId: 'image-response-fixture',
-      } }, { type: 'error', category: 'protocol', retryable: false }],
+      } }, { type: 'error', category: 'protocol', retryable: false, imageProtocolDiagnostic: 'usage' }],
     },
   ];
 
@@ -418,7 +486,7 @@ test('image responses keep known usage and an owned descriptor on tool failure o
   }
 });
 
-test('image response rejects malformed roles, function calls, file rows, state, finish, and tool metadata', async (t) => {
+test('image response rejects malformed roles, function calls, file rows, state, finish, and tool metadata safely', async (t) => {
   const valid = imageGenerationPayload();
   const goodMessage = (valid.messages as Array<Record<string, unknown>>)[0]!;
   const goodContent = goodMessage.content as unknown[];
@@ -427,22 +495,25 @@ test('image response rejects malformed roles, function calls, file rows, state, 
   const badToolNameMessage = (name: unknown) => ({
     role: 'assistant', content: [{ files: [baseFile] }, { tool_execution: { name, status: 'success' } }],
   });
-  const cases: Array<{ label: string; payload: Record<string, unknown> }> = [
-    { label: 'wrong model', payload: imageGenerationPayload({ model: 'GigaChat-3-Lite' }) },
-    { label: 'wrong role', payload: imageGenerationPayload({ messages: [{ ...goodMessage, role: 'user' }] }) },
-    { label: 'invalid state', payload: imageGenerationPayload({ messages: [{ ...goodMessage, tool_state_id: 'bad-state' }] }) },
-    { label: 'non-stop finish', payload: imageGenerationPayload({ finish_reason: 'function_call' }) },
+  const cases: Array<{ label: string; payload: Record<string, unknown>; diagnostic: ImageProtocolDiagnostic }> = [
+    { label: 'wrong model', payload: imageGenerationPayload({ model: 'GigaChat-3-Lite' }), diagnostic: 'metadata' },
+    { label: 'wrong role', payload: imageGenerationPayload({ messages: [{ ...goodMessage, role: 'user' }] }), diagnostic: 'message' },
+    { label: 'invalid state', payload: imageGenerationPayload({ messages: [{ ...goodMessage, tool_state_id: 'bad-state' }] }), diagnostic: 'message' },
+    { label: 'non-stop finish', payload: imageGenerationPayload({ finish_reason: 'function_call' }), diagnostic: 'finish-reason' },
     { label: 'more than sixteen content parts', payload: imageGenerationPayload({
       messages: [{ role: 'assistant', content: Array.from({ length: 17 }, () => ({ text: 'x' })) }],
-    }) },
-    { label: 'ordinary text has no generated file', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [{ text: 'image URL: https://example.invalid/x.png' }] }] }) },
-    { label: 'custom function call is rejected', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [{ function_call: { name: 'read', arguments: { path: 'x' } } }] }] }) },
-    { label: 'multiple files are rejected', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [filePart, filePart] }] }) },
-    { label: 'wrong file MIME is rejected', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [{ files: [{ ...baseFile, mime: 'text/plain' }] }] }] }) },
-    { label: 'wrong file target is rejected', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [{ files: [{ ...baseFile, target: 'document' }] }] }] }) },
-    { label: 'unsafe file ID is rejected', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [{ files: [{ ...baseFile, id: '../private' }] }] }] }) },
-    { label: 'control-bearing tool name is rejected', payload: imageGenerationPayload({ messages: [badToolNameMessage('image\nworker')] }) },
-    { label: 'non-string tool name is rejected', payload: imageGenerationPayload({ messages: [badToolNameMessage(42)] }) },
+    }), diagnostic: 'content' },
+    { label: 'ordinary text has no generated file', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [{ text: 'image URL: https://example.invalid/x.png' }] }] }), diagnostic: 'missing-image' },
+    { label: 'custom function call is rejected', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [{ function_call: { name: 'read', arguments: { path: 'x' } } }] }] }), diagnostic: 'content' },
+    { label: 'multiple files across parts are rejected', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [filePart, filePart] }] }), diagnostic: 'file' },
+    { label: 'multiple files in one part are rejected', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [{ files: [baseFile, { ...baseFile, id: 'another-image-file' }] }] }] }), diagnostic: 'file' },
+    { label: 'non-array file rows are rejected', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [{ files: baseFile }] }] }), diagnostic: 'file' },
+    { label: 'wrong file MIME is rejected', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [{ files: [{ ...baseFile, mime: 'text/plain' }] }] }] }), diagnostic: 'file' },
+    { label: 'wrong file target is rejected', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [{ files: [{ ...baseFile, target: 'document' }] }] }] }), diagnostic: 'file' },
+    { label: 'unsafe file ID is rejected', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [{ files: [{ ...baseFile, id: '../private' }] }] }] }), diagnostic: 'file' },
+    { label: 'non-text content is rejected', payload: imageGenerationPayload({ messages: [{ role: 'assistant', content: [{ text: 42 }, { files: [baseFile] }] }] }), diagnostic: 'text' },
+    { label: 'control-bearing tool name is rejected', payload: imageGenerationPayload({ messages: [badToolNameMessage('image\nworker')] }), diagnostic: 'tool-execution' },
+    { label: 'non-string tool name is rejected', payload: imageGenerationPayload({ messages: [badToolNameMessage(42)] }), diagnostic: 'tool-execution' },
   ];
   for (const scenario of cases) {
     await t.test(scenario.label, async () => {
@@ -451,7 +522,9 @@ test('image response rejects malformed roles, function calls, file rows, state, 
       const events = await collectImageEvents(provider);
       assert.equal(events[0]?.type, 'usage', 'safe known usage is reported before image-shape rejection');
       assert.equal(events.some((event) => event.type === 'completed'), false);
-      assert.deepEqual(events[events.length - 1], { type: 'error', category: 'protocol', retryable: false });
+      assert.deepEqual(events[events.length - 1], {
+        type: 'error', category: 'protocol', retryable: false, imageProtocolDiagnostic: scenario.diagnostic,
+      });
     });
   }
 

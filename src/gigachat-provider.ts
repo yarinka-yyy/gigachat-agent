@@ -4,7 +4,7 @@ import { type ClientRequest, type IncomingHttpHeaders, type IncomingMessage } fr
 import { Agent, request as httpsRequest } from 'node:https';
 import { isDeepStrictEqual } from 'node:util';
 import * as tls from 'node:tls';
-import type { BalanceFamilyId, GigaChatProvider, InstructionLayer, ModelRegistrySnapshot, ProviderAttachmentReference, ProviderBalanceObservation, ProviderConnectionSnapshot, ProviderErrorCategory, ProviderEvent, ProviderFileRecord, ProviderFileUploadInput, ProviderFunctionCall, ProviderProtocolExchange, ProviderTurnRequest, ProviderUsageValues, ProviderV2FunctionWire } from './contracts';
+import { isImageProtocolDiagnostic, type BalanceFamilyId, type GigaChatProvider, type ImageProtocolDiagnostic, type InstructionLayer, type ModelRegistrySnapshot, type ProviderAttachmentReference, type ProviderBalanceObservation, type ProviderConnectionSnapshot, type ProviderErrorCategory, type ProviderEvent, type ProviderFileRecord, type ProviderFileUploadInput, type ProviderFunctionCall, type ProviderProtocolExchange, type ProviderTurnRequest, type ProviderUsageValues, type ProviderV2FunctionWire } from './contracts';
 import { discoveredModelRegistry, failedModelRegistry, isModelAvailable, requireModelId, unavailableModelRegistry, type GigaChatModelId } from './models';
 import { billingFamilyForUsageLabel, CHAT_MODEL_FAMILIES, isChatModelAvailable } from './model-catalog';
 import { attachmentContentType, inspectLocalAttachmentContent, LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES, PROVIDER_MEDIA_LIMIT_BYTES, PROVIDER_REQUEST_LIMIT_BYTES } from './attachment-policy';
@@ -85,7 +85,7 @@ export type ProviderImageGenerationEvent =
   | { type: 'usage'; usage: ProviderUsageValues }
   | { type: 'generated-image'; image: ProviderGeneratedImage }
   | { type: 'completed' }
-  | { type: 'error'; category: ProviderErrorCategory; retryable: boolean };
+  | { type: 'error'; category: ProviderErrorCategory; retryable: boolean; imageProtocolDiagnostic?: ImageProtocolDiagnostic };
 
 export function serializeProviderTurnRequest(request: ProviderTurnRequest): SerializedProviderTurnRequest {
   let modelId: string;
@@ -290,14 +290,20 @@ export class GigaChatProviderError extends Error {
   readonly category: ProviderErrorCategory;
   readonly retryable: boolean;
   readonly httpStatus?: number;
+  readonly imageProtocolDiagnostic?: ImageProtocolDiagnostic;
 
-  constructor(category: ProviderErrorCategory, retryable = false, httpStatus?: number) {
+  constructor(category: ProviderErrorCategory, retryable = false, httpStatus?: number, imageProtocolDiagnostic?: ImageProtocolDiagnostic) {
     super(category);
     this.name = 'GigaChatProviderError';
     this.category = category;
     this.retryable = retryable;
     if (httpStatus !== undefined && Number.isInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599) this.httpStatus = httpStatus;
+    if (category === 'protocol' && isImageProtocolDiagnostic(imageProtocolDiagnostic)) this.imageProtocolDiagnostic = imageProtocolDiagnostic;
   }
+}
+
+function imageProtocolError(diagnostic: ImageProtocolDiagnostic): GigaChatProviderError {
+  return new GigaChatProviderError('protocol', false, undefined, diagnostic);
 }
 
 interface AccessToken {
@@ -814,11 +820,22 @@ export function createGigaChatProvider(options: {
         timeoutMs: IMAGE_GENERATION_TIMEOUT_MS,
       }), operation.controller.signal, operationGeneration);
       if (response.statusCode !== 200) throw statusError(response.statusCode);
-      if (!isJsonContentType(response.headers)) throw new GigaChatProviderError('protocol');
+      let hasJsonContentType = false;
+      try { hasJsonContentType = isJsonContentType(response.headers); }
+      catch (error) {
+        if (error instanceof GigaChatProviderError && error.category === 'protocol') throw imageProtocolError('response-json');
+        throw error;
+      }
+      if (!hasJsonContentType) throw imageProtocolError('response-json');
       cancelResponseOnAbort = () => response?.cancel();
       operation.controller.signal.addEventListener('abort', cancelResponseOnAbort, { once: true });
 
-      const value = await readJsonResponse(response, operation.controller.signal);
+      let value: unknown;
+      try { value = await readJsonResponse(response, operation.controller.signal); }
+      catch (error) {
+        if (error instanceof GigaChatProviderError && error.category === 'protocol') throw imageProtocolError('response-json');
+        throw error;
+      }
       assertCurrent(operationGeneration, operation.controller.signal);
       const usage = parseProviderUsage(value);
       if (usage.values && hasKnownProviderUsage(usage.values)) yield { type: 'usage', usage: usage.values };
@@ -829,14 +846,17 @@ export function createGigaChatProvider(options: {
         throw new GigaChatProviderError(parsed.finishReason);
       }
       if (parsed.toolFailed) throw new GigaChatProviderError('tool');
-      if (usage.invalid) throw new GigaChatProviderError('protocol');
-      if (parsed.finishReason !== 'stop') throw new GigaChatProviderError('protocol');
+      if (usage.invalid) throw imageProtocolError('usage');
+      if (parsed.finishReason !== 'stop') throw imageProtocolError('finish-reason');
       assertCurrent(operationGeneration, operation.controller.signal);
       yield { type: 'completed' };
     } catch (error) {
       const normalized = error instanceof GigaChatProviderError
         ? error : transportError(error, operation.controller.signal);
-      yield { type: 'error', category: normalized.category, retryable: normalized.retryable };
+      const diagnostic = normalized.category === 'protocol' && isImageProtocolDiagnostic(normalized.imageProtocolDiagnostic)
+        ? normalized.imageProtocolDiagnostic : undefined;
+      yield { type: 'error', category: normalized.category, retryable: normalized.retryable,
+        ...(diagnostic ? { imageProtocolDiagnostic: diagnostic } : {}) };
     } finally {
       if (cancelResponseOnAbort) operation.controller.signal.removeEventListener('abort', cancelResponseOnAbort);
       response?.cancel();
@@ -1320,22 +1340,28 @@ interface ParsedImageGenerationResponse {
 }
 
 function parseImageGenerationResponse(value: unknown, requestedModelId: string): ParsedImageGenerationResponse {
-  if (!isRecord(value)) throw new GigaChatProviderError('protocol');
+  if (!isRecord(value)) throw imageProtocolError('metadata');
+  if (value.finish_reason !== undefined && value.finish_reason !== null && typeof value.finish_reason !== 'string') {
+    throw imageProtocolError('finish-reason');
+  }
   const withoutUsage = { ...value, usage: undefined };
-  const metadata = parseV2Metadata(withoutUsage, requestedModelId);
+  let metadata: V2Metadata;
+  try { metadata = parseV2Metadata(withoutUsage, requestedModelId); }
+  catch { throw imageProtocolError('metadata'); }
   if (!metadata.model || value.thread_id !== undefined && value.id !== undefined && value.thread_id !== value.id) {
-    throw new GigaChatProviderError('protocol');
+    throw imageProtocolError('metadata');
   }
   if (!Array.isArray(value.messages) || value.messages.length !== 1 || !isRecord(value.messages[0])) {
-    throw new GigaChatProviderError('protocol');
+    throw imageProtocolError('message');
   }
   const message = value.messages[0];
-  if (message.role !== 'assistant' || !Array.isArray(message.content) || message.content.length < 1 || message.content.length > 16
-    || Object.keys(message).some((key) => !['role', 'message_id', 'tool_state_id', 'content'].includes(key))) {
-    throw new GigaChatProviderError('protocol');
+  if (message.role !== 'assistant'
+    || Object.keys(message).some((key) => !['role', 'message_id', 'tool_state_id', 'content'].includes(key))
+    || message.message_id !== undefined && !safeProviderIdentity(message.message_id)
+    || message.tool_state_id !== undefined && !isProviderStateId(message.tool_state_id)) throw imageProtocolError('message');
+  if (!Array.isArray(message.content) || message.content.length < 1 || message.content.length > 16) {
+    throw imageProtocolError('content');
   }
-  if (message.message_id !== undefined && !safeProviderIdentity(message.message_id)) throw new GigaChatProviderError('protocol');
-  if (message.tool_state_id !== undefined && !isProviderStateId(message.tool_state_id)) throw new GigaChatProviderError('protocol');
 
   let file: ProviderGeneratedImage | null = null;
   let text = '';
@@ -1344,32 +1370,32 @@ function parseImageGenerationResponse(value: unknown, requestedModelId: string):
   for (const part of message.content) {
     if (!isRecord(part) || Object.keys(part).length === 0
       || Object.keys(part).some((key) => !['text', 'files', 'tool_execution'].includes(key))) {
-      throw new GigaChatProviderError('protocol');
+      throw imageProtocolError('content');
     }
     if (Object.prototype.hasOwnProperty.call(part, 'text')) {
-      if (typeof part.text !== 'string') throw new GigaChatProviderError('protocol');
+      if (typeof part.text !== 'string') throw imageProtocolError('text');
       text += part.text;
-      if (Buffer.byteLength(text, 'utf8') > MAX_GENERATED_IMAGE_TEXT_BYTES) throw new GigaChatProviderError('protocol');
+      if (Buffer.byteLength(text, 'utf8') > MAX_GENERATED_IMAGE_TEXT_BYTES) throw imageProtocolError('text');
     }
     if (Object.prototype.hasOwnProperty.call(part, 'files')) {
-      if (!Array.isArray(part.files) || part.files.length !== 1 || file !== null || !isRecord(part.files[0])) {
-        throw new GigaChatProviderError('protocol');
+      if (!Array.isArray(part.files) || part.files.length > 1) throw imageProtocolError('file');
+      for (const row of part.files) {
+        if (file !== null || !isRecord(row)
+          || Object.keys(row).some((key) => !['id', 'mime', 'target'].includes(key))
+          || !isSafeRemoteFileId(row.id) || (row.mime !== 'image/jpeg' && row.mime !== 'image/png') || row.target !== 'image') {
+          throw imageProtocolError('file');
+        }
+        file = {
+          fileId: row.id,
+          contentType: row.mime,
+          ...(text ? { assistantText: text } : {}),
+          ...(typeof message.tool_state_id === 'string' ? { functionsStateId: message.tool_state_id } : {}),
+          ...(metadata.threadId ? { responseId: metadata.threadId } : {}),
+        };
       }
-      const row = part.files[0];
-      if (Object.keys(row).some((key) => !['id', 'mime', 'target'].includes(key))
-        || !isSafeRemoteFileId(row.id) || (row.mime !== 'image/jpeg' && row.mime !== 'image/png') || row.target !== 'image') {
-        throw new GigaChatProviderError('protocol');
-      }
-      file = {
-        fileId: row.id,
-        contentType: row.mime,
-        ...(text ? { assistantText: text } : {}),
-        ...(typeof message.tool_state_id === 'string' ? { functionsStateId: message.tool_state_id } : {}),
-        ...(metadata.threadId ? { responseId: metadata.threadId } : {}),
-      };
     }
     if (Object.prototype.hasOwnProperty.call(part, 'tool_execution')) {
-      if (toolExecutionSeen || !isRecord(part.tool_execution)) throw new GigaChatProviderError('protocol');
+      if (toolExecutionSeen || !isRecord(part.tool_execution)) throw imageProtocolError('tool-execution');
       toolExecutionSeen = true;
       const execution = part.tool_execution;
       if (Object.keys(execution).some((key) => !['name', 'status', 'seconds_left', 'censored'].includes(key))
@@ -1378,12 +1404,12 @@ function parseImageGenerationResponse(value: unknown, requestedModelId: string):
         || execution.seconds_left !== undefined && (!Number.isSafeInteger(execution.seconds_left)
           || (execution.seconds_left as number) < 0 || (execution.seconds_left as number) > 3600)
         || execution.censored !== undefined && typeof execution.censored !== 'boolean') {
-        throw new GigaChatProviderError('protocol');
+        throw imageProtocolError('tool-execution');
       }
       toolFailed = execution.status === 'fail' || execution.censored === true;
     }
   }
-  if (!file) throw new GigaChatProviderError('protocol');
+  if (!file) throw imageProtocolError('missing-image');
   if (text) file.assistantText = text;
   return { image: file, finishReason: value.finish_reason as string | null | undefined, toolFailed };
 }

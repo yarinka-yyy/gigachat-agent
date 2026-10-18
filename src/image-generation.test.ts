@@ -42,6 +42,7 @@ function createRuntimeForImageStore(store: LocalStore, imageProvider: ImageGener
   guard?: ReturnType<typeof createBalanceScopeGuard>;
   getKey?: () => Promise<string>;
   beforeUsageReceipt?: () => Promise<void>;
+  rejectDiagnosticTurnSave?: boolean;
   validateDecodedImage?: ImageGenerationStreamOptions['validateDecodedImage'];
   unavailableCoordinatorChatIds?: readonly string[];
   transformRequest?: (request: ProviderTurnRequest) => ProviderTurnRequest;
@@ -67,6 +68,14 @@ function createRuntimeForImageStore(store: LocalStore, imageProvider: ImageGener
         stageCalls += 1;
         return target.stageGeneratedImage(...args);
       };
+      if (property === 'updateRuntimeTurn' && options.rejectDiagnosticTurnSave) {
+        return (turn: Parameters<LocalStore['updateRuntimeTurn']>[0]) => {
+          if (turn.status === 'failed' && turn.imageProtocolDiagnostic !== undefined) {
+            throw new Error('synthetic terminal persistence failure');
+          }
+          return target.updateRuntimeTurn(turn);
+        };
+      }
       return Reflect.get(target, property, receiver);
     },
   });
@@ -112,7 +121,7 @@ function createRuntimeForImageStore(store: LocalStore, imageProvider: ImageGener
     assertProviderStateOwner: (owner, signal) => assertProviderStateOwner(owner, guard, signal),
     consumeTurn: (turn, signal) => store.consumeTurnReservation(turn, signal),
     releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
-    persistTurnRecord: (turn) => store.updateRuntimeTurn(turn),
+    persistTurnRecord: (turn) => imageStore.updateRuntimeTurn(turn),
     appendAssistant: async (turn, text, signal, functionsStateId, terminalTurn, owner, generatedArtifactId) => {
       appendCalls.push(turn.turnId);
       assertProviderStateOwner(owner, guard, signal);
@@ -483,11 +492,108 @@ test('provider failure preserves a received remote image descriptor and known us
   assert.equal(usage?.failedRequestCount, 1);
 });
 
-test('provider failure before a descriptor retains an unknown intent and does not list or guess remote IDs', async (t) => {
+test('image protocol diagnostics persist with an unknown intent and block a same-anchor retry', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-image-unknown-failure-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const store = await openStore(directory);
   const chat = await createImageChat(store, 'Unknown image outcome');
+  let generations = 0;
+  let downloads = 0;
+  let deletions = 0;
+  const imageProvider: ImageGenerationProvider = {
+    generateImage: () => {
+      generations += 1;
+      return (async function* () {
+        yield { type: 'usage', usage: USAGE };
+        yield { type: 'error', category: 'protocol', retryable: false, imageProtocolDiagnostic: 'file' };
+      })();
+    },
+    downloadGeneratedImage: async () => { downloads += 1; return PNG; },
+    deleteFile: async () => { deletions += 1; },
+  };
+  const harness = createRuntimeForImageStore(store, imageProvider);
+  const accepted = await acceptImageTurn(store, chat.id, 'image-unknown-failure-turn', 'Create an image.');
+  assert.equal(harness.runtime.enqueue(accepted.turn), accepted.turn.turnId);
+  await harness.runtime.whenIdle();
+  const owner = await captureProviderStateOwner(createBalanceScopeGuard(), async () => TEST_KEY);
+  const entries = await store.getProviderGeneratedImageEntries(owner.accountScope);
+  assert.equal(generations, 1);
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0]?.state, 'unknown');
+  assert.equal(entries[0]?.remoteFileId, null);
+  assert.deepEqual({ downloads, deletions, prepareProviderRequest: harness.preparationCalls.length }, { downloads: 0, deletions: 0, prepareProviderRequest: 0 });
+  const snapshot = harness.runtime.list(chat.id)[0];
+  const detail = await store.getChat(chat.id);
+  assert.equal(snapshot?.status, 'failed');
+  assert.equal(snapshot?.errorCategory, 'protocol');
+  assert.equal(snapshot?.imageProtocolDiagnostic, 'file');
+  assert.equal(detail.turns.find((row) => row.turnId === accepted.turn.turnId)?.imageProtocolDiagnostic, 'file');
+  assert.equal(detail.messages.length, 1, 'a failed protocol response is not appended as an assistant artifact');
+  assert.equal((await store.getUsageLedger()).byChat.find((row) => row.key === chat.id)?.totalTokens.knownTokens, USAGE.totalTokens);
+  await assert.rejects(harness.runtime.retry(accepted.turn.turnId), { message: IMAGE_RECOVERY_REQUIRED_MESSAGE });
+  assert.equal(generations, 1, 'the retained unknown intent prevents a paid same-anchor retry');
+});
+
+test('image coordinator drops diagnostic values outside its fixed allowlist', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-image-diagnostic-filter-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await createImageChat(store, 'Image diagnostic filter');
+  const forgedEvent = {
+    type: 'error', category: 'protocol', retryable: false, imageProtocolDiagnostic: 'private-provider-value',
+  } as unknown as ProviderImageGenerationEvent;
+  const imageProvider: ImageGenerationProvider = {
+    generateImage: () => (async function* () { yield forgedEvent; })(),
+    downloadGeneratedImage: async () => PNG,
+    deleteFile: async () => undefined,
+  };
+  const harness = createRuntimeForImageStore(store, imageProvider);
+  const accepted = await acceptImageTurn(store, chat.id, 'image-forged-diagnostic-turn', 'Create an image.');
+  assert.equal(harness.runtime.enqueue(accepted.turn), accepted.turn.turnId);
+  await harness.runtime.whenIdle();
+
+  const snapshot = harness.runtime.list(chat.id)[0];
+  const detail = await store.getChat(chat.id);
+  assert.equal(snapshot?.errorCategory, 'protocol');
+  assert.equal(snapshot?.imageProtocolDiagnostic, undefined);
+  assert.equal(detail.turns.find((row) => row.turnId === accepted.turn.turnId)?.imageProtocolDiagnostic, undefined);
+  assert.equal(JSON.stringify({ snapshot, turns: detail.turns }).includes('private-provider-value'), false);
+  const owner = await captureProviderStateOwner(createBalanceScopeGuard(), async () => TEST_KEY);
+  assert.equal((await store.getProviderGeneratedImageEntries(owner.accountScope))[0]?.state, 'unknown');
+});
+
+test('terminal Store failure replaces an image diagnostic with storage category', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-image-diagnostic-storage-failure-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await createImageChat(store, 'Image diagnostic storage failure');
+  const imageProvider: ImageGenerationProvider = {
+    generateImage: () => (async function* () {
+      yield { type: 'usage', usage: USAGE };
+      yield { type: 'error', category: 'protocol', retryable: false, imageProtocolDiagnostic: 'file' };
+    })(),
+    downloadGeneratedImage: async () => PNG,
+    deleteFile: async () => undefined,
+  };
+  const harness = createRuntimeForImageStore(store, imageProvider, { rejectDiagnosticTurnSave: true });
+  const accepted = await acceptImageTurn(store, chat.id, 'image-diagnostic-storage-turn', 'Create an image.');
+  assert.equal(harness.runtime.enqueue(accepted.turn), accepted.turn.turnId);
+  await assert.rejects(harness.runtime.whenIdle(), /Очередь приостановлена/);
+
+  const snapshot = harness.runtime.list(chat.id)[0];
+  const detail = await store.getChat(chat.id);
+  assert.equal(snapshot?.status, 'failed');
+  assert.equal(snapshot?.errorCategory, 'storage');
+  assert.equal(snapshot?.imageProtocolDiagnostic, undefined);
+  assert.equal(detail.turns.find((row) => row.turnId === accepted.turn.turnId)?.imageProtocolDiagnostic, undefined);
+  assert.equal((await store.getUsageLedger()).byChat.find((row) => row.key === chat.id)?.totalTokens.knownTokens, USAGE.totalTokens);
+});
+
+test('network failure before a descriptor retains the original unknown-intent coverage', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-image-unknown-network-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await createImageChat(store, 'Image network outcome');
   let generations = 0;
   let downloads = 0;
   let deletions = 0;
@@ -503,7 +609,7 @@ test('provider failure before a descriptor retains an unknown intent and does no
     deleteFile: async () => { deletions += 1; },
   };
   const harness = createRuntimeForImageStore(store, imageProvider);
-  const accepted = await acceptImageTurn(store, chat.id, 'image-unknown-failure-turn', 'Create an image.');
+  const accepted = await acceptImageTurn(store, chat.id, 'image-unknown-network-turn', 'Create an image.');
   assert.equal(harness.runtime.enqueue(accepted.turn), accepted.turn.turnId);
   await harness.runtime.whenIdle();
   const owner = await captureProviderStateOwner(createBalanceScopeGuard(), async () => TEST_KEY);

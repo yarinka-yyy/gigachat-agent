@@ -3318,6 +3318,56 @@ test('image provider result completes an empty-text Runtime turn once and keeps 
   assert.equal(attachmentPreparationCalls, 0);
 });
 
+test('Runtime filters forged image diagnostics and drops them on cancellation and ordinary text errors', async () => {
+  const cases: Array<{
+    name: string;
+    imageMode: boolean;
+    event: unknown;
+    status: 'failed' | 'cancelled';
+    category: string;
+  }> = [
+    {
+      name: 'unknown-code', imageMode: true,
+      event: { type: 'error', category: 'protocol', retryable: false, imageProtocolDiagnostic: 'private-provider-value' },
+      status: 'failed', category: 'protocol',
+    },
+    {
+      name: 'wrong-category', imageMode: true,
+      event: { type: 'error', category: 'network', retryable: true, imageProtocolDiagnostic: 'file' },
+      status: 'failed', category: 'network',
+    },
+    {
+      name: 'cancelled', imageMode: true,
+      event: { type: 'error', category: 'cancel', retryable: false, imageProtocolDiagnostic: 'file' },
+      status: 'cancelled', category: 'cancel',
+    },
+    {
+      name: 'ordinary-text', imageMode: false,
+      event: { type: 'error', category: 'protocol', retryable: false, imageProtocolDiagnostic: 'file' },
+      status: 'failed', category: 'protocol',
+    },
+  ];
+
+  for (const [index, scenario] of cases.entries()) {
+    const turn = turnFor(`image-diagnostic-filter-${index}`, 'A bounded diagnostic check.');
+    if (scenario.imageMode) turn.modelId = 'GigaChat-3-Ultra';
+    const event = scenario.event as ProviderEvent;
+    const runtime = makeRuntime(makeProvider(async function* () { yield event; }), {
+      prepareTurn: async (input) => ({
+        request: requestFor(input),
+        ...(scenario.imageMode ? { imageGeneration: (async function* () { yield event; })() } : {}),
+      }),
+    });
+    assert.equal(runtime.enqueue(turn), turn.turnId);
+    await runtime.whenIdle();
+    const snapshot = runtime.list(turn.chatId)[0];
+    assert.equal(snapshot?.status, scenario.status, scenario.name);
+    assert.equal(snapshot?.errorCategory, scenario.category, scenario.name);
+    assert.equal(snapshot?.imageProtocolDiagnostic, undefined, scenario.name);
+    assert.equal(JSON.stringify(snapshot).includes('private-provider-value'), false, scenario.name);
+  }
+});
+
 test('image mode rejects missing, duplicate, malformed, ordinary-text, and function-call results before append or tools', async () => {
   const cases: Array<{ name: string; imageMode: boolean; events: ProviderEvent[] }> = [
     { name: 'missing result', imageMode: true, events: [{ type: 'completed' }] },

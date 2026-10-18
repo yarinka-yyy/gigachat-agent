@@ -6,6 +6,7 @@ import type {
   GigaChatProvider,
   HookDispatchInput,
   HookRunResult,
+  ImageProtocolDiagnostic,
   ProviderFunctionCall,
   ProviderErrorCategory,
   ProviderEvent,
@@ -19,7 +20,7 @@ import type {
   UsageReceipt,
   UsageReceiptStatus,
 } from './contracts';
-import { PROVIDER_ERROR_CATEGORIES } from './contracts';
+import { isImageProtocolDiagnostic, PROVIDER_ERROR_CATEGORIES } from './contracts';
 import { LocalToolError, type LocalToolEvent, type LocalTools } from './local-tools';
 import { HookDispatchAbortError } from './hooks';
 import { MAX_USAGE_COUNT, mergeUsageReceipt } from './usage';
@@ -139,7 +140,7 @@ interface StopState {
   pendingToolIds: Set<string>;
   waiters: Set<() => void>;
   pendingOperationCount: number;
-  pendingOutcome: { status: 'completed' | 'failed' | 'cancelled'; error?: string; errorCategory?: ProviderErrorCategory } | null;
+  pendingOutcome: { status: 'completed' | 'failed' | 'cancelled'; error?: string; errorCategory?: ProviderErrorCategory; imageProtocolDiagnostic?: ImageProtocolDiagnostic } | null;
   terminalRecordSaved?: boolean;
 }
 
@@ -175,6 +176,8 @@ function copyTurn(turn: RuntimeTurn): RuntimeTurnSnapshot {
     ...(turn.draft === undefined ? {} : { draft: turn.draft }),
     ...(turn.error ? { error: turn.error } : {}),
     ...(turn.errorCategory ? { errorCategory: turn.errorCategory } : {}),
+    ...(turn.status === 'failed' && turn.errorCategory === 'protocol' && isImageProtocolDiagnostic(turn.imageProtocolDiagnostic)
+      ? { imageProtocolDiagnostic: turn.imageProtocolDiagnostic } : {}),
     ...(turn.retryEligible ? { retryEligible: true } : {}),
   };
 }
@@ -216,6 +219,12 @@ function runtimeErrorCategory(error: unknown, turnTimedOut = false): ProviderErr
     case 'TOOL_RECEIPT_STORE_UNAVAILABLE': return 'tool';
     default: return undefined;
   }
+}
+
+function imageProtocolDiagnosticFromError(error: unknown): ImageProtocolDiagnostic | undefined {
+  if (typeof error !== 'object' || error === null || !('category' in error) || error.category !== 'protocol'
+    || !('imageProtocolDiagnostic' in error)) return undefined;
+  return isImageProtocolDiagnostic(error.imageProtocolDiagnostic) ? error.imageProtocolDiagnostic : undefined;
 }
 
 function isProviderToolName(value: string): value is ProviderToolName {
@@ -540,12 +549,17 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       if (state.pendingOutcome.errorCategory) turn.errorCategory = state.pendingOutcome.errorCategory;
       else if (state.pendingOutcome.status === 'cancelled') turn.errorCategory = 'cancel';
       else delete turn.errorCategory;
+      if (state.pendingOutcome.status === 'failed' && turn.errorCategory === 'protocol'
+        && isImageProtocolDiagnostic(state.pendingOutcome.imageProtocolDiagnostic)) {
+        turn.imageProtocolDiagnostic = state.pendingOutcome.imageProtocolDiagnostic;
+      } else delete turn.imageProtocolDiagnostic;
       turn.controller = undefined;
       if (state.pendingOutcome.status === 'completed' && turn.pendingTerminal) {
         turn.endedAt = turn.pendingTerminal.endedAt;
         turn.activeDurationMs = turn.pendingTerminal.activeDurationMs;
         delete turn.error;
         delete turn.errorCategory;
+        delete turn.imageProtocolDiagnostic;
       }
       delete turn.pendingTerminal;
       publish(turn);
@@ -560,6 +574,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           state.pendingOperationCount -= 1;
           blockedTurnId = turnId;
           turn.errorCategory = 'storage';
+          delete turn.imageProtocolDiagnostic;
           turn.error = 'Состояние остановленного хода не сохранено; очередь приостановлена.';
           publish(turn);
           refreshRetryEligibility();
@@ -664,7 +679,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
   const holdForPendingOperation = (
     turn: RuntimeTurn,
     state: StopState,
-    outcome: Promise<{ status: 'completed' | 'failed' | 'cancelled'; error?: string; errorCategory?: ProviderErrorCategory }>,
+    outcome: Promise<{ status: 'completed' | 'failed' | 'cancelled'; error?: string; errorCategory?: ProviderErrorCategory; imageProtocolDiagnostic?: ImageProtocolDiagnostic }>,
     message: string,
   ): void => {
     state.pendingOperationCount += 1;
@@ -686,6 +701,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     turn.status = 'failed';
     delete turn.retryEligible;
     delete turn.errorCategory;
+    delete turn.imageProtocolDiagnostic;
     turn.error = 'Не удалось подтвердить остановку потока или локального инструмента; очередь приостановлена.';
     turn.endedAt = new Date().toISOString();
     const state = stopStates.get(turn.id);
@@ -722,6 +738,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     let reservationConsumed = false;
     let turnTimedOut = false;
     let providerCallStarted = false;
+    let imageGenerationTurn = false;
     let answer = '';
     let activeUsageReceipt: UsageReceipt | null = null;
     let usagePersistenceTimedOut = false;
@@ -887,6 +904,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         providerStateOwner = prepared.providerStateOwner;
         imageGeneration = prepared.imageGeneration ?? null;
       } else request = prepared;
+      imageGenerationTurn = imageGeneration !== null;
       if (imageGeneration && (compactionContext || turn.input.operation === 'compaction')) {
         throw Object.assign(new Error('IMAGE_GENERATION_PROTOCOL'), { category: 'protocol' as const });
       }
@@ -1047,7 +1065,12 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
             scheduleDraftPublish();
           } else if (rawEvent.type === 'error') {
             if (rawEvent.category === 'cancel') throw abortError();
-            throw Object.assign(new Error('PROVIDER_ERROR'), { category: rawEvent.category });
+            const diagnostic = imageGeneration && rawEvent.category === 'protocol' && isImageProtocolDiagnostic(rawEvent.imageProtocolDiagnostic)
+              ? rawEvent.imageProtocolDiagnostic : undefined;
+            throw Object.assign(new Error('PROVIDER_ERROR'), {
+              category: rawEvent.category,
+              ...(diagnostic ? { imageProtocolDiagnostic: diagnostic } : {}),
+            });
           } else if (rawEvent.type === 'function-call') {
             if (imageGeneration) throw Object.assign(new Error('IMAGE_GENERATION_FUNCTION_CALL'), { category: 'protocol' as const });
             if (completed || functionCall) throw new Error('PROVIDER_PROTOCOL');
@@ -1229,6 +1252,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           draft: undefined,
           error: undefined,
           errorCategory: undefined,
+          imageProtocolDiagnostic: undefined,
           retryEligible: undefined,
         });
         options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
@@ -1262,6 +1286,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         turn.status = 'completed';
         delete turn.error;
         delete turn.errorCategory;
+        delete turn.imageProtocolDiagnostic;
         delete turn.retryEligible;
         turn.endedAt = terminalTurn.endedAt;
         turn.activeDurationMs = terminalTurn.activeDurationMs;
@@ -1277,9 +1302,13 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         flushDraft();
         markStopUnconfirmed(turn);
       } else if (stopState.pendingOperationCount > 0) {
+        const errorCategory = runtimeErrorCategory(error, turnTimedOut);
+        const imageProtocolDiagnostic = imageGenerationTurn && errorCategory === 'protocol'
+          ? imageProtocolDiagnosticFromError(error) : undefined;
         if (blockedTurnId !== turn.id) holdForPendingOperation(turn, stopState, Promise.resolve({
           status: 'failed', error: 'Ожидание локальной операции не завершено.',
-          ...(runtimeErrorCategory(error, turnTimedOut) ? { errorCategory: runtimeErrorCategory(error, turnTimedOut) } : {}),
+          ...(errorCategory ? { errorCategory } : {}),
+          ...(imageProtocolDiagnostic ? { imageProtocolDiagnostic } : {}),
         }), 'Ожидание локальной операции не завершено; очередь приостановлена.');
       } else if (stopState.pendingOutcome) {
         maybeUnblock(turn.id);
@@ -1311,6 +1340,10 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         if (turn.status === 'cancelled') turn.errorCategory = 'cancel';
         else if (category) turn.errorCategory = category;
         else delete turn.errorCategory;
+        const imageProtocolDiagnostic = imageGenerationTurn && turn.status === 'failed' && category === 'protocol'
+          ? imageProtocolDiagnosticFromError(terminalError) : undefined;
+        if (imageProtocolDiagnostic) turn.imageProtocolDiagnostic = imageProtocolDiagnostic;
+        else delete turn.imageProtocolDiagnostic;
         if (turn.status === 'failed') {
           turn.error = turnTimedOut
             ? 'Ход превысил общий лимит времени.'
@@ -1351,6 +1384,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
             blockedTurnId = turn.id;
             turn.status = 'failed';
             turn.errorCategory = 'storage';
+            delete turn.imageProtocolDiagnostic;
             turn.error = 'Состояние остановленного хода не сохранено; очередь приостановлена.';
             publish(turn);
             refreshRetryEligibility();

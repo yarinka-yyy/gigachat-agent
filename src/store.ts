@@ -3,7 +3,7 @@ import { Buffer } from 'node:buffer';
 import { constants } from 'node:fs';
 import { copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { DEFAULT_NOTIFICATION_SETTINGS, PROVIDER_ERROR_CATEGORIES, type AcceptedTurnInput, type BalanceFamilyId, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type ChatTurnRecord, type CompactSnapshot, type CompactionPrefix, type HomeDraftAttachment, type HomeDraftInput, type HomeDraftRecord, type HookEvent, type HookRunResult, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderBalanceFamily, type ProviderBalanceObservation, type ProviderErrorCategory, type ProviderGeneratedImageLedgerEntry, type ProviderProtocolExchange, type ProviderToolName, type ProviderUploadLedgerEntry, type ProviderV2FunctionWire, type RuntimeActivity, type RuntimeTurnSnapshot, type Settings, type SettingsPatch, type StudioBalanceAnchorInput, type Theme, type UsageLedgerSummary, type UsageProfileView, type UsageReceipt } from './contracts';
+import { DEFAULT_NOTIFICATION_SETTINGS, isImageProtocolDiagnostic, PROVIDER_ERROR_CATEGORIES, type AcceptedTurnInput, type BalanceFamilyId, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type ChatTurnRecord, type CompactSnapshot, type CompactionPrefix, type HomeDraftAttachment, type HomeDraftInput, type HomeDraftRecord, type HookEvent, type HookRunResult, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderBalanceFamily, type ProviderBalanceObservation, type ProviderErrorCategory, type ProviderGeneratedImageLedgerEntry, type ProviderProtocolExchange, type ProviderToolName, type ProviderUploadLedgerEntry, type ProviderV2FunctionWire, type RuntimeActivity, type RuntimeTurnSnapshot, type Settings, type SettingsPatch, type StudioBalanceAnchorInput, type Theme, type UsageLedgerSummary, type UsageProfileView, type UsageReceipt } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { IMAGE_GENERATION_MODEL_ID } from './image-mode';
 import { requireModelId } from './models';
@@ -936,7 +936,9 @@ function validateChatTurnRecord(value: unknown): ChatTurnRecord {
     || (value.queueDurationMs !== undefined && (!Number.isSafeInteger(value.queueDurationMs) || (value.queueDurationMs as number) < 0 || (value.queueDurationMs as number) > MAX_TURN_DURATION_MS))
     || (value.activeDurationMs !== undefined && (!Number.isSafeInteger(value.activeDurationMs) || (value.activeDurationMs as number) < 0 || (value.activeDurationMs as number) > MAX_TURN_DURATION_MS))
     || (value.error !== undefined && (typeof value.error !== 'string' || value.error.length > 1000))
-    || (value.errorCategory !== undefined && !(PROVIDER_ERROR_CATEGORIES as readonly unknown[]).includes(value.errorCategory))) {
+    || (value.errorCategory !== undefined && !(PROVIDER_ERROR_CATEGORIES as readonly unknown[]).includes(value.errorCategory))
+    || (value.imageProtocolDiagnostic !== undefined
+      && (value.status !== 'failed' || value.errorCategory !== 'protocol' || !isImageProtocolDiagnostic(value.imageProtocolDiagnostic)))) {
     throw new Error('Некорректная запись хода чата.');
   }
   const operation = value.operation as 'compaction' | undefined;
@@ -964,6 +966,7 @@ function validateChatTurnRecord(value: unknown): ChatTurnRecord {
     activity: value.activity.map(validateRuntimeActivity),
     ...(value.error === undefined ? {} : { error: value.error as string }),
     ...(value.errorCategory === undefined ? {} : { errorCategory: value.errorCategory as ProviderErrorCategory }),
+    ...(value.imageProtocolDiagnostic === undefined ? {} : { imageProtocolDiagnostic: value.imageProtocolDiagnostic as ChatTurnRecord['imageProtocolDiagnostic'] }),
   };
 }
 
@@ -1006,6 +1009,7 @@ function recordFromRuntimeTurn(turn: RuntimeTurnSnapshot): ChatTurnRecord {
     activity: turn.activity,
     ...(turn.error === undefined ? {} : { error: turn.error }),
     ...(turn.errorCategory === undefined ? {} : { errorCategory: turn.errorCategory }),
+    ...(turn.imageProtocolDiagnostic === undefined ? {} : { imageProtocolDiagnostic: turn.imageProtocolDiagnostic }),
   });
 }
 

@@ -1884,6 +1884,46 @@ test('trusted runtime assistant append preserves draft and final provider state 
   assert.deepEqual(restored.turns, detail.turns);
 });
 
+test('persisted image protocol diagnostics are fixed, protocol-only, and optional for older turns', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-image-protocol-diagnostic-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat(undefined, 'image');
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Ultra' });
+  const accepted = await store.acceptLocalMessage(chat.id, 'Create an image.', 'image-protocol-diagnostic-turn');
+  const queued = await store.getChat(chat.id);
+  const queuedRecord = queued.turns.find((turn) => turn.turnId === accepted.turn.turnId);
+  assert.ok(queuedRecord);
+  assert.equal('imageProtocolDiagnostic' in queuedRecord, false, 'the optional field remains absent on legacy/queued records');
+
+  const failed: RuntimeTurnSnapshot = {
+    id: accepted.turn.turnId, chatId: chat.id, anchorMessageId: accepted.turn.messageId,
+    assistantMessageId: accepted.turn.assistantMessageId!, modelId: accepted.turn.modelId,
+    status: 'failed', createdAt: queuedRecord.createdAt, endedAt: timestamp, activity: [],
+    errorCategory: 'protocol', imageProtocolDiagnostic: 'file',
+  };
+  await store.updateRuntimeTurn(failed);
+  const chatPath = join(await store.getChatFolder(chat.id), 'chat.json');
+  const validBytes = await readFile(chatPath);
+  const legacyFile = JSON.parse(validBytes.toString('utf8')) as { turns: Array<Record<string, unknown>> };
+  delete legacyFile.turns.find((turn) => turn.turnId === accepted.turn.turnId)?.imageProtocolDiagnostic;
+  await writeFile(chatPath, JSON.stringify(legacyFile), 'utf8');
+  const legacyReopened = await openStore(directory);
+  assert.equal((await legacyReopened.getChat(chat.id)).turns.find((turn) => turn.turnId === accepted.turn.turnId)?.imageProtocolDiagnostic, undefined,
+    'an older record without the optional diagnostic remains readable');
+  await writeFile(chatPath, validBytes);
+
+  const reopened = await openStore(directory);
+  const restored = await reopened.getChat(chat.id);
+  assert.equal(restored.turns.find((turn) => turn.turnId === accepted.turn.turnId)?.imageProtocolDiagnostic, 'file');
+
+  const forged = { ...failed, imageProtocolDiagnostic: 'private-provider-value' as unknown as RuntimeTurnSnapshot['imageProtocolDiagnostic'] };
+  await assert.rejects(reopened.updateRuntimeTurn(forged), /Некорректная запись хода чата/);
+  await assert.rejects(reopened.updateRuntimeTurn({ ...failed, errorCategory: 'network' }), /Некорректная запись хода чата/);
+  assert.deepEqual(await readFile(chatPath), validBytes, 'invalid diagnostic data never changes the durable record');
+  assert.equal((await reopened.getChat(chat.id)).turns.find((turn) => turn.turnId === accepted.turn.turnId)?.imageProtocolDiagnostic, 'file');
+});
+
 test('generated image bytes, assistant artifact, ownership, and completed turn survive reopen and queue insertion', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-generated-image-result-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
