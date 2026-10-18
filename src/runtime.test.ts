@@ -681,6 +681,58 @@ test('keeps production compaction disabled and refuses unexpected summarizer fun
   assert.equal(hookEvents.filter((event) => event === 'after-compaction').length, 0);
 });
 
+test('rejects a symbol-only completed compaction without replacing context or blocking the next turn', async () => {
+  const started: string[] = [];
+  const hookEvents: string[] = [];
+  const consumed: string[] = [];
+  const priorSnapshotText = 'Предыдущая сохранённая сводка';
+  let savedSnapshotText = priorSnapshotText;
+  let snapshots = 0;
+  const provider = makeProvider(async function* (request) {
+    started.push(request.messages[request.messages.length - 1]?.text ?? '');
+    yield { type: 'text-delta', text: request.usageKind === 'compaction' ? '|' : 'Следующий ответ' };
+    yield { type: 'completed' };
+  });
+  const runtime = createTurnRuntime({
+    provider,
+    tools: testTools,
+    prepareTurn: async (turn): Promise<ProviderTurnRequest | PreparedTurn> => turn.operation === 'compaction'
+      ? {
+        request: { ...requestFor(turn), usageKind: 'compaction', functionCallMode: 'none' },
+        compaction: {
+          boundaryMessageId: turn.compactBoundaryMessageId!,
+          coveredThroughMessageId: turn.messageId,
+          coveredPrefixHash: 'f'.repeat(64),
+          expectedSnapshotId: 'prior-snapshot',
+          provenance: 'fixture',
+        },
+      }
+      : requestFor(turn),
+    consumeTurn: async (turn) => { consumed.push(turn.turnId); },
+    releaseTurn: () => undefined,
+    appendAssistant: async () => undefined,
+    appendCompaction: async (_turn, text) => { snapshots += 1; savedSnapshotText = text; },
+    compactionEnabled: true,
+    recordUsageReceipt: async () => undefined,
+    runHooks: async (_turn, input) => { hookEvents.push(input.event); return []; },
+  });
+
+  const compactionTurn = compactionTurnFor('chat-symbol-only-compact');
+  const nextTurn = turnFor('chat-after-symbol-only-compact');
+  assert.ok(runtime.enqueueCompaction(compactionTurn));
+  assert.ok(runtime.enqueue(nextTurn));
+  await runtime.whenIdle();
+
+  assert.equal(runtime.list(compactionTurn.chatId)[0]?.status, 'failed');
+  assert.equal(runtime.list(nextTurn.chatId)[0]?.status, 'completed');
+  assert.equal(snapshots, 0);
+  assert.equal(savedSnapshotText, priorSnapshotText);
+  assert.equal(hookEvents.filter((event) => event === 'before-compaction').length, 1);
+  assert.equal(hookEvents.includes('after-compaction'), false);
+  assert.deepEqual(started, ['Сожми историю', 'chat-after-symbol-only-compact']);
+  assert.deepEqual(consumed, [compactionTurn.turnId, nextTurn.turnId]);
+});
+
 test('pre-compaction Hook blocks provider work and provider errors never commit a summary', async () => {
   let providerCalls = 0;
   let snapshots = 0;

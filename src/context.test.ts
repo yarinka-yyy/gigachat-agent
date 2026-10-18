@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
 import { test } from 'node:test';
 import type { ChatDetail, ChatMessage, CompactSnapshot, ProviderProtocolExchange } from './contracts';
-import { buildNextTurnContext, countContextTextTokens, hashCompactionPrefix } from './context';
+import { buildNextTurnContext, countContextTextTokens, hashCompactionPrefix, validateCompactSummary } from './context';
 import { GigaChatProviderError, MAX_PROVIDER_REQUEST_BYTES, serializeProviderTurnRequest } from './gigachat-provider';
 
 const at = '2026-10-09T12:00:00.000Z';
@@ -90,6 +90,42 @@ test('fails closed when the prefix under a snapshot changed and does not hide or
   assert.throws(() => buildNextTurnContext(input([user('u1')], {
     protocolHistory: [{ anchorMessageId: 'missing', name: 'read', arguments: {}, content: null, functionsStateId: null, result: '{"ok":true}' }],
   })), (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
+});
+
+test('keeps the prior summary and later tool history while placing compaction task after the old assistant reply', () => {
+  const messages = [user('u1', 'Earlier question'), assistant('a1', 'Earlier answer'),
+    user('u2', 'Latest question'), assistant('a2', 'Latest answer')];
+  const protocolHistory: ProviderProtocolExchange[] = [{
+    anchorMessageId: 'u2', name: 'read', arguments: { path: 'notes.txt' }, content: null,
+    functionsStateId: null, result: '{"ok":true}',
+  }];
+  const compactSnapshot = snapshot('u1', 'a1', messages);
+  const originalMessages = structuredClone(messages);
+  const originalProtocol = structuredClone(protocolHistory);
+  const context = buildNextTurnContext(input(messages, {
+    compactSnapshot,
+    protocolHistory,
+    taskInstruction: 'Сверни историю.',
+    usageKind: 'compaction',
+    functionCallMode: 'none',
+  }));
+
+  assert.equal(context.request.system.filter((layer) => layer.source === 'summary').length, 1);
+  assert.equal(context.request.system.find((layer) => layer.source === 'summary')?.text, compactSnapshot.text);
+  assert.deepEqual(context.request.messages.map((message) => message.text), ['Latest question', 'Latest answer', 'Сверни историю.']);
+  assert.equal(context.request.messages[context.request.messages.length - 1]?.role, 'user');
+  assert.deepEqual(context.request.protocolHistory, protocolHistory);
+  assert.deepEqual(messages, originalMessages);
+  assert.deepEqual(protocolHistory, originalProtocol);
+});
+
+test('rejects compact summaries without any Unicode letter or number but accepts Cyrillic, Latin, and numeric text', () => {
+  for (const value of ['|', ' \t\n ', '…—!?', '🔥✨']) {
+    assert.throws(() => validateCompactSummary(value), /Сводка должна быть непустым текстом/);
+  }
+  assert.equal(validateCompactSummary('  Решение принято.  '), 'Решение принято.');
+  assert.equal(validateCompactSummary('Keep the retry limit at 3.'), 'Keep the retry limit at 3.');
+  assert.equal(validateCompactSummary('  404  '), '404');
 });
 
 test('filters state after compact-prefix validation and sizes the same filtered request', () => {
@@ -245,7 +281,8 @@ test('adds an app-owned task only for a current empty-text user anchor with acce
     globalText: '', projectInstructions: [], selectedSkill: null,
     taskInstruction: 'Сверни историю.', usageKind: 'compaction', functionCallMode: 'none',
   }));
-  assert.equal(compacting.request.system.find((layer) => layer.label === 'Задача текущего запроса')?.text, 'Сверни историю.');
+  assert.equal(compacting.request.system.some((layer) => layer.label === 'Задача текущего запроса'), false);
+  assert.equal(compacting.request.messages[compacting.request.messages.length - 1]?.text, 'Сверни историю.');
 });
 
 test('rejects unsupported image counts and media aggregate size before network serialization', () => {

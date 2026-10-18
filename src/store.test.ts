@@ -1431,9 +1431,13 @@ test('runs queued turns through the real context builder and store compaction, t
   assert.deepEqual(requests[2]?.messages.map((message) => message.text), [
     'Первый запрос', 'Ответ:Первый запрос', 'Второй запрос',
   ]);
-  assert.deepEqual(requests[3]?.messages.map((message) => message.text), [
+  const compactionRequest = requests[3]!;
+  assert.deepEqual(compactionRequest.messages.slice(0, -1).map((message) => message.text), [
     'Первый запрос', 'Ответ:Первый запрос', 'Второй запрос', 'Ответ:Второй запрос',
   ]);
+  assert.equal(compactionRequest.messages[compactionRequest.messages.length - 1]?.role, 'user');
+  assert.equal(compactionRequest.messages[compactionRequest.messages.length - 1]?.text, COMPACTION_TASK_INSTRUCTION);
+  assert.equal(compactionRequest.system.some((layer) => layer.text.includes(COMPACTION_TASK_INSTRUCTION)), false);
   assert.equal(requests[3]?.protocolHistory?.length, 1);
   assert.equal(requests[3]?.protocolHistory?.[0]?.anchorMessageId, first.turn.messageId);
   assert.equal(requests[3]?.protocolHistory?.[0]?.result, JSON.stringify({ ok: true, result: 'fixture:src/example.ts' }));
@@ -1455,6 +1459,8 @@ test('runs queued turns through the real context builder and store compaction, t
 
   const reloaded = await openStore(directory);
   const savedChat = await reloaded.getChat(chat.id);
+  assert.equal(savedChat.messages.some((message) => message.text === COMPACTION_TASK_INSTRUCTION), false,
+    'the request-only task is not persisted to Store history');
   const savedCompactionTurn = savedChat.turns.find((turn) => turn.turnId === compact.turn.turnId);
   assert.equal(savedCompactionTurn?.status, 'completed');
   assert.ok(savedCompactionTurn?.activity.some((activity) => activity.kind === 'hook' && activity.event === 'after-compaction'));

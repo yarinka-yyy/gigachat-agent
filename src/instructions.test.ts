@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { buildInstructionRequest } from './instructions';
+import { serializeProviderTurnRequest } from './gigachat-provider';
 
 const userMessage = { id: 'message-1', role: 'user' as const, text: 'Задача', createdAt: '2026-09-27T00:00:00.000Z' };
 
@@ -39,23 +40,61 @@ test('keeps a provider model ID outside the former static list in the accepted r
   assert.equal(request.modelId, 'vendor/model.v4:preview');
 });
 
-test('appends a prior summary and bounded task after the existing instruction order', () => {
+test('keeps ordinary task instructions in the system after a prior summary', () => {
   const request = buildInstructionRequest({
     globalText: 'Global',
     projectInstructions: [{ scope: 'project', text: 'Project' }],
     selectedSkill: { name: 'Review', scope: 'Global', text: 'Skill' },
     compactSnapshot: { text: 'Prior summary' },
     taskInstruction: 'Summarize the covered prefix.',
-    usageKind: 'compaction',
     functionCallMode: 'none',
     messages: [userMessage],
     permissionProfile: 'ask',
     modelId: 'vendor/model.v4:preview',
   });
   assert.deepEqual(request.system.map((layer) => layer.source), ['runtime', 'global', 'project', 'skill', 'summary', 'runtime']);
-  assert.equal(request.usageKind, 'compaction');
   assert.equal(request.functionCallMode, 'none');
   assert.deepEqual(request.messages, [userMessage]);
+});
+
+test('puts a compaction task after completed history as one deterministic request-only V2 user message', () => {
+  const history = [
+    userMessage,
+    { id: 'assistant-1', role: 'assistant' as const, text: 'Earlier answer', createdAt: '2026-09-27T00:01:00.000Z' },
+  ];
+  const historyBefore = structuredClone(history);
+  const taskInstruction = 'Summarize the covered prefix.';
+  const build = () => buildInstructionRequest({
+    globalText: 'Global',
+    compactSnapshot: { text: 'Prior summary' },
+    taskInstruction,
+    usageKind: 'compaction',
+    functionCallMode: 'none',
+    messages: history,
+    permissionProfile: 'ask',
+    modelId: 'GigaChat-2-Pro',
+  });
+  const request = build();
+  const repeated = build();
+  const taskMessage = request.messages[request.messages.length - 1];
+  const wire = JSON.parse(serializeProviderTurnRequest(request).body) as {
+    messages: Array<{ role: string; content: Array<{ text?: string }> }>;
+  };
+  const taskOccurrences = wire.messages.flatMap((message) => message.content)
+    .filter((part) => part.text === taskInstruction).length;
+
+  assert.equal(taskMessage?.role, 'user');
+  assert.equal(taskMessage?.text, taskInstruction);
+  assert.ok(taskMessage?.id.startsWith('request-compaction-'));
+  assert.equal(taskMessage?.id, repeated.messages[repeated.messages.length - 1]?.id,
+    'request-only identity is deterministic for the same history');
+  assert.deepEqual(request.messages.slice(0, history.length), history);
+  assert.equal(request.messages.length, history.length + 1);
+  assert.equal(request.system.some((layer) => layer.text.includes(taskInstruction)), false);
+  assert.equal(wire.messages[wire.messages.length - 1]?.role, 'user');
+  assert.deepEqual(wire.messages[wire.messages.length - 1]?.content, [{ text: taskInstruction }]);
+  assert.equal(taskOccurrences, 1);
+  assert.deepEqual(history, historyBefore, 'building the request leaves persisted source messages untouched');
 });
 
 test('rejects malformed project instruction sources', () => {

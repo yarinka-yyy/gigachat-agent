@@ -39,6 +39,15 @@ function addLayer(
   layers.push({ source, label, ...(scope ? { scope } : {}), text: normalized });
 }
 
+function requestOnlyCompactionMessageId(messages: readonly ChatMessage[]): string {
+  const base = `request-compaction-${messages[messages.length - 1]?.id ?? 'empty'}`;
+  const messageIds = new Set(messages.map((message) => message.id));
+  if (!messageIds.has(base)) return base;
+  let suffix = 1;
+  while (messageIds.has(`${base}-${suffix}`)) suffix += 1;
+  return `${base}-${suffix}`;
+}
+
 export function buildInstructionRequest(input: InstructionInput): ProviderTurnRequest {
   if (!Array.isArray(input.messages) || !Array.isArray(input.projectInstructions ?? [])) {
     throw new Error('Некорректные слои инструкций.');
@@ -54,6 +63,7 @@ export function buildInstructionRequest(input: InstructionInput): ProviderTurnRe
     }
     addLayer(layers, 'project', 'AGENTS.md', project.text, project.scope.trim());
   }
+  const messages = input.messages.map((message) => ({ ...message }));
   if (input.selectedSkill) {
     if (!input.selectedSkill.name.trim() || !input.selectedSkill.scope.trim()) {
       throw new Error('Некорректный источник Skill.');
@@ -65,12 +75,21 @@ export function buildInstructionRequest(input: InstructionInput): ProviderTurnRe
   }
   if (input.taskInstruction !== undefined) {
     if (typeof input.taskInstruction !== 'string') throw new Error('Некорректная задача контекста.');
-    addLayer(layers, 'runtime', 'Задача текущего запроса', input.taskInstruction);
+    if (input.usageKind === 'compaction') {
+      if (input.taskInstruction.trim()) {
+        messages.push({
+          id: requestOnlyCompactionMessageId(messages),
+          role: 'user',
+          text: input.taskInstruction,
+          createdAt: messages[messages.length - 1]?.createdAt ?? '1970-01-01T00:00:00.000Z',
+        });
+      }
+    } else addLayer(layers, 'runtime', 'Задача текущего запроса', input.taskInstruction);
   }
 
   return {
     system: layers,
-    messages: input.messages.map((message) => ({ ...message })),
+    messages,
     protocolHistory: (input.protocolHistory ?? []).map((exchange) => structuredClone(exchange)),
     permissionProfile,
     modelId,
