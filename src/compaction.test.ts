@@ -1,0 +1,352 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import type { ChatArtifact, ChatMessage, ChatToolReceipt } from './contracts';
+import {
+  compileExtractiveCompaction,
+  createCompactionSources,
+  formatArchivedCompactionNotes,
+  selectRetainedCompactionMessages,
+  serializeCompactionTranscript,
+} from './compaction';
+
+const at = '2026-10-18T12:00:00.000Z';
+const user = (id: string, text: string, attachmentIds?: string[]): ChatMessage => ({
+  id, role: 'user', text, createdAt: at, ...(attachmentIds ? { attachmentIds } : {}),
+});
+const assistant = (id: string, text: string): ChatMessage => ({ id, role: 'assistant', text, createdAt: at, source: 'runtime' });
+
+function selection(...retained: boolean[]): string {
+  return JSON.stringify({ version: 2, decisions: retained.map((retain, index) => ({ sourceRef: `m${index}`, retain })) });
+}
+
+function candidate(decisions: unknown[], version = 2): string {
+  return JSON.stringify({ version, decisions });
+}
+
+function retainedRefs(...indices: number[]): unknown[] {
+  return ['retained-source-refs', indices.map((index) => `m${index}`)];
+}
+
+test('sends only message refs, roles and text while keeping tool and attachment data app-side', () => {
+  const messages = [
+    user('local-user-id', 'Открой заметку.', ['local-attachment-id']),
+    assistant('local-assistant-id', 'Запись говорит: «готово».\nТочный код: `x\\y`.') ,
+  ];
+  const receipt: ChatToolReceipt = {
+    receiptId: 'private-receipt-id', anchorMessageId: 'local-user-id', name: 'read',
+    arguments: { path: 'notes.txt' }, content: null, functionsStateId: 'private-state-id',
+    status: 'unknown', result: 'effect unknown', createdAt: at,
+  };
+  const artifact: ChatArtifact = {
+    id: 'local-attachment-id', name: 'notes.txt', storedName: 'private-local-name', size: 12,
+    sha256: 'a'.repeat(64), createdAt: at, messageId: 'local-user-id',
+  };
+  const sources = createCompactionSources(messages, [receipt], [artifact]);
+  const transcript = serializeCompactionTranscript(sources);
+  const records = JSON.parse(transcript.slice(transcript.indexOf('\n') + 1)) as Array<Record<string, unknown>>;
+
+  assert.deepEqual(records, [
+    { sourceRef: 'm0', role: 'user', text: 'Открой заметку.' },
+    { sourceRef: 'm1', role: 'assistant', text: 'Запись говорит: «готово».\nТочный код: `x\\y`.' },
+  ]);
+  assert.equal(transcript.includes('local-user-id'), false);
+  assert.equal(transcript.includes('private-receipt-id'), false);
+  assert.equal(transcript.includes('private-state-id'), false);
+  assert.equal(transcript.includes('powershell'), false);
+  assert.equal(transcript.includes('notes.txt'), false);
+  assert.deepEqual(sources.tools.map(({ anchorRef, status, result }) => ({ anchorRef, status, result })), [
+    { anchorRef: 'm0', status: 'unknown', result: 'effect unknown' },
+  ]);
+  assert.deepEqual(sources.messages[0]?.attachments, [{ name: 'notes.txt', sizeBytes: 12, sha256: 'a'.repeat(64) }]);
+  assert.ok(Object.isFrozen(sources) && Object.isFrozen(sources.messages) && Object.isFrozen(sources.tools));
+});
+
+test('keeps both sides of an exchange when either its question or answer is selected', () => {
+  const messages = [
+    user('question-1', 'Сколько строк осталось?'),
+    assistant('answer-1', 'Осталось 11 строк.'),
+    user('question-2', 'Можно перезаписать исходник?'),
+    assistant('answer-2', 'Нет, исходник остаётся неизменным.'),
+  ];
+  const sources = createCompactionSources(messages, [], []);
+  const expectedFirstExchange = [
+    retainedRefs(0, 1),
+    ['user', 'Сколько строк осталось?'],
+    ['assistant', 'Осталось 11 строк.'],
+  ];
+  assert.deepEqual(JSON.parse(compileExtractiveCompaction(selection(true, false, false, false), sources)), expectedFirstExchange);
+  assert.deepEqual(JSON.parse(compileExtractiveCompaction(selection(false, true, false, false), sources)), expectedFirstExchange);
+});
+
+test('drops a wholly excluded filler exchange but keeps the selected exchange whole', () => {
+  const messages = [
+    user('filler', 'Привет.'),
+    assistant('ack', 'Привет, чем помочь?'),
+    user('question', 'Нужно ли сохранять контрольный файл?'),
+    assistant('answer', 'Да, контрольный файл нужно сохранить.'),
+  ];
+  const sources = createCompactionSources(messages, [], []);
+  const compiled = compileExtractiveCompaction(selection(false, false, true, false), sources);
+
+  assert.deepEqual(JSON.parse(compiled), [
+    retainedRefs(2, 3),
+    ['user', 'Нужно ли сохранять контрольный файл?'],
+    ['assistant', 'Да, контрольный файл нужно сохранить.'],
+  ]);
+});
+
+test('retains a tool anchor and actual tool result even when its decision excludes the message', () => {
+  const messages = [
+    user('tool-anchor', 'Проверь output.tsv только чтением.'),
+    assistant('noise', 'Фоновое сообщение без новых сведений.'),
+    user('next', 'Проверь, кто отвечает за следующий шаг.'),
+  ];
+  const receipt: ChatToolReceipt = {
+    receiptId: 'receipt', anchorMessageId: 'tool-anchor', name: 'read', arguments: { path: 'output.tsv' },
+    content: 'Прочитано без изменений.', functionsStateId: null, status: 'completed',
+    result: 'read-only success', createdAt: at,
+  };
+  const sources = createCompactionSources(messages, [receipt], []);
+  const compiled = compileExtractiveCompaction(selection(false, false, true), sources);
+
+  assert.deepEqual(JSON.parse(compiled), [
+    retainedRefs(0, 1, 2),
+    ['user', 'Проверь output.tsv только чтением.'],
+    ['tool', 'read', 'completed', { path: 'output.tsv' }, 'Прочитано без изменений.', 'read-only success'],
+    ['assistant', 'Фоновое сообщение без новых сведений.'],
+    ['user', 'Проверь, кто отвечает за следующий шаг.'],
+  ]);
+});
+
+test('keeps leading assistant runs and groups across empty users and consecutive assistants', () => {
+  const messages = [
+    assistant('leading-kept', 'Первая вводная реплика.'),
+    assistant('leading-excluded', 'Продолжение вводной реплики.'),
+    user('empty-user', ''),
+    assistant('reply-kept', 'Ответ после пустого пользовательского сообщения.'),
+    assistant('consecutive-excluded', 'Следующая реплика того же обмена.'),
+    user('filler', 'Привет.'),
+    assistant('ack', 'Здравствуйте.'),
+    user('question', 'Сохранить контрольный файл?'),
+    assistant('answer', 'Да, сохраните его.'),
+  ];
+  const sources = createCompactionSources(messages, [], []);
+  const compiled = compileExtractiveCompaction(candidate([
+    { sourceRef: 'm0', retain: true },
+    { sourceRef: 'm1', retain: false },
+    { sourceRef: 'm3', retain: true },
+    { sourceRef: 'm4', retain: false },
+    { sourceRef: 'm5', retain: false },
+    { sourceRef: 'm6', retain: false },
+    { sourceRef: 'm7', retain: true },
+    { sourceRef: 'm8', retain: false },
+  ]), sources);
+
+  assert.deepEqual(JSON.parse(compiled), [
+    retainedRefs(0, 1, 2, 3, 4, 7, 8),
+    ['assistant', 'Первая вводная реплика.'],
+    ['assistant', 'Продолжение вводной реплики.'],
+    ['assistant', 'Ответ после пустого пользовательского сообщения.'],
+    ['assistant', 'Следующая реплика того же обмена.'],
+    ['user', 'Сохранить контрольный файл?'],
+    ['assistant', 'Да, сохраните его.'],
+  ]);
+});
+
+test('keeps an attached exchange and its metadata when only the answer is selected', () => {
+  const messages = [user('attached', 'Проверь файл.', ['attachment']), assistant('kept', 'Проверка не выполнялась.')];
+  const artifact: ChatArtifact = {
+    id: 'attachment', name: 'report.pdf', storedName: 'internal-name', size: 42,
+    sha256: 'b'.repeat(64), createdAt: at, messageId: 'attached',
+  };
+  const sources = createCompactionSources(messages, [], [artifact]);
+  const compiled = compileExtractiveCompaction(selection(false, true), sources);
+
+  assert.deepEqual(JSON.parse(compiled), [
+    retainedRefs(0, 1),
+    ['user', 'Проверь файл.'],
+    ['attachment', 'report.pdf', 42, 'b'.repeat(64), false],
+    ['assistant', 'Проверка не выполнялась.'],
+  ]);
+});
+
+test('retains omitted source messages while applying ordered explicit exclusions', () => {
+  const messages = [
+    user('u1', 'Закрытый вопрос.'), assistant('a1', 'Подтверждённый итог.'),
+    user('u2', 'Фоновый вопрос.'), assistant('a2', 'Фоновый ответ.'),
+    user('u3', 'Ещё один закрытый вопрос.'), assistant('a3', 'Ещё один итог.'),
+  ];
+  const sources = createCompactionSources(messages, [], []);
+  const compiled = compileExtractiveCompaction(candidate([
+    { sourceRef: 'm0', retain: false },
+    { sourceRef: 'm1', retain: false },
+    { sourceRef: 'm2', retain: false },
+    { sourceRef: 'm4', retain: false },
+    { sourceRef: 'm5', retain: false },
+  ]), sources);
+
+  assert.deepEqual(JSON.parse(compiled)[0], retainedRefs(2, 3));
+  assert.deepEqual(selectRetainedCompactionMessages(compiled, messages), messages.slice(2, 4));
+});
+
+test('rejects malformed, empty, duplicated, unordered, all-exclude, or oversized message decisions', () => {
+  const sources = createCompactionSources([user('u1', 'Исходный вопрос.'), assistant('a1', 'Подтверждённый ответ.')], [], []);
+  const complete = [
+    { sourceRef: 'm0', retain: true },
+    { sourceRef: 'm1', retain: false },
+  ];
+  const valid = candidate(complete);
+  const invalidCandidates: Array<[string, string, RegExp]> = [
+    ['wrong version', candidate(complete, 1), /неверную структуру/],
+    ['wrong root shape', JSON.stringify({ version: 2, decisions: complete, extra: true }), /неверную структуру/],
+    ['wrong decisions type', JSON.stringify({ version: 2, decisions: 'm0' }), /неверную структуру/],
+    ['wrong decision shape', candidate([{ sourceRef: 'm0', retain: true, reason: 'extra' }, complete[1]]), /некорректное решение/],
+    ['wrong retain type', candidate([{ sourceRef: 'm0', retain: 'true' }, complete[1]]), /некорректное решение/],
+    ['raw control character', valid.replace('m0', 'm\u0001'), /корректным JSON/],
+    ['escaped control ref', candidate([{ sourceRef: 'm\u0001', retain: true }, complete[1]]), /некорректное решение/],
+    ['unknown ref', candidate([{ sourceRef: 'm9', retain: true }, complete[1]]), /неизвестный или повторный/],
+    ['duplicate ref', candidate([complete[0], complete[0]]), /неизвестный или повторный/],
+    ['empty decisions', candidate([]), /не содержит решений/],
+    ['out of order', candidate([...complete].reverse()), /исходном порядке/],
+    ['all nonempty messages excluded', candidate(complete.map((decision) => ({ ...decision, retain: false }))), /все непустые сообщения/],
+    ['candidate byte limit', ' '.repeat(64 * 1024 + 1), /превышает допустимый размер/],
+  ];
+  for (const [name, candidate, expectedError] of invalidCandidates) {
+    assert.throws(() => compileExtractiveCompaction(candidate, sources), expectedError, name);
+  }
+
+  const longSource = `${'x'.repeat(32 * 1024)}.`;
+  const longSources = createCompactionSources([assistant('long', longSource)], [], []);
+  assert.throws(() => compileExtractiveCompaction(selection(true), longSources), /размером до 32 КиБ/);
+});
+
+test('rejects excluding every nonempty message even when tool data would remain', () => {
+  const messages = [user('tool-anchor', 'Проверь заметку.'), assistant('answer', 'Результат проверки.')];
+  const receipt: ChatToolReceipt = {
+    receiptId: 'receipt', anchorMessageId: 'tool-anchor', name: 'read', arguments: { path: 'notes.txt' },
+    content: null, functionsStateId: null, status: 'completed', result: 'Прочитано.', createdAt: at,
+  };
+  const sources = createCompactionSources(messages, [receipt], []);
+
+  assert.throws(() => compileExtractiveCompaction(selection(false, false), sources), /все непустые сообщения/);
+  const emptySources = createCompactionSources([user('empty-only', '')], [], []);
+  assert.throws(() => compileExtractiveCompaction(candidate([]), emptySources), /исключил все сообщения истории/);
+});
+
+test('restores complete source messages from retained refs and rejects malformed or partial manifests', () => {
+  const messages: ChatMessage[] = [
+    { ...user('u1', 'Question', ['file']), createdAt: at },
+    { ...assistant('a1', 'Answer'), functionsStateId: 'old-state' },
+    user('empty-tool-anchor', ''),
+    assistant('a2', 'Tool response'),
+    user('u2', 'Filler'),
+    assistant('a3', 'Filler response'),
+  ];
+  const receipt: ChatToolReceipt = {
+    receiptId: 'receipt', anchorMessageId: 'empty-tool-anchor', name: 'read', arguments: { path: 'notes.txt' },
+    content: null, functionsStateId: null, status: 'completed', result: 'Read only.', createdAt: at,
+  };
+  const artifact: ChatArtifact = {
+    id: 'file', name: 'notes.txt', storedName: 'private-file', size: 12,
+    sha256: 'a'.repeat(64), createdAt: at, messageId: 'u1',
+  };
+  const sources = createCompactionSources(messages, [receipt], [artifact]);
+  const compiled = compileExtractiveCompaction(candidate([
+    { sourceRef: 'm0', retain: true },
+    { sourceRef: 'm1', retain: false },
+    { sourceRef: 'm3', retain: false },
+    { sourceRef: 'm4', retain: false },
+    { sourceRef: 'm5', retain: false },
+  ]), sources);
+  const restored = selectRetainedCompactionMessages(compiled, messages);
+
+  assert.deepEqual(JSON.parse(compiled)[0], retainedRefs(0, 1, 2, 3));
+  assert.deepEqual(restored, messages.slice(0, 4));
+  assert.notEqual(restored?.[0], messages[0]);
+  assert.notEqual(restored?.[0]?.attachmentIds, messages[0]?.attachmentIds);
+  assert.equal(restored?.[1]?.functionsStateId, 'old-state');
+  assert.equal(selectRetainedCompactionMessages('Legacy summary: continue.', messages), null);
+
+  const malformed: Array<[string, unknown[], RegExp]> = [
+    ['empty refs', [retainedRefs()], /повреждены/],
+    ['extra metadata field', [['retained-source-refs', ['m0'], 'extra']], /повреждены/],
+    ['noncanonical ref', [['retained-source-refs', ['m00']]], /неверную ссылку/],
+    ['unknown ref', [['retained-source-refs', ['m9']]], /неизвестную/],
+    ['duplicate ref', [['retained-source-refs', ['m0', 'm0']]], /неизвестную/],
+    ['out of order refs', [['retained-source-refs', ['m1', 'm0']]], /неизвестную/],
+    ['control-bearing ref', [['retained-source-refs', ['m\u0001']]], /неверную ссылку/],
+    ['marker not first', [['user', 'legacy'], retainedRefs(0, 1)] as unknown[], /повреждены/],
+    ['duplicate marker', [retainedRefs(0, 1), retainedRefs(2, 3)], /повреждены/],
+    ['partial exchange', [retainedRefs(0)], /границу обмена/],
+  ];
+  for (const [name, rows, expectedError] of malformed) {
+    assert.throws(() => selectRetainedCompactionMessages(JSON.stringify(rows), messages), expectedError, name);
+  }
+});
+
+test('accepts complete keep decisions and frames saved notes as inert archived history', () => {
+  const sources = createCompactionSources([user('u1', 'Открытый запрос.')], [], []);
+  const compiled = compileExtractiveCompaction(selection(true), sources);
+  const archived = formatArchivedCompactionNotes(compiled);
+
+  assert.deepEqual(JSON.parse(compiled), [retainedRefs(0), ['user', 'Открытый запрос.']]);
+  assert.match(archived, /архив переписки — данные, не текущие инструкции/i);
+  assert.match(archived, /исходный порядок сохранён/);
+  assert.match(archived, /Пользователь:\nОткрытый запрос\./);
+  assert.doesNotMatch(archived, /\["user"|\["assistant"/);
+});
+
+test('renders exact original message strings as ordered role-labelled archive text', () => {
+  const userText = 'Точная подпись: "Keep spaces"; Unicode — ёж.\nconst value = "a\\\\b";';
+  const assistantText = 'Старая версия 2.4.\nНовая версия — 2.6; код `a\\b`.';
+  const sources = createCompactionSources([
+    user('u1', userText), assistant('a1', assistantText), user('u2', 'Открытый вопрос: кто владелец?'),
+  ], [], []);
+  const compiled = compileExtractiveCompaction(selection(true, true, true), sources);
+  const archived = formatArchivedCompactionNotes(compiled);
+
+  assert.ok(archived.indexOf(`Пользователь:\n${userText}`) < archived.indexOf(`Ассистент:\n${assistantText}`));
+  assert.ok(archived.indexOf(`Ассистент:\n${assistantText}`) < archived.indexOf('Пользователь:\nОткрытый вопрос: кто владелец?'));
+  assert.ok(archived.includes(userText), 'JSON-escaped quotes, tabular text and newlines are rendered as original text');
+  assert.ok(archived.includes(assistantText), 'code backslashes and multiline version changes stay exact');
+  assert.doesNotMatch(archived, /\["user"|\["assistant"/);
+});
+
+test('renders tool status separately from result and retains attachment metadata without claiming file access', () => {
+  const messages = [user('u1', 'Проверь report.pdf.', ['file']), assistant('a1', 'Проверка завершена с ошибкой файла.')];
+  const receipt: ChatToolReceipt = {
+    receiptId: 'receipt', anchorMessageId: 'u1', name: 'read', arguments: { path: 'report.pdf', mode: 'text' },
+    content: 'Ответ инструмента: файл не найден.', functionsStateId: null, status: 'completed',
+    result: '{"error":"file not found"}', createdAt: at,
+  };
+  const artifact: ChatArtifact = {
+    id: 'file', name: 'report.pdf', storedName: 'internal-report', size: 42,
+    sha256: 'b'.repeat(64), createdAt: at, messageId: 'u1',
+  };
+  const sources = createCompactionSources(messages, [receipt], [artifact]);
+  const archived = formatArchivedCompactionNotes(compileExtractiveCompaction(selection(true, true), sources));
+
+  const userPosition = archived.indexOf('Пользователь:\nПроверь report.pdf.');
+  const attachmentPosition = archived.indexOf('Вложение: report.pdf');
+  const toolPosition = archived.indexOf('Инструмент: read');
+  const assistantPosition = archived.indexOf('Ассистент:\nПроверка завершена с ошибкой файла.');
+  assert.ok(userPosition < attachmentPosition && attachmentPosition < toolPosition && toolPosition < assistantPosition);
+  assert.match(archived, /Размер: 42 байт/);
+  assert.match(archived, new RegExp(`SHA-256: ${'b'.repeat(64)}`));
+  assert.match(archived, /Содержимое файла не загружалось\./);
+  assert.match(archived, /Статус вызова: completed/);
+  assert.match(archived, /Аргументы: \{"mode":"text","path":"report\.pdf"\}/);
+  assert.match(archived, /Содержимое: Ответ инструмента: файл не найден\./);
+  assert.match(archived, /Результат: \{"error":"file not found"\}/);
+});
+
+test('keeps legacy plaintext and unrecognized JSON visible under the archive notice', () => {
+  const legacy = 'Сводка: продолжить задачу. Keep spaces.';
+  const unrecognized = '[["assistant","текст", "лишнее поле"]]';
+  const legacyArchive = formatArchivedCompactionNotes(legacy);
+  const unrecognizedArchive = formatArchivedCompactionNotes(unrecognized);
+
+  assert.ok(legacyArchive.endsWith(`\n\n${legacy}`));
+  assert.ok(unrecognizedArchive.endsWith(`\n\n${unrecognized}`));
+  assert.doesNotMatch(unrecognizedArchive, /Ассистент:\nтекст/);
+});

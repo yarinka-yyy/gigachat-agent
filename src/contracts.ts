@@ -537,7 +537,7 @@ export interface RuntimeAvailability {
   helperRecovered: boolean;
   rendererToolApi: false;
   helperUnavailableReason: string | null;
-  compactionAvailable: false;
+  compactionAvailable: boolean;
   compactionUnavailableReason: string;
 }
 
@@ -842,6 +842,7 @@ export interface AppApi {
   };
   runtime: {
     getStatus(): Promise<RuntimeAvailability>;
+    compact(chatId: string): Promise<{ detail: ChatDetail; queued: boolean }>;
     list(chatId: string): Promise<RuntimeTurnSnapshot[]>;
     cancel(chatId: string, turnId: string): Promise<boolean>;
     retry(chatId: string, turnId: string): Promise<string | null>;

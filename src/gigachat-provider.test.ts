@@ -12,6 +12,7 @@ import {
   GIGACHAT_API_BASE_URL,
   GIGACHAT_OAUTH_URL,
   GigaChatProviderError,
+  serializeProviderTurnRequest,
   type ProviderImageGenerationRequest,
   type ProviderTransport,
   type ProviderTransportRequest,
@@ -1439,7 +1440,7 @@ test('streams V2 SSE across split UTF-8, split CRLF, and a CR-only final delimit
   const completionBody = completionRequests[0]?.body;
   const requestBody = JSON.parse(typeof completionBody === 'string' ? completionBody : Buffer.from(completionBody ?? []).toString('utf8')) as {
     model: string; messages: Array<Record<string, unknown>>; tools: Array<{ functions: { specifications: Array<{ name: string }> } }>;
-    tool_config: { mode: string }; model_options: { parallel_tool_calls: boolean }; stream: boolean;
+    tool_config: { mode: string }; model_options: { parallel_tool_calls: boolean; max_tokens?: number; response_format?: unknown }; stream: boolean;
   };
   assert.equal(requestBody.model, 'GigaChat-3-Ultra');
   assert.deepEqual(requestBody.messages, [
@@ -1449,8 +1450,59 @@ test('streams V2 SSE across split UTF-8, split CRLF, and a CR-only final delimit
   assert.equal(requestBody.stream, true);
   assert.equal(requestBody.tool_config.mode, 'auto');
   assert.equal(requestBody.model_options.parallel_tool_calls, false);
+  assert.equal(requestBody.model_options.max_tokens, undefined);
+  assert.equal(requestBody.model_options.response_format, undefined);
   assert.deepEqual(requestBody.tools[0]?.functions.specifications.map((fn) => fn.name), ['list', 'search', 'read', 'write', 'open', 'powershell']);
   assert.equal(requestBody.messages.filter((message) => message.role === 'system').length, 1);
+});
+
+test('uses strict structured JSON output only for compaction requests', () => {
+  const serialized = serializeProviderTurnRequest({
+    system: [{ source: 'runtime', label: 'Runtime', text: 'Runtime rules' }],
+    messages: [{ id: 'compaction-task', role: 'user', text: 'Extract verified notes.', createdAt: '2026-10-18T00:00:00.000Z' }],
+    permissionProfile: 'ask',
+    modelId: 'GigaChat-3-Lightning',
+    usageKind: 'compaction',
+    functionCallMode: 'none',
+  });
+  const body = JSON.parse(serialized.body) as { model_options: Record<string, unknown> };
+  const ordinarySerialized = serializeProviderTurnRequest({
+    system: [],
+    messages: [{ id: 'ordinary', role: 'user', text: 'Ordinary request.', createdAt: '2026-10-18T00:00:00.000Z' }],
+    permissionProfile: 'ask',
+    modelId: 'GigaChat-3-Lightning',
+  });
+  const ordinaryBody = JSON.parse(ordinarySerialized.body) as { model_options: Record<string, unknown> };
+
+  assert.deepEqual(body.model_options, {
+    parallel_tool_calls: false,
+    max_tokens: 4096,
+    response_format: {
+      type: 'json_schema',
+      schema: {
+        type: 'object',
+        properties: {
+          version: { type: 'integer', enum: [2] },
+          decisions: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                sourceRef: { type: 'string' },
+                retain: { type: 'boolean' },
+              },
+              required: ['sourceRef', 'retain'],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ['version', 'decisions'],
+        additionalProperties: false,
+      },
+      strict: true,
+    },
+  });
+  assert.deepEqual(ordinaryBody.model_options, { parallel_tool_calls: false });
 });
 
 test('accepts terminal-only V2 assistant metadata after validated text deltas', async () => {

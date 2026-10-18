@@ -49,7 +49,7 @@ import {
   X,
   type LucideIcon,
 } from 'lucide-react';
-import { completeComposerSuggestion, getComposerCompletion, isUnavailableCompactCommand, type ComposerSuggestion } from './commands';
+import { classifyCompactCommand, completeComposerSuggestion, getComposerCompletion, type ComposerSuggestion } from './commands';
 import type {
   AppInfo,
   CloseAttemptResult,
@@ -70,6 +70,7 @@ import type {
   Project,
   ProjectPatch,
   RuntimeTurnSnapshot,
+  RuntimeAvailability,
   SkillRecord,
   SkillRegistrySnapshot,
   SkillScope,
@@ -732,6 +733,7 @@ export default function App() {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [modelRegistry, setModelRegistry] = useState<ModelRegistrySnapshot>(() => unavailableModelRegistry());
   const [modelRegistryLoading, setModelRegistryLoading] = useState(false);
+  const [runtimeAvailability, setRuntimeAvailability] = useState<RuntimeAvailability | null>(null);
   const settingsRef = useRef<Settings>(DEFAULT_SETTINGS);
   const [runtimeMode, setRuntimeMode] = useState<'api' | 'web'>('api');
   const [navigation, setNavigation] = useState<Navigation>({ history: [{ page: 'home' }], index: 0 });
@@ -1093,6 +1095,16 @@ export default function App() {
     });
     return () => { cancelled = true; };
   }, [route.page, settingsSection]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void window.gigaChat.runtime.getStatus().then((availability) => {
+      if (!cancelled) setRuntimeAvailability(availability);
+    }).catch(() => {
+      if (!cancelled) setRuntimeAvailability(null);
+    });
+    return () => { cancelled = true; };
+  }, [route.page]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1666,6 +1678,29 @@ export default function App() {
     ? availableChatModelOptions.filter((option) => option.currentId === IMAGE_GENERATION_MODEL_ID)
     : availableChatModelOptions;
   const composerModelAvailable = isChatModelAvailable(modelRegistry, composerModelId);
+  const compactChatDetail = route.page === 'chat' && chatDetail?.id === route.id ? chatDetail : null;
+  const compactUsers = compactChatDetail?.messages.filter((message) => message.role === 'user') ?? [];
+  const compactBoundary = compactUsers.length >= 3 ? compactUsers[compactUsers.length - 3] : null;
+  const compactBoundaryIndex = compactBoundary ? compactChatDetail?.messages.findIndex((message) => message.id === compactBoundary.id) ?? -1 : -1;
+  const compactCoveredIndex = compactChatDetail?.compactSnapshot
+    ? compactChatDetail.messages.findIndex((message) => message.id === compactChatDetail.compactSnapshot?.coveredThroughMessageId)
+    : -1;
+  const compactionSuggestionAvailable = Boolean(runtimeAvailability?.compactionAvailable
+    && runtimeAvailability.providerConfigured
+    && runtimeMode === 'api'
+    && route.page === 'chat'
+    && selectedChat?.id === route.id
+    && selectedChat?.kind === 'text'
+    && compactChatDetail?.kind === 'text'
+    && composerModelId === 'GigaChat-3-Lightning'
+    && isChatModelAvailable(modelRegistry, 'GigaChat-3-Lightning')
+    && compactChatDetail.draftAttachments.length === 0
+    && !compactChatDetail.turns.some((turn) => turn.status === 'queued' || turn.status === 'running')
+    && !runtimeTurns.some((turn) => turn.chatId === route.id && (turn.status === 'queued' || turn.status === 'running'))
+    && compactBoundary !== null
+    && compactBoundaryIndex >= 0
+    && (!compactChatDetail.compactSnapshot || compactCoveredIndex >= 0 && compactBoundaryIndex > compactCoveredIndex)
+    && !compactChatDetail.messages.slice(0, compactBoundaryIndex + 1).some((message) => message.role === 'user' && message.attachmentIds?.length));
   const composerModelFamily = modelFamilyForId(composerModelId);
   const composerModelUnknown = !composerIsImageChat && Boolean(composerModelId && !composerModelFamily);
   const composerLegacyUpgrade = composerIsImageChat ? null : legacyModelUpgrade(composerModelId);
@@ -1691,7 +1726,7 @@ export default function App() {
     : activeHomeDraftRecord ? activeHomeDraftRecord.skillId
       : route.page === 'home' && pendingSkillChatIdRef.current === null ? pendingSkillId : null;
   const selectedComposerSkill = skillRegistry.skills.find((skill) => skill.id === selectedComposerSkillId && skill.enabled) ?? null;
-  const composerCompletion = completionDismissed ? null : getComposerCompletion(draft, composerCaret, composerSkills, composerProjectId);
+  const composerCompletion = completionDismissed ? null : getComposerCompletion(draft, composerCaret, composerSkills, composerProjectId, compactionSuggestionAvailable);
 
   function insertComposerSuggestion(suggestion: ComposerSuggestion, caret = composerInputRef.current?.selectionStart ?? composerCaret): void {
     const inserted = completeComposerSuggestion(draft, caret, suggestion);
@@ -1705,7 +1740,8 @@ export default function App() {
 
   function handleComposerKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>): void {
     if (event.nativeEvent.isComposing) return;
-    const completion = completionDismissed ? null : getComposerCompletion(draft, event.currentTarget.selectionStart, composerSkills, composerProjectId);
+    const completion = completionDismissed ? null
+      : getComposerCompletion(draft, event.currentTarget.selectionStart, composerSkills, composerProjectId, compactionSuggestionAvailable);
     if (event.key === 'Escape' && completion) {
       event.preventDefault();
       setCompletionDismissed(true);
@@ -1932,6 +1968,135 @@ export default function App() {
     return trackRendererOperation(() => submitMessageOperation());
   }
 
+  async function submitCompactionCommand(sourceRoute: Route, command: 'exact' | 'arguments'): Promise<void> {
+    if (command === 'arguments') {
+      setNotice('Команда принимает только отдельную запись /compact без аргументов.');
+      return;
+    }
+    if (sourceRoute.page !== 'chat' || !sourceRoute.id) {
+      setNotice('Сжатие доступно только в существующем текстовом чате.');
+      return;
+    }
+    const chatId = sourceRoute.id;
+    const detail = chatDetail?.id === chatId ? chatDetail : null;
+    if (!detail || selectedChat?.id !== chatId || detail.kind !== 'text' || selectedChat.kind !== 'text') {
+      setNotice('Сжатие доступно только в существующем текстовом чате.');
+      return;
+    }
+    if (runtimeMode !== 'api') {
+      setNotice('Сжатие доступно в режиме подключения GigaChat API.');
+      return;
+    }
+    if (!runtimeAvailability?.compactionAvailable) {
+      setNotice(runtimeAvailability?.compactionUnavailableReason ?? 'Команда /compact пока недоступна. История чата не изменена.');
+      return;
+    }
+    if (!runtimeAvailability.providerConfigured) {
+      setNotice('Подключите GigaChat API перед сжатием контекста.');
+      return;
+    }
+    if (detail.draftAttachments.length > 0) {
+      setNotice('Сначала удалите файлы из черновика перед сжатием контекста.');
+      return;
+    }
+    if (chatDraftImportInFlight.current.has(chatId)) {
+      setNotice('Дождитесь завершения выбора файла перед сжатием контекста.');
+      return;
+    }
+    const modelId = detail.modelId ?? settings.defaultModelId;
+    if (modelId !== 'GigaChat-3-Lightning' || !isChatModelAvailable(modelRegistry, 'GigaChat-3-Lightning')) {
+      setNotice('Для сжатия выберите доступную модель GigaChat Lite. Модель автоматически не меняется.');
+      return;
+    }
+    if (detail.turns.some((turn) => turn.status === 'queued' || turn.status === 'running')
+      || runtimeTurns.some((turn) => turn.chatId === chatId && (turn.status === 'queued' || turn.status === 'running'))) {
+      setNotice('Дождитесь завершения текущего хода перед сжатием контекста.');
+      return;
+    }
+    const users = detail.messages.filter((message) => message.role === 'user');
+    const boundary = users.length >= 3 ? users[users.length - 3] : null;
+    const boundaryIndex = boundary ? detail.messages.findIndex((message) => message.id === boundary.id) : -1;
+    if (!boundary || boundaryIndex < 0) {
+      setNotice('Нужно сохранить два последних обмена; старой истории для сжатия пока недостаточно.');
+      return;
+    }
+    if (detail.compactSnapshot) {
+      const coveredIndex = detail.messages.findIndex((message) => message.id === detail.compactSnapshot?.coveredThroughMessageId);
+      if (coveredIndex < 0 || boundaryIndex <= coveredIndex) {
+        setNotice('Нет новой старой части истории для сжатия; прежний контекст сохранён.');
+        return;
+      }
+    }
+    if (detail.messages.slice(0, boundaryIndex + 1)
+      .some((message) => message.role === 'user' && (message.attachmentIds?.length ?? 0) > 0)) {
+      setNotice('Сжатие истории с прикреплёнными файлами пока не проверено; исходная история сохранена.');
+      return;
+    }
+    if (sending || sendInProgress.current) return;
+
+    const sourceRouteGeneration = routeGeneration.current;
+    const sourceDraftRevision = draftRevision.current;
+    const acceptedDraftSave = draftSave.current;
+    const acceptedPermissionSave = permissionProfileSave.current;
+    const acceptedSkillSave = skillSelectionSave.current;
+    const acceptedPermissionRevision = permissionProfileRevision.current;
+    const acceptedSkillRevision = skillSelectionRevision.current;
+    sendInProgress.current = true;
+    sendingRoute.current = sourceRoute;
+    setSending(true);
+    try {
+      await acceptedDraftSave;
+      await acceptedPermissionSave;
+      await acceptedSkillSave;
+      const sourceRouteIsCurrent = () => sourceRouteGeneration === routeGeneration.current
+        && routeRef.current.page === 'chat' && routeRef.current.id === chatId;
+      const commandIsCurrent = () => sourceRouteIsCurrent()
+        && sourceDraftRevision === draftRevision.current
+        && classifyCompactCommand(draftRef.current) === 'exact';
+      if (!commandIsCurrent()) {
+        if (sourceRouteIsCurrent()) {
+          setNotice('Черновик изменился; новый текст оставлен без отправки.');
+        }
+        return;
+      }
+      const result = await window.gigaChat.runtime.compact(chatId);
+      if (sourceRouteIsCurrent()) returnChatToCurrentFlow(chatId);
+      const turns = await window.gigaChat.runtime.list(chatId);
+      if (sourceRouteIsCurrent()) {
+        setRuntimeTurns((current) => mergeRuntimeTurnSnapshots(chatId, current, turns));
+        setChatDetail((current) => current?.id === chatId ? {
+          ...result.detail,
+          ...(acceptedPermissionRevision === permissionProfileRevision.current ? {} : {
+            nextTurnPermissionProfile: current.nextTurnPermissionProfile,
+          }),
+          ...(acceptedSkillRevision === skillSelectionRevision.current ? {} : {
+            nextTurnSkillId: current.nextTurnSkillId,
+          }),
+        } : current);
+      }
+      setChats(await window.gigaChat.chats.list());
+      if (result.queued) {
+        if (commandIsCurrent()) {
+          changeDraft('');
+          setNotice('');
+          showSuccess('Сжатие поставлено в очередь GigaChat; последние два обмена сохранены.');
+        } else if (sourceRouteIsCurrent()) {
+          showSuccess('Сжатие поставлено в очередь GigaChat; новый черновик оставлен без изменений.');
+        }
+      } else if (commandIsCurrent()) {
+        setNotice('Сжатие сохранено как неотправленное; черновик оставлен для проверки.');
+      }
+    } catch (error) {
+      rendererOperations.current.reportFailure(error);
+      if (sourceRouteGeneration === routeGeneration.current
+        && routeRef.current.page === 'chat' && routeRef.current.id === chatId) setNotice(getErrorMessage(error));
+    } finally {
+      sendingRoute.current = null;
+      sendInProgress.current = false;
+      setSending(false);
+    }
+  }
+
   async function submitMessageOperation(): Promise<void> {
     const sourceRoute = routeRef.current;
     const value = draftRef.current.trim();
@@ -1939,6 +2104,11 @@ export default function App() {
       ? structuredClone(homeDraftRef.current) : null;
     const initialChatAttachments = sourceRoute.page === 'chat' && chatDetail && chatDetail.id === sourceRoute.id
       ? structuredClone(chatDetail.draftAttachments) : [];
+    const compactCommand = classifyCompactCommand(value);
+    if (compactCommand !== 'none') {
+      await submitCompactionCommand(sourceRoute, compactCommand);
+      return;
+    }
     const currentSelectedChat = selectedChat;
     const selectedImageChat = sourceRoute.page === 'chat'
       && currentSelectedChat != null && currentSelectedChat.id === sourceRoute.id
@@ -1962,11 +2132,6 @@ export default function App() {
     let sourceHomeDraftGeneration = homeDraftSaveGeneration.current;
     const sourceDefaultModelId = settingsRef.current.defaultModelId;
     const sourceDefaultPermissionProfile = settingsRef.current.defaultPermissionProfile;
-    if (value && !initialHomeDraft?.attachments.length && !initialChatAttachments.length && isUnavailableCompactCommand(value)) {
-      const status = await window.gigaChat.runtime.getStatus().catch(() => null);
-      showSuccess(status?.compactionUnavailableReason ?? 'Команда /compact пока недоступна; история чата не изменена.');
-      return;
-    }
     const sourceDraftRevision = draftRevision.current;
     const acceptedDraftSave = draftSave.current;
     const acceptedPermissionSave = permissionProfileSave.current;

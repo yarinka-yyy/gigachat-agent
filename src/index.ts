@@ -4,7 +4,7 @@ import { lstat, mkdir, mkdtemp, readFile, realpath, rm, rmdir, stat, writeFile }
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, safeStorage, screen, session, shell, systemPreferences, Tray, WebContentsView, type IpcMainInvokeEvent, type MediaAccessPermissionRequest } from 'electron';
 import { openStore, type LocalStore } from './store';
-import { COMPACTION_QUALITY_VERIFIED, COMPACTION_UNAVAILABLE_REASON, COMPACTION_TASK_INSTRUCTION, buildNextTurnContext, validateCompactSummary } from './context';
+import { assertCompactionWireReduction, COMPACTION_QUALITY_VERIFIED, COMPACTION_UNAVAILABLE_REASON, COMPACTION_TASK_INSTRUCTION, buildNextTurnContext, validateCompactSummary } from './context';
 import { createContextPreview } from './context-preview';
 import { createLocalTools, createPowerShellHelper, resolvePowerShellHelperPath } from './local-tools';
 import { createTurnRuntime, queueAcceptedTurnOrMarkNotSent, type PreparedCompactionContext, type TurnRuntime } from './runtime';
@@ -50,6 +50,8 @@ import {
   type NsisInstallRegistration,
 } from './lifecycle';
 import { validateProjectFolder } from './project-paths';
+
+const COMPACTION_MODEL_ID = 'GigaChat-3-Lightning';
 
 declare const MAIN_WINDOW_WEBPACK_ENTRY: string;
 declare const MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY: string;
@@ -811,6 +813,9 @@ async function createMainRuntime(
     prepareTurn: async (turn, signal) => {
       if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
       if (turn.operation === 'compaction' && !COMPACTION_QUALITY_VERIFIED) throw new Error(COMPACTION_UNAVAILABLE_REASON);
+      if (turn.operation === 'compaction' && turn.modelId !== COMPACTION_MODEL_ID) {
+        throw Object.assign(new Error('Для продолжения сжатия выберите GigaChat Lite; автоматической смены модели нет.'), { category: 'model' as const });
+      }
       const providerStateOwner = await captureProviderStateOwner(providerStateScopeGuard, () => secureStore.load(), signal);
       assertProviderStateOwner(providerStateOwner, providerStateScopeGuard, signal);
       await store.validateAcceptedTurn(turn);
@@ -865,6 +870,10 @@ async function createMainRuntime(
         messages,
         protocolHistory,
         compactSnapshot: detail.compactSnapshot,
+        ...(turn.operation === 'compaction' ? {
+          compactionToolReceipts: detail.toolReceipts,
+          compactionArtifacts: detail.artifacts,
+        } : {}),
         permissionProfile: turn.permissionProfile,
         modelId: turn.modelId,
         ...(turn.operation === 'compaction' ? {
@@ -881,6 +890,7 @@ async function createMainRuntime(
         },
       });
       if (turn.operation === 'compaction' && compactionPrefix) {
+        if (!context.compactionSources) throw new Error('Для сжатия не подготовлены исходные записи истории.');
         assertProviderStateOwner(providerStateOwner, providerStateScopeGuard, signal);
         return {
           request: context.request,
@@ -891,6 +901,7 @@ async function createMainRuntime(
             coveredPrefixHash: compactionPrefix.coveredPrefixHash,
             expectedSnapshotId: turn.compactExpectedSnapshotId ?? null,
             provenance: 'provider' as const,
+            sources: context.compactionSources,
           },
         };
       }
@@ -949,6 +960,28 @@ async function createMainRuntime(
     appendCompaction: async (turn, text, signal, context: PreparedCompactionContext, terminalTurn,
       functionsStateId, owner) => {
       assertProviderStateOwner(owner, providerStateScopeGuard, signal);
+      const detail = await store.getChat(turn.chatId);
+      const lastMessage = detail.messages[detail.messages.length - 1];
+      if (!lastMessage) throw Object.assign(new Error('COMPACTION_CONTEXT_UNAVAILABLE'), { category: 'context' as const });
+      const messages = await store.getMessagesThrough(turn.chatId, lastMessage.id);
+      const protocolHistory = await store.getToolProtocolThrough(turn.chatId, lastMessage.id);
+      const ownership = await store.getProviderStateOwnership(turn.chatId, owner.accountScope);
+      const buildMeasuredContext = (compactSnapshot: CompactSnapshot | null) => {
+        const context = buildNextTurnContext({
+          globalText: '',
+          projectInstructions: [],
+          selectedSkill: null,
+          messages,
+          protocolHistory,
+          compactSnapshot,
+          permissionProfile: turn.permissionProfile,
+          modelId: turn.modelId ?? (() => { throw new Error('Модель для контекста не выбрана.'); })(),
+          functionCallMode: 'auto',
+        }, {
+          providerStateFilter: { detail, ownership, currentAnchorMessageId: null },
+        });
+        return context.wireBytes;
+      };
       const snapshot: CompactSnapshot = {
         id: randomUUID(),
         version: 1,
@@ -960,6 +993,11 @@ async function createMainRuntime(
         provenance: context.provenance,
         createdAt: new Date().toISOString(),
       };
+      assertCompactionWireReduction(
+        buildMeasuredContext(detail.compactSnapshot),
+        buildMeasuredContext(snapshot),
+      );
+      assertProviderStateOwner(owner, providerStateScopeGuard, signal);
       await store.commitCompactSnapshot(turn.chatId, snapshot, context.expectedSnapshotId, signal, terminalTurn,
         functionsStateId ? { accountScope: owner.accountScope, functionsStateId } : undefined);
     },
@@ -1649,6 +1687,47 @@ async function registerIpcHandlers(
     const turnId = requireId(turnIdInput);
     await store.getChat(chatId);
     return runtime.retry(turnId, chatId);
+  });
+  handle('runtime:compact', async (chatIdInput) => {
+    if (!availability.compactionAvailable) throw new Error(COMPACTION_UNAVAILABLE_REASON);
+    const chatId = requireId(chatIdInput);
+    const detail = await store.getChat(chatId);
+    if (detail.kind !== 'text') throw new Error('Сжатие доступно только в текстовом чате.');
+    if (detail.draftAttachments.length > 0) throw new Error('Сначала удалите файлы из черновика.');
+    if (detail.turns.some((turn) => turn.status === 'queued' || turn.status === 'running')
+      || runtime.list(chatId).some((turn) => turn.status === 'queued' || turn.status === 'running')) {
+      throw new Error('Дождитесь завершения текущего хода перед сжатием контекста.');
+    }
+    const settings = await store.getSettings();
+    const selectedModelId = detail.modelId ?? settings.defaultModelId;
+    if (selectedModelId !== COMPACTION_MODEL_ID) {
+      throw new Error('Для сжатия выберите GigaChat Lite; модель автоматически не меняется.');
+    }
+    if (providerConnection.getConnectionStatus().state !== 'connected'
+      || !isChatModelAvailable(providerConnection.getModelRegistry(), COMPACTION_MODEL_ID)) {
+      throw new Error('Подключите GigaChat и проверьте доступность GigaChat Lite перед сжатием.');
+    }
+    const users = detail.messages.filter((message) => message.role === 'user');
+    const boundary = users.length >= 3 ? users[users.length - 3] : undefined;
+    if (!boundary) throw new Error('Нужно сохранить два последних обмена; старой истории для сжатия пока недостаточно.');
+
+    const accepted = await store.acceptCompactionTurn(chatId, randomUUID(), boundary.id);
+    const queued = await queueAcceptedTurnOrMarkNotSent({
+      shouldQueue: availability.compactionAvailable
+        && providerConnection.getConnectionStatus().state === 'connected'
+        && accepted.turn.modelId === COMPACTION_MODEL_ID
+        && isChatModelAvailable(providerConnection.getModelRegistry(), COMPACTION_MODEL_ID),
+      enqueue: () => runtime.enqueueCompaction(accepted.turn),
+      markNotSent: () => store.markQueuedTurnNotSent(
+        accepted.turn,
+        'Сжатие не поставлено в очередь; исходная история и сводка сохранены.',
+      ),
+      releaseReservation: () => store.releaseTurnReservation(accepted.turn.turnId),
+    });
+    return {
+      detail: queued.queued ? await store.getChat(chatId) : queued.persisted.detail,
+      queued: queued.queued,
+    };
   });
   handle('runtime:status', () => ({
     ...availability,

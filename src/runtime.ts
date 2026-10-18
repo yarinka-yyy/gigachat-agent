@@ -24,7 +24,7 @@ import { isImageProtocolDiagnostic, PROVIDER_ERROR_CATEGORIES } from './contract
 import { LocalToolError, type LocalToolEvent, type LocalTools } from './local-tools';
 import { HookDispatchAbortError } from './hooks';
 import { MAX_USAGE_COUNT, mergeUsageReceipt } from './usage';
-import { validateCompactSummary } from './context';
+import { compileExtractiveCompaction, type CompactionSources } from './compaction';
 import { MISSING_REMOTE_ATTACHMENT_MESSAGE, MissingRemoteAttachmentError } from './attachments';
 import { HISTORICAL_PROVIDER_STATE_ATTACHMENTS_MESSAGE, HistoricalProviderStateAttachmentsError } from './provider-state';
 import type { ProviderStateOwner } from './provider-state';
@@ -57,6 +57,7 @@ export interface PreparedCompactionContext {
   coveredPrefixHash: string;
   expectedSnapshotId: string | null;
   provenance: CompactSnapshot['provenance'];
+  sources: CompactionSources;
 }
 
 export interface PreparedTurn {
@@ -196,6 +197,8 @@ function runtimeErrorCategory(error: unknown, turnTimedOut = false): ProviderErr
     case 'MODEL_NOT_SELECTED': return 'model';
     case 'TURN_PREPARE_TIMEOUT':
     case 'COMPACTION_CONTEXT_UNAVAILABLE':
+    case 'COMPACTION_CANDIDATE_REJECTED':
+    case 'COMPACTION_NO_REDUCTION':
     case 'UNEXPECTED_COMPACTION_FUNCTION':
     case 'RESPONSE_LIMIT': return 'context';
     case 'PROVIDER_STEP_TIMEOUT':
@@ -218,6 +221,13 @@ function runtimeErrorCategory(error: unknown, turnTimedOut = false): ProviderErr
     case 'LOCAL_TOOL_TIMEOUT':
     case 'TOOL_RECEIPT_STORE_UNAVAILABLE': return 'tool';
     default: return undefined;
+  }
+}
+
+function compileCompactionCandidate(value: string, sources: CompactionSources): string {
+  try { return compileExtractiveCompaction(value, sources); }
+  catch {
+    throw Object.assign(new Error('COMPACTION_CANDIDATE_REJECTED'), { category: 'context' as const });
   }
 }
 
@@ -912,7 +922,13 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
       if (!request.modelId) throw new Error('MODEL_NOT_SELECTED');
       if (turn.input.operation === 'compaction') {
-        if (!compactionContext) throw new Error('COMPACTION_CONTEXT_UNAVAILABLE');
+        if (!compactionContext || !Array.isArray(compactionContext.sources?.messages)
+          || compactionContext.sources.messages.length === 0 || !Array.isArray(compactionContext.sources.tools)
+          || request.usageKind !== 'compaction' || request.functionCallMode !== 'none'
+          || (request.protocolHistory?.length ?? 0) !== 0 || request.messages.length !== 2
+          || request.messages.some((message) => message.role !== 'user')) {
+          throw new Error('COMPACTION_CONTEXT_UNAVAILABLE');
+        }
         const beforeResults = await runHookEvent({ event: 'before-compaction', projectId: turn.input.projectId });
         const rejected = beforeResults.find((result) => result.status !== 'completed' || result.decision === 'block');
         if (rejected) throw new Error(rejected.reason ?? 'Проверка Hook остановила сжатие контекста.');
@@ -1258,7 +1274,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
         const appendOperation = turn.input.operation === 'compaction'
           ? options.appendCompaction && compactionContext
-            ? options.appendCompaction(turn.input, validateCompactSummary(answer), controller.signal, compactionContext,
+            ? options.appendCompaction(turn.input, compileCompactionCandidate(answer, compactionContext.sources), controller.signal, compactionContext,
               terminalTurn, completedFunctionsStateId, providerStateOwner)
               .then(async () => {
                 await runHookEvent({ event: 'after-compaction', projectId: turn.input.projectId }, new AbortController().signal, turn.input, terminalTurn).catch(() => undefined);
@@ -1268,12 +1284,15 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
             providerStateOwner, generatedArtifactId);
         const appending = appendOperation.catch((error: unknown) => {
           if (isAbortError(error)) throw error;
+          if (turn.input.operation === 'compaction' && error instanceof Error && error.message === 'COMPACTION_NO_REDUCTION') throw error;
           throw Object.assign(new Error('ASSISTANT_SAVE_FAILED'), { category: 'storage' as const });
         });
         const appendOutcome = appending.then(
           () => ({ status: 'completed' as const }),
           (error: unknown) => turn.cancelRequested || isAbortError(error)
             ? ({ status: 'cancelled' as const, errorCategory: 'cancel' as const })
+            : turn.input.operation === 'compaction' && error instanceof Error && error.message === 'COMPACTION_NO_REDUCTION'
+              ? ({ status: 'failed' as const, error: 'Сжатие отклонено: запрос не стал короче; прежний контекст сохранён.', errorCategory: 'context' as const })
             : ({ status: 'failed' as const, error: 'Ответ не удалось сохранить. Сообщение пользователя осталось в чате.', errorCategory: 'storage' as const }),
         );
         const appended = await bounded(appending.then(() => true), operationTimeoutMs);
@@ -1353,6 +1372,10 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
                 ? 'Выберите модель GigaChat для следующего хода.'
                 : terminalError instanceof Error && terminalError.message === 'TURN_PREPARE_TIMEOUT'
                   ? 'Подготовка хода превысила ограниченное время ожидания.'
+                  : terminalError instanceof Error && terminalError.message === 'COMPACTION_CANDIDATE_REJECTED'
+                    ? 'Сжатие отклонено; прежний контекст сохранён.'
+                  : terminalError instanceof Error && terminalError.message === 'COMPACTION_NO_REDUCTION'
+                    ? 'Сжатие отклонено: запрос не стал короче; прежний контекст сохранён.'
                   : terminalError instanceof Error && terminalError.message === 'PROVIDER_STEP_TIMEOUT'
                     ? 'Поток не ответил в отведённое время.'
                     : terminalError instanceof Error && terminalError.message === 'TURN_CONSUME_TIMEOUT'

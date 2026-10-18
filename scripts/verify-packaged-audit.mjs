@@ -36,8 +36,11 @@ async function runNodeDriver() {
   const nativeWorkspaceMode = process.argv.includes('--native-browser-workspace');
   const holdForReview = process.argv.includes('--hold-for-review');
   const imageGenerationSmoke = process.argv.includes('--image-generation-smoke');
+  const compactionSmoke = process.argv.includes('--compaction-smoke');
   assert.equal(imageGenerationSmoke && nativeWorkspaceMode, false, 'image-generation smoke is an isolated renderer fixture');
-  assert.equal(imageGenerationSmoke && holdForReview, false, 'image-generation smoke must remain hidden and unattended');
+  assert.equal(compactionSmoke && nativeWorkspaceMode, false, 'compaction smoke is an isolated renderer fixture');
+  assert.equal(compactionSmoke && imageGenerationSmoke, false, 'compaction smoke uses its own renderer fixture');
+  assert.equal((imageGenerationSmoke || compactionSmoke) && holdForReview, false, 'isolated renderer smoke must stay unattended');
   const { register } = await import('tsx/esm/api');
   register();
   require('tsx/cjs/api').register();
@@ -51,7 +54,8 @@ async function runNodeDriver() {
     await mkdir(join(repo, '.qa'), { recursive: true });
     return realpath(join(repo, '.qa'));
   });
-  const fixturePrefix = imageGenerationSmoke ? 'plan011-image-generation-smoke-'
+  const fixturePrefix = compactionSmoke ? 'plan011-compaction-smoke-'
+    : imageGenerationSmoke ? 'plan011-image-generation-smoke-'
     : nativeWorkspaceMode ? 'plan009-browser-workspace-native-' : 'plan009-browser-workspace-renderer-';
   const fixture = await import('node:fs/promises').then(({ mkdtemp }) => mkdtemp(join(qaDirectory, fixturePrefix)));
   assert.equal(dirname(fixture), qaDirectory, 'fixture must be a direct child of ignored app/.qa');
@@ -279,8 +283,12 @@ async function runElectronHost() {
   const nativeWorkspaceMode = process.argv.includes('--native-browser-workspace');
   const holdForReview = process.argv.includes('--hold-for-review');
   const imageGenerationSmoke = process.argv.includes('--image-generation-smoke');
+  const compactionSmoke = process.argv.includes('--compaction-smoke');
   assert.equal(imageGenerationSmoke && nativeWorkspaceMode, false, 'image-generation smoke cannot load the native browser fixture');
+  assert.equal(compactionSmoke && nativeWorkspaceMode, false, 'compaction smoke cannot load the native browser fixture');
+  assert.equal(compactionSmoke && imageGenerationSmoke, false, 'compaction smoke cannot load the image fixture');
   assert.equal(imageGenerationSmoke && holdForReview, false, 'image-generation smoke must remain hidden and unattended');
+  assert.equal(compactionSmoke && holdForReview, false, 'compaction smoke must remain unattended');
   let generatedImagePreview = null;
   if (imageGenerationSmoke) {
     const width = 16;
@@ -318,7 +326,7 @@ async function runElectronHost() {
   const makeChat = (id, title, projectId = null, kind = 'text') => ({ id, title, projectId, pinned: false, archived: false, createdAt: timestamp, updatedAt: timestamp, kind });
   const makeDetail = (summary, text, draft = '') => ({
     ...summary, draft, nextTurnPermissionProfile: null, modelId: summary.kind === 'image' ? 'GigaChat-3-Ultra' : null, nextTurnSkillId: null,
-    messages: imageGenerationSmoke && summary.kind === 'image' ? [] : [{ id: `${summary.id}-message`, role: 'assistant', text, createdAt: timestamp }],
+    messages: (imageGenerationSmoke || compactionSmoke) && summary.kind === 'image' ? [] : [{ id: `${summary.id}-message`, role: 'assistant', text, createdAt: timestamp }],
     turns: [], toolReceipts: [], artifacts: [], draftAttachments: [], compactSnapshot: null,
   });
   const makeBrowserTab = (id, title, url) => ({ id, title, url, canGoBack: false, canGoForward: false, loading: false, error: null });
@@ -338,10 +346,19 @@ async function runElectronHost() {
   const chats = [
     chatA,
     chatB,
-    ...(imageGenerationSmoke ? [imageLegacy, imageHistory] : []),
+    ...(imageGenerationSmoke || compactionSmoke ? [imageLegacy, imageHistory] : []),
     ...Array.from({ length: 24 }, (_, index) => makeChat(`history-${index + 1}`, `History chat ${String(index + 1).padStart(2, '0')}`)),
   ];
   const details = new Map(chats.map((chat, index) => [chat.id, makeDetail(chat, index === 0 ? 'A baseline' : index === 1 ? 'B baseline' : 'History baseline')]));
+  if (compactionSmoke) {
+    const detail = details.get(chatA.id);
+    detail.modelId = 'GigaChat-3-Lightning';
+    detail.messages = Array.from({ length: 3 }, (_, index) => [
+      { id: `compact-user-${index + 1}`, role: 'user', text: `Synthetic question ${index + 1}`, createdAt: timestamp },
+      { id: `compact-answer-${index + 1}`, role: 'assistant', source: 'runtime', text: `Synthetic answer ${index + 1}`, createdAt: timestamp },
+    ]).flat();
+    details.get(chatB.id).modelId = 'GigaChat-3-Lightning';
+  }
   if (imageGenerationSmoke) {
     const legacy = details.get(imageLegacy.id);
     legacy.modelId = 'GigaChat-3-Pro';
@@ -385,12 +402,13 @@ async function runElectronHost() {
     deferHomeDraftSendResponse: false, pendingHomeDraftSends: [], homeDraftSendCalls: [], rejectNextHomeDraftSend: false,
     homeDraftAttachmentSequence: 0, homeDraftAcceptanceSequence: 0,
     runtimeTurns: new Map(), retryCalls: [], runtimeCancelCalls: [], copyMessageCalls: [], rejectNextCopyMessage: false,
-    modelRegistry: imageGenerationSmoke
+    compactionCalls: [], compactionListCalls: [], deferCompaction: false, pendingCompactions: [], rejectNextCompaction: false,
+    modelRegistry: imageGenerationSmoke || compactionSmoke
       ? { state: 'ready', modelIds: smokeModelIds, errorCategory: null, exhaustedModelIds: [] }
       : { state: 'unavailable', modelIds: [], errorCategory: null }, modelRegistryCalls: [],
-    connectionStatus: imageGenerationSmoke ? { state: 'connected', errorCategory: null } : { state: 'not-configured', errorCategory: null },
+    connectionStatus: imageGenerationSmoke || compactionSmoke ? { state: 'connected', errorCategory: null } : { state: 'not-configured', errorCategory: null },
     connectionCalls: [], nextConnectionFailure: null,
-    keyStatus: { available: true, saved: imageGenerationSmoke, usable: imageGenerationSmoke },
+    keyStatus: { available: true, saved: imageGenerationSmoke || compactionSmoke, usable: imageGenerationSmoke || compactionSmoke },
     hookRegistry: { hooks: [], issues: [] }, hookCalls: [],
     profileFixtures,
     profileView: profileFixtures.empty, profileViewCalls: 0, profileRefreshCalls: 0, profileAnchorSaveCalls: [],
@@ -974,12 +992,42 @@ async function runElectronHost() {
       state.modelRegistryCalls.push(method);
       return clone(state.modelRegistry);
     }
-    if (group === 'runtime' && method === 'list') return clone(state.runtimeTurns.get(args[0]) ?? []);
+    if (group === 'runtime' && method === 'list') {
+      if (compactionSmoke) state.compactionListCalls.push(args[0]);
+      return clone(state.runtimeTurns.get(args[0]) ?? []);
+    }
     if (group === 'runtime' && method === 'getStatus') return {
-      providerConfigured: false, helperRecovered: false, rendererToolApi: false,
-      helperUnavailableReason: 'Synthetic renderer fixture.', compactionAvailable: false,
-      compactionUnavailableReason: 'Команда /compact выключена до проверки качества сводки. История чата не изменена.',
+      providerConfigured: compactionSmoke, helperRecovered: false, rendererToolApi: false,
+      helperUnavailableReason: 'Synthetic renderer fixture.', compactionAvailable: compactionSmoke,
+      compactionUnavailableReason: 'Ручное сжатие доступно только в API-режиме для текстового чата с моделью GigaChat-3-Lightning. История чата не изменена.',
     };
+    if (group === 'runtime' && method === 'compact') {
+      const chatId = args[0];
+      state.compactionCalls.push({ chatId });
+      if (state.rejectNextCompaction) {
+        state.rejectNextCompaction = false;
+        throw new Error('Synthetic compaction rejection.');
+      }
+      const detail = state.details.get(chatId);
+      if (!detail) throw new Error('Synthetic chat not found.');
+      const boundary = detail.messages.filter((message) => message.role === 'user').at(-3);
+      if (!boundary) throw new Error('Synthetic compaction boundary missing.');
+      const turnId = `compact-smoke-${state.compactionCalls.length}`;
+      const createdAt = new Date().toISOString();
+      const record = {
+        turnId, anchorMessageId: boundary.id, assistantMessageId: null, modelId: detail.modelId,
+        operation: 'compaction', status: 'queued', createdAt, activity: [],
+      };
+      detail.turns.push(record);
+      const snapshot = {
+        id: turnId, chatId, anchorMessageId: boundary.id, assistantMessageId: null,
+        modelId: detail.modelId, operation: 'compaction', status: 'queued', createdAt, activity: [],
+      };
+      state.runtimeTurns.set(chatId, [...(state.runtimeTurns.get(chatId) ?? []), snapshot]);
+      const result = { detail: clone(detail), queued: true };
+      if (!state.deferCompaction) return result;
+      return new Promise((resolve, reject) => state.pendingCompactions.push({ chatId, turnId, snapshot, result, resolve, reject }));
+    }
     if (group === 'runtime' && method === 'cancel') {
       state.runtimeCancelCalls.push({ chatId: args[0], turnId: args[1] });
       return true;
@@ -1463,7 +1511,7 @@ async function runElectronHost() {
     return true;
   })()`);
   const capture = async (name) => {
-    if (!imageGenerationSmoke && !window.isVisible()) window.showInactive();
+    if (!imageGenerationSmoke && !compactionSmoke && !window.isVisible()) window.showInactive();
     if (name === 'close-pending-import-settings-config') {
       console.log(`MIXED_CLOSE capture before RAF ${JSON.stringify({
         visible: window.isVisible(),
@@ -1478,12 +1526,13 @@ async function runElectronHost() {
       })}`);
     }
     let image = await window.webContents.capturePage();
-    if (image.isEmpty() && !imageGenerationSmoke) {
+    if (image.isEmpty() && !imageGenerationSmoke && !compactionSmoke) {
       window.showInactive();
       await sleep(120);
       image = await window.webContents.capturePage();
     }
     assert.equal(image.isEmpty(), false, `screenshot is empty while the fixture window stays hidden: ${name}`);
+    if (compactionSmoke) assert.equal(window.isVisible(), false, 'compaction smoke screenshots must never reveal the BrowserWindow');
     const screenshotPath = join(fixturePath, `${name}.png`);
     await writeFile(screenshotPath, image.toPNG());
     console.log(`SCREENSHOT ${screenshotPath}`);
@@ -1726,6 +1775,153 @@ async function runElectronHost() {
       appends: state.appendCalls.length, saves: state.generatedImageSaveCalls.length, opens: state.generatedImageOpenCalls.length,
       previews: state.generatedImagePreviewCalls.length, stagedDrops: state.chatDraftStageCalls.length, pickerCalls: state.chatDraftPickCalls })}`);
     process.stdout.write('Plan011 image-generation renderer smoke: PASS\n', () => app.exit(0));
+  };
+
+  const runCompactionSmoke = async () => {
+    assert.equal(window.isVisible(), false, 'compaction smoke starts without showing its BrowserWindow');
+    const chatId = 'chat-a';
+    const detail = state.details.get(chatId);
+    const draftSelector = '.composer textarea';
+    const originalMessages = clone(detail.messages);
+    const originalAppendCount = state.appendCalls.length;
+    const compactCallCount = () => state.compactionCalls.length;
+    const publishStatus = async (turnId, status, assertRendered = true) => {
+      const current = state.runtimeTurns.get(chatId) ?? [];
+      const existing = current.find((turn) => turn.id === turnId);
+      assert.ok(existing, `runtime snapshot exists for ${turnId}`);
+      const next = {
+        ...existing,
+        status,
+        ...(status === 'running' ? { startedAt: new Date().toISOString() } : {}),
+        ...(status === 'completed' || status === 'failed' ? { endedAt: new Date().toISOString() } : {}),
+      };
+      state.runtimeTurns.set(chatId, current.map((turn) => turn.id === turnId ? next : turn));
+      const persisted = state.details.get(chatId).turns.find((turn) => turn.turnId === turnId);
+      if (persisted) Object.assign(persisted, { status: next.status, ...(next.startedAt ? { startedAt: next.startedAt } : {}), ...(next.endedAt ? { endedAt: next.endedAt } : {}) });
+      window.webContents.send('audit:runtime', clone(next));
+      if (assertRendered) {
+        await waitDom(`compaction turn becomes ${status}`, `document.querySelector(${JSON.stringify(`[data-turn-id="${turnId}"] .turn-activity-status.status-${status}`)})`);
+      }
+      return next;
+    };
+    const acceptDeferredCompaction = async (index, assertRendered = true) => {
+      const pending = state.pendingCompactions.splice(index, 1)[0];
+      assert.ok(pending, `deferred compaction ${index + 1} exists`);
+      const listCallsBefore = state.compactionListCalls.length;
+      pending.resolve(pending.result);
+      await waitUntil('accepted compaction response reaches runtime list', () => state.compactionListCalls.length > listCallsBefore);
+      if (assertRendered) {
+        await waitDom('accepted compaction is visible in the queue', `document.querySelector(${JSON.stringify(`[data-turn-id="${pending.turnId}"] .turn-activity-status.status-queued`)})`);
+      }
+      return pending.turnId;
+    };
+
+    await clickChat('Chat A');
+    await waitDom('compaction smoke opens eligible Chat A', `document.querySelector('.chat-header-title')?.textContent === 'Chat A' && !document.querySelector(${JSON.stringify(draftSelector)})?.disabled`);
+    await fillTextarea(draftSelector, '/');
+    await waitDom('manual compact suggestion is enabled', `document.querySelector('#composer-suggestion-compact') && !document.querySelector('#composer-suggestion-compact')?.disabled`);
+    window.setSize(1408, 900);
+    await sleep(180);
+    await capture('compact-command-wide-1408x900');
+    window.setSize(560, 480);
+    await sleep(180);
+    await capture('compact-command-narrow-560x480');
+    window.setSize(1120, 760);
+    await sleep(100);
+
+    await click('#composer-suggestion-compact');
+    await waitDom('mouse autocomplete inserts exact manual command', `document.querySelector(${JSON.stringify(draftSelector)})?.value.trim() === '/compact'`);
+    await waitUntil('exact command draft is persisted before acceptance', () => state.details.get(chatId).draft.trim() === '/compact');
+    await click('.send-button');
+    await waitUntil('mouse command makes one compact call', () => compactCallCount() === 1);
+    await waitDom('accepted mouse command reports queued success', `document.body.innerText.includes('Сжатие поставлено в очередь GigaChat')`);
+    await waitUntil('accepted command clear is saved in Chat A', () => state.details.get(chatId).draft === '');
+    assert.equal(state.appendCalls.length, originalAppendCount, 'manual command never appends normal chat text');
+    assert.deepEqual(state.details.get(chatId).messages, originalMessages, 'manual command leaves visible raw history unchanged');
+    assert.equal(await evaluate(`document.querySelector(${JSON.stringify(draftSelector)})?.value`), '', 'accepted exact command draft is cleared');
+    const firstTurnId = state.details.get(chatId).turns.at(-1)?.turnId;
+    assert.ok(firstTurnId);
+    await waitDom('queued compaction shows its queue action', `document.querySelector(${JSON.stringify(`[data-turn-id="${firstTurnId}"] .runtime-cancel`)})`);
+    await publishStatus(firstTurnId, 'running');
+    await publishStatus(firstTurnId, 'completed');
+
+    await clickChat('Chat B');
+    await waitDom('Chat B has insufficient compactable history', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'`);
+    await fillTextarea(draftSelector, '/compact');
+    await click('.send-button');
+    await waitDom('insufficient history is explained locally', `document.body.innerText.includes('Нужно сохранить два последних обмена')`);
+    assert.equal(compactCallCount(), 1, 'ineligible chat does not reach the compact bridge');
+    await fillTextarea(draftSelector, '/compact later');
+    await click('.send-button');
+    await waitDom('command arguments are rejected locally', `document.body.innerText.includes('Команда принимает только отдельную запись /compact')`);
+    assert.equal(compactCallCount(), 1, 'command with arguments does not reach the compact bridge');
+    assert.equal(state.appendCalls.length, originalAppendCount, 'blocked commands never append ordinary text');
+
+    await clickChat('Legacy image chat');
+    await waitDom('image chat opens for a command blocker check', `document.querySelector('.chat-header-title')?.textContent === 'Legacy image chat'`);
+    await fillTextarea(draftSelector, '/compact');
+    await click('.send-button');
+    await waitDom('image chat receives a text-chat-only notice', `document.body.innerText.includes('Сжатие доступно только в существующем текстовом чате')`);
+    assert.equal(compactCallCount(), 1, 'image chat does not reach the compact bridge');
+
+    await clickChat('Chat A');
+    await waitDom('Chat A returns with the accepted command draft cleared', `document.querySelector('.chat-header-title')?.textContent === 'Chat A' && document.querySelector(${JSON.stringify(draftSelector)})?.value === ''`);
+    state.deferCompaction = true;
+    await fillTextarea(draftSelector, '/');
+    assert.equal(await evaluate(`(() => { const textarea = document.querySelector(${JSON.stringify(draftSelector)}); textarea?.focus(); return document.activeElement === textarea; })()`), true,
+      'keyboard command test focuses the composer without revealing the window');
+    window.webContents.focus();
+    await sendKey('DOWN');
+    await sendKey('ENTER');
+    await waitDom('keyboard autocomplete inserts compact command', `document.querySelector(${JSON.stringify(draftSelector)})?.value.trim() === '/compact'`);
+    await sendKey('ENTER');
+    await waitUntil('keyboard command waits on one deferred bridge call', () => compactCallCount() === 2 && state.pendingCompactions.length === 1);
+    assert.equal(await evaluate(`document.querySelector('.send-button')?.disabled`), true, 'send is locked while the bridge is pending');
+    await evaluate(`document.querySelector('.send-button')?.click()`);
+    assert.equal(compactCallCount(), 2, 'a second click during the deferred call cannot enqueue another compact');
+
+    state.deferPermissionUpdates = true;
+    await click('.composer-permission-menu > button');
+    await waitDom('permission choices open during compact response', `document.querySelector('.permission-picker-popup')`);
+    await clickText('.permission-picker-option', 'Полный доступ');
+    await waitUntil('new permission revision is pending', () => state.pendingPermissionUpdates.length === 1);
+    resolvePermissionUpdate(state.pendingPermissionUpdates[0]);
+    await waitUntil('new permission revision is saved', () => state.details.get(chatId).nextTurnPermissionProfile === 'full');
+    state.deferPermissionUpdates = false;
+
+    const secondTurnId = await acceptDeferredCompaction(0);
+    await waitDom('late compact result preserves the newer permission choice', `document.querySelector('.composer-permission-menu > button')?.textContent.includes('Полный доступ')`);
+    await publishStatus(secondTurnId, 'running');
+    await publishStatus(secondTurnId, 'completed');
+
+    state.deferCompaction = true;
+    await fillTextarea(draftSelector, '/compact');
+    await click('.send-button');
+    await waitUntil('route-race compact call is deferred', () => compactCallCount() === 3 && state.pendingCompactions.length === 1);
+    await clickChat('Chat B');
+    await waitDom('route changes while compact response is pending', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'`);
+    await fillTextarea(draftSelector, 'New Chat B draft while Chat A compacts');
+    const thirdTurnId = await acceptDeferredCompaction(0, false);
+    await waitDom('late compact result keeps the other chat draft and route', `document.querySelector('.chat-header-title')?.textContent === 'Chat B' && document.querySelector(${JSON.stringify(draftSelector)})?.value === 'New Chat B draft while Chat A compacts'`);
+    await publishStatus(thirdTurnId, 'running', false);
+    await publishStatus(thirdTurnId, 'completed', false);
+    assert.equal(await evaluate(`Boolean(document.querySelector(${JSON.stringify(`[data-turn-id="${thirdTurnId}"]`)}))`), false,
+      'a background Chat A compaction is not rendered inside Chat B');
+
+    await clickChat('Chat A');
+    await waitDom('Chat A returns for rejection notice check', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'`);
+    state.rejectNextCompaction = true;
+    await fillTextarea(draftSelector, '/compact');
+    await click('.send-button');
+    await waitUntil('rejected exact command makes one bridge call', () => compactCallCount() === 4);
+    await waitDom('bridge rejection appears as a local notice', `document.body.innerText.includes('Synthetic compaction rejection.')`);
+    assert.equal(await evaluate(`document.querySelector(${JSON.stringify(draftSelector)})?.value.trim()`), '/compact', 'failed compaction keeps the command draft for inspection');
+    assert.equal(compactCallCount(), 4, 'each exact command makes one bridge call');
+    assert.equal(state.appendCalls.length, originalAppendCount, 'manual commands and the other chat draft are never appended as an ordinary request');
+    assert.deepEqual(state.details.get(chatId).messages, originalMessages, 'all compact smoke paths preserve the visible raw history');
+    assert.equal(window.isVisible(), false, 'compaction renderer smoke stays offscreen and hidden');
+    console.log(`COMPACTION_SMOKE_COUNTS ${JSON.stringify({ compactCalls: compactCallCount(), appends: state.appendCalls.length, screenshots: ['compact-command-wide-1408x900.png', 'compact-command-narrow-560x480.png'] })}`);
+    process.stdout.write('Plan011 manual compaction renderer smoke: PASS\n', () => app.exit(0));
   };
 
   const runNativeBrowserWorkspace = async () => {
@@ -2157,7 +2353,7 @@ async function runElectronHost() {
       width: 1120,
       height: 760,
       webPreferences: {
-        ...(imageGenerationSmoke ? { offscreen: true } : {}),
+        ...(imageGenerationSmoke || compactionSmoke ? { offscreen: true } : {}),
         preload: join(fixturePath, 'preload.cjs'),
         contextIsolation: true,
         sandbox: true,
@@ -2244,6 +2440,11 @@ async function runElectronHost() {
 
     if (imageGenerationSmoke) {
       await runImageGenerationSmoke();
+      return;
+    }
+
+    if (compactionSmoke) {
+      await runCompactionSmoke();
       return;
     }
 
@@ -5921,7 +6122,7 @@ const methods = {
   homeDraft: ['get','save','importFile','pickFiles','stageFiles','getAttachmentPreview','removeFile','send'],
   projects: ['list','create','pickFolder','instructionsBackupPath','update','remove','chooseFolder','openFolder','readInstructions','saveInstructions','saveInstructionsCopy'],
   chats: ['list','get','create','update','appendLocalMessage','importFile','pickDraftFiles','stageDraftFiles','getDraftAttachmentPreview','getArtifactPreview','getGeneratedImagePreview','saveGeneratedImage','removeDraftFile','copyMessage','openArtifact','openFolder','remove'],
-  runtime: ['getStatus','list','cancel','retry'],
+  runtime: ['getStatus','list','compact','cancel','retry'],
   permissions: ['readConfig','saveConfig','respond'],
   skills: ['list','readSource','setEnabled','openFolder'],
   hooks: ['list','inspect','trust','setEnabled'],

@@ -9,7 +9,9 @@ import type { CustomPolicy } from './custom-permissions';
 import type { LocalTools, LocalToolsOptions, PowerShellRequest } from './local-tools';
 import { createLocalTools, LocalToolError } from './local-tools';
 import { createHookApprovalGate, createHookDispatcher, createHookRegistry, HookDispatchAbortError, type HookExecutionContext } from './hooks';
-import { createTurnRuntime, queueAcceptedTurnOrMarkNotSent, type PreparedTurn, type ToolReceiptInput, type ToolReceiptStart, type TurnRuntimeOptions } from './runtime';
+import { createTurnRuntime, queueAcceptedTurnOrMarkNotSent, type PreparedCompactionContext, type PreparedTurn, type ToolReceiptInput, type ToolReceiptStart, type TurnRuntimeOptions } from './runtime';
+import { COMPACTION_TASK_INSTRUCTION } from './context';
+import { createCompactionSources, serializeCompactionTranscript, type CompactionSources } from './compaction';
 import { mergeUsageReceipt } from './usage';
 import { createBalanceScopeGuard } from './usage-view';
 import {
@@ -52,7 +54,57 @@ function compactionTurnFor(chatId: string): AcceptedTurnInput {
   };
 }
 
+function compactionSourcesFor(turn: AcceptedTurnInput): CompactionSources {
+  return createCompactionSources(turn.messages, [], []);
+}
+
+function preparedCompactionContext(turn: AcceptedTurnInput, overrides: Partial<PreparedCompactionContext> = {}): PreparedCompactionContext {
+  return {
+    boundaryMessageId: turn.compactBoundaryMessageId ?? turn.messageId,
+    coveredThroughMessageId: turn.messageId,
+    coveredPrefixHash: 'c'.repeat(64),
+    expectedSnapshotId: null,
+    provenance: 'fixture',
+    sources: compactionSourcesFor(turn),
+    ...overrides,
+  };
+}
+
+function compactionRecordsForRequest(request: ProviderTurnRequest): Array<{ sourceRef?: string; role?: string; text?: string }> {
+  const transcript = request.messages[0]?.text ?? '';
+  const records = JSON.parse(transcript.slice(transcript.indexOf('\n') + 1)) as Array<{ sourceRef?: string; role?: string; text?: string }>;
+  assert.ok(records.length > 0 && records.every((record) => /^m\d+$/.test(record.sourceRef ?? '')
+    && (record.role === 'user' || record.role === 'assistant') && typeof record.text === 'string'));
+  return records;
+}
+
+function compactionCandidateForRequest(request: ProviderTurnRequest): string {
+  return JSON.stringify({ version: 2, decisions: compactionRecordsForRequest(request)
+    .map((record) => ({ sourceRef: record.sourceRef, retain: true })) });
+}
+
+function invalidCompactionSelectionForRequest(request: ProviderTurnRequest): string {
+  const decisions = compactionRecordsForRequest(request).map((record) => ({ sourceRef: record.sourceRef, retain: true }));
+  assert.ok(decisions[0]);
+  return JSON.stringify({ version: 2, decisions: [...decisions, decisions[0]] });
+}
+
 function requestFor(turn: AcceptedTurnInput): ProviderTurnRequest {
+  if (turn.operation === 'compaction') {
+    const sources = compactionSourcesFor(turn);
+    return {
+      system: [],
+      modelId: turn.modelId,
+      messages: [
+        { id: 'request-compaction-transcript', role: 'user', text: serializeCompactionTranscript(sources), createdAt: turn.messages[0]?.createdAt ?? '2026-09-27T00:00:00.000Z' },
+        { id: 'request-compaction-task', role: 'user', text: COMPACTION_TASK_INSTRUCTION, createdAt: turn.messages[0]?.createdAt ?? '2026-09-27T00:00:00.000Z' },
+      ],
+      protocolHistory: [],
+      permissionProfile: turn.permissionProfile,
+      usageKind: 'compaction',
+      functionCallMode: 'none',
+    };
+  }
   return {
     system: [],
     modelId: turn.modelId,
@@ -167,8 +219,15 @@ function makeOwnedStoreRuntime(
       let compaction: PreparedTurn['compaction'];
       if (turn.operation === 'compaction') {
         const prefix = await store.getCompactionPrefix(turn.chatId, turn.compactBoundaryMessageId);
+        const detail = await store.getChat(turn.chatId);
+        const sources = createCompactionSources(prefix.messages, detail.toolReceipts, detail.artifacts);
         request = {
-          system: [], messages: prefix.messages, protocolHistory: prefix.protocolHistory,
+          system: [],
+          messages: [
+            { id: 'request-compaction-transcript', role: 'user', text: serializeCompactionTranscript(sources), createdAt: prefix.messages[0]?.createdAt ?? '2026-09-27T00:00:00.000Z' },
+            { id: 'request-compaction-task', role: 'user', text: COMPACTION_TASK_INSTRUCTION, createdAt: prefix.messages[0]?.createdAt ?? '2026-09-27T00:00:00.000Z' },
+          ],
+          protocolHistory: [],
           permissionProfile: turn.permissionProfile, modelId: turn.modelId,
           usageKind: 'compaction', functionCallMode: 'none',
         };
@@ -178,6 +237,7 @@ function makeOwnedStoreRuntime(
           coveredPrefixHash: prefix.coveredPrefixHash,
           expectedSnapshotId: turn.compactExpectedSnapshotId ?? null,
           provenance: 'provider',
+          sources,
         };
       } else {
         request = {
@@ -188,7 +248,7 @@ function makeOwnedStoreRuntime(
           modelId: turn.modelId,
         };
       }
-      if (filterOutboundState) {
+      if (filterOutboundState && turn.operation !== 'compaction') {
         assertProviderStateOwner(providerStateOwner, guard, signal);
         const detail = await store.getChat(turn.chatId);
         assertProviderStateOwner(providerStateOwner, guard, signal);
@@ -497,27 +557,18 @@ test('holds FIFO through delayed compaction save and its single after hook', asy
   const hookEvents: string[] = [];
   let summarySaved = false;
   const provider = makeProvider(async function* (request) {
-    const prompt = request.messages[0]?.text ?? '';
+    const prompt = request.usageKind === 'compaction' ? 'Сожми историю' : request.messages[0]?.text ?? '';
     started.push(prompt);
-    yield { type: 'text-delta', text: prompt === 'Сожми историю' ? 'Сводка истории' : 'Ответ после сжатия' };
+    yield { type: 'text-delta', text: request.usageKind === 'compaction' ? compactionCandidateForRequest(request) : 'Ответ после сжатия' };
     yield { type: 'completed' };
   });
   const runtime = createTurnRuntime({
     provider,
     tools: testTools,
-    prepareTurn: async (turn): Promise<ProviderTurnRequest | { request: ProviderTurnRequest; compaction: {
-      boundaryMessageId: string; coveredThroughMessageId: string; coveredPrefixHash: string;
-      expectedSnapshotId: string | null; provenance: 'fixture';
-    } }> => turn.operation === 'compaction'
+    prepareTurn: async (turn): Promise<ProviderTurnRequest | PreparedTurn> => turn.operation === 'compaction'
       ? {
         request: requestFor(turn),
-        compaction: {
-          boundaryMessageId: turn.messageId,
-          coveredThroughMessageId: turn.messageId,
-          coveredPrefixHash: 'a'.repeat(64),
-          expectedSnapshotId: null,
-          provenance: 'fixture',
-        },
+        compaction: preparedCompactionContext(turn, { coveredPrefixHash: 'a'.repeat(64) }),
       }
       : requestFor(turn),
     consumeTurn: async () => undefined,
@@ -575,27 +626,18 @@ test('a rejected compaction append skips the after hook and releases FIFO only a
   const started: string[] = [];
   const hookEvents: string[] = [];
   const provider = makeProvider(async function* (request) {
-    const prompt = request.messages[0]?.text ?? '';
+    const prompt = request.usageKind === 'compaction' ? 'Сожми историю' : request.messages[0]?.text ?? '';
     started.push(prompt);
-    yield { type: 'text-delta', text: prompt === 'Сожми историю' ? 'Сводка истории' : 'Ответ следующего хода' };
+    yield { type: 'text-delta', text: request.usageKind === 'compaction' ? compactionCandidateForRequest(request) : 'Ответ следующего хода' };
     yield { type: 'completed' };
   });
   const runtime = createTurnRuntime({
     provider,
     tools: testTools,
-    prepareTurn: async (turn): Promise<ProviderTurnRequest | { request: ProviderTurnRequest; compaction: {
-      boundaryMessageId: string; coveredThroughMessageId: string; coveredPrefixHash: string;
-      expectedSnapshotId: string | null; provenance: 'fixture';
-    } }> => turn.operation === 'compaction'
+    prepareTurn: async (turn): Promise<ProviderTurnRequest | PreparedTurn> => turn.operation === 'compaction'
       ? {
         request: requestFor(turn),
-        compaction: {
-          boundaryMessageId: turn.compactBoundaryMessageId!,
-          coveredThroughMessageId: turn.messageId,
-          coveredPrefixHash: 'e'.repeat(64),
-          expectedSnapshotId: null,
-          provenance: 'fixture',
-        },
+        compaction: preparedCompactionContext(turn, { coveredPrefixHash: 'e'.repeat(64) }),
       }
       : requestFor(turn),
     consumeTurn: async () => undefined,
@@ -651,18 +693,9 @@ test('keeps production compaction disabled and refuses unexpected summarizer fun
   const fixture = createTurnRuntime({
     provider,
     tools: { write: async () => { writes += 1; } } as unknown as LocalTools,
-    prepareTurn: async (turn): Promise<ProviderTurnRequest | { request: ProviderTurnRequest; compaction: {
-      boundaryMessageId: string; coveredThroughMessageId: string; coveredPrefixHash: string;
-      expectedSnapshotId: string | null; provenance: 'fixture';
-    } }> => ({
+    prepareTurn: async (turn): Promise<ProviderTurnRequest | PreparedTurn> => ({
       request: { ...requestFor(turn), functionCallMode: 'none' },
-      compaction: {
-        boundaryMessageId: turn.messageId,
-        coveredThroughMessageId: turn.messageId,
-        coveredPrefixHash: 'b'.repeat(64),
-        expectedSnapshotId: null,
-        provenance: 'fixture',
-      },
+      compaction: preparedCompactionContext(turn, { coveredPrefixHash: 'b'.repeat(64) }),
     }),
     consumeTurn: async () => undefined,
     releaseTurn: () => undefined,
@@ -681,16 +714,17 @@ test('keeps production compaction disabled and refuses unexpected summarizer fun
   assert.equal(hookEvents.filter((event) => event === 'after-compaction').length, 0);
 });
 
-test('rejects a symbol-only completed compaction without replacing context or blocking the next turn', async () => {
+test('rejects a duplicate source ref, keeps the prior context, and continues the next turn', async () => {
   const started: string[] = [];
   const hookEvents: string[] = [];
   const consumed: string[] = [];
+  const compactionReceiptStatuses: UsageReceipt['status'][] = [];
   const priorSnapshotText = 'Предыдущая сохранённая сводка';
   let savedSnapshotText = priorSnapshotText;
   let snapshots = 0;
   const provider = makeProvider(async function* (request) {
-    started.push(request.messages[request.messages.length - 1]?.text ?? '');
-    yield { type: 'text-delta', text: request.usageKind === 'compaction' ? '|' : 'Следующий ответ' };
+    started.push(request.usageKind === 'compaction' ? 'Сожми историю' : request.messages[request.messages.length - 1]?.text ?? '');
+    yield { type: 'text-delta', text: request.usageKind === 'compaction' ? invalidCompactionSelectionForRequest(request) : 'Следующий ответ' };
     yield { type: 'completed' };
   });
   const runtime = createTurnRuntime({
@@ -699,13 +733,9 @@ test('rejects a symbol-only completed compaction without replacing context or bl
     prepareTurn: async (turn): Promise<ProviderTurnRequest | PreparedTurn> => turn.operation === 'compaction'
       ? {
         request: { ...requestFor(turn), usageKind: 'compaction', functionCallMode: 'none' },
-        compaction: {
-          boundaryMessageId: turn.compactBoundaryMessageId!,
-          coveredThroughMessageId: turn.messageId,
-          coveredPrefixHash: 'f'.repeat(64),
-          expectedSnapshotId: 'prior-snapshot',
-          provenance: 'fixture',
-        },
+        compaction: preparedCompactionContext(turn, {
+          coveredPrefixHash: 'f'.repeat(64), expectedSnapshotId: 'prior-snapshot',
+        }),
       }
       : requestFor(turn),
     consumeTurn: async (turn) => { consumed.push(turn.turnId); },
@@ -713,7 +743,9 @@ test('rejects a symbol-only completed compaction without replacing context or bl
     appendAssistant: async () => undefined,
     appendCompaction: async (_turn, text) => { snapshots += 1; savedSnapshotText = text; },
     compactionEnabled: true,
-    recordUsageReceipt: async () => undefined,
+    recordUsageReceipt: async (receipt) => {
+      if (receipt.requestKind === 'compaction') compactionReceiptStatuses.push(receipt.status);
+    },
     runHooks: async (_turn, input) => { hookEvents.push(input.event); return []; },
   });
 
@@ -724,13 +756,56 @@ test('rejects a symbol-only completed compaction without replacing context or bl
   await runtime.whenIdle();
 
   assert.equal(runtime.list(compactionTurn.chatId)[0]?.status, 'failed');
+  assert.equal(runtime.list(compactionTurn.chatId)[0]?.error, 'Сжатие отклонено; прежний контекст сохранён.');
   assert.equal(runtime.list(nextTurn.chatId)[0]?.status, 'completed');
   assert.equal(snapshots, 0);
   assert.equal(savedSnapshotText, priorSnapshotText);
+  assert.deepEqual(compactionReceiptStatuses, ['pending', 'completed']);
   assert.equal(hookEvents.filter((event) => event === 'before-compaction').length, 1);
   assert.equal(hookEvents.includes('after-compaction'), false);
   assert.deepEqual(started, ['Сожми историю', 'chat-after-symbol-only-compact']);
   assert.deepEqual(consumed, [compactionTurn.turnId, nextTurn.turnId]);
+});
+
+test('reports a non-reducing compaction separately and retains completed usage', async () => {
+  const usageReceipts: UsageReceipt[] = [];
+  let snapshotCommitAttempts = 0;
+  const provider = makeProvider(async function* (request) {
+    yield { type: 'usage', promptTokens: 120, completionTokens: 20, totalTokens: 140, precachedPromptTokens: 0 };
+    yield { type: 'text-delta', text: compactionCandidateForRequest(request) };
+    yield { type: 'completed' };
+  });
+  const runtime = createTurnRuntime({
+    provider,
+    tools: testTools,
+    prepareTurn: async (turn): Promise<ProviderTurnRequest | PreparedTurn> => ({
+      request: requestFor(turn),
+      compaction: preparedCompactionContext(turn),
+    }),
+    consumeTurn: async () => undefined,
+    releaseTurn: () => undefined,
+    appendAssistant: async () => undefined,
+    appendCompaction: async () => {
+      snapshotCommitAttempts += 1;
+      throw Object.assign(new Error('COMPACTION_NO_REDUCTION'), { category: 'context' as const });
+    },
+    compactionEnabled: true,
+    recordUsageReceipt: async (receipt) => { usageReceipts.push(structuredClone(receipt)); },
+  });
+
+  assert.ok(runtime.enqueueCompaction(compactionTurnFor('chat-no-reduction')));
+  await runtime.whenIdle();
+  const failed = runtime.list('chat-no-reduction')[0];
+  assert.equal(failed?.status, 'failed');
+  assert.equal(failed?.errorCategory, 'context');
+  assert.equal(failed?.error, 'Сжатие отклонено: запрос не стал короче; прежний контекст сохранён.');
+  const completedUsage = [...usageReceipts].reverse().find((receipt) => receipt.status === 'completed');
+  assert.ok(usageReceipts.some((receipt) => receipt.status === 'pending'));
+  assert.ok(completedUsage);
+  assert.equal(completedUsage.promptTokens, 120);
+  assert.equal(completedUsage.completionTokens, 20);
+  assert.equal(completedUsage.totalTokens, 140);
+  assert.equal(snapshotCommitAttempts, 1);
 });
 
 test('pre-compaction Hook blocks provider work and provider errors never commit a summary', async () => {
@@ -744,18 +819,9 @@ test('pre-compaction Hook blocks provider work and provider errors never commit 
   const makeCompactionRuntime = (blocked: boolean) => createTurnRuntime({
     provider,
     tools: testTools,
-    prepareTurn: async (turn): Promise<ProviderTurnRequest | { request: ProviderTurnRequest; compaction: {
-      boundaryMessageId: string; coveredThroughMessageId: string; coveredPrefixHash: string;
-      expectedSnapshotId: string | null; provenance: 'fixture';
-    } }> => ({
+    prepareTurn: async (turn): Promise<ProviderTurnRequest | PreparedTurn> => ({
       request: requestFor(turn),
-      compaction: {
-        boundaryMessageId: turn.compactBoundaryMessageId!,
-        coveredThroughMessageId: turn.messageId,
-        coveredPrefixHash: 'c'.repeat(64),
-        expectedSnapshotId: null,
-        provenance: 'fixture',
-      },
+      compaction: preparedCompactionContext(turn, { coveredPrefixHash: 'c'.repeat(64) }),
     }),
     consumeTurn: async () => undefined,
     releaseTurn: () => undefined,
@@ -812,15 +878,9 @@ test('cancelling a running compaction never saves a snapshot or runs its after h
   const runtime = createTurnRuntime({
     provider,
     tools: testTools,
-    prepareTurn: async (turn) => ({
+    prepareTurn: async (turn): Promise<PreparedTurn> => ({
       request: requestFor(turn),
-      compaction: {
-        boundaryMessageId: turn.compactBoundaryMessageId!,
-        coveredThroughMessageId: turn.messageId,
-        coveredPrefixHash: 'd'.repeat(64),
-        expectedSnapshotId: null,
-        provenance: 'fixture' as const,
-      },
+      compaction: preparedCompactionContext(turn, { coveredPrefixHash: 'd'.repeat(64) }),
     }),
     consumeTurn: async () => undefined,
     releaseTurn: () => undefined,
@@ -1841,7 +1901,7 @@ test('runtime binds assistant, tool and compact state to the captured account an
   const provider = makeProvider(async function* (request) {
     if (request.usageKind === 'compaction') {
       compactCalls += 1;
-      yield { type: 'text-delta', text: `Сводка ${compactCalls}` };
+      yield { type: 'text-delta', text: compactionCandidateForRequest(request) };
       yield compactCalls === 1
         ? { type: 'completed', functionsStateId: compactStateId }
         : { type: 'completed' };
@@ -1914,7 +1974,7 @@ test('runtime binds assistant, tool and compact state to the captured account an
   await runtime.whenIdle();
   const compacted = await (await openStore(directory)).getChat(chat.id);
   assert.deepEqual(compacted.messages, originalMessages, 'compaction keeps the public raw message history intact');
-  assert.equal(compacted.compactSnapshot?.text, 'Сводка 1');
+  assert.match(compacted.compactSnapshot?.text ?? '', /Содержимое прочитано/);
   assert.deepEqual(await (await openStore(directory)).getProviderStateOwnership(chat.id, stateA.accountScope), {
     ...stateAView,
     compact: { snapshotId: compacted.compactSnapshot!.id, owned: true, functionsStateId: compactStateId },
@@ -1925,7 +1985,7 @@ test('runtime binds assistant, tool and compact state to the captured account an
   await runtime.whenIdle();
   const noStateCompactedStore = await openStore(directory);
   const noStateCompacted = await noStateCompactedStore.getChat(chat.id);
-  assert.equal(noStateCompacted.compactSnapshot?.text, 'Сводка 2');
+  assert.match(noStateCompacted.compactSnapshot?.text ?? '', /Результат чтения/);
   assert.deepEqual((await noStateCompactedStore.getProviderStateOwnership(chat.id, stateA.accountScope)).compact,
     { snapshotId: noStateCompacted.compactSnapshot!.id, owned: false, functionsStateId: null },
     'a new compact snapshot without a returned state does not inherit the prior owner');

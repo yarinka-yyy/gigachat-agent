@@ -1,18 +1,23 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { completeComposerSuggestion, getComposerCompletion, isUnavailableCompactCommand } from './commands';
+import { classifyCompactCommand, completeComposerSuggestion, getComposerCompletion } from './commands';
 
-test('suggests the unavailable compact command without enabling it', () => {
+test('suggests compact only when Main reports it available and classifies exact input separately from arguments', () => {
   const completion = getComposerCompletion('/comp');
   assert.equal(completion?.kind, 'command');
   const suggestion = completion?.items[0];
   assert.ok(suggestion);
   assert.equal(suggestion.label, '/compact');
   assert.equal(suggestion.available, false);
-  assert.match(suggestion.description, /проверки качества сводки/);
-  assert.equal(isUnavailableCompactCommand('  /COMPACT  '), true);
-  assert.equal(isUnavailableCompactCommand('/compact now'), true);
+  assert.match(suggestion.description, /GigaChat Lite/);
+  const available = getComposerCompletion('/comp', undefined, [], null, true)?.items[0];
+  assert.equal(available?.available, true);
   assert.throws(() => completeComposerSuggestion('/comp', 5, suggestion));
+  assert.doesNotThrow(() => available && completeComposerSuggestion('/comp', 5, available));
+  assert.equal(classifyCompactCommand('  /COMPACT  '), 'exact');
+  assert.equal(classifyCompactCommand('/compact now'), 'arguments');
+  assert.equal(classifyCompactCommand('покажи /compact'), 'none');
+  assert.equal(classifyCompactCommand('/compactmore'), 'none');
 });
 
 test('offers only enabled installed skills and stores selection separately from message text', () => {
@@ -42,7 +47,7 @@ test('keeps ordinary text out of command suggestions and explains an empty skill
   const completion = getComposerCompletion('$');
   assert.deepEqual(completion?.items, []);
   assert.equal(completion?.emptyMessage, 'Локальные Skills пока не обнаружены.');
-  assert.equal(isUnavailableCompactCommand('покажи /compact'), false);
+  assert.equal(classifyCompactCommand('покажи /compact'), 'none');
 });
 
 test('shows Global Skills and only the selected project scope in autocomplete', () => {

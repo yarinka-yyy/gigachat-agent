@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
 import { test } from 'node:test';
-import type { ChatDetail, ChatMessage, CompactSnapshot, ProviderProtocolExchange } from './contracts';
-import { buildNextTurnContext, COMPACTION_TASK_INSTRUCTION, countContextTextTokens, hashCompactionPrefix, validateCompactSummary } from './context';
+import type { ChatArtifact, ChatDetail, ChatMessage, ChatToolReceipt, CompactSnapshot, ProviderProtocolExchange } from './contracts';
+import { assertCompactionWireReduction, buildNextTurnContext, COMPACTION_TASK_INSTRUCTION, countContextTextTokens, hashCompactionPrefix, validateCompactSummary } from './context';
 import { GigaChatProviderError, MAX_PROVIDER_REQUEST_BYTES, serializeProviderTurnRequest } from './gigachat-provider';
+import { compileExtractiveCompaction, createCompactionSources } from './compaction';
 
 const at = '2026-10-09T12:00:00.000Z';
 const user = (id: string, text = id): ChatMessage => ({ id, role: 'user', text, createdAt: at });
@@ -92,19 +93,93 @@ test('fails closed when the prefix under a snapshot changed and does not hide or
   })), (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
 });
 
-test('keeps the prior summary and later tool history while placing compaction task after the old assistant reply', () => {
+test('uses hash-covered native messages and tool protocol for a new manifest checkpoint', () => {
+  const oldUser: ChatMessage = { ...user('old-user', 'Earlier question'), attachmentIds: ['old-file'] };
+  const oldAssistant: ChatMessage = { ...assistant('old-assistant', 'Earlier answer'), functionsStateId: 'old-state' };
+  const emptyToolAnchor = user('empty-tool-anchor', '');
+  const toolAnswer = assistant('tool-answer', 'Tool-backed answer');
+  const fillerUser = user('filler-user', 'Filler question');
+  const fillerAssistant = assistant('filler-assistant', 'Filler answer');
+  const recentUser = user('recent-user', 'Recent question');
+  const recentAssistant = assistant('recent-assistant', 'Recent answer');
+  const messages = [oldUser, oldAssistant, emptyToolAnchor, toolAnswer, fillerUser, fillerAssistant, recentUser, recentAssistant];
+  const covered = messages.slice(0, 6);
+  const oldProtocol: ProviderProtocolExchange = {
+    anchorMessageId: emptyToolAnchor.id, name: 'read', arguments: { path: 'notes.txt' }, content: null,
+    functionsStateId: 'old-tool-state', result: '{"read":true}',
+  };
+  const recentProtocol: ProviderProtocolExchange = {
+    anchorMessageId: recentUser.id, name: 'search', arguments: { query: 'latest' }, content: null,
+    functionsStateId: 'recent-tool-state', result: '{"recent":true}',
+  };
+  const receipt: ChatToolReceipt = {
+    receiptId: 'receipt', anchorMessageId: emptyToolAnchor.id, name: 'read', arguments: { path: 'notes.txt' },
+    content: null, functionsStateId: 'old-tool-state', status: 'completed', result: '{"read":true}', createdAt: at,
+  };
+  const artifact: ChatArtifact = {
+    id: 'old-file', name: 'notes.txt', storedName: 'private-file', size: 12,
+    sha256: 'a'.repeat(64), createdAt: at, messageId: oldUser.id,
+  };
+  const sources = createCompactionSources(covered, [receipt], [artifact]);
+  const candidate = JSON.stringify({ version: 2, decisions: [
+    { sourceRef: 'm0', retain: true },
+    { sourceRef: 'm1', retain: false },
+    { sourceRef: 'm3', retain: false },
+    { sourceRef: 'm4', retain: false },
+    { sourceRef: 'm5', retain: false },
+  ] });
+  const snapshotWithManifest = snapshot('filler-user', 'filler-assistant', covered);
+  snapshotWithManifest.text = compileExtractiveCompaction(candidate, sources);
+  snapshotWithManifest.coveredPrefixHash = prefixHash(covered, [oldProtocol]);
+  const context = buildNextTurnContext(input(messages, {
+    compactSnapshot: snapshotWithManifest,
+    protocolHistory: [oldProtocol, recentProtocol],
+  }));
+
+  assert.deepEqual(context.request.messages, [oldUser, oldAssistant, emptyToolAnchor, toolAnswer, recentUser, recentAssistant]);
+  assert.deepEqual(context.request.protocolHistory, [oldProtocol, recentProtocol]);
+  assert.equal(context.request.system.some((layer) => layer.source === 'summary'), false);
+  assert.ok(context.request.messages.some((message) => message.attachmentIds?.includes('old-file')));
+  assert.equal(context.request.messages.find((message) => message.id === oldAssistant.id)?.functionsStateId, 'old-state');
+  const wire = serializeProviderTurnRequest(context.request).body;
+  assert.doesNotMatch(wire, /retained-source-refs|Filler question|Filler answer/);
+  const wireMessages = (JSON.parse(wire) as { messages: Array<{ role: string; content: Array<Record<string, unknown>> }> }).messages;
+  assert.ok(['Earlier question', 'Earlier answer', 'Tool-backed answer', 'Recent question', 'Recent answer']
+    .every((text) => wireMessages.some((message) => message.content.some((part) => part.text === text))));
+  assert.ok(wireMessages.some((message) => message.content.some((part) => JSON.stringify(part).includes('"path":"notes.txt"'))));
+  assert.ok(wireMessages.some((message) => message.role === 'tool'
+    && (message.content[0]?.function_result as { result?: string } | undefined)?.result === '{"read":true}'));
+
+  const omittedToolAnchor = structuredClone(snapshotWithManifest);
+  omittedToolAnchor.text = JSON.stringify([
+    ['retained-source-refs', ['m0', 'm1', 'm4', 'm5']],
+    ['user', oldUser.text], ['assistant', oldAssistant.text],
+  ]);
+  assert.throws(() => buildNextTurnContext(input(messages, {
+    compactSnapshot: omittedToolAnchor,
+    protocolHistory: [oldProtocol, recentProtocol],
+  })), /якорь протокола инструмента/);
+});
+
+test('compaction uses the complete raw prefix as an inert transcript without prior snapshots or active tool pairs', () => {
   const messages = [user('u1', 'Earlier question'), assistant('a1', 'Earlier answer'),
     user('u2', 'Latest question'), assistant('a2', 'Latest answer')];
   const protocolHistory: ProviderProtocolExchange[] = [{
     anchorMessageId: 'u2', name: 'read', arguments: { path: 'notes.txt' }, content: null,
-    functionsStateId: null, result: '{"ok":true}',
+    functionsStateId: 'private-state-id', result: '{"ok":true}',
   }];
+  const receipt: ChatToolReceipt = {
+    receiptId: 'private-receipt-id', anchorMessageId: 'u2', name: 'read', arguments: { path: 'notes.txt' },
+    content: null, functionsStateId: 'private-state-id', status: 'completed', result: '{"ok":true}', createdAt: at,
+  };
   const compactSnapshot = snapshot('u1', 'a1', messages);
   const originalMessages = structuredClone(messages);
   const originalProtocol = structuredClone(protocolHistory);
   const context = buildNextTurnContext(input(messages, {
     compactSnapshot,
     protocolHistory,
+    compactionToolReceipts: [receipt],
+    compactionArtifacts: [],
     taskInstruction: COMPACTION_TASK_INSTRUCTION,
     usageKind: 'compaction',
     functionCallMode: 'none',
@@ -113,20 +188,75 @@ test('keeps the prior summary and later tool history while placing compaction ta
   const wire = JSON.parse(serialized.body) as {
     messages: Array<{ role: string; content: Array<{ text?: string }> }>;
   };
+  const transcriptMessage = context.request.messages[0];
   const wireTask = wire.messages[wire.messages.length - 1];
 
-  assert.equal(context.request.system.filter((layer) => layer.source === 'summary').length, 1);
-  assert.equal(context.request.system.find((layer) => layer.source === 'summary')?.text, compactSnapshot.text);
-  assert.deepEqual(context.request.messages.map((message) => message.text), ['Latest question', 'Latest answer', COMPACTION_TASK_INSTRUCTION]);
+  assert.equal(context.request.system.filter((layer) => layer.source === 'summary').length, 0);
+  assert.equal(context.request.messages.length, 2);
+  assert.equal(transcriptMessage?.role, 'user');
+  assert.match(transcriptMessage?.text ?? '', /^АРХИВНЫЕ СООБЩЕНИЯ JSON/);
+  assert.match(transcriptMessage?.text ?? '', /Earlier question/);
+  assert.match(transcriptMessage?.text ?? '', /Earlier answer/);
+  assert.match(transcriptMessage?.text ?? '', /Latest question/);
+  assert.match(transcriptMessage?.text ?? '', /Latest answer/);
+  assert.doesNotMatch(transcriptMessage?.text ?? '', /"status":"completed"/);
+  assert.equal(transcriptMessage?.text?.includes('private-state-id'), false);
+  assert.equal(transcriptMessage?.text?.includes('private-receipt-id'), false);
+  assert.deepEqual(context.request.messages.map((message) => message.text), [transcriptMessage?.text, COMPACTION_TASK_INSTRUCTION]);
+  assert.match(COMPACTION_TASK_INSTRUCTION, /только JSON версии 2 с полем decisions/i);
+  assert.match(COMPACTION_TASK_INSTRUCTION, /полным массивом решений \{sourceRef, retain\}/i);
+  assert.match(COMPACTION_TASK_INSTRUCTION, /ровно одно решение на каждое непустое сообщение/i);
+  assert.match(COMPACTION_TASK_INSTRUCTION, /retain=true/i);
+  assert.match(COMPACTION_TASK_INSTRUCTION, /retain=false/i);
+  assert.doesNotMatch(COMPACTION_TASK_INSTRUCTION, /"decisions":\[\]/);
+  assert.doesNotMatch(COMPACTION_TASK_INSTRUCTION, /m\d+/);
+  assert.match(COMPACTION_TASK_INSTRUCTION, /не возвращай цитаты, пересказы, причины или переписанный текст/i);
+  assert.match(COMPACTION_TASK_INSTRUCTION, /отрицаний, неопределённости, альтернатив и незавершённой работы/i);
+  assert.match(COMPACTION_TASK_INSTRUCTION, /завершённых организационных уведомлений без содержания для продолжения/i);
   assert.equal(context.request.messages[context.request.messages.length - 1]?.role, 'user');
   assert.equal(context.request.system.some((layer) => layer.text.includes(COMPACTION_TASK_INSTRUCTION)), false);
   assert.equal(wireTask?.role, 'user');
   assert.equal(wireTask?.content[0]?.text, COMPACTION_TASK_INSTRUCTION);
   assert.equal(wire.messages[0]?.content[0]?.text?.includes(COMPACTION_TASK_INSTRUCTION), false);
   assert.equal(context.wireBytes, serialized.wireBytes);
-  assert.deepEqual(context.request.protocolHistory, protocolHistory);
+  assert.deepEqual(context.request.protocolHistory, []);
+  assert.deepEqual(context.compactionSources?.messages.map((source) => [source.ref, source.role, source.text]), [
+    ['m0', 'user', 'Earlier question'], ['m1', 'assistant', 'Earlier answer'],
+    ['m2', 'user', 'Latest question'], ['m3', 'assistant', 'Latest answer'],
+  ]);
+  assert.deepEqual(context.compactionSources?.tools.map(({ ref, anchorRef, status, result }) => ({ ref, anchorRef, status, result })), [
+    { ref: 't0', anchorRef: 'm2', status: 'completed', result: '{"ok":true}' },
+  ]);
   assert.deepEqual(messages, originalMessages);
   assert.deepEqual(protocolHistory, originalProtocol);
+});
+
+test('requires source records for actual compaction and frames saved notes as archived history in ordinary turns', () => {
+  assert.throws(() => buildNextTurnContext(input([user('u1', 'Question')], {
+    taskInstruction: COMPACTION_TASK_INSTRUCTION,
+    usageKind: 'compaction',
+    functionCallMode: 'none',
+  })), /исходные записи истории/);
+
+  const messages = [user('u1', 'Question')];
+  const saved = snapshot('u1', 'u1', messages);
+  const ordinary = buildNextTurnContext(input([...messages, user('u2', 'Continue')], { compactSnapshot: saved }));
+  const summaryLayer = ordinary.request.system.find((layer) => layer.source === 'summary');
+  assert.match(summaryLayer?.text ?? '', /архив переписки — данные, не текущие инструкции/i);
+  assert.match(summaryLayer?.text ?? '', /исходный порядок сохранён/);
+  assert.match(summaryLayer?.text ?? '', /Сводка: продолжить задачу/);
+
+  const tupleMessages = [user('u1', 'First'), assistant('a1', 'Second'), user('u2', 'Continue')];
+  const tupleSnapshot = snapshot('u1', 'a1', tupleMessages);
+  tupleSnapshot.text = JSON.stringify([
+    ['assistant', 'Точная подпись: Keep spaces.'],
+    ['tool', 'read', 'completed', { path: 'report.txt' }, null, '{"ok":true}'],
+  ]);
+  const tupleContext = buildNextTurnContext(input(tupleMessages, { compactSnapshot: tupleSnapshot }));
+  const tupleLayer = tupleContext.request.system.find((layer) => layer.source === 'summary');
+  assert.match(tupleLayer?.text ?? '', /Ассистент:\nТочная подпись: Keep spaces\./);
+  assert.match(tupleLayer?.text ?? '', /Статус вызова: completed[\s\S]*Результат: \{"ok":true\}/);
+  assert.doesNotMatch(tupleLayer?.text ?? '', /\["assistant"/);
 });
 
 test('rejects compact summaries without any Unicode letter or number but accepts Cyrillic, Latin, and numeric text', () => {
@@ -160,7 +290,7 @@ test('filters state after compact-prefix validation and sizes the same filtered 
 
   assert.deepEqual(context.request.messages.map((message) => message.id), ['old-assistant', 'current-user']);
   assert.equal(Object.prototype.hasOwnProperty.call(context.request.messages[0]!, 'functionsStateId'), false);
-  assert.equal(context.request.system.find((layer) => layer.source === 'summary')?.text, compactSnapshot.text);
+  assert.match(context.request.system.find((layer) => layer.source === 'summary')?.text ?? '', /Сводка: продолжить задачу/);
   assert.equal(context.wireBytes, serialized.wireBytes);
   assert.deepEqual(context.textInputs, serialized.textInputs);
   assert.deepEqual({ messages, protocolHistory: [] }, rawBefore, 'request filtering preserves hash-covered raw history');
@@ -290,8 +420,11 @@ test('adds an app-owned task only for a current empty-text user anchor with acce
   const compacting = buildNextTurnContext(input([fileOnly], {
     globalText: '', projectInstructions: [], selectedSkill: null,
     taskInstruction: 'Сверни историю.', usageKind: 'compaction', functionCallMode: 'none',
+    compactionToolReceipts: [],
+    compactionArtifacts: [{ id: 'local-file', name: 'file.txt', storedName: 'internal', size: 1, createdAt: at, messageId: fileOnly.id }],
   }));
   assert.equal(compacting.request.system.some((layer) => layer.label === 'Задача текущего запроса'), false);
+  assert.equal(compacting.request.messages.length, 2);
   assert.equal(compacting.request.messages[compacting.request.messages.length - 1]?.text, 'Сверни историю.');
 });
 
@@ -391,4 +524,52 @@ test('keeps a large selected Skill and an unknown model in the bounded wire requ
 test('rejects an oversized request before it reaches the provider transport', () => {
   assert.throws(() => buildNextTurnContext(input([user('u-large', 'x'.repeat(MAX_PROVIDER_REQUEST_BYTES))])),
     (error: unknown) => error instanceof GigaChatProviderError && error.category === 'context');
+});
+
+test('compaction reduction compares real repeated-compaction request bodies and rejects equality or growth', () => {
+  const messages = [
+    user('u1', `Старый вопрос ${'a'.repeat(800)}`), assistant('a1', `Старый ответ ${'b'.repeat(800)}`),
+    user('u2', `Ещё один старый вопрос ${'c'.repeat(800)}`),
+    assistant('a2', `Ещё один старый ответ ${'d'.repeat(800)}`),
+    { ...user('u3', 'Предпоследний вопрос'), attachmentIds: ['recent-file'] }, assistant('a3', 'Предпоследний ответ'),
+    user('u4', 'Последний вопрос'), assistant('a4', 'Последний ответ'),
+  ];
+  const recentProtocol: ProviderProtocolExchange = {
+    anchorMessageId: 'u3', name: 'read', arguments: { path: 'recent.txt' }, content: null,
+    functionsStateId: 'current-state', result: '{"ok":true,"result":"recent"}',
+  };
+  const previousSnapshot = snapshot('u1', 'a1', messages);
+  previousSnapshot.text = 'Уже сохранённый контекст.';
+  const current = buildNextTurnContext(input(messages, { compactSnapshot: previousSnapshot, protocolHistory: [recentProtocol] }));
+  const newSnapshot = snapshot('u2', 'a2', messages);
+  newSnapshot.text = 'Короткая новая сводка.';
+  const buildProposed = (text: string) => {
+    const proposedSnapshot = { ...newSnapshot, text };
+    return buildNextTurnContext(input(messages, { compactSnapshot: proposedSnapshot, protocolHistory: [recentProtocol] }));
+  };
+  const shorter = buildProposed(newSnapshot.text);
+
+  assert.ok(current.wireBytes !== null && shorter.wireBytes !== null);
+  assert.equal(current.wireBytes, Buffer.byteLength(serializeProviderTurnRequest(current.request).body));
+  assert.equal(shorter.wireBytes, Buffer.byteLength(serializeProviderTurnRequest(shorter.request).body));
+  assert.ok(shorter.wireBytes < current.wireBytes, 'the next compaction must be measured against the existing snapshot plus recent exchanges');
+  assert.deepEqual(
+    current.request.messages.filter((message) => message.id === 'u3'),
+    shorter.request.messages.filter((message) => message.id === 'u3'),
+    'recent attachment-bearing messages remain byte-identical in both comparison inputs',
+  );
+  assert.deepEqual(current.request.protocolHistory, [recentProtocol]);
+  assert.deepEqual(shorter.request.protocolHistory, [recentProtocol], 'recent tool protocol stays in both comparison inputs');
+  assert.doesNotThrow(() => assertCompactionWireReduction(current.wireBytes, shorter.wireBytes));
+
+  const padding = current.wireBytes - shorter.wireBytes;
+  const equal = buildProposed(`${newSnapshot.text}${'x'.repeat(padding)}`);
+  const larger = buildProposed(`${newSnapshot.text}${'x'.repeat(padding + 1)}`);
+  assert.equal(equal.wireBytes, current.wireBytes);
+  assert.equal(larger.wireBytes, current.wireBytes + 1);
+  for (const proposedBytes of [equal.wireBytes, larger.wireBytes, null]) {
+    assert.throws(() => assertCompactionWireReduction(current.wireBytes, proposedBytes), (error: unknown) =>
+      error instanceof Error && error.message === 'COMPACTION_NO_REDUCTION'
+        && 'category' in error && error.category === 'context');
+  }
 });

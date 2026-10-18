@@ -9,6 +9,7 @@ import { discoveredModelRegistry, failedModelRegistry, isModelAvailable, require
 import { billingFamilyForUsageLabel, CHAT_MODEL_FAMILIES, isChatModelAvailable } from './model-catalog';
 import { attachmentContentType, inspectLocalAttachmentContent, LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES, PROVIDER_MEDIA_LIMIT_BYTES, PROVIDER_REQUEST_LIMIT_BYTES } from './attachment-policy';
 import { validateProviderV2FunctionWire } from './provider-wire';
+import { COMPACTION_OUTPUT_TOKEN_LIMIT } from './compaction';
 
 export const GIGACHAT_API_BASE_URL = 'https://api.giga.chat/v1';
 const GIGACHAT_V2_CHAT_COMPLETIONS_URL = 'https://api.giga.chat/v2/chat/completions';
@@ -23,6 +24,30 @@ const MAX_RESPONSE_EVENT_COUNT = 4096;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_REQUEST_TIMEOUT_MS = 90_000;
 const MAX_FUNCTION_ARGUMENT_BYTES = 1_900_000;
+const COMPACTION_RESPONSE_FORMAT = {
+  type: 'json_schema',
+  schema: {
+    type: 'object',
+    properties: {
+      version: { type: 'integer', enum: [2] },
+      decisions: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            sourceRef: { type: 'string' },
+            retain: { type: 'boolean' },
+          },
+          required: ['sourceRef', 'retain'],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ['version', 'decisions'],
+    additionalProperties: false,
+  },
+  strict: true,
+};
 const IMAGE_GENERATION_MODEL_ID = 'GigaChat-3-Ultra';
 const IMAGE_GENERATION_TIMEOUT_MS = 90_000;
 const MAX_GENERATED_IMAGE_BYTES = Math.min(LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES);
@@ -165,7 +190,13 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
       model: modelId,
       messages,
       ...(tools ? { tools } : {}),
-      model_options: { parallel_tool_calls: false },
+      model_options: {
+        parallel_tool_calls: false,
+        ...(request.usageKind === 'compaction' ? {
+          max_tokens: COMPACTION_OUTPUT_TOKEN_LIMIT,
+          response_format: COMPACTION_RESPONSE_FORMAT,
+        } : {}),
+      },
       tool_config: { mode: functionsEnabled ? 'auto' : 'none' },
       stream: true,
     });

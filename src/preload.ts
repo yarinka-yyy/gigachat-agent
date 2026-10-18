@@ -125,6 +125,7 @@ const api: AppApi = {
   },
   runtime: {
     getStatus: () => ipcRenderer.invoke('runtime:status') as Promise<RuntimeAvailability>,
+    compact: (chatId) => ipcRenderer.invoke('runtime:compact', chatId) as Promise<{ detail: ChatDetail; queued: boolean }>,
     list: (chatId) => ipcRenderer.invoke('runtime:list', chatId) as Promise<RuntimeTurnSnapshot[]>,
     cancel: (chatId, turnId) => ipcRenderer.invoke('runtime:cancel', chatId, turnId) as Promise<boolean>,
     retry: (chatId, turnId) => ipcRenderer.invoke('runtime:retry', chatId, turnId) as Promise<string | null>,

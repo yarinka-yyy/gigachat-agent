@@ -119,14 +119,14 @@ test('Save conflict preserves dirty text and releases the operation guard', asyn
 test('IME keeps Enter/arrows/Escape available; ordinary Skill Enter still works', () => {
   for (const key of ['Enter', 'ArrowDown', 'ArrowUp', 'Escape']) {
     let prevented = false; let changed = false;
-    const context = vm.createContext({ completionDismissed: false, draft: '$テ', composerSkills: [{ id: 'global/test', name: 'テスト', enabled: true, scope: 'global' }], composerProjectId: null, completionIndex: 0,
+    const context = vm.createContext({ completionDismissed: false, draft: '$テ', composerSkills: [{ id: 'global/test', name: 'テスト', enabled: true, scope: 'global' }], composerProjectId: null, completionIndex: 0, compactionSuggestionAvailable: false,
       getComposerCompletion, setCompletionDismissed() { changed = true; }, setCompletionIndex() { changed = true; }, insertComposerSuggestion() { changed = true; }, submitMessage() { changed = true; } });
     vm.runInContext(compile(functionText('handleComposerKeyDown')), context);
     context.handleComposerKeyDown({ key, shiftKey: false, currentTarget: { selectionStart: 2 }, nativeEvent: { isComposing: true }, preventDefault() { prevented = true; } });
     assert.equal(prevented, false, key); assert.equal(changed, false, key);
   }
   let selection = ''; let draft = '$テ';
-  const context = vm.createContext({ completionDismissed: false, draft, composerSkills: [{ id: 'global/test', name: 'テスト', enabled: true, scope: 'global' }], composerProjectId: null, completionIndex: 0,
+  const context = vm.createContext({ completionDismissed: false, draft, composerSkills: [{ id: 'global/test', name: 'テスト', enabled: true, scope: 'global' }], composerProjectId: null, completionIndex: 0, compactionSuggestionAvailable: false,
     getComposerCompletion, insertComposerSuggestion(suggestion: Parameters<typeof completeComposerSuggestion>[2], caret: number) { selection = suggestion.skillId ?? ''; draft = completeComposerSuggestion(draft, caret, suggestion).value; } });
   vm.runInContext(compile(functionText('handleComposerKeyDown')), context);
   context.handleComposerKeyDown({ key: 'Enter', shiftKey: false, currentTarget: { selectionStart: 2 }, nativeEvent: { isComposing: false }, preventDefault() {} });

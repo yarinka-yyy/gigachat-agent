@@ -700,6 +700,44 @@ test('accepted but unqueued turns become durable not-sent without overwriting la
   store.releaseTurnReservation(runningAccepted.turn.turnId);
 });
 
+test('a compaction that fails to enter the runtime queue is durably settled without changing chat history', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-compaction-not-sent-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const first = await store.acceptLocalMessage(chat.id, 'Первый запрос', 'compaction-not-sent-first');
+  await appendAcceptedAnswer(store, first.turn, 'Первый ответ');
+  const second = await store.acceptLocalMessage(chat.id, 'Второй запрос', 'compaction-not-sent-second');
+  await appendAcceptedAnswer(store, second.turn, 'Второй ответ');
+  const third = await store.acceptLocalMessage(chat.id, 'Третий запрос', 'compaction-not-sent-third');
+  await appendAcceptedAnswer(store, third.turn, 'Третий ответ');
+
+  const before = await store.getChat(chat.id);
+  const boundary = before.messages.find((message) => message.id === first.turn.messageId);
+  assert.ok(boundary);
+  const accepted = await store.acceptCompactionTurn(chat.id, 'compaction-not-sent', boundary.id);
+  assert.equal(accepted.turn.operation, 'compaction');
+  assert.equal(accepted.turn.assistantMessageId, null);
+  assert.equal(accepted.turn.compactBoundaryMessageId, boundary.id);
+  assert.equal(accepted.turn.compactExpectedSnapshotId, null);
+
+  const reason = 'Сжатие не было поставлено в очередь.';
+  const settled = await store.markQueuedTurnNotSent(accepted.turn, reason);
+  assert.equal(settled.marked, true);
+  assert.equal(settled.detail.turns.find((turn) => turn.turnId === accepted.turn.turnId)?.status, 'failed');
+  assert.equal(settled.detail.turns.find((turn) => turn.turnId === accepted.turn.turnId)?.operation, 'compaction');
+  assert.equal(settled.detail.turns.find((turn) => turn.turnId === accepted.turn.turnId)?.error, reason);
+  assert.deepEqual(settled.detail.messages, before.messages);
+  assert.equal(settled.detail.compactSnapshot, null);
+  assert.equal((await store.markQueuedTurnNotSent(accepted.turn, 'Не заменять причину.')).marked, false);
+  const reopened = await openStore(directory);
+  const restored = await reopened.getChat(chat.id);
+  assert.deepEqual(restored.messages, before.messages);
+  assert.equal(restored.compactSnapshot, null);
+  assert.equal(restored.turns.find((turn) => turn.turnId === accepted.turn.turnId)?.status, 'failed');
+  store.releaseTurnReservation(accepted.turn.turnId);
+});
+
 test('a failed home-send journal write leaves the unsent draft and files available', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-home-send-failure-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -1202,7 +1240,7 @@ test('inserts a queued reply after its user anchor and assembles only history th
   for (const turn of [first.turn, second.turn, third.turn]) store.releaseTurnReservation(turn.turnId);
 });
 
-test('compaction captures the fixed queued prefix, keeps tool pairing, and persists without hiding messages', async (t) => {
+test('manual compaction captures the selected boundary, keeps tool pairing, and persists without hiding messages', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-compaction-prefix-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const store = await openStore(directory);
@@ -1217,14 +1255,24 @@ test('compaction captures the fixed queued prefix, keeps tool pairing, and persi
   await appendAcceptedAnswer(store, first.turn, 'answer1');
 
   const second = await store.acceptLocalMessage(chat.id, 'user2', 'turn-compact-user2');
-  const compact = await store.acceptCompactionTurn(chat.id, 'turn-compact');
-  assert.equal(compact.turn.messageId, second.turn.messageId);
   await appendAcceptedAnswer(store, second.turn, 'answer2');
-  await store.acceptLocalMessage(chat.id, 'user3', 'turn-compact-user3');
+  const third = await store.acceptLocalMessage(chat.id, 'user3', 'turn-compact-user3');
+  await appendAcceptedAnswer(store, third.turn, 'answer3');
+  const pendingPath = join(directory, 'pending.txt');
+  await writeFile(pendingPath, 'Pending draft attachment.', 'utf8');
+  const pendingDraft = await store.stageChatDraftFile(chat.id, pendingPath);
+  await assert.rejects(
+    store.acceptCompactionTurn(chat.id, 'turn-compact-draft-file', first.turn.messageId),
+    /удалите файлы из черновика/i,
+    'the serialized acceptance check catches a draft attachment after Main preflight',
+  );
+  await store.removeChatDraftFile(chat.id, pendingDraft.draftAttachments[0]!.id);
+  const compact = await store.acceptCompactionTurn(chat.id, 'turn-compact', first.turn.messageId);
+  assert.equal(compact.turn.messageId, first.turn.messageId);
 
   const prefix = await store.getCompactionPrefix(chat.id, compact.turn.messageId);
-  assert.deepEqual(prefix.messages.map((message) => message.text), ['user1', 'answer1', 'user2', 'answer2']);
-  assert.equal(prefix.coveredThroughMessageId, (await store.getChat(chat.id)).messages[3]?.id);
+  assert.deepEqual(prefix.messages.map((message) => message.text), ['user1', 'answer1']);
+  assert.equal(prefix.coveredThroughMessageId, (await store.getChat(chat.id)).messages[1]?.id);
   assert.deepEqual(prefix.protocolHistory.map((exchange) => ({
     anchorMessageId: exchange.anchorMessageId,
     name: exchange.name,
@@ -1240,22 +1288,44 @@ test('compaction captures the fixed queued prefix, keeps tool pairing, and persi
   const snapshot: CompactSnapshot = {
     id: 'snapshot-compact-1', version: 1, boundaryMessageId: compact.turn.messageId,
     coveredThroughMessageId: prefix.coveredThroughMessageId, coveredPrefixHash: prefix.coveredPrefixHash,
-    text: 'Сохранены user1, tool result, answer1 и user2.', modelId: 'GigaChat-2-Pro',
+    text: 'Сохранены user1, tool result и answer1.', modelId: 'GigaChat-2-Pro',
     provenance: 'fixture', createdAt: timestamp,
   };
   await store.commitCompactSnapshot(chat.id, snapshot, compact.turn.compactExpectedSnapshotId ?? null, undefined,
     completedCompactionTurn(compact.turn, (await store.getChat(chat.id)).turns.find((turn) => turn.turnId === compact.turn.turnId)!.createdAt));
   const beforeReload = await store.getChat(chat.id);
-  assert.deepEqual(beforeReload.messages.map((message) => message.text), ['user1', 'answer1', 'user2', 'answer2', 'user3']);
+  assert.deepEqual(beforeReload.messages.map((message) => message.text), ['user1', 'answer1', 'user2', 'answer2', 'user3', 'answer3']);
   assert.deepEqual(beforeReload.compactSnapshot, snapshot);
 
   const restored = await openStore(directory);
   const afterReload = await restored.getChat(chat.id);
   assert.deepEqual(afterReload.messages, beforeReload.messages);
   assert.deepEqual(afterReload.compactSnapshot, snapshot);
-  store.releaseTurnReservation(first.turn.turnId);
-  store.releaseTurnReservation(second.turn.turnId);
+  for (const turn of [first.turn, second.turn, third.turn]) store.releaseTurnReservation(turn.turnId);
   store.releaseTurnReservation(compact.turn.turnId);
+});
+
+test('default compaction prefix keeps every assistant message in the boundary exchange', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-compaction-multiple-assistant-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const accepted = await store.acceptLocalMessage(chat.id, 'Boundary question', 'turn-multiple-assistant');
+  await appendAcceptedAnswer(store, accepted.turn, 'First assistant message');
+  const chatPath = join(directory, 'chats', chat.id, 'chat.json');
+  const saved = JSON.parse(await readFile(chatPath, 'utf8')) as Record<string, unknown> & { messages: ChatMessage[] };
+  saved.messages.push({
+    id: 'assistant-follow-up', role: 'assistant', text: 'Second assistant message',
+    createdAt: timestamp, source: 'runtime',
+  });
+  await writeFile(chatPath, JSON.stringify(saved), 'utf8');
+
+  const reopened = await openStore(directory);
+  const prefix = await reopened.getCompactionPrefix(chat.id, accepted.turn.messageId);
+  assert.deepEqual(prefix.messages.map((message) => message.text), [
+    'Boundary question', 'First assistant message', 'Second assistant message',
+  ]);
+  store.releaseTurnReservation(accepted.turn.turnId);
 });
 
 test('compact snapshot conflicts, save failures, and cancellation leave prior summary and history intact', async (t) => {
@@ -1322,17 +1392,14 @@ test('compact snapshot conflicts, save failures, and cancellation leave prior su
   store.releaseTurnReservation(second.turn.turnId);
 });
 
-test('runs queued turns through the real context builder and store compaction, then reloads summary with recent history', async (t) => {
+test('runs completed exchanges through compaction, reopens the checkpoint, and keeps recent history verbatim', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-compaction-e2e-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const store = await openStore(directory);
   const chat = await store.createChat();
   await store.updateChat(chat.id, { modelId: 'future/model-without-capability-metadata' });
-  const first = await store.acceptLocalMessage(chat.id, 'Первый запрос', 'turn-e2e-first');
-  const second = await store.acceptLocalMessage(chat.id, 'Второй запрос', 'turn-e2e-second');
-  const compact = await store.acceptCompactionTurn(chat.id, 'turn-e2e-compact');
-  const third = await store.acceptLocalMessage(chat.id, 'Третий запрос', 'turn-e2e-third');
   const requests: ProviderTurnRequest[] = [];
+  const compactionPrefixes: ChatMessage[][] = [];
   const hookEvents: string[] = [];
   let reads = 0;
   const provider: GigaChatProvider = {
@@ -1340,7 +1407,16 @@ test('runs queued turns through the real context builder and store compaction, t
       requests.push(structuredClone(request));
       yield { type: 'usage', promptTokens: 8, completionTokens: 2, totalTokens: 10, precachedPromptTokens: 1 };
       if (request.usageKind === 'compaction') {
-        yield { type: 'text-delta', text: 'Сводка: первый, второй и результат чтения.' };
+        const transcript = request.messages[0]?.text ?? '';
+        const records = JSON.parse(transcript.slice(transcript.indexOf('\n') + 1)) as Array<{
+          sourceRef?: string; role?: string; text?: string;
+        }>;
+        assert.ok(records.length > 0 && records.every((record) => /^m\d+$/.test(record.sourceRef ?? '')
+          && (record.role === 'user' || record.role === 'assistant') && typeof record.text === 'string'));
+        yield { type: 'text-delta', text: JSON.stringify({
+          version: 2,
+          decisions: records.map((record) => ({ sourceRef: record.sourceRef, retain: true })),
+        }) };
       } else {
         const userPrompt = [...request.messages].reverse().find((message) => message.role === 'user')?.text ?? '';
         if (userPrompt === 'Первый запрос' && !request.protocolHistory?.length) {
@@ -1367,6 +1443,7 @@ test('runs queued turns through the real context builder and store compaction, t
       const prefix = turn.operation === 'compaction'
         ? await store.getCompactionPrefix(turn.chatId, turn.compactBoundaryMessageId)
         : null;
+      if (prefix) compactionPrefixes.push(structuredClone(prefix.messages));
       const messages = prefix?.messages ?? await store.getMessagesThrough(turn.chatId, turn.messageId);
       const protocolHistory = prefix?.protocolHistory ?? await store.getToolProtocolThrough(turn.chatId, turn.messageId);
       const context = buildNextTurnContext({
@@ -1376,6 +1453,10 @@ test('runs queued turns through the real context builder and store compaction, t
         messages,
         protocolHistory,
         compactSnapshot: detail.compactSnapshot,
+        ...(turn.operation === 'compaction' ? {
+          compactionToolReceipts: detail.toolReceipts,
+          compactionArtifacts: detail.artifacts,
+        } : {}),
         permissionProfile: turn.permissionProfile,
         modelId: turn.modelId,
         ...(turn.operation === 'compaction' ? {
@@ -1393,6 +1474,7 @@ test('runs queued turns through the real context builder and store compaction, t
           coveredPrefixHash: prefix.coveredPrefixHash,
           expectedSnapshotId: turn.compactExpectedSnapshotId ?? null,
           provenance: 'fixture',
+          sources: context.compactionSources!,
         },
       };
     },
@@ -1420,40 +1502,68 @@ test('runs queued turns through the real context builder and store compaction, t
     },
   });
 
+  const first = await store.acceptLocalMessage(chat.id, 'Первый запрос', 'turn-e2e-first');
   assert.ok(runtime.enqueue(first.turn));
+  await runtime.whenIdle();
+  const second = await store.acceptLocalMessage(chat.id, 'Второй запрос', 'turn-e2e-second');
   assert.ok(runtime.enqueue(second.turn));
-  assert.ok(runtime.enqueueCompaction(compact.turn));
+  await runtime.whenIdle();
+  const third = await store.acceptLocalMessage(chat.id, 'Третий запрос', 'turn-e2e-third');
   assert.ok(runtime.enqueue(third.turn));
+  await runtime.whenIdle();
+  const compact = await store.acceptCompactionTurn(chat.id, 'turn-e2e-compact', first.turn.messageId);
+  assert.ok(runtime.enqueueCompaction(compact.turn));
+  await runtime.whenIdle();
+  const fourth = await store.acceptLocalMessage(chat.id, 'Четвёртый запрос', 'turn-e2e-fourth');
+  assert.ok(runtime.enqueue(fourth.turn));
+  await runtime.whenIdle();
+  const compactAgain = await store.acceptCompactionTurn(chat.id, 'turn-e2e-compact-again', second.turn.messageId);
+  assert.ok(runtime.enqueueCompaction(compactAgain.turn));
+  await runtime.whenIdle();
+  const fifth = await store.acceptLocalMessage(chat.id, 'Пятый запрос', 'turn-e2e-fifth');
+  assert.ok(runtime.enqueue(fifth.turn));
   await runtime.whenIdle();
 
   assert.equal(reads, 1);
-  assert.equal(requests.length, 5);
-  assert.deepEqual(requests[2]?.messages.map((message) => message.text), [
-    'Первый запрос', 'Ответ:Первый запрос', 'Второй запрос',
+  assert.equal(requests.length, 8);
+  assert.deepEqual(compactionPrefixes.map((prefix) => prefix.map((message) => message.text)), [
+    ['Первый запрос', 'Ответ:Первый запрос'],
+    ['Первый запрос', 'Ответ:Первый запрос', 'Второй запрос', 'Ответ:Второй запрос'],
+  ], 'repeat compaction rebuilds from the original raw prefix under the prior native checkpoint');
+  assert.deepEqual(requests[3]?.messages.map((message) => message.text), [
+    'Первый запрос', 'Ответ:Первый запрос', 'Второй запрос', 'Ответ:Второй запрос', 'Третий запрос',
   ]);
-  const compactionRequest = requests[3]!;
-  assert.deepEqual(compactionRequest.messages.slice(0, -1).map((message) => message.text), [
-    'Первый запрос', 'Ответ:Первый запрос', 'Второй запрос', 'Ответ:Второй запрос',
-  ]);
+  const compactionRequest = requests[4]!;
+  assert.equal(compactionRequest.messages.length, 2);
+  assert.match(compactionRequest.messages[0]?.text ?? '', /Первый запрос/);
+  assert.match(compactionRequest.messages[0]?.text ?? '', /Ответ:Первый запрос/);
+  assert.doesNotMatch(compactionRequest.messages[0]?.text ?? '', /Второй запрос|Третий запрос/);
+  assert.doesNotMatch(compactionRequest.messages[0]?.text ?? '', /"status":"completed"/);
+  assert.equal(compactionRequest.messages[0]?.text?.includes('state-read-first'), false);
   assert.equal(compactionRequest.messages[compactionRequest.messages.length - 1]?.role, 'user');
   assert.equal(compactionRequest.messages[compactionRequest.messages.length - 1]?.text, COMPACTION_TASK_INSTRUCTION);
   assert.equal(compactionRequest.system.some((layer) => layer.text.includes(COMPACTION_TASK_INSTRUCTION)), false);
-  assert.equal(requests[3]?.protocolHistory?.length, 1);
-  assert.equal(requests[3]?.protocolHistory?.[0]?.anchorMessageId, first.turn.messageId);
-  assert.equal(requests[3]?.protocolHistory?.[0]?.result, JSON.stringify({ ok: true, result: 'fixture:src/example.ts' }));
-  assert.equal(requests[3]?.functionCallMode, 'none');
-  assert.equal(requests[3]?.usageKind, 'compaction');
-  assert.deepEqual(requests[4]?.messages.map((message) => message.text), ['Третий запрос']);
-  assert.match(requests[4]?.system.find((layer) => layer.source === 'summary')?.text ?? '', /Сводка: первый, второй/);
-  assert.equal(requests[4]?.protocolHistory?.length, 0);
-  assert.equal(hookEvents.filter((event) => event === 'before-compaction').length, 1);
-  assert.equal(hookEvents.filter((event) => event === 'after-compaction').length, 1);
+  assert.equal(compactionRequest.protocolHistory?.length, 0);
+  assert.equal(compactionRequest.functionCallMode, 'none');
+  assert.equal(compactionRequest.usageKind, 'compaction');
+  assert.deepEqual(requests[5]?.messages.map((message) => message.text), [
+    'Первый запрос', 'Ответ:Первый запрос', 'Второй запрос', 'Ответ:Второй запрос',
+    'Третий запрос', 'Ответ:Третий запрос', 'Четвёртый запрос',
+  ]);
+  assert.equal(requests[5]?.system.some((layer) => layer.source === 'summary'), false);
+  assert.deepEqual(requests[5]?.protocolHistory?.map((exchange) => ({
+    name: exchange.name, arguments: exchange.arguments, content: exchange.content, result: exchange.result,
+  })), [{ name: 'read', arguments: { path: 'src/example.ts' }, content: null, result: '{"ok":true,"result":"fixture:src/example.ts"}' }]);
+  assert.equal(requests[6]?.usageKind, 'compaction');
+  assert.match(requests[6]?.messages[0]?.text ?? '', /Второй запрос/);
+  assert.equal(hookEvents.filter((event) => event === 'before-compaction').length, 2);
+  assert.equal(hookEvents.filter((event) => event === 'after-compaction').length, 2);
 
   const usageFile = JSON.parse(await readFile(join(directory, 'usage.json'), 'utf8')) as {
     receipts: Array<{ requestKind: string; status: string }>;
   };
   assert.deepEqual(usageFile.receipts.map((receipt) => receipt.requestKind), [
-    'chat', 'tool-continuation', 'chat', 'compaction', 'chat',
+    'chat', 'tool-continuation', 'chat', 'chat', 'compaction', 'chat', 'compaction', 'chat',
   ]);
   assert.ok(usageFile.receipts.every((receipt) => receipt.status === 'completed'));
 
@@ -1463,6 +1573,8 @@ test('runs queued turns through the real context builder and store compaction, t
     'the request-only task is not persisted to Store history');
   const savedCompactionTurn = savedChat.turns.find((turn) => turn.turnId === compact.turn.turnId);
   assert.equal(savedCompactionTurn?.status, 'completed');
+  assert.equal(savedChat.turns.find((turn) => turn.turnId === compactAgain.turn.turnId)?.status, 'completed');
+  assert.equal(savedChat.compactSnapshot?.boundaryMessageId, second.turn.messageId, 'the second checkpoint advances to the newer covered exchange');
   assert.ok(savedCompactionTurn?.activity.some((activity) => activity.kind === 'hook' && activity.event === 'after-compaction'));
   const afterRestart = await reloaded.acceptLocalMessage(chat.id, 'После перезапуска', 'turn-after-restart');
   const futureMessages = await reloaded.getMessagesThrough(chat.id, afterRestart.turn.messageId);
@@ -1473,10 +1585,12 @@ test('runs queued turns through the real context builder and store compaction, t
     permissionProfile: afterRestart.turn.permissionProfile, modelId: afterRestart.turn.modelId,
   });
   assert.deepEqual(futureContext.request.messages.map((message) => message.text), [
-    'Третий запрос', 'Ответ:Третий запрос', 'После перезапуска',
+    'Первый запрос', 'Ответ:Первый запрос', 'Второй запрос', 'Ответ:Второй запрос',
+    'Третий запрос', 'Ответ:Третий запрос', 'Четвёртый запрос', 'Ответ:Четвёртый запрос',
+    'Пятый запрос', 'Ответ:Пятый запрос', 'После перезапуска',
   ]);
-  assert.match(futureContext.request.system.find((layer) => layer.source === 'summary')?.text ?? '', /Сводка: первый, второй/);
-  assert.equal(futureContext.request.protocolHistory?.length, 0);
+  assert.equal(futureContext.request.system.some((layer) => layer.source === 'summary'), false);
+  assert.equal(futureContext.request.protocolHistory?.length, 1);
   reloaded.releaseTurnReservation(afterRestart.turn.turnId);
 });
 

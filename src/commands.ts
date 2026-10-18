@@ -23,15 +23,17 @@ export interface ComposerCompletion {
   emptyMessage?: string;
 }
 
-const commandOptions: readonly ComposerSuggestion[] = [
-  {
+function commandOptions(compactionAvailable: boolean): readonly ComposerSuggestion[] {
+  return [{
     id: 'compact',
     label: '/compact',
     insertText: '/compact',
-    description: 'Недоступна до проверки качества сводки; история останется без изменений.',
-    available: false,
-  },
-];
+    description: compactionAvailable
+      ? 'Сжать старую часть истории и сохранить два последних обмена.'
+      : 'Доступна в текстовом чате с подключённой моделью GigaChat Lite.',
+    available: compactionAvailable,
+  }];
+}
 
 function activeToken(value: string, caret: number): { kind: 'command' | 'skill'; token: string; start: number; end: number } | null {
   if (!Number.isSafeInteger(caret) || caret < 0 || caret > value.length) return null;
@@ -49,11 +51,12 @@ export function getComposerCompletion(
   caret = value.length,
   skills: readonly SkillCommandOption[] = [],
   projectId: string | null = null,
+  compactionAvailable = false,
 ): ComposerCompletion | null {
   const token = activeToken(value, caret);
   if (!token) return null;
   if (token.kind === 'command') {
-    const items = commandOptions.filter((option) => option.label.toLocaleLowerCase().startsWith(token.token));
+    const items = commandOptions(compactionAvailable).filter((option) => option.label.toLocaleLowerCase().startsWith(token.token));
     return { kind: 'command', items, ...(items.length ? {} : { emptyMessage: 'Команда не найдена.' }) };
   }
 
@@ -97,6 +100,10 @@ export function completeComposerSuggestion(
   return { value: nextValue, caret: token.start + insertion.length };
 }
 
-export function isUnavailableCompactCommand(value: string): boolean {
-  return /^\/compact(?:\s|$)/i.test(value.trimStart());
+export type CompactCommandInput = 'none' | 'exact' | 'arguments';
+
+export function classifyCompactCommand(value: string): CompactCommandInput {
+  const trimmed = value.trim();
+  if (!/^\/compact(?:\s|$)/i.test(trimmed)) return 'none';
+  return /^\/compact$/i.test(trimmed) ? 'exact' : 'arguments';
 }

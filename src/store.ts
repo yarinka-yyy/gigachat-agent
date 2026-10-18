@@ -153,7 +153,7 @@ export interface LocalStore {
   updateChat(id: unknown, patch: unknown): Promise<ChatSummary>;
   appendLocalMessage(id: unknown, text: unknown): Promise<ChatDetail>;
   acceptLocalMessage(id: unknown, text: unknown, turnId: unknown, attachmentIds?: unknown, expectedModelId?: unknown, validateBeforeCommit?: () => void): Promise<{ detail: ChatDetail; turn: AcceptedTurnInput }>;
-  acceptCompactionTurn(id: unknown, turnId: unknown): Promise<{ detail: ChatDetail; turn: AcceptedTurnInput }>;
+  acceptCompactionTurn(id: unknown, turnId: unknown, boundaryMessageId?: unknown): Promise<{ detail: ChatDetail; turn: AcceptedTurnInput }>;
   releaseTurnReservation(turnId: unknown): void;
   markQueuedTurnNotSent(turn: AcceptedTurnInput, reason: unknown): Promise<{ detail: ChatDetail; marked: boolean }>;
   reserveRetryTurn(original: AcceptedTurnInput, retry: AcceptedTurnInput): Promise<void>;
@@ -1405,6 +1405,7 @@ function validateAcceptedTurnRecord(
   value: unknown,
   allowLegacyAssistantId = true,
   allowImageAssistantAttachments = false,
+  allowCompactionOperation = false,
 ): AcceptedTurnInput {
   if (!isRecord(value) || !Array.isArray(value.messages) || !Number.isSafeInteger(value.historyBoundary)
     || (value.historyBoundary as number) < 1 || value.historyBoundary !== value.messages.length || !isRecord(value.reservation)) {
@@ -1435,6 +1436,9 @@ function validateAcceptedTurnRecord(
   const ids = messages.map((message) => message.id);
   if (new Set(ids).size !== ids.length) throw new Error('Повтор сообщения в принятом ходе.');
   const turnId = requireId(value.turnId);
+  const operation = value.operation === undefined ? undefined
+    : allowCompactionOperation && value.operation === 'compaction' ? 'compaction'
+      : (() => { throw new Error('Недопустимый служебный ход.'); })();
   const legacyAssistantId = value.assistantMessageId === undefined;
   if (legacyAssistantId && !allowLegacyAssistantId) throw new Error('В принятом ходе отсутствует зарезервированный ответ.');
   const assistantMessageId = legacyAssistantId ? assistantMessageIdForLegacyTurn(turnId)
@@ -1463,10 +1467,23 @@ function validateAcceptedTurnRecord(
       skillRevision: revision(value.reservation.skillRevision),
     },
   };
-  if (value.operation !== undefined) throw new Error('Домашний черновик не может принимать служебный ход.');
+  if (operation === 'compaction') {
+    turn.operation = operation;
+    turn.compactBoundaryMessageId = requireId(value.compactBoundaryMessageId);
+    const compactExpectedSnapshotId = value.compactExpectedSnapshotId === null
+      ? null
+      : requireId(value.compactExpectedSnapshotId);
+    if (turn.compactBoundaryMessageId !== turn.messageId) {
+      throw new Error('Граница принятого сжатия повреждена.');
+    }
+    turn.compactExpectedSnapshotId = compactExpectedSnapshotId;
+  }
   const sourceMessage = messages.find((message) => message.id === turn.messageId && message.role === 'user');
   if (!sourceMessage) throw new Error('В принятом ходе отсутствует исходный запрос.');
-  if (assistantMessageId === null || ids.includes(assistantMessageId)) throw new Error('Зарезервированный ответ принятого хода повреждён.');
+  if ((operation === 'compaction') !== (assistantMessageId === null)
+    || assistantMessageId !== null && ids.includes(assistantMessageId)) {
+    throw new Error('Зарезервированный ответ принятого хода повреждён.');
+  }
   if (value.attachmentIds !== undefined && JSON.stringify(turn.attachmentIds ?? []) !== JSON.stringify(sourceMessage.attachmentIds ?? [])) {
     throw new Error('Вложения принятого сообщения не совпадают со снимком хода.');
   }
@@ -1617,8 +1634,15 @@ function buildCompactionPrefix(
 ): CompactionPrefix {
   const anchorIndex = chat.messages.findIndex((message) => message.id === boundaryMessageId && message.role === 'user');
   if (anchorIndex < 0) throw new Error('Граница сжатия отсутствует в истории чата.');
+  let defaultCoveredIndex = anchorIndex;
+  if (coveredThroughMessageId === undefined) {
+    for (let index = anchorIndex + 1; index < chat.messages.length; index += 1) {
+      if (chat.messages[index]?.role !== 'assistant') break;
+      defaultCoveredIndex = index;
+    }
+  }
   const coveredIndex = coveredThroughMessageId === undefined
-    ? (chat.messages[anchorIndex + 1]?.role === 'assistant' ? anchorIndex + 1 : anchorIndex)
+    ? defaultCoveredIndex
     : chat.messages.findIndex((message) => message.id === coveredThroughMessageId);
   if (coveredIndex < anchorIndex) throw new Error('Покрытая граница отсутствует в истории чата.');
   const endIndex = coveredIndex + 1;
@@ -3390,16 +3414,42 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       const detail = structuredClone(findChat(before.id));
       return { detail, turn };
     }),
-    acceptCompactionTurn: (idInput, turnIdInput) => serialize(async () => {
+    acceptCompactionTurn: (idInput, turnIdInput, boundaryMessageIdInput) => serialize(async () => {
       const turnId = requireId(turnIdInput);
       if (turnReservations.has(turnId)) throw new Error('Ход с таким идентификатором уже принят.');
       const detail = findChat(idInput);
-      const lastUserMessage = [...detail.messages].reverse().find((message) => message.role === 'user');
-      if (!lastUserMessage) throw new Error('Сначала добавьте сообщение перед сжатием контекста.');
+      if (detail.turns.some((turn) => turn.status === 'queued' || turn.status === 'running')) {
+        throw new Error('Дождитесь завершения текущего хода перед сжатием контекста.');
+      }
+      const users = detail.messages.filter((message) => message.role === 'user');
+      const boundaryMessage = boundaryMessageIdInput === undefined
+        ? users[users.length - 1]
+        : detail.messages.find((message) => message.id === requireId(boundaryMessageIdInput) && message.role === 'user');
+      if (!boundaryMessage) throw new Error('Сначала добавьте сообщение перед сжатием контекста.');
+      if (boundaryMessageIdInput !== undefined) {
+        if (detail.draftAttachments.length > 0) {
+          throw new Error('Сначала удалите файлы из черновика перед сжатием контекста.');
+        }
+        const expectedBoundary = users.length >= 3 ? users[users.length - 3] : undefined;
+        if (!expectedBoundary || boundaryMessage.id !== expectedBoundary.id) {
+          throw new Error('Для сжатия нужно сохранить два последних обмена без изменений.');
+        }
+        if (detail.compactSnapshot) {
+          const coveredIndex = detail.messages.findIndex((message) => message.id === detail.compactSnapshot?.coveredThroughMessageId);
+          const boundaryIndex = detail.messages.findIndex((message) => message.id === boundaryMessage.id);
+          if (coveredIndex < 0 || boundaryIndex <= coveredIndex) {
+            throw new Error('Нет нового старого префикса для сжатия; сохранённый контекст не изменён.');
+          }
+        }
+        const prefix = buildCompactionPrefix(detail, boundaryMessage.id);
+        if (prefix.messages.some((message) => message.role === 'user' && (message.attachmentIds?.length ?? 0) > 0)) {
+          throw new Error('Сжатие истории с прикреплёнными файлами пока не проверено; исходная история сохранена.');
+        }
+      }
       if (detail.projectId && !projects.some((item) => item.id === detail.projectId)) {
         throw new Error('Проект чата больше недоступен.');
       }
-      const turn = createAcceptedTurn(detail, turnId, lastUserMessage.id, 'compaction');
+      const turn = createAcceptedTurn(detail, turnId, boundaryMessage.id, 'compaction');
       const accepted = { ...detail, updatedAt: new Date().toISOString(), turns: [...detail.turns, recordForAcceptedTurn(turn)] };
       try { await saveChat(accepted); }
       catch (error) { turnReservations.delete(turnId); throw error; }
@@ -3412,8 +3462,10 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       const rawTurn = structuredClone(turnInput);
       const existingChat = isRecord(rawTurn) && typeof rawTurn.chatId === 'string'
         ? chats.find((item) => item.id === rawTurn.chatId) : undefined;
-      const accepted = validateAcceptedTurnRecord(rawTurn, false, existingChat?.kind === 'image');
-      if (accepted.operation || accepted.assistantMessageId === null || typeof reasonInput !== 'string'
+      const accepted = validateAcceptedTurnRecord(rawTurn, false, existingChat?.kind === 'image', true);
+      if ((accepted.operation !== undefined && accepted.operation !== 'compaction')
+        || (accepted.operation !== 'compaction' && accepted.assistantMessageId === null)
+        || typeof reasonInput !== 'string'
         || !reasonInput.trim() || reasonInput.length > 500) {
         throw new Error('Некорректная запись хода, который не был отправлен.');
       }
