@@ -961,10 +961,10 @@ async function createMainRuntime(
       functionsStateId, owner) => {
       assertProviderStateOwner(owner, providerStateScopeGuard, signal);
       const detail = await store.getChat(turn.chatId);
-      const lastMessage = detail.messages[detail.messages.length - 1];
-      if (!lastMessage) throw Object.assign(new Error('COMPACTION_CONTEXT_UNAVAILABLE'), { category: 'context' as const });
-      const messages = await store.getMessagesThrough(turn.chatId, lastMessage.id);
-      const protocolHistory = await store.getToolProtocolThrough(turn.chatId, lastMessage.id);
+      const lastUserMessage = detail.messages.filter((message) => message.role === 'user').pop();
+      if (!lastUserMessage) throw Object.assign(new Error('COMPACTION_CONTEXT_UNAVAILABLE'), { category: 'context' as const });
+      const currentPrefix = await store.getCompactionPrefix(turn.chatId, lastUserMessage.id);
+      const { messages, protocolHistory } = currentPrefix;
       const ownership = await store.getProviderStateOwnership(turn.chatId, owner.accountScope);
       const buildMeasuredContext = (compactSnapshot: CompactSnapshot | null) => {
         const context = buildNextTurnContext({

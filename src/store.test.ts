@@ -6,7 +6,8 @@ import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { openStore as openStoreProduction, type StoreFaultStage, type StoreOpenOptions } from './store';
 import type { AcceptedTurnInput, ChatMessage, CompactSnapshot, GigaChatProvider, HookDispatchInput, HookRunResult, InstructionCommitRequest, InstructionCommitResult, ProviderEvent, ProviderTurnRequest, RuntimeTurnSnapshot } from './contracts';
-import { COMPACTION_TASK_INSTRUCTION, buildNextTurnContext, hashCompactionPrefix } from './context';
+import { assertCompactionWireReduction, COMPACTION_TASK_INSTRUCTION, buildNextTurnContext, hashCompactionPrefix } from './context';
+import { compileExtractiveCompaction, createCompactionSources } from './compaction';
 import { instructionFileHash } from './instruction-documents';
 import { createTurnRuntime, type PreparedTurn } from './runtime';
 import { IMAGE_GENERATION_MODEL_ID } from './image-mode';
@@ -1302,6 +1303,116 @@ test('manual compaction captures the selected boundary, keeps tool pairing, and 
   assert.deepEqual(afterReload.messages, beforeReload.messages);
   assert.deepEqual(afterReload.compactSnapshot, snapshot);
   for (const turn of [first.turn, second.turn, third.turn]) store.releaseTurnReservation(turn.turnId);
+  store.releaseTurnReservation(compact.turn.turnId);
+});
+
+test('Main compaction save reads and commits the full history through the last user when chat ends in assistant', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-compaction-main-assistant-tail-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Lightning' });
+  const exchanges = [
+    { user: 'Older request detail '.repeat(500), assistant: 'Older answer detail '.repeat(500) },
+    { user: 'Another older request '.repeat(500), assistant: 'Another older answer '.repeat(500) },
+    { user: 'Boundary request with a completed read result.', assistant: 'Boundary answer after the read.' },
+    { user: 'Recent request kept verbatim.', assistant: 'Recent answer kept verbatim.' },
+    { user: 'Latest request kept verbatim.', assistant: 'Latest answer kept verbatim.' },
+  ];
+  const acceptedTurns: AcceptedTurnInput[] = [];
+  for (let index = 0; index < exchanges.length; index += 1) {
+    const accepted = await store.acceptLocalMessage(chat.id, exchanges[index]!.user, `turn-main-assistant-tail-${index}`);
+    acceptedTurns.push(accepted.turn);
+    if (index === 2) {
+      const receiptId = 'a'.repeat(64);
+      await store.beginToolReceipt(chat.id, accepted.turn.messageId, {
+        receiptId, name: 'read', arguments: { path: 'covered.txt' }, content: null, functionsStateId: null,
+      });
+      await store.completeToolReceipt(chat.id, accepted.turn.messageId, receiptId, 'completed',
+        JSON.stringify({ ok: true, result: { contents: 'Read result remains attached to its boundary exchange.' } }));
+    }
+    await appendAcceptedAnswer(store, accepted.turn, exchanges[index]!.assistant);
+  }
+
+  const before = await store.getChat(chat.id);
+  const lastUser = before.messages.filter((message) => message.role === 'user').pop();
+  const lastMessage = before.messages[before.messages.length - 1];
+  assert.ok(lastUser);
+  assert.equal(lastMessage?.role, 'assistant');
+  await assert.rejects(store.getMessagesThrough(chat.id, lastMessage!.id), /Принятое сообщение не найдено/);
+  await assert.rejects(store.getToolProtocolThrough(chat.id, lastMessage!.id), /Принятое сообщение не найдено/);
+
+  const fullPrefix = await store.getCompactionPrefix(chat.id, lastUser.id);
+  assert.deepEqual(fullPrefix.messages, before.messages, 'the last user anchor includes its completed assistant reply');
+  assert.equal(fullPrefix.protocolHistory.length, 1);
+  assert.equal(fullPrefix.protocolHistory[0]?.anchorMessageId, acceptedTurns[2]?.messageId);
+
+  const boundaryTurn = acceptedTurns[2]!;
+  const boundaryPrefix = await store.getCompactionPrefix(chat.id, boundaryTurn.messageId);
+  assert.equal(boundaryPrefix.messages.length, 6);
+  assert.equal(boundaryPrefix.coveredThroughMessageId, boundaryPrefix.messages[5]?.id);
+  assert.equal(boundaryPrefix.protocolHistory.length, 1);
+  assert.deepEqual(boundaryPrefix.protocolHistory[0], {
+    anchorMessageId: boundaryTurn.messageId,
+    name: 'read',
+    arguments: { path: 'covered.txt' },
+    content: null,
+    functionsStateId: null,
+    result: JSON.stringify({ ok: true, result: { contents: 'Read result remains attached to its boundary exchange.' } }),
+  });
+  const sources = createCompactionSources(boundaryPrefix.messages, before.toolReceipts, before.artifacts);
+  assert.deepEqual(sources.tools, [{
+    ref: 't0', anchorRef: 'm4', name: 'read', arguments: { path: 'covered.txt' }, content: null,
+    status: 'completed',
+    result: JSON.stringify({ ok: true, result: { contents: 'Read result remains attached to its boundary exchange.' } }),
+  }]);
+  const candidate = JSON.stringify({
+    version: 2,
+    decisions: sources.messages.map((source, index) => ({ sourceRef: source.ref, retain: index >= sources.messages.length - 2 })),
+  });
+  const snapshot: CompactSnapshot = {
+    id: 'snapshot-main-assistant-tail', version: 1, boundaryMessageId: boundaryTurn.messageId,
+    coveredThroughMessageId: boundaryPrefix.coveredThroughMessageId,
+    coveredPrefixHash: boundaryPrefix.coveredPrefixHash,
+    text: compileExtractiveCompaction(candidate, sources),
+    modelId: 'GigaChat-3-Lightning', provenance: 'fixture', createdAt: timestamp,
+  };
+  const buildMeasuredContext = (compactSnapshot: CompactSnapshot | null) => buildNextTurnContext({
+    globalText: '', projectInstructions: [], selectedSkill: null,
+    messages: fullPrefix.messages,
+    protocolHistory: fullPrefix.protocolHistory,
+    compactSnapshot,
+    permissionProfile: 'ask', modelId: 'GigaChat-3-Lightning', functionCallMode: 'auto',
+  });
+  const currentContext = buildMeasuredContext(before.compactSnapshot);
+  const proposedContext = buildMeasuredContext(snapshot);
+  assertCompactionWireReduction(currentContext.wireBytes, proposedContext.wireBytes);
+  assert.deepEqual(proposedContext.request.messages.map((message) => [message.role, message.text]),
+    exchanges.slice(2).flatMap((exchange) => [['user', exchange.user], ['assistant', exchange.assistant]]));
+  assert.equal(proposedContext.request.protocolHistory?.length, 1);
+  assert.equal(proposedContext.request.protocolHistory?.[0]?.anchorMessageId, boundaryTurn.messageId);
+
+  const compact = await store.acceptCompactionTurn(chat.id, 'turn-main-assistant-tail-compact', boundaryTurn.messageId);
+  const compactDetail = await store.getChat(chat.id);
+  const acceptedCompactRecord = compactDetail.turns.find((turn) => turn.turnId === compact.turn.turnId);
+  assert.ok(acceptedCompactRecord);
+  await store.commitCompactSnapshot(chat.id, snapshot, compact.turn.compactExpectedSnapshotId ?? null, undefined,
+    completedCompactionTurn(compact.turn, acceptedCompactRecord.createdAt));
+
+  const reopened = await openStore(directory);
+  const after = await reopened.getChat(chat.id);
+  assert.deepEqual(after.messages, before.messages, 'compaction preserves every raw original message');
+  assert.deepEqual(after.compactSnapshot, snapshot);
+  assert.equal(after.turns.find((turn) => turn.turnId === compact.turn.turnId)?.status, 'completed');
+  const reopenedPrefix = await reopened.getCompactionPrefix(chat.id, lastUser.id);
+  assert.deepEqual(reopenedPrefix.messages, before.messages);
+  assert.deepEqual(reopenedPrefix.protocolHistory, fullPrefix.protocolHistory);
+  const reopenedContext = buildMeasuredContext(after.compactSnapshot);
+  assert.deepEqual(reopenedContext.request.messages.map((message) => [message.role, message.text]),
+    exchanges.slice(2).flatMap((exchange) => [['user', exchange.user], ['assistant', exchange.assistant]]));
+  assert.deepEqual(reopenedContext.request.protocolHistory, fullPrefix.protocolHistory);
+
+  for (const turn of acceptedTurns) store.releaseTurnReservation(turn.turnId);
   store.releaseTurnReservation(compact.turn.turnId);
 });
 
