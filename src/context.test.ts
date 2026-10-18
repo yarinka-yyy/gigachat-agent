@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
 import { test } from 'node:test';
 import type { ChatDetail, ChatMessage, CompactSnapshot, ProviderProtocolExchange } from './contracts';
-import { buildNextTurnContext, countContextTextTokens, hashCompactionPrefix, validateCompactSummary } from './context';
+import { buildNextTurnContext, COMPACTION_TASK_INSTRUCTION, countContextTextTokens, hashCompactionPrefix, validateCompactSummary } from './context';
 import { GigaChatProviderError, MAX_PROVIDER_REQUEST_BYTES, serializeProviderTurnRequest } from './gigachat-provider';
 
 const at = '2026-10-09T12:00:00.000Z';
@@ -105,15 +105,25 @@ test('keeps the prior summary and later tool history while placing compaction ta
   const context = buildNextTurnContext(input(messages, {
     compactSnapshot,
     protocolHistory,
-    taskInstruction: 'Сверни историю.',
+    taskInstruction: COMPACTION_TASK_INSTRUCTION,
     usageKind: 'compaction',
     functionCallMode: 'none',
   }));
+  const serialized = serializeProviderTurnRequest(context.request);
+  const wire = JSON.parse(serialized.body) as {
+    messages: Array<{ role: string; content: Array<{ text?: string }> }>;
+  };
+  const wireTask = wire.messages[wire.messages.length - 1];
 
   assert.equal(context.request.system.filter((layer) => layer.source === 'summary').length, 1);
   assert.equal(context.request.system.find((layer) => layer.source === 'summary')?.text, compactSnapshot.text);
-  assert.deepEqual(context.request.messages.map((message) => message.text), ['Latest question', 'Latest answer', 'Сверни историю.']);
+  assert.deepEqual(context.request.messages.map((message) => message.text), ['Latest question', 'Latest answer', COMPACTION_TASK_INSTRUCTION]);
   assert.equal(context.request.messages[context.request.messages.length - 1]?.role, 'user');
+  assert.equal(context.request.system.some((layer) => layer.text.includes(COMPACTION_TASK_INSTRUCTION)), false);
+  assert.equal(wireTask?.role, 'user');
+  assert.equal(wireTask?.content[0]?.text, COMPACTION_TASK_INSTRUCTION);
+  assert.equal(wire.messages[0]?.content[0]?.text?.includes(COMPACTION_TASK_INSTRUCTION), false);
+  assert.equal(context.wireBytes, serialized.wireBytes);
   assert.deepEqual(context.request.protocolHistory, protocolHistory);
   assert.deepEqual(messages, originalMessages);
   assert.deepEqual(protocolHistory, originalProtocol);
