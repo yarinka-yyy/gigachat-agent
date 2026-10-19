@@ -220,6 +220,8 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
       model_options: {
         parallel_tool_calls: false,
         ...(maxOutputTokens !== undefined ? { max_tokens: maxOutputTokens } : {}),
+        ...(request.compactionFormat === 'semantic' || request.compactionFormat === 'semantic-repair-patch'
+          ? { temperature: 0.0001 } : {}),
         ...(request.usageKind === 'compaction' ? {
           response_format: request.compactionFormat === 'semantic'
             ? SEMANTIC_COMPACTION_RESPONSE_FORMAT

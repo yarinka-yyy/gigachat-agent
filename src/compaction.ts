@@ -11,6 +11,8 @@ const MAX_SEMANTIC_QUOTES_PER_FACT = 8;
 const MAX_SEMANTIC_TOTAL_ENTRIES = 128;
 const MAX_SEMANTIC_COVERAGE_SOURCES = 64;
 const MAX_SEMANTIC_COUNTS = { constraints: 24, decisions: 32, openWork: 32, facts: 48, pastTopics: 8 } as const;
+const MAX_GENERATED_PAST_TOPICS = 2;
+const MAX_GENERATED_PAST_TOPIC_CHARS = 256;
 export const COMPACTION_OUTPUT_TOKEN_LIMIT = 4096;
 const RETAINED_SOURCE_REFS_MARKER = 'retained-source-refs';
 export const SEMANTIC_COMPACTION_FORMAT = 'gigachat-semantic-memory' as const;
@@ -64,6 +66,15 @@ const semanticFactSchema = {
   required: ['text', 'sourceRefs', 'exactQuotes'],
   additionalProperties: false,
 };
+const semanticGeneratedPastTopicSchema = {
+  type: 'object',
+  properties: {
+    text: { type: 'string', minLength: 1, maxLength: MAX_GENERATED_PAST_TOPIC_CHARS },
+    sourceRefs: semanticSourceRefsSchema,
+  },
+  required: ['text', 'sourceRefs'],
+  additionalProperties: false,
+};
 
 const semanticMemorySchema = {
   type: 'object',
@@ -91,8 +102,8 @@ const semanticMemorySchema = {
       type: 'array', maxItems: MAX_SEMANTIC_COUNTS.facts, items: semanticFactSchema,
     },
     pastTopics: {
-      description: 'Краткие сгруппированные итоги закрытых неактивных тем; не перечисляй подробно каждый старый обмен.',
-      type: 'array', maxItems: MAX_SEMANTIC_COUNTS.pastTopics, items: semanticEntrySchema,
+      description: 'Не более двух сгруппированных итогов закрытых неактивных тем, каждый до 256 символов; ненужные темы опускай.',
+      type: 'array', maxItems: MAX_GENERATED_PAST_TOPICS, items: semanticGeneratedPastTopicSchema,
     },
   },
   required: ['format', 'version', 'activeTask', 'constraints', 'decisions', 'openWork', 'facts', 'pastTopics'],

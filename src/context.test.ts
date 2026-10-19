@@ -379,6 +379,8 @@ test('prepares a semantic request from the whole supplied raw prefix without exp
   assert.equal(context.request.messages[1]?.text, SEMANTIC_COMPACTION_TASK_INSTRUCTION);
   assert.match(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /coverageRefSet.*строго в указанном порядке/i);
   assert.match(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /все такие ссылки должны быть представлены в sourceRefs памяти/i);
+  assert.match(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /действующее ограничение.*сохраняй в constraints/i);
+  assert.match(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /не более чем в две записи по 256 символов каждая/i);
   assert.equal(context.request.system.some((layer) => layer.source === 'summary'), false);
   assert.equal(envelope.previousMemory, null, 'first semantic compaction starts from the supplied raw prefix');
   assert.deepEqual(envelope.coverageRefSet, ['m0', 'm1', 'm2', 'm3', 't0', 't1']);

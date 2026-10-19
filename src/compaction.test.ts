@@ -783,6 +783,17 @@ test('bounds past topics, individual entries and aggregate serialized semantic m
   assert.throws(() => validateSemanticCompactionMemory(semanticCandidate({ activeTask: { text: 'x'.repeat(4 * 1024 + 1), sourceRefs: ['m0'] } }), sources), /служебный или некорректный текст/);
   const oversizedFacts = Array.from({ length: 8 }, (_, index) => ({ text: `${index + 1}${'x'.repeat(4 * 1024 - 1)}`, sourceRefs: ['m1'] }));
   assert.throws(() => compileSemanticCompactionMemory(semanticCandidate({ facts: oversizedFacts }), sources), /ограничение 32 КиБ/);
+
+  const legacyMemory = {
+    format: 'gigachat-semantic-memory', version: 1, activeTask: null,
+    constraints: [], decisions: [], openWork: [], facts: [],
+    pastTopics: Array.from({ length: 8 }, (_, index) => ({
+      text: `Подробный архивный итог ${index + 1}. `.repeat(40).trim(), sourceRefs: ['m0'],
+    })),
+  };
+  const reopened = validateSemanticCompactionMemory(JSON.stringify(legacyMemory), sources);
+  assert.equal(reopened.pastTopics.length, 8, 'the stricter provider generation schema does not restrict stored-memory compatibility');
+  assert.ok(reopened.pastTopics.every((topic) => topic.text.length > 256));
 });
 
 test('keeps the legacy extractive version-2 contract separate from semantic memory version 1', () => {

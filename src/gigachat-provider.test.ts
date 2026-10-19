@@ -1510,6 +1510,8 @@ test('uses explicit output caps while preserving ordinary and compaction default
     },
   });
   assert.deepEqual(ordinaryBody.model_options, { parallel_tool_calls: false });
+  assert.equal(Object.prototype.hasOwnProperty.call(body.model_options, 'temperature'), false,
+    'legacy extractive compaction keeps its existing model options');
   assert.equal(explicitCompactionBody.model_options.max_tokens, 256,
     'an explicit cap overrides the 4096 compaction default');
   assert.deepEqual(explicitCompactionBody.model_options.response_format, body.model_options.response_format,
@@ -1530,7 +1532,7 @@ test('serializes only semantic compaction with ordered coverage, strict memory s
   const serialized = serializeProviderTurnRequest(request);
   const body = JSON.parse(serialized.body) as {
     tools?: unknown[]; tool_config: { mode: string };
-    model_options: { max_tokens: number; response_format: { strict: boolean; schema: {
+    model_options: { max_tokens: number; temperature: number; response_format: { strict: boolean; schema: {
       properties: Record<string, unknown>; required: string[]; additionalProperties: boolean;
     } } };
   };
@@ -1545,9 +1547,15 @@ test('serializes only semantic compaction with ordered coverage, strict memory s
   const decisions = memory.properties.decisions as { description: string; maxItems: number };
   const openWork = memory.properties.openWork as { description: string; maxItems: number };
   const factsDescription = (memory.properties.facts as { description: string }).description as string;
-  const pastTopics = memory.properties.pastTopics as { description: string; maxItems: number };
+  const pastTopics = memory.properties.pastTopics as {
+    description: string; maxItems: number; items: {
+      properties: Record<string, { type?: string; maxLength?: number; maxItems?: number; uniqueItems?: boolean }>;
+      required: string[]; additionalProperties: boolean;
+    };
+  };
 
   assert.equal(body.model_options.max_tokens, 4096);
+  assert.equal(body.model_options.temperature, 0.0001);
   assert.equal(body.tool_config.mode, 'none', 'semantic compaction suppresses tool execution even for an auto caller');
   assert.equal(body.tools, undefined);
   assert.equal(body.model_options.response_format.strict, true);
@@ -1569,11 +1577,17 @@ test('serializes only semantic compaction with ordered coverage, strict memory s
   assert.match(openWork.description, /только действительно незавершённые.*не включай закрытые темы/i);
   assert.equal(facts.maxItems, 48);
   assert.match(factsDescription, /подтверждённое текущее состояние.*точные идентификаторы и значения/i);
-  assert.match(pastTopics.description, /краткие сгруппированные итоги.*не перечисляй подробно каждый старый обмен/i);
+  assert.match(pastTopics.description, /не более двух.*до 256 символов/i);
   assert.equal(constraints.maxItems, 24);
   assert.equal(decisions.maxItems, 32);
   assert.equal(openWork.maxItems, 32);
-  assert.equal(pastTopics.maxItems, 8);
+  assert.equal(pastTopics.maxItems, 2);
+  assert.deepEqual(pastTopics.items.required, ['text', 'sourceRefs']);
+  assert.equal(pastTopics.items.additionalProperties, false);
+  assert.equal(pastTopics.items.properties.text?.type, 'string');
+  assert.equal(pastTopics.items.properties.text?.maxLength, 256);
+  assert.equal(pastTopics.items.properties.sourceRefs?.maxItems, 32);
+  assert.equal(pastTopics.items.properties.sourceRefs?.uniqueItems, true);
   assert.deepEqual(facts.items.required, ['text', 'sourceRefs', 'exactQuotes']);
   const exactQuotes = facts.items.properties.exactQuotes as { minItems: number; maxItems: number };
   assert.equal(exactQuotes.minItems, 0);
@@ -1597,7 +1611,7 @@ test('serializes patch repair only as a tool-free compaction request with its st
   };
   const wire = JSON.parse(serializeProviderTurnRequest(request).body) as {
     tools?: unknown[]; tool_config: { mode: string };
-    model_options: { max_tokens: number; response_format: { strict: boolean; schema: {
+    model_options: { max_tokens: number; temperature: number; response_format: { strict: boolean; schema: {
       properties: Record<string, unknown>; required: string[]; additionalProperties: boolean;
     } } };
   };
@@ -1608,6 +1622,7 @@ test('serializes patch repair only as a tool-free compaction request with its st
   };
 
   assert.equal(wire.model_options.max_tokens, 4096);
+  assert.equal(wire.model_options.temperature, 0.0001);
   assert.equal(wire.tool_config.mode, 'none');
   assert.equal(wire.tools, undefined);
   assert.equal(wire.model_options.response_format.strict, true);
