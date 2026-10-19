@@ -13,6 +13,7 @@ import { createInstructionDocument, instructionFileHash } from './instruction-do
 import { MAX_USAGE_RECEIPTS, mergeUsageReceipt, summarizeUsage, validateUsageReceipt } from './usage';
 import { buildUsageProfileView, type UsageBalanceAnchorViewInput } from './usage-view';
 import { hashCompactionPrefix, validateCompactSummary } from './context';
+import { compileSemanticCompactionMemory, createCompactionSources } from './compaction';
 import { attachmentContentType, inspectLocalAttachmentContent, LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES } from './attachment-policy';
 import { validateProviderV2FunctionWire } from './provider-wire';
 
@@ -829,9 +830,14 @@ function parseChatFile(value: unknown): Loaded<ChatFile> {
   };
 }
 
-function validateCompactSnapshot(value: unknown, messages: readonly ChatMessage[]): CompactSnapshot | null {
+function validateCompactSnapshot(
+  value: unknown,
+  messages: readonly ChatMessage[],
+  toolReceipts: readonly ChatToolReceipt[],
+  artifacts: readonly ChatArtifact[],
+): CompactSnapshot | null {
   if (value === null) return null;
-  if (!isRecord(value) || value.version !== 1 || typeof value.coveredPrefixHash !== 'string'
+  if (!isRecord(value) || (value.version !== 1 && value.version !== 2) || typeof value.coveredPrefixHash !== 'string'
     || !/^[a-f0-9]{64}$/.test(value.coveredPrefixHash)
     || (value.provenance !== 'fixture' && value.provenance !== 'provider')) {
     throw new Error('Invalid compact snapshot.');
@@ -842,13 +848,16 @@ function validateCompactSnapshot(value: unknown, messages: readonly ChatMessage[
   const boundaryIndex = messages.findIndex((message) => message.id === boundaryMessageId);
   const coveredIndex = messages.findIndex((message) => message.id === coveredThroughMessageId);
   if (coveredIndex < boundaryIndex) throw new Error('Invalid compact covered prefix.');
+  const text = value.version === 1
+    ? validateCompactSummary(value.text)
+    : compileSemanticCompactionMemory(value.text, createCompactionSources(messages.slice(0, coveredIndex + 1), toolReceipts, artifacts));
   return {
     id: requireId(value.id),
-    version: 1,
+    version: value.version,
     boundaryMessageId,
     coveredThroughMessageId,
     coveredPrefixHash: value.coveredPrefixHash,
-    text: validateCompactSummary(value.text),
+    text,
     modelId: requireModelId(value.modelId),
     provenance: value.provenance,
     createdAt: requireTimestamp(value.createdAt),
@@ -1165,7 +1174,7 @@ function validateChatDetail(value: unknown): Loaded<ChatDetail> {
     if (!isSkillId(value.nextTurnSkillId)) throw new Error('Invalid next-turn Skill.');
     nextTurnSkillId = value.nextTurnSkillId;
   }
-  let compactSnapshot = version >= 8 ? validateCompactSnapshot(value.compactSnapshot, messages) : null;
+  let compactSnapshot = version >= 8 ? validateCompactSnapshot(value.compactSnapshot, messages, toolReceipts, artifacts) : null;
   if (compactSnapshot) {
     const storedChat = { ...chat, messages, artifacts, draftAttachments, toolReceipts, turns, nextTurnPermissionProfile, nextTurnSkillId,
       modelId: version >= 6 && value.modelId !== null ? requireModelId(value.modelId) : null,
@@ -3776,7 +3785,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       }
       const currentSnapshotId = chat.compactSnapshot?.id ?? null;
       if (currentSnapshotId !== expectedSnapshotIdInput) throw new Error('Сводка чата изменилась; новая сводка не сохранена.');
-      const snapshot = validateCompactSnapshot(snapshotInput, chat.messages);
+      const snapshot = validateCompactSnapshot(snapshotInput, chat.messages, chat.toolReceipts, chat.artifacts);
       if (!snapshot) throw new Error('Некорректная сводка чата.');
       const currentOwnership = providerStateOwnershipByChatId.get(chat.id) ?? emptyProviderStateOwnership();
       if (currentSnapshotId === snapshot.id && chat.compactSnapshot) {
@@ -3797,8 +3806,14 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       const previousBoundaryIndex = chat.compactSnapshot
         ? chat.messages.findIndex((message) => message.id === chat.compactSnapshot?.boundaryMessageId)
         : -1;
+      const previousCoveredIndex = chat.compactSnapshot
+        ? chat.messages.findIndex((message) => message.id === chat.compactSnapshot?.coveredThroughMessageId)
+        : -1;
       const nextBoundaryIndex = chat.messages.findIndex((message) => message.id === snapshot.boundaryMessageId);
-      if (nextBoundaryIndex < previousBoundaryIndex) throw new Error('Сводка не может откатывать уже покрытую историю.');
+      const nextCoveredIndex = chat.messages.findIndex((message) => message.id === snapshot.coveredThroughMessageId);
+      if (nextBoundaryIndex < previousBoundaryIndex || nextCoveredIndex < previousCoveredIndex) {
+        throw new Error('Сводка не может откатывать уже покрытую историю.');
+      }
       let turns = chat.turns;
       if (terminalTurnInput) {
         const terminalTurn = recordFromRuntimeTurn(terminalTurnInput);

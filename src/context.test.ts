@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import type { ChatArtifact, ChatDetail, ChatMessage, ChatToolReceipt, CompactSnapshot, ProviderProtocolExchange } from './contracts';
 import { assertCompactionWireReduction, buildNextTurnContext, COMPACTION_TASK_INSTRUCTION, countContextTextTokens, hashCompactionPrefix, validateCompactSummary } from './context';
 import { GigaChatProviderError, MAX_PROVIDER_REQUEST_BYTES, serializeProviderTurnRequest } from './gigachat-provider';
-import { compileExtractiveCompaction, createCompactionSources } from './compaction';
+import { compileExtractiveCompaction, compileSemanticCompactionMemory, createCompactionSources } from './compaction';
 
 const at = '2026-10-09T12:00:00.000Z';
 const user = (id: string, text = id): ChatMessage => ({ id, role: 'user', text, createdAt: at });
@@ -257,6 +257,86 @@ test('requires source records for actual compaction and frames saved notes as ar
   assert.match(tupleLayer?.text ?? '', /Ассистент:\nТочная подпись: Keep spaces\./);
   assert.match(tupleLayer?.text ?? '', /Статус вызова: completed[\s\S]*Результат: \{"ok":true\}/);
   assert.doesNotMatch(tupleLayer?.text ?? '', /\["assistant"/);
+});
+
+test('uses a v2 semantic archive only after covered-prefix hash and source validation', () => {
+  const oldUser: ChatMessage = {
+    ...user('u1', 'Covered user message stays out of the next request.'), attachmentIds: ['file1'],
+  };
+  const oldAssistant = assistant('a1', 'Covered answer stays out of the next request.');
+  oldAssistant.functionsStateId = 'covered-private-state';
+  const currentUser = user('u2', 'Continue from the saved checkpoint.');
+  const covered = [oldUser, oldAssistant];
+  const receipt: ChatToolReceipt = {
+    receiptId: 'e'.repeat(64), anchorMessageId: oldUser.id, name: 'read', arguments: { path: 'report.txt' },
+    content: 'Tool output contains exact detail.', functionsStateId: 'covered-tool-state', status: 'completed',
+    result: '{"ok":true}', createdAt: at,
+  };
+  const protocol: ProviderProtocolExchange = {
+    anchorMessageId: oldUser.id, name: receipt.name, arguments: receipt.arguments, content: receipt.content,
+    functionsStateId: receipt.functionsStateId, result: receipt.result!,
+  };
+  const artifact: ChatArtifact = {
+    id: 'file1', name: 'report.txt', storedName: 'private-report.txt', size: 12,
+    sha256: 'a'.repeat(64), createdAt: at, messageId: oldUser.id,
+  };
+  const sources = createCompactionSources(covered, [receipt], [artifact]);
+  const memory = (activeRef = 'm0', quote = 'exact detail') => ({
+    format: 'gigachat-semantic-memory', version: 1,
+    activeTask: { text: 'Continue the current task.', sourceRefs: [activeRef] },
+    constraints: [], decisions: [], openWork: [],
+    facts: [{ text: 'The tool confirmed a detail.', sourceRefs: ['t0'], exactQuotes: [{ sourceRef: 't0', text: quote }] }],
+    pastTopics: [],
+  });
+  const snapshot: CompactSnapshot = {
+    id: 'semantic-context-v2', version: 2, boundaryMessageId: oldUser.id, coveredThroughMessageId: oldAssistant.id,
+    coveredPrefixHash: hashCompactionPrefix(covered, [protocol]), text: compileSemanticCompactionMemory(JSON.stringify(memory()), sources),
+    modelId: 'vendor/model.v4:preview', provenance: 'fixture', createdAt: at,
+  };
+  const context = buildNextTurnContext(input([...covered, currentUser], {
+    compactSnapshot: snapshot,
+    protocolHistory: [protocol],
+    compactionToolReceipts: [receipt],
+    compactionArtifacts: [artifact],
+  }));
+  const summary = context.request.system.find((layer) => layer.source === 'summary')?.text ?? '';
+
+  assert.deepEqual(context.request.messages.map((message) => message.id), [currentUser.id]);
+  assert.deepEqual(context.request.protocolHistory, [], 'covered tool calls are archived, not replayed');
+  assert.match(summary, /Архивная семантическая память v1/);
+  assert.match(summary, /Continue the current task\./);
+  assert.match(summary, /exact detail/);
+  assert.doesNotMatch(JSON.stringify(context.request), /Covered user message stays out|Covered answer stays out|covered-private-state/);
+
+  const emptySuffix = buildNextTurnContext(input(covered, {
+    compactSnapshot: snapshot,
+    protocolHistory: [protocol],
+    compactionToolReceipts: [receipt],
+    compactionArtifacts: [artifact],
+  }));
+  assert.deepEqual(emptySuffix.request.messages, [], 'an assistant-covered tail may leave no raw suffix');
+  assert.match(emptySuffix.request.system.find((layer) => layer.source === 'summary')?.text ?? '', /Continue the current task\./);
+
+  const fullSources = createCompactionSources([...covered, currentUser], [receipt], [artifact]);
+  const futureReference = { ...snapshot, id: 'semantic-future-ref', text: compileSemanticCompactionMemory(JSON.stringify(memory('m2')), fullSources) };
+  assert.throws(() => buildNextTurnContext(input([...covered, currentUser], {
+    compactSnapshot: futureReference,
+    protocolHistory: [protocol],
+    compactionToolReceipts: [receipt],
+    compactionArtifacts: [artifact],
+  })), /неизвестную или повторную ссылку/, 'a source in the uncovered suffix cannot validate a saved reference');
+
+  const falseQuote = { ...snapshot, id: 'semantic-false-quote', text: JSON.stringify(memory('m0', 'not present in the source')) };
+  assert.throws(() => buildNextTurnContext(input([...covered, currentUser], {
+    compactSnapshot: falseQuote,
+    protocolHistory: [protocol],
+    compactionToolReceipts: [receipt],
+    compactionArtifacts: [artifact],
+  })), /Точная цитата не совпадает/);
+  assert.throws(() => buildNextTurnContext(input([...covered, currentUser], {
+    compactSnapshot: snapshot,
+    protocolHistory: [protocol],
+  })), /нужны покрытые записи инструментов и вложений/);
 });
 
 test('rejects compact summaries without any Unicode letter or number but accepts Cyrillic, Latin, and numeric text', () => {

@@ -228,6 +228,8 @@ export async function createContextPreview(
     messages,
     protocolHistory,
     compactSnapshot: detail?.compactSnapshot ?? null,
+    compactionToolReceipts: detail?.toolReceipts,
+    compactionArtifacts: detail?.artifacts,
     permissionProfile,
     modelId,
   }, {

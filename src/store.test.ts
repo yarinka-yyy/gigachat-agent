@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import { openStore as openStoreProduction, type StoreFaultStage, type StoreOpenOptions } from './store';
 import type { AcceptedTurnInput, ChatMessage, CompactSnapshot, GigaChatProvider, HookDispatchInput, HookRunResult, InstructionCommitRequest, InstructionCommitResult, ProviderEvent, ProviderTurnRequest, RuntimeTurnSnapshot } from './contracts';
 import { assertCompactionWireReduction, COMPACTION_TASK_INSTRUCTION, buildNextTurnContext, hashCompactionPrefix } from './context';
-import { compileExtractiveCompaction, createCompactionSources } from './compaction';
+import { compileExtractiveCompaction, compileSemanticCompactionMemory, createCompactionSources } from './compaction';
 import { instructionFileHash } from './instruction-documents';
 import { createTurnRuntime, type PreparedTurn } from './runtime';
 import { IMAGE_GENERATION_MODEL_ID } from './image-mode';
@@ -1304,6 +1304,106 @@ test('manual compaction captures the selected boundary, keeps tool pairing, and 
   assert.deepEqual(afterReload.compactSnapshot, snapshot);
   for (const turn of [first.turn, second.turn, third.turn]) store.releaseTurnReservation(turn.turnId);
   store.releaseTurnReservation(compact.turn.turnId);
+});
+
+test('validates and reopens v2 semantic snapshots against only covered messages and source records', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-semantic-snapshot-v2-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  let failSnapshotSave = false;
+  const store = await openStore(directory, {
+    testFaults: { beforeCompactSnapshotCommit: () => { if (failSnapshotSave) throw new Error('synthetic v2 save failure'); } },
+  });
+  const chat = await store.createChat();
+  const sourcePath = join(directory, 'covered.txt');
+  await writeFile(sourcePath, 'covered attachment bytes', 'utf8');
+  const stagingStore = store as typeof store & {
+    stageChatDraftFile(chatId: string, path: string): Promise<import('./contracts').ChatDetail>;
+  };
+  const staged = await stagingStore.stageChatDraftFile(chat.id, sourcePath);
+  const attachmentId = staged.draftAttachments[0]!.id;
+  const first = await store.acceptLocalMessage(chat.id, 'Covered request with an attachment.', 'turn-semantic-v2-first', [attachmentId]);
+  const receiptId = 'd'.repeat(64);
+  await store.beginToolReceipt(chat.id, first.turn.messageId, {
+    receiptId, name: 'read', arguments: { path: 'covered.txt' }, content: 'Tool output: exact detail.', functionsStateId: null,
+  });
+  await store.completeToolReceipt(chat.id, first.turn.messageId, receiptId, 'completed', JSON.stringify({ ok: true, value: 'exact detail' }));
+  await appendAcceptedAnswer(store, first.turn, 'Covered assistant answer.');
+  const later = await store.acceptLocalMessage(chat.id, 'Uncovered request.', 'turn-semantic-v2-later');
+  await appendAcceptedAnswer(store, later.turn, 'Uncovered assistant answer.');
+
+  const before = await store.getChat(chat.id);
+  const prefix = await store.getCompactionPrefix(chat.id, first.turn.messageId);
+  assert.equal(prefix.messages[prefix.messages.length - 1]?.role, 'assistant', 'coverage includes the completed boundary answer');
+  const sources = createCompactionSources(prefix.messages, before.toolReceipts, before.artifacts);
+  const memory = (activeRef = 'm0', quote = 'exact detail', task = 'Continue the covered task.') => ({
+    format: 'gigachat-semantic-memory', version: 1,
+    activeTask: { text: task, sourceRefs: [activeRef] },
+    constraints: [], decisions: [], openWork: [],
+    facts: [{ text: 'The covered tool result is preserved.', sourceRefs: ['t0'], exactQuotes: [{ sourceRef: 't0', text: quote }] }],
+    pastTopics: [],
+  });
+  const snapshot: CompactSnapshot = {
+    id: 'semantic-snapshot-v2', version: 2, boundaryMessageId: first.turn.messageId,
+    coveredThroughMessageId: prefix.coveredThroughMessageId, coveredPrefixHash: prefix.coveredPrefixHash,
+    text: compileSemanticCompactionMemory(JSON.stringify(memory()), sources), modelId: 'GigaChat-3-Lightning',
+    provenance: 'fixture', createdAt: timestamp,
+  };
+  await store.commitCompactSnapshot(chat.id, snapshot, null);
+
+  const fullSources = createCompactionSources(before.messages, before.toolReceipts, before.artifacts);
+  const futureRefSnapshot = { ...snapshot, id: 'semantic-future-ref', text: compileSemanticCompactionMemory(JSON.stringify(memory('m2')), fullSources) };
+  await assert.rejects(store.commitCompactSnapshot(chat.id, futureRefSnapshot, snapshot.id), /неизвестную или повторную ссылку/);
+  const unknownRefSnapshot = { ...snapshot, id: 'semantic-unknown-ref', text: JSON.stringify(memory('m99')) };
+  await assert.rejects(store.commitCompactSnapshot(chat.id, unknownRefSnapshot, snapshot.id), /неизвестную или повторную ссылку/);
+  const falseQuoteSnapshot = { ...snapshot, id: 'semantic-false-quote', text: JSON.stringify(memory('m0', 'not present in the covered source')) };
+  await assert.rejects(store.commitCompactSnapshot(chat.id, falseQuoteSnapshot, snapshot.id), /Точная цитата не совпадает/);
+  await assert.rejects(store.commitCompactSnapshot(chat.id, { ...snapshot, id: 'semantic-bad-hash', coveredPrefixHash: 'f'.repeat(64) }, snapshot.id), /История изменилась/);
+  await assert.rejects(store.commitCompactSnapshot(chat.id, { ...snapshot, id: 'semantic-stale-owner' }, 'stale-snapshot'), /изменилась/);
+  await assert.rejects(store.commitCompactSnapshot(chat.id, { ...snapshot, id: 'semantic-bad-version', version: 3 } as unknown as CompactSnapshot, snapshot.id), /Invalid compact snapshot/);
+
+  const earlierCoverage = {
+    ...snapshot,
+    id: 'semantic-coverage-rollback',
+    coveredThroughMessageId: first.turn.messageId,
+    coveredPrefixHash: hashCompactionPrefix(prefix.messages.slice(0, 1), prefix.protocolHistory),
+  };
+  await assert.rejects(store.commitCompactSnapshot(chat.id, earlierCoverage, snapshot.id), /не может откатывать/,
+    'coverage cannot move back from an assistant tail while retaining the same user boundary');
+
+  const replacement: CompactSnapshot = {
+    ...snapshot,
+    id: 'semantic-save-failure',
+    text: compileSemanticCompactionMemory(JSON.stringify(memory('m0', 'exact detail', 'Replacement task.')), sources),
+  };
+  const beforeFailedWrites = await store.getChat(chat.id);
+  failSnapshotSave = true;
+  await assert.rejects(store.commitCompactSnapshot(chat.id, replacement, snapshot.id), /synthetic v2 save failure/);
+  failSnapshotSave = false;
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(store.commitCompactSnapshot(chat.id, replacement, snapshot.id, controller.signal),
+    (error: unknown) => error instanceof Error && error.name === 'AbortError');
+  const afterFailedWrites = await store.getChat(chat.id);
+  assert.deepEqual(afterFailedWrites.messages, beforeFailedWrites.messages);
+  assert.deepEqual(afterFailedWrites.toolReceipts, beforeFailedWrites.toolReceipts);
+  assert.deepEqual(afterFailedWrites.artifacts, beforeFailedWrites.artifacts);
+  assert.deepEqual(afterFailedWrites.compactSnapshot, snapshot);
+
+  const reopened = await openStore(directory);
+  const restored = await reopened.getChat(chat.id);
+  assert.deepEqual(restored.compactSnapshot, snapshot);
+  assert.deepEqual(restored.messages, before.messages);
+  assert.deepEqual(restored.toolReceipts, before.toolReceipts);
+  assert.deepEqual(restored.artifacts, before.artifacts);
+
+  const chatPath = join(directory, 'chats', chat.id, 'chat.json');
+  const raw = JSON.parse(await readFile(chatPath, 'utf8')) as { compactSnapshot: CompactSnapshot };
+  raw.compactSnapshot.text = JSON.stringify(memory('m99'));
+  await writeFile(chatPath, JSON.stringify(raw), 'utf8');
+  const corruptedStore = await openStore(directory);
+  await assert.rejects(corruptedStore.getChat(chat.id), /Чат|истор/i);
+  store.releaseTurnReservation(first.turn.turnId);
+  store.releaseTurnReservation(later.turn.turnId);
 });
 
 test('Main compaction save reads and commits the full history through the last user when chat ends in assistant', async (t) => {

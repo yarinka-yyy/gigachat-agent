@@ -225,6 +225,8 @@ test('chat preview assembles the same persisted sources plus current text and re
   assert.deepEqual(assembled.projectInstructions, [{ scope: project.name, text: 'Private project instructions.' }]);
   assert.deepEqual(assembled.selectedSkill, { name: skill.name, scope: `Project · ${project.name}`, text: skill.instructions });
   assert.deepEqual(assembled.compactSnapshot, detail.compactSnapshot);
+  assert.deepEqual(assembled.compactionToolReceipts, detail.toolReceipts);
+  assert.deepEqual(assembled.compactionArtifacts, detail.artifacts);
   assert.deepEqual(assembled.messages.slice(-3).map((message) => message.text), [
     lastUser.text, lastAssistant.text, 'Current visible prompt',
   ]);

@@ -65,7 +65,7 @@ export interface ChatMessage {
 
 export interface CompactSnapshot {
   id: string;
-  version: 1;
+  version: 1 | 2;
   boundaryMessageId: string;
   coveredThroughMessageId: string;
   coveredPrefixHash: string;

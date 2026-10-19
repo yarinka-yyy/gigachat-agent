@@ -870,10 +870,8 @@ async function createMainRuntime(
         messages,
         protocolHistory,
         compactSnapshot: detail.compactSnapshot,
-        ...(turn.operation === 'compaction' ? {
-          compactionToolReceipts: detail.toolReceipts,
-          compactionArtifacts: detail.artifacts,
-        } : {}),
+        compactionToolReceipts: detail.toolReceipts,
+        compactionArtifacts: detail.artifacts,
         permissionProfile: turn.permissionProfile,
         modelId: turn.modelId,
         ...(turn.operation === 'compaction' ? {
@@ -974,6 +972,8 @@ async function createMainRuntime(
           messages,
           protocolHistory,
           compactSnapshot,
+          compactionToolReceipts: detail.toolReceipts,
+          compactionArtifacts: detail.artifacts,
           permissionProfile: turn.permissionProfile,
           modelId: turn.modelId ?? (() => { throw new Error('Модель для контекста не выбрана.'); })(),
           functionCallMode: 'auto',

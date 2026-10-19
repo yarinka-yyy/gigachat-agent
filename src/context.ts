@@ -4,7 +4,7 @@ import type { ChatArtifact, ChatMessage, ChatToolReceipt, CompactSnapshot, Conte
 import { buildInstructionRequest, type InstructionInput } from './instructions';
 import { MAX_PROVIDER_REQUEST_BYTES, serializeProviderTurnRequest, type GigaChatProviderConnection } from './gigachat-provider';
 import { filterProviderStateForOutboundRequest, type ProviderStateOutboundFilterInput } from './provider-state';
-import { createCompactionSources, formatArchivedCompactionNotes, selectRetainedCompactionMessages, serializeCompactionTranscript, validateCompactSummary, type CompactionSources } from './compaction';
+import { createCompactionSources, formatArchivedCompactionNotes, formatSemanticCompactionMemory, selectRetainedCompactionMessages, serializeCompactionTranscript, validateCompactSummary, type CompactionSources } from './compaction';
 
 export { validateCompactSummary } from './compaction';
 
@@ -93,7 +93,8 @@ function selectRecentMessages(messages: NextTurnContextInput['messages'], snapsh
   coveredPrefix: null | { messages: ChatMessage[]; coveredAnchors: Set<string> };
 } {
   if (!snapshot) return { messages: messages.map((message) => ({ ...message })), coveredPrefix: null };
-  validateCompactSummary(snapshot.text);
+  if (snapshot.version === 1) validateCompactSummary(snapshot.text);
+  else if (snapshot.version !== 2) throw new Error('Версия сохранённой сводки не поддерживается.');
   const boundaryIndex = messages.findIndex((message) => message.id === snapshot.boundaryMessageId && message.role === 'user');
   if (boundaryIndex < 0) throw new Error('Граница сводки отсутствует в истории чата.');
   const coveredThroughIndex = messages.findIndex((message) => message.id === snapshot.coveredThroughMessageId);
@@ -132,6 +133,7 @@ export function buildNextTurnContext(
   let selectedMessages: ChatMessage[];
   let protocolHistory: ProviderProtocolExchange[];
   let compactionSources: CompactionSources | undefined;
+  let semanticSummaryText: string | null = null;
   let nativeCheckpointSelected = false;
   if (isCompaction) {
     if (typeof input.taskInstruction !== 'string' || !input.taskInstruction.trim()
@@ -156,22 +158,34 @@ export function buildNextTurnContext(
       if (coveredPrefixHash !== input.compactSnapshot?.coveredPrefixHash) {
         throw new Error('История под сводкой изменилась; сжатый контекст не будет применён.');
       }
-      const retainedPrefix = selectRetainedCompactionMessages(input.compactSnapshot!.text, selected.coveredPrefix.messages);
-      if (retainedPrefix) {
-        const retainedIds = new Set(retainedPrefix.map((message) => message.id));
-        if (coveredProtocol.some((exchange) => !retainedIds.has(exchange.anchorMessageId))) {
-          throw new Error('Сохранённая выборка истории исключила якорь протокола инструмента.');
+      if (input.compactSnapshot?.version === 2) {
+        if (input.compactionToolReceipts === undefined || input.compactionArtifacts === undefined) {
+          throw new Error('Для semantic-сводки нужны покрытые записи инструментов и вложений.');
         }
-        selectedMessages = [...retainedPrefix, ...selected.messages];
-        const selectedIds = new Set(selectedMessages.map((message) => message.id));
-        protocolHistory = (input.protocolHistory ?? [])
-          .filter((exchange) => selectedIds.has(exchange.anchorMessageId))
-          .map((exchange) => structuredClone(exchange));
-        nativeCheckpointSelected = true;
-      } else {
+        semanticSummaryText = formatSemanticCompactionMemory(input.compactSnapshot.text, createCompactionSources(
+          selected.coveredPrefix.messages, input.compactionToolReceipts, input.compactionArtifacts,
+        ));
         protocolHistory = (input.protocolHistory ?? [])
           .filter((exchange) => !selected.coveredPrefix!.coveredAnchors.has(exchange.anchorMessageId))
           .map((exchange) => structuredClone(exchange));
+      } else {
+        const retainedPrefix = selectRetainedCompactionMessages(input.compactSnapshot!.text, selected.coveredPrefix.messages);
+        if (retainedPrefix) {
+          const retainedIds = new Set(retainedPrefix.map((message) => message.id));
+          if (coveredProtocol.some((exchange) => !retainedIds.has(exchange.anchorMessageId))) {
+            throw new Error('Сохранённая выборка истории исключила якорь протокола инструмента.');
+          }
+          selectedMessages = [...retainedPrefix, ...selected.messages];
+          const selectedIds = new Set(selectedMessages.map((message) => message.id));
+          protocolHistory = (input.protocolHistory ?? [])
+            .filter((exchange) => selectedIds.has(exchange.anchorMessageId))
+            .map((exchange) => structuredClone(exchange));
+          nativeCheckpointSelected = true;
+        } else {
+          protocolHistory = (input.protocolHistory ?? [])
+            .filter((exchange) => !selected.coveredPrefix!.coveredAnchors.has(exchange.anchorMessageId))
+            .map((exchange) => structuredClone(exchange));
+        }
       }
     }
   }
@@ -183,7 +197,7 @@ export function buildNextTurnContext(
     ...input,
     ...(shouldAddFilesOnlyTask ? { taskInstruction: FILES_ONLY_TASK_INSTRUCTION } : {}),
     compactSnapshot: isCompaction || nativeCheckpointSelected || !input.compactSnapshot
-      ? null : { text: formatArchivedCompactionNotes(input.compactSnapshot.text) },
+      ? null : { text: semanticSummaryText ?? formatArchivedCompactionNotes(input.compactSnapshot.text) },
     messages: selectedMessages,
     protocolHistory,
   });
