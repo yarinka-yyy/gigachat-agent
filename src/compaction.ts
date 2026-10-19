@@ -110,102 +110,11 @@ const semanticMemorySchema = {
   additionalProperties: false,
 };
 
-const semanticCoverageDecisionSchema = {
-  type: 'object',
-  properties: {
-    sourceRef: { type: 'string', pattern: '^(m|t)(0|[1-9][0-9]*)$' },
-    retain: { type: 'boolean' },
-  },
-  required: ['sourceRef', 'retain'],
-  additionalProperties: false,
-};
-
 export const SEMANTIC_COMPACTION_RESPONSE_FORMAT = {
   type: 'json_schema',
-  schema: {
-    type: 'object',
-    properties: {
-      coverage: {
-        type: 'array', minItems: 1, maxItems: MAX_SEMANTIC_COVERAGE_SOURCES, items: semanticCoverageDecisionSchema,
-      },
-      memory: semanticMemorySchema,
-    },
-    required: ['coverage', 'memory'],
-    additionalProperties: false,
-  },
+  schema: semanticMemorySchema,
   strict: true,
 };
-
-function validateSemanticCompactionRepairRefs(patchRefSet: readonly string[], requiredRetainRefs: readonly string[]): void {
-  const isRefList = (refs: readonly string[], allowEmpty = false) => (allowEmpty || refs.length > 0)
-    && refs.length <= MAX_SEMANTIC_COVERAGE_SOURCES
-    && refs.every((ref) => typeof ref === 'string' && /^(m|t)(0|[1-9]\d*)$/.test(ref))
-    && new Set(refs).size === refs.length;
-  if (!Array.isArray(patchRefSet) || !isRefList(patchRefSet)
-    || !Array.isArray(requiredRetainRefs) || requiredRetainRefs.length > patchRefSet.length
-    || !isRefList(requiredRetainRefs, true) || requiredRetainRefs.some((ref) => !patchRefSet.includes(ref))) {
-    throw new Error('Invalid semantic compaction repair refs.');
-  }
-}
-
-function semanticCompactionRepairValueSchema(requiredRetain: boolean) {
-  const common = {
-    retain: { type: 'boolean', enum: [true] },
-    text: { type: 'string', minLength: 1, maxLength: MAX_SEMANTIC_ENTRY_BYTES },
-  };
-  const retainedBranches = [
-    {
-      type: 'object',
-      properties: { ...common, section: { type: 'string', enum: ['constraints'] },
-        scope: { type: 'string', minLength: 1, maxLength: MAX_SEMANTIC_SCOPE_BYTES } },
-      required: ['retain', 'section', 'scope', 'text'], additionalProperties: false,
-    },
-    {
-      type: 'object',
-      properties: { ...common, section: { type: 'string', enum: ['decisions', 'openWork', 'facts', 'pastTopics'] },
-        scope: { type: 'null' } },
-      required: ['retain', 'section', 'scope', 'text'], additionalProperties: false,
-    },
-  ];
-  const branches = requiredRetain ? retainedBranches : [...retainedBranches, {
-    type: 'object',
-    properties: {
-      retain: { type: 'boolean', enum: [false] },
-      section: { type: 'string', enum: ['none'] },
-      scope: { type: 'null' },
-      text: { type: 'string', enum: [''] },
-    },
-    required: ['retain', 'section', 'scope', 'text'], additionalProperties: false,
-  }];
-  return { anyOf: branches };
-}
-
-export function createSemanticCompactionRepairResponseFormat(
-  patchRefSet: readonly string[],
-  requiredRetainRefs: readonly string[],
-) {
-  validateSemanticCompactionRepairRefs(patchRefSet, requiredRetainRefs);
-  const requiredRetainSet = new Set(requiredRetainRefs);
-  return {
-    type: 'json_schema',
-    schema: {
-      type: 'object',
-      properties: {
-        format: { type: 'string', enum: ['gigachat-semantic-patch'] },
-        version: { type: 'integer', enum: [1] },
-        patches: {
-          type: 'object',
-          properties: Object.fromEntries(patchRefSet.map((ref) => [ref, semanticCompactionRepairValueSchema(requiredRetainSet.has(ref))])),
-          required: [...patchRefSet],
-          additionalProperties: false,
-        },
-      },
-      required: ['format', 'version', 'patches'],
-      additionalProperties: false,
-    },
-    strict: true,
-  };
-}
 
 export interface SemanticCompactionEntry {
   text: string;
@@ -234,11 +143,6 @@ export interface SemanticCompactionMemory {
   openWork: SemanticCompactionEntry[];
   facts: SemanticCompactionFact[];
   pastTopics: SemanticCompactionEntry[];
-}
-
-export interface SemanticCompactionCoverageDecision {
-  sourceRef: string;
-  retain: boolean;
 }
 
 export interface CompactionAttachmentSource {
@@ -626,264 +530,20 @@ export function validateSemanticCompactionMemory(value: unknown, sources: Compac
   return parseSemanticCompactionMemory(value, sources);
 }
 
-export function compileSemanticCompactionMemory(value: unknown, sources: CompactionSources): string {
-  return canonicalJson(parseSemanticCompactionMemory(value, sources));
-}
-
-export interface SemanticCompactionCoverageDiagnostics {
-  missingCoverageRefs: string[];
-  duplicateCoverageRefs: string[];
-  outOfOrder: boolean;
-  retainTrueUncitedRefs: string[];
-  citedFalseRefs: string[];
-}
-
-export type SemanticCompactionPatchSection = 'constraints' | 'decisions' | 'openWork' | 'facts' | 'pastTopics' | 'none';
-
-export interface SemanticCompactionPatch {
-  retain: boolean;
-  section: SemanticCompactionPatchSection;
-  scope: string | null;
-  text: string;
-}
-
-export interface SemanticCompactionPatchResponse {
-  format: 'gigachat-semantic-patch';
-  version: 1;
-  patches: Record<string, SemanticCompactionPatch>;
-}
-
-export type SemanticCompactionRepairPlan =
-  | { status: 'valid'; compiledMemory: string }
-  | { status: 'normalize'; compiledMemory: string }
-  | { status: 'patches'; compiledMemory: string; patchRefSet: string[]; requiredRetainRefSet: string[];
-    diagnostics: SemanticCompactionCoverageDiagnostics }
-  | { status: 'terminal'; reason: Extract<SemanticCompactionCoverageInspection, { status: 'terminal' }>['reason'] };
-
-export type SemanticCompactionCoverageInspection =
-  | { status: 'valid'; compiledMemory: string }
-  | { status: 'repairable'; diagnostics: SemanticCompactionCoverageDiagnostics }
-  | { status: 'terminal'; reason: 'candidate-too-large' | 'invalid-json' | 'invalid-wrapper' | 'invalid-memory'
-    | 'invalid-expected-coverage-size' | 'invalid-expected-coverage' | 'unknown-coverage-ref' | 'invalid-coverage-row'
-    | 'memory-source-outside-coverage' };
-
-export function inspectCoveredSemanticCompactionCandidate(
+export function compileSemanticCompactionMemory(
   value: unknown,
   sources: CompactionSources,
-  coverageRefSet: readonly string[],
-): SemanticCompactionCoverageInspection {
-  const sourceTexts = semanticSourceTexts(sources);
-  if (!Array.isArray(coverageRefSet) || coverageRefSet.length === 0 || coverageRefSet.length > MAX_SEMANTIC_COVERAGE_SOURCES) {
-    return { status: 'terminal', reason: 'invalid-expected-coverage-size' };
-  }
-  let expectedRefs: string[];
-  try { expectedRefs = validateSemanticCoverageRefSet(coverageRefSet, sourceTexts); }
-  catch { return { status: 'terminal', reason: 'invalid-expected-coverage' }; }
-  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > MAX_COMPACTION_CANDIDATE_BYTES) {
-    return { status: 'terminal', reason: 'candidate-too-large' };
-  }
-  let parsed: unknown;
-  try { parsed = JSON.parse(value); }
-  catch { return { status: 'terminal', reason: 'invalid-json' }; }
-  if (!isRecord(parsed) || !hasOnlyKeys(parsed, ['coverage', 'memory']) || !Array.isArray(parsed.coverage)
-    || parsed.coverage.length > MAX_SEMANTIC_COVERAGE_SOURCES) {
-    return { status: 'terminal', reason: 'invalid-wrapper' };
-  }
-
-  let compiledMemory: string;
-  try { compiledMemory = compileSemanticCompactionMemory(canonicalJson(parsed.memory), sources); }
-  catch { return { status: 'terminal', reason: 'invalid-memory' }; }
-  const memory = JSON.parse(compiledMemory) as SemanticCompactionMemory;
-  const citedRefs = new Set(semanticMemorySourceRefs(memory));
-  const expectedSet = new Set(expectedRefs);
-  if ([...citedRefs].some((ref) => !expectedSet.has(ref))) {
-    return { status: 'terminal', reason: 'memory-source-outside-coverage' };
-  }
-
-  const expectedIndex = new Map(expectedRefs.map((ref, index) => [ref, index]));
-  const decisions = new Map<string, boolean>();
-  const duplicateSet = new Set<string>();
-  let previousIndex = -1;
-  let outOfOrder = false;
-  for (const item of parsed.coverage) {
-    if (!isRecord(item) || !hasOnlyKeys(item, ['sourceRef', 'retain'])
-      || typeof item.sourceRef !== 'string' || typeof item.retain !== 'boolean') {
-      return { status: 'terminal', reason: 'invalid-coverage-row' };
-    }
-    const index = expectedIndex.get(item.sourceRef);
-    if (index === undefined) return { status: 'terminal', reason: 'unknown-coverage-ref' };
-    if (decisions.has(item.sourceRef)) {
-      duplicateSet.add(item.sourceRef);
-      continue;
-    }
-    if (index < previousIndex) outOfOrder = true;
-    previousIndex = index;
-    decisions.set(item.sourceRef, item.retain);
-  }
-  const missingCoverageRefs = expectedRefs.filter((ref) => !decisions.has(ref));
-  const duplicateCoverageRefs = expectedRefs.filter((ref) => duplicateSet.has(ref));
-  const retainTrueUncitedRefs = expectedRefs.filter((ref) => !duplicateSet.has(ref)
-    && decisions.get(ref) === true && !citedRefs.has(ref));
-  const citedFalseRefs = expectedRefs.filter((ref) => !duplicateSet.has(ref)
-    && decisions.get(ref) === false && citedRefs.has(ref));
-  const diagnostics = { missingCoverageRefs, duplicateCoverageRefs, outOfOrder, retainTrueUncitedRefs, citedFalseRefs };
-  if (missingCoverageRefs.length || duplicateCoverageRefs.length || outOfOrder
-    || retainTrueUncitedRefs.length || citedFalseRefs.length) {
-    return { status: 'repairable', diagnostics };
-  }
-  return { status: 'valid', compiledMemory };
-}
-
-export function prepareSemanticCompactionRepairPlan(
-  value: unknown,
-  sources: CompactionSources,
-  coverageRefSet: readonly string[],
-): SemanticCompactionRepairPlan {
-  const inspection = inspectCoveredSemanticCompactionCandidate(value, sources, coverageRefSet);
-  if (inspection.status === 'terminal') return inspection;
-  if (inspection.status === 'valid') return inspection;
-
-  let wrapper: unknown;
-  try { wrapper = JSON.parse(value as string); }
-  catch { return { status: 'terminal', reason: 'invalid-json' }; }
-  if (!isRecord(wrapper) || !hasOnlyKeys(wrapper, ['coverage', 'memory'])) {
-    return { status: 'terminal', reason: 'invalid-wrapper' };
-  }
-  let compiledMemory: string;
-  let expectedRefs: string[];
-  try {
-    compiledMemory = compileSemanticCompactionMemory(canonicalJson(wrapper.memory), sources);
-    expectedRefs = validateSemanticCoverageRefSet(coverageRefSet, semanticSourceTexts(sources));
-  } catch {
-    return { status: 'terminal', reason: 'invalid-memory' };
-  }
-  const memory = JSON.parse(compiledMemory) as SemanticCompactionMemory;
-  const citedRefs = new Set(semanticMemorySourceRefs(memory));
-  const patchableRefs = new Set([
-    ...inspection.diagnostics.missingCoverageRefs,
-    ...inspection.diagnostics.duplicateCoverageRefs,
-    ...inspection.diagnostics.retainTrueUncitedRefs,
-  ]);
-  const patchRefSet = expectedRefs.filter((ref) => patchableRefs.has(ref) && !citedRefs.has(ref));
-  if (patchRefSet.length) {
-    const requiredRetainRefSet = patchRefSet.filter((ref) =>
-      (wrapper.coverage as SemanticCompactionCoverageDecision[]).some((decision) => decision.sourceRef === ref && decision.retain));
-    return { status: 'patches', compiledMemory, patchRefSet, requiredRetainRefSet, diagnostics: inspection.diagnostics };
-  }
-
-  const normalized = JSON.stringify({
-    coverage: expectedRefs.map((sourceRef) => ({ sourceRef, retain: citedRefs.has(sourceRef) })),
-    memory,
-  });
-  try {
-    return { status: 'normalize', compiledMemory: compileCoveredSemanticCompactionMemory(normalized, sources, expectedRefs) };
-  } catch {
-    return { status: 'terminal', reason: 'invalid-wrapper' };
-  }
-}
-
-export function compileSemanticCompactionRepairPatches(
-  candidate: unknown,
-  patchValue: unknown,
-  sources: CompactionSources,
-  coverageRefSet: readonly string[],
+  allowedSourceRefs?: readonly string[],
 ): string {
-  const plan = prepareSemanticCompactionRepairPlan(candidate, sources, coverageRefSet);
-  if (plan.status !== 'patches') throw new Error('Кандидат не требует допустимого semantic patch-исправления.');
-  if (typeof patchValue !== 'string' || Buffer.byteLength(patchValue, 'utf8') > MAX_COMPACT_SUMMARY_BYTES) {
-    throw new Error('Ответ semantic patch превышает ограничение 32 КиБ.');
-  }
-  let parsed: unknown;
-  try { parsed = JSON.parse(patchValue); }
-  catch { throw new Error('Ответ semantic patch должен быть корректным JSON.'); }
-  if (!isRecord(parsed) || !hasOnlyKeys(parsed, ['format', 'version', 'patches'])
-    || parsed.format !== 'gigachat-semantic-patch' || parsed.version !== 1 || !isRecord(parsed.patches)) {
-    throw new Error('Ответ semantic patch имеет неверную версию или структуру.');
-  }
-  const patchKeys = Object.keys(parsed.patches);
-  if (patchKeys.length !== plan.patchRefSet.length || patchKeys.some((ref) => !plan.patchRefSet.includes(ref))) {
-    throw new Error('Ответ semantic patch должен содержать ровно ключи исправляемых исходников.');
-  }
-
-  const memory = JSON.parse(plan.compiledMemory) as SemanticCompactionMemory;
-  const sectionNames = new Set<SemanticCompactionPatchSection>(['constraints', 'decisions', 'openWork', 'facts', 'pastTopics', 'none']);
-  const requiredRetainSet = new Set(plan.requiredRetainRefSet);
-  for (const sourceRef of plan.patchRefSet) {
-    const row = parsed.patches[sourceRef];
-    if (!isRecord(row) || !hasOnlyKeys(row, ['retain', 'section', 'scope', 'text'])
-      || typeof row.retain !== 'boolean'
-      || typeof row.section !== 'string' || !sectionNames.has(row.section as SemanticCompactionPatchSection)
-      || (row.scope !== null && typeof row.scope !== 'string') || typeof row.text !== 'string') {
-      throw new Error('Semantic patch имеет неверную структуру для одного из исходников.');
-    }
-    if (!row.retain) {
-      if (requiredRetainSet.has(sourceRef)) {
-        throw new Error('Semantic patch не может отвергнуть исходник, который coverage пометил retain=true.');
-      }
-      if (row.section !== 'none' || row.scope !== null || row.text !== '') {
-        throw new Error('Отвергнутый semantic patch не должен содержать текст или раздел памяти.');
-      }
-      continue;
-    }
-    if (row.section === 'none') throw new Error('Сохраняемый semantic patch должен указывать раздел памяти.');
-    const text = validateSemanticText(row.text, MAX_SEMANTIC_ENTRY_BYTES);
-    if (row.section === 'constraints') {
-      const scope = validateSemanticText(row.scope, MAX_SEMANTIC_SCOPE_BYTES);
-      memory.constraints.push({ text, sourceRefs: [sourceRef], scope });
-    } else {
-      if (row.scope !== null) throw new Error('Область допускается только для semantic patch-ограничения.');
-      const entry = { text, sourceRefs: [sourceRef] };
-      if (row.section === 'decisions') memory.decisions.push(entry);
-      else if (row.section === 'openWork') memory.openWork.push(entry);
-      else if (row.section === 'facts') memory.facts.push(entry);
-      else memory.pastTopics.push(entry);
+  const memory = parseSemanticCompactionMemory(value, sources);
+  if (allowedSourceRefs !== undefined) {
+    const sourceTexts = semanticSourceTexts(sources);
+    const allowed = new Set(validateSemanticCoverageRefSet(allowedSourceRefs, sourceTexts));
+    if (semanticMemorySourceRefs(memory).some((ref) => !allowed.has(ref))) {
+      throw new Error('Семантическая память ссылается на исходник вне текущего архива.');
     }
   }
-
-  const citedRefs = new Set(semanticMemorySourceRefs(memory));
-  const normalized = JSON.stringify({
-    coverage: coverageRefSet.map((sourceRef) => ({ sourceRef, retain: citedRefs.has(sourceRef) })),
-    memory,
-  });
-  return compileCoveredSemanticCompactionMemory(normalized, sources, coverageRefSet);
-}
-
-export function compileCoveredSemanticCompactionMemory(
-  value: unknown,
-  sources: CompactionSources,
-  coverageRefSet: readonly string[],
-): string {
-  const inspection = inspectCoveredSemanticCompactionCandidate(value, sources, coverageRefSet);
-  if (inspection.status === 'valid') return inspection.compiledMemory;
-  if (inspection.status === 'terminal') {
-    if (inspection.reason === 'invalid-memory' && typeof value === 'string') {
-      const wrapper = JSON.parse(value) as { memory: unknown };
-      compileSemanticCompactionMemory(canonicalJson(wrapper.memory), sources);
-      throw new Error('Кандидат semantic-сжатия содержит некорректную semantic-память или цитаты.');
-    }
-    const messages: Record<typeof inspection.reason, string> = {
-      'candidate-too-large': 'Кандидат semantic-сжатия превышает допустимый размер.',
-      'invalid-json': 'Кандидат semantic-сжатия должен быть корректным JSON.',
-      'invalid-wrapper': 'Кандидат semantic-сжатия должен содержать только coverage и memory корректной структуры.',
-      'invalid-memory': 'Кандидат semantic-сжатия содержит некорректную semantic-память или цитаты.',
-      'invalid-expected-coverage-size': `Список исходников semantic-сжатия должен содержать от 1 до ${MAX_SEMANTIC_COVERAGE_SOURCES} ссылок.`,
-      'invalid-expected-coverage': 'Список исходников semantic-сжатия содержит неизвестную или повторную ссылку.',
-      'unknown-coverage-ref': 'Решения coverage содержат неизвестную ссылку.',
-      'invalid-coverage-row': 'Решение coverage имеет неверную структуру.',
-      'memory-source-outside-coverage': 'Семантическая память ссылается на исходник вне переданного набора coverage.',
-    };
-    throw new Error(messages[inspection.reason]);
-  }
-  if (inspection.diagnostics.missingCoverageRefs.length) {
-    throw new Error('Решения coverage должны перечислять каждый переданный исходник ровно один раз.');
-  }
-  if (inspection.diagnostics.duplicateCoverageRefs.length || inspection.diagnostics.outOfOrder) {
-    throw new Error('Решения coverage должны точно совпадать с переданными исходниками и их порядком.');
-  }
-  if (inspection.diagnostics.retainTrueUncitedRefs.length) {
-    throw new Error('Сохранённый исходник coverage не представлен в семантической памяти.');
-  }
-  throw new Error('Семантическая память ссылается на исходник, отмеченный retain=false.');
+  return canonicalJson(memory);
 }
 
 export function formatSemanticCompactionMemory(value: unknown, sources: CompactionSources): string {

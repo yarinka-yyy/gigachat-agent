@@ -21,7 +21,6 @@ import {
 import { validateProviderV2FunctionWire } from './provider-wire';
 import { createTurnRuntime } from './runtime';
 import type { LocalTools } from './local-tools';
-import { createSemanticCompactionRepairResponseFormat } from './compaction';
 
 const FIXED_NOW = Date.UTC(2026, 9, 9, 12);
 
@@ -1519,7 +1518,7 @@ test('uses explicit output caps while preserving ordinary and compaction default
   assert.deepEqual(explicitOrdinaryBody.model_options, { parallel_tool_calls: false, max_tokens: 512 });
 });
 
-test('serializes only semantic compaction with ordered coverage, strict memory schema and no tools', () => {
+test('serializes semantic compaction as strict plain memory and disables tools', () => {
   const request: ProviderTurnRequest = {
     system: [{ source: 'runtime', label: 'Runtime', text: 'Runtime rules' }],
     messages: [{ id: 'semantic-task', role: 'user', text: 'Prepare semantic memory.', createdAt: '2026-10-18T00:00:00.000Z' }],
@@ -1529,25 +1528,20 @@ test('serializes only semantic compaction with ordered coverage, strict memory s
     compactionFormat: 'semantic',
     functionCallMode: 'auto',
   };
-  const serialized = serializeProviderTurnRequest(request);
-  const body = JSON.parse(serialized.body) as {
+  const body = JSON.parse(serializeProviderTurnRequest(request).body) as {
     tools?: unknown[]; tool_config: { mode: string };
     model_options: { max_tokens: number; temperature: number; response_format: { strict: boolean; schema: {
       properties: Record<string, unknown>; required: string[]; additionalProperties: boolean;
     } } };
   };
   const schema = body.model_options.response_format.schema;
-  const coverage = schema.properties.coverage as { type: string; minItems: number; maxItems: number;
-    items: { required: string[]; additionalProperties: boolean; properties: Record<string, { type?: string }> } };
-  const memory = schema.properties.memory as { required: string[]; additionalProperties: boolean;
-    properties: Record<string, Record<string, unknown>> };
-  const facts = memory.properties.facts as { maxItems: number; items: { required: string[]; properties: Record<string, unknown> } };
-  const activeTask = memory.properties.activeTask as { description: string; anyOf: Array<{ type: string }> };
-  const constraints = memory.properties.constraints as { description: string; maxItems: number };
-  const decisions = memory.properties.decisions as { description: string; maxItems: number };
-  const openWork = memory.properties.openWork as { description: string; maxItems: number };
-  const factsDescription = (memory.properties.facts as { description: string }).description as string;
-  const pastTopics = memory.properties.pastTopics as {
+  const facts = schema.properties.facts as { maxItems: number; items: { required: string[]; properties: Record<string, unknown> } };
+  const activeTask = schema.properties.activeTask as { description: string; anyOf: Array<{ type: string }> };
+  const constraints = schema.properties.constraints as { description: string; maxItems: number };
+  const decisions = schema.properties.decisions as { description: string; maxItems: number };
+  const openWork = schema.properties.openWork as { description: string; maxItems: number };
+  const factsDescription = (schema.properties.facts as { description: string }).description as string;
+  const pastTopics = schema.properties.pastTopics as {
     description: string; maxItems: number; items: {
       properties: Record<string, { type?: string; maxLength?: number; maxItems?: number; uniqueItems?: boolean }>;
       required: string[]; additionalProperties: boolean;
@@ -1559,17 +1553,10 @@ test('serializes only semantic compaction with ordered coverage, strict memory s
   assert.equal(body.tool_config.mode, 'none', 'semantic compaction suppresses tool execution even for an auto caller');
   assert.equal(body.tools, undefined);
   assert.equal(body.model_options.response_format.strict, true);
-  assert.deepEqual(schema.required, ['coverage', 'memory']);
+  assert.deepEqual(schema.required, ['format', 'version', 'activeTask', 'constraints', 'decisions', 'openWork', 'facts', 'pastTopics']);
   assert.equal(schema.additionalProperties, false);
-  assert.equal(coverage.type, 'array');
-  assert.equal(coverage.minItems, 1);
-  assert.equal(coverage.maxItems, 64);
-  assert.deepEqual(coverage.items.required, ['sourceRef', 'retain']);
-  assert.equal(coverage.items.additionalProperties, false);
-  assert.equal(coverage.items.properties.sourceRef?.type, 'string');
-  assert.equal(coverage.items.properties.retain?.type, 'boolean');
-  assert.deepEqual(memory.required, ['format', 'version', 'activeTask', 'constraints', 'decisions', 'openWork', 'facts', 'pastTopics']);
-  assert.equal(memory.additionalProperties, false);
+  assert.equal(Object.prototype.hasOwnProperty.call(schema.properties, 'coverage'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(schema.properties, 'memory'), false);
   assert.deepEqual(activeTask.anyOf.map((entry) => entry.type), ['object', 'null']);
   assert.match(activeTask.description, /текущая активная задача.*точные рабочие идентификаторы/i);
   assert.match(constraints.description, /действующие ограничения.*областью, условиями и исключениями/i);
@@ -1593,76 +1580,15 @@ test('serializes only semantic compaction with ordered coverage, strict memory s
   assert.equal(exactQuotes.minItems, 0);
   assert.equal(exactQuotes.maxItems, 8);
 
-  const ordinary = { ...request, usageKind: undefined } as unknown as ProviderTurnRequest;
-  assert.throws(() => serializeProviderTurnRequest(ordinary), (error: unknown) =>
+  const wrongUsageKind = { ...request, usageKind: undefined } as unknown as ProviderTurnRequest;
+  assert.throws(() => serializeProviderTurnRequest(wrongUsageKind), (error: unknown) =>
     error instanceof GigaChatProviderError && error.category === 'protocol');
+  const ordinary = serializeProviderTurnRequest({
+    ...request, usageKind: 'chat', compactionFormat: undefined, functionCallMode: 'none',
+  });
+  const ordinaryOptions = (JSON.parse(ordinary.body) as { model_options: Record<string, unknown> }).model_options;
+  assert.equal(Object.prototype.hasOwnProperty.call(ordinaryOptions, 'temperature'), false);
 });
-
-test('serializes patch repair only as a tool-free compaction request with its strict patch schema', () => {
-  const request: ProviderTurnRequest = {
-    system: [{ source: 'runtime', label: 'Runtime', text: 'Runtime rules' }],
-    messages: [{ id: 'semantic-repair', role: 'user', text: 'Create source patches.', createdAt: '2026-10-18T00:00:00.000Z' }],
-    permissionProfile: 'ask',
-    modelId: 'GigaChat-3-Lightning',
-    usageKind: 'compaction',
-    compactionFormat: 'semantic-repair-patch',
-    compactionRepair: { patchRefSet: ['m1', 'm2'], requiredRetainRefs: ['m1'] },
-    functionCallMode: 'none',
-  };
-  const wire = JSON.parse(serializeProviderTurnRequest(request).body) as {
-    tools?: unknown[]; tool_config: { mode: string };
-    model_options: { max_tokens: number; temperature: number; response_format: { strict: boolean; schema: {
-      properties: Record<string, unknown>; required: string[]; additionalProperties: boolean;
-    } } };
-  };
-  const schema = wire.model_options.response_format.schema;
-  const patches = schema.properties.patches as {
-    properties: Record<string, { anyOf: Array<{ properties: Record<string, unknown>; required: string[]; additionalProperties: boolean }> }>;
-    required: string[]; additionalProperties: boolean;
-  };
-
-  assert.equal(wire.model_options.max_tokens, 4096);
-  assert.equal(wire.model_options.temperature, 0.0001);
-  assert.equal(wire.tool_config.mode, 'none');
-  assert.equal(wire.tools, undefined);
-  assert.equal(wire.model_options.response_format.strict, true);
-  assert.deepEqual(wire.model_options.response_format,
-    createSemanticCompactionRepairResponseFormat(['m1', 'm2'], ['m1']));
-  assert.deepEqual(schema.required, ['format', 'version', 'patches']);
-  assert.equal(schema.additionalProperties, false);
-  assert.deepEqual((schema.properties.format as { enum: string[] }).enum, ['gigachat-semantic-patch']);
-  assert.deepEqual((schema.properties.version as { enum: number[] }).enum, [1]);
-  assert.deepEqual(patches.required, ['m1', 'm2']);
-  assert.equal(patches.additionalProperties, false);
-  assert.equal(patches.properties.m1?.anyOf.length, 2, 'required retain refs have no false branch');
-  assert.equal(patches.properties.m2?.anyOf.length, 3, 'other refs can be explicitly dropped');
-  assert.equal(patches.properties.m1?.anyOf.every((branch) => branch.additionalProperties === false), true);
-  assert.deepEqual((patches.properties.m1?.anyOf[0]?.properties.section as { enum: string[] }).enum, ['constraints']);
-
-  assert.throws(() => serializeProviderTurnRequest({ ...request, functionCallMode: 'auto' }), (error: unknown) =>
-    error instanceof GigaChatProviderError && error.category === 'protocol');
-  assert.throws(() => serializeProviderTurnRequest({ ...request, usageKind: 'chat' } as unknown as ProviderTurnRequest), (error: unknown) =>
-    error instanceof GigaChatProviderError && error.category === 'protocol');
-  assert.throws(() => serializeProviderTurnRequest({ ...request, compactionRepair: undefined } as unknown as ProviderTurnRequest),
-    (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
-  assert.throws(() => serializeProviderTurnRequest({ ...request, compactionRepair: {
-    patchRefSet: ['m1'], requiredRetainRefs: [], extra: true,
-  } } as unknown as ProviderTurnRequest), (error: unknown) =>
-    error instanceof GigaChatProviderError && error.category === 'protocol');
-  assert.throws(() => serializeProviderTurnRequest({ ...request, compactionRepair: {
-    patchRefSet: ['m1', 'm1'], requiredRetainRefs: [],
-  } }), (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
-  assert.throws(() => serializeProviderTurnRequest({ ...request, compactionRepair: {
-    patchRefSet: ['m1'], requiredRetainRefs: ['m2'],
-  } }), (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
-  assert.throws(() => serializeProviderTurnRequest({ ...request, compactionFormat: 'semantic' } as unknown as ProviderTurnRequest),
-    (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
-  assert.throws(() => serializeProviderTurnRequest({
-    ...request, usageKind: 'chat', compactionFormat: undefined,
-  } as unknown as ProviderTurnRequest), (error: unknown) =>
-    error instanceof GigaChatProviderError && error.category === 'protocol');
-});
-
 test('rejects invalid explicit output caps at the provider wire boundary', () => {
   const request: ProviderTurnRequest = {
     system: [],

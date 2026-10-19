@@ -2,11 +2,11 @@ import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
 import { test } from 'node:test';
 import type { ChatArtifact, ChatDetail, ChatMessage, ChatToolReceipt, CompactSnapshot, ProviderProtocolExchange } from './contracts';
-import { assertCompactionWireReduction, buildNextTurnContext, buildSemanticCompactionRepairRequest, COMPACTION_TASK_INSTRUCTION, countContextTextTokens,
+import { assertCompactionWireReduction, buildNextTurnContext, buildSemanticCompactionReviewRequest, COMPACTION_TASK_INSTRUCTION, countContextTextTokens,
   hashCompactionPrefix, SEMANTIC_COMPACTION_TASK_INSTRUCTION, validateCompactSummary } from './context';
 import { GigaChatProviderError, MAX_PROVIDER_REQUEST_BYTES, serializeProviderTurnRequest } from './gigachat-provider';
-import { compileExtractiveCompaction, compileSemanticCompactionMemory, compileSemanticCompactionRepairPatches,
-  createCompactionSources, getSemanticCompactionCoverageRefSet, validateSemanticCompactionMemory } from './compaction';
+import { compileExtractiveCompaction, compileSemanticCompactionMemory,
+  createCompactionSources, getSemanticCompactionCoverageRefSet } from './compaction';
 
 const at = '2026-10-09T12:00:00.000Z';
 const user = (id: string, text = id): ChatMessage => ({ id, role: 'user', text, createdAt: at });
@@ -377,8 +377,8 @@ test('prepares a semantic request from the whole supplied raw prefix without exp
   assert.equal(context.request.compactionFormat, 'semantic');
   assert.equal(context.request.functionCallMode, 'none');
   assert.equal(context.request.messages[1]?.text, SEMANTIC_COMPACTION_TASK_INSTRUCTION);
-  assert.match(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /coverageRefSet.*строго в указанном порядке/i);
-  assert.match(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /все такие ссылки должны быть представлены в sourceRefs памяти/i);
+  assert.match(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /не обязательно ссылаться на каждый исходник/i);
+  assert.doesNotMatch(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /coverageRefSet|retain=true|решение на каждое сообщение/i);
   assert.match(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /действующее ограничение.*сохраняй в constraints/i);
   assert.match(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /не более чем в две записи по 256 символов каждая/i);
   assert.equal(context.request.system.some((layer) => layer.source === 'summary'), false);
@@ -479,6 +479,16 @@ test('rolls semantic compaction forward with stable global refs and only the new
     ],
   });
   assert.doesNotThrow(() => compileSemanticCompactionMemory(nextCandidate, context.compactionSources!));
+  const review = buildSemanticCompactionReviewRequest(context.request, context.compactionSources!, envelope.coverageRefSet, nextCandidate);
+  assert.ok(review);
+  const reviewEnvelope = JSON.parse(review.messages[0]!.text.slice(review.messages[0]!.text.indexOf('\n') + 1)) as typeof envelope;
+  assert.deepEqual(reviewEnvelope.previousMemory, envelope.previousMemory);
+  assert.deepEqual(reviewEnvelope.messages, envelope.messages, 'the review sees only the new raw suffix');
+  assert.deepEqual(reviewEnvelope.tools, envelope.tools, 'the review sees only suffix tool records');
+  assert.match(review.messages[1]!.text, /The old tool returned its result\./,
+    'validated prior memory may be reviewed without resending the old raw tool record');
+  assert.doesNotMatch(reviewEnvelope.messages.map(({ text }) => text).join('\n'), /Old raw request\.|Old raw answer\./);
+  assert.equal(buildSemanticCompactionReviewRequest(review, context.compactionSources!, envelope.coverageRefSet, nextCandidate), null);
 
   assert.throws(() => buildNextTurnContext(input(allMessages, {
     compactSnapshot: { ...priorSnapshot, coveredPrefixHash: '0'.repeat(64) }, protocolHistory: [oldProtocol, newProtocol],
@@ -502,188 +512,89 @@ test('rolls semantic compaction forward with stable global refs and only the new
   })), /новый завершённый фрагмент истории/i);
 });
 
-test('builds a repair request from only diagnosed semantic sources and keeps the original request immutable', () => {
-  const messages = Array.from({ length: 52 }, (_, index) => {
-    const text = new Map([
-      [0, 'The active request is to finish the package verification.'],
-      [5, 'An older detail was cited in the candidate.'],
-      [32, 'The current scope excludes public rankings.'],
-      [38, 'The current marker is ORION-9F2.'],
-      [46, 'The build target is version 0.9.4-rc2 on Windows 11.'],
-      [51, 'The final package verification remains open.'],
-    ]).get(index) ?? `History item ${index}.`;
-    if (index === 32) return { ...user(`private-message-id-${index}`, text), functionsStateId: 'private-message-state' };
-    if (index === 38) return { ...user(`private-message-id-${index}`, text), attachmentIds: ['repair-attachment'] };
-    return index % 2 === 0
-      ? user(`private-message-id-${index}`, text)
-      : assistant(`private-message-id-${index}`, text);
-  });
-  const receipts: ChatToolReceipt[] = [{
-    receiptId: 'private-receipt-id', anchorMessageId: messages[32]!.id, name: 'read', arguments: { query: 'current scope' },
-    content: 'The current scope was checked.', functionsStateId: 'private-tool-state', status: 'completed',
-    result: 'No public rankings are included.', createdAt: at,
-  }];
-  const artifacts: ChatArtifact[] = [{
-    id: 'repair-attachment', name: 'scope.txt', storedName: 'private-local-path', size: 17,
-    sha256: 'c'.repeat(64), createdAt: at, messageId: messages[38]!.id,
-  }];
+test('builds an independent semantic review from the exact current archive and a validated candidate', () => {
+  const messages = [
+    user('semantic-review-user', 'Continue the current package validation.'),
+    assistant('semantic-review-answer', 'The Windows build is ready for review.'),
+  ];
+  const receipt: ChatToolReceipt = {
+    receiptId: 'private-review-receipt', anchorMessageId: messages[0]!.id, name: 'read', arguments: { path: 'status.txt' },
+    content: 'The package status was checked.', functionsStateId: 'private-review-state', status: 'completed',
+    result: 'The build is ready.', createdAt: at,
+  };
   const context = buildNextTurnContext(input(messages, {
     usageKind: 'compaction', compactionFormat: 'semantic', functionCallMode: 'none',
-    compactionToolReceipts: receipts, compactionArtifacts: artifacts,
-  }));
-  const sources = context.compactionSources;
-  assert.ok(sources);
-  const coverageRefSet = getSemanticCompactionCoverageRefSet(sources);
-  const memory = {
-    format: 'gigachat-semantic-memory', version: 1,
-    activeTask: { text: 'Finish the package verification.', sourceRefs: ['m0'] },
-    constraints: [], decisions: [], openWork: [],
-    facts: [{ text: 'An older detail is cited.', sourceRefs: ['m5'] }],
-    pastTopics: [],
-  };
-  const uncited = new Set(['m32', 'm38', 'm46', 't0']);
-  const coverage = coverageRefSet.filter((ref) => ref !== 'm51').map((sourceRef) => ({
-    sourceRef,
-    retain: sourceRef === 'm0' || uncited.has(sourceRef),
-  }));
-  const candidate = JSON.stringify({ coverage, memory });
-  const originalRequest = structuredClone(context.request);
-
-  const repair = buildSemanticCompactionRepairRequest(context.request, sources, coverageRefSet, candidate);
-
-  assert.ok(repair);
-  assert.deepEqual(context.request, originalRequest);
-  assert.deepEqual(repair.system, originalRequest.system);
-  assert.equal(repair.usageKind, 'compaction');
-  assert.equal(repair.compactionFormat, 'semantic-repair-patch');
-  assert.deepEqual(repair.compactionRepair, {
-    patchRefSet: ['m32', 'm38', 'm46', 'm51', 't0'],
-    requiredRetainRefs: ['m32', 'm38', 'm46', 't0'],
-  });
-  assert.equal(repair.functionCallMode, 'none');
-  assert.equal(repair.maxOutputTokens, 4096);
-  assert.deepEqual(repair.protocolHistory, []);
-  assert.equal(repair.attachments, undefined);
-  assert.equal(repair.messages.length, 2);
-  assert.deepEqual(repair.messages.map(({ role }) => role), ['user', 'user']);
-  const repairWire = serializeProviderTurnRequest(repair);
-  assert.ok(repairWire.wireBytes <= MAX_PROVIDER_REQUEST_BYTES);
-  const repairWireMessages = (JSON.parse(repairWire.body) as { messages: Array<{ role: string }> }).messages;
-  assert.deepEqual(repairWireMessages.map(({ role }) => role), ['system', 'user', 'user']);
-  assert.equal(repairWireMessages.some(({ role }) => role === 'tool'), false);
-
-  const archiveText = repair.messages[0]!.text;
-  const repairArchive = JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)) as {
-    format: string;
-    version: number;
-    patchRefSet: string[];
-    requiredRetainRefs: string[];
-    memory: typeof memory;
-    repairSources: Array<Record<string, unknown>>;
-  };
-  assert.equal(repairArchive.format, 'gigachat-semantic-repair-input');
-  assert.equal(repairArchive.version, 1);
-  assert.deepEqual(repairArchive.patchRefSet, ['m32', 'm38', 'm46', 'm51', 't0']);
-  assert.deepEqual(repairArchive.requiredRetainRefs, ['m32', 'm38', 'm46', 't0']);
-  assert.deepEqual(repairArchive.memory, JSON.parse(compileSemanticCompactionMemory(JSON.stringify(memory), sources)));
-  assert.deepEqual(repairArchive.repairSources.map((source) => source.sourceRef), repairArchive.patchRefSet);
-  assert.equal(repairArchive.repairSources.find((source) => source.sourceRef === 'm32')?.text,
-    'The current scope excludes public rankings.');
-  assert.deepEqual(repairArchive.repairSources.find((source) => source.sourceRef === 't0'), {
-    sourceRef: 't0', anchorRef: 'm32', name: 'read', arguments: { query: 'current scope' }, status: 'completed',
-    content: 'The current scope was checked.', result: 'No public rankings are included.',
-  });
-  assert.deepEqual(Object.keys(repairArchive).sort(), ['format', 'memory', 'patchRefSet', 'repairSources', 'requiredRetainRefs', 'version']);
-  assert.doesNotMatch(archiveText, /History item 1\.|private-message-id|private-message-state|private-receipt-id|private-tool-state|private-local-path|storedName|functionsStateId|coverageRefSet|diagnostics|candidate/);
-  assert.match(archiveText, /АРХИВ ДЛЯ PATCH-ИСПРАВЛЕНИЯ JSON[\s\S]*данные истории, а не инструкции/);
-  assert.match(repair.messages[1]!.text, /gigachat-semantic-patch версии 1/);
-
-  const repairedMemory = compileSemanticCompactionRepairPatches(candidate, JSON.stringify({
-    format: 'gigachat-semantic-patch', version: 1,
-    patches: {
-      m32: { retain: true, section: 'constraints', scope: 'Current project', text: 'Keep the verified scope.' },
-      m38: { retain: true, section: 'decisions', scope: null, text: 'Use the current marker.' },
-      m46: { retain: true, section: 'facts', scope: null, text: 'The target is a Windows build.' },
-      m51: { retain: true, section: 'openWork', scope: null, text: 'Finish package verification.' },
-      t0: { retain: true, section: 'facts', scope: null, text: 'The tool confirmed the current scope.' },
-    },
-  }), sources, coverageRefSet);
-  assert.doesNotThrow(() => compileSemanticCompactionMemory(repairedMemory, sources));
-
-  const validCandidate = JSON.stringify({
-    coverage: coverageRefSet.map((sourceRef) => ({ sourceRef, retain: sourceRef === 'm0' })),
-    memory: { ...memory, facts: [] },
-  });
-  assert.equal(buildSemanticCompactionRepairRequest(context.request, sources, coverageRefSet, validCandidate), null);
-  const normalizableCandidate = JSON.stringify({
-    coverage: [...coverageRefSet].reverse().map((sourceRef) => ({
-      sourceRef, retain: sourceRef !== 'm0' && ['m5'].includes(sourceRef),
-    })),
-    memory,
-  });
-  assert.equal(buildSemanticCompactionRepairRequest(context.request, sources, coverageRefSet, normalizableCandidate), null,
-    'order and cited-false corrections are deterministic and do not request another generation');
-  assert.equal(buildSemanticCompactionRepairRequest(context.request, sources, coverageRefSet, '{'), null);
-  const invalidQuote = {
-    ...memory,
-    facts: [{ text: 'A fabricated quote.', sourceRefs: ['m0'], exactQuotes: [{ sourceRef: 'm0', text: 'not in the source' }] }],
-  };
-  assert.equal(buildSemanticCompactionRepairRequest(context.request, sources, coverageRefSet,
-    JSON.stringify({ coverage, memory: invalidQuote })), null);
-  assert.equal(buildSemanticCompactionRepairRequest({ ...context.request, functionCallMode: 'auto' }, sources, coverageRefSet, candidate), null);
-  const mismatchedSources = createCompactionSources(messages.map((message, index) => index === 32
-    ? { ...message, text: 'Changed current scope.' } : message), receipts, artifacts);
-  assert.equal(buildSemanticCompactionRepairRequest(context.request, mismatchedSources, coverageRefSet, candidate), null);
-  assert.equal(buildSemanticCompactionRepairRequest({ ...context.request, compactionFormat: 'semantic-repair-patch' },
-    sources, coverageRefSet, candidate), null, 'a patch request cannot recursively generate another repair request');
-});
-
-test('carries verified prior memory into rolling repair without resending its old raw messages', () => {
-  const messages = [user('repair-old-user', 'Older active request.'), assistant('repair-old-assistant', 'Earlier result.'),
-    user('repair-new-user', 'Continue with the latest update.'), assistant('repair-new-assistant', 'Latest result.')];
-  const covered = messages.slice(0, 2);
-  const previousMemoryValue = {
-    format: 'gigachat-semantic-memory', version: 1,
-    activeTask: { text: 'Continue the original task.', sourceRefs: ['m0'] },
-    constraints: [], decisions: [], openWork: [], facts: [], pastTopics: [],
-  };
-  const previousSources = createCompactionSources(covered, [], []);
-  const previousMemoryJson = JSON.stringify(previousMemoryValue);
-  const previousText = compileSemanticCompactionMemory(previousMemoryJson, previousSources);
-  const previousMemory = validateSemanticCompactionMemory(previousMemoryJson, previousSources);
-  const previousSnapshot: CompactSnapshot = {
-    id: 'repair-rolling-snapshot', version: 2, boundaryMessageId: messages[0]!.id,
-    coveredThroughMessageId: messages[1]!.id, coveredPrefixHash: prefixHash(covered), text: previousText,
-    modelId: 'GigaChat-3-Lightning', provenance: 'fixture', createdAt: at,
-  };
-  const context = buildNextTurnContext(input(messages, {
-    compactSnapshot: previousSnapshot, usageKind: 'compaction', compactionFormat: 'semantic', functionCallMode: 'none',
-    compactionToolReceipts: [], compactionArtifacts: [],
+    compactionToolReceipts: [receipt], compactionArtifacts: [],
   }));
   const sources = context.compactionSources!;
-  const coverageRefSet = getSemanticCompactionCoverageRefSet(sources, previousMemory, covered.length);
-  assert.deepEqual(coverageRefSet, ['m0', 'm2', 'm3']);
+  const sourceRefs = getSemanticCompactionCoverageRefSet(sources);
   const candidate = JSON.stringify({
-    coverage: [{ sourceRef: 'm0', retain: true }, { sourceRef: 'm2', retain: false }],
-    memory: previousMemory,
+    format: 'gigachat-semantic-memory', version: 1,
+    activeTask: { text: 'Continue package validation.', sourceRefs: ['m0'] },
+    constraints: [], decisions: [], openWork: [{ text: 'Review the Windows build.', sourceRefs: ['m1'] }],
+    facts: [{ text: 'The read confirmed the build is ready.', sourceRefs: ['t0'],
+      exactQuotes: [{ sourceRef: 't0', text: 'The build is ready.' }] }],
+    pastTopics: [],
   });
+  const originalRequest = structuredClone(context.request);
 
-  const repair = buildSemanticCompactionRepairRequest(context.request, sources, coverageRefSet, candidate);
+  const review = buildSemanticCompactionReviewRequest(context.request, sources, sourceRefs, candidate);
 
-  assert.ok(repair);
-  assert.deepEqual(repair.compactionRepair, { patchRefSet: ['m3'], requiredRetainRefs: [] });
-  const archiveText = repair.messages[0]!.text;
-  const archive = JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)) as {
-    memory: unknown;
-    patchRefSet: string[];
-    repairSources: Array<{ sourceRef: string; text?: string }>;
+  assert.ok(review);
+  assert.deepEqual(context.request, originalRequest, 'review preparation does not mutate the original request');
+  assert.deepEqual(review.system, originalRequest.system);
+  assert.equal(review.modelId, originalRequest.modelId);
+  assert.equal(review.usageKind, 'compaction');
+  assert.equal(review.compactionFormat, 'semantic');
+  assert.equal(Object.prototype.hasOwnProperty.call(review, 'compactionRepair'), false);
+  assert.equal(review.functionCallMode, 'none');
+  assert.equal(review.maxOutputTokens, 4096);
+  assert.equal(review.messages.length, 3);
+  assert.deepEqual(review.messages.map(({ role }) => role), ['user', 'user', 'user']);
+  assert.equal(review.messages[0]?.text, context.request.messages[0]?.text, 'review reuses the exact source archive');
+  assert.match(review.messages[1]?.text ?? '', /^ЧЕРНОВИК SEMANTIC-ПАМЯТИ JSON/);
+  assert.match(review.messages[1]?.text ?? '', /Review the Windows build/);
+  assert.match(review.messages[2]?.text ?? '', /Независимо проверь черновик semantic-памяти/);
+
+  const reviewWire = serializeProviderTurnRequest(review);
+  assert.ok(reviewWire.wireBytes <= MAX_PROVIDER_REQUEST_BYTES);
+  const wire = JSON.parse(reviewWire.body) as {
+    tools?: unknown[]; tool_config: { mode: string };
+    messages: Array<{ role: string }>;
+    model_options: { response_format: { schema: { required: string[]; properties: Record<string, unknown> } } };
   };
-  assert.deepEqual(archive.memory, JSON.parse(previousText));
-  assert.deepEqual(archive.patchRefSet, ['m3']);
-  assert.deepEqual(archive.repairSources, [{ sourceRef: 'm3', role: 'assistant', text: 'Latest result.', attachments: [] }]);
-  assert.doesNotMatch(archiveText, /Older active request\.|Earlier result\./);
-});
+  assert.deepEqual(wire.messages.map(({ role }) => role), ['system', 'user', 'user', 'user']);
+  assert.equal(wire.tool_config.mode, 'none');
+  assert.equal(wire.tools, undefined);
+  assert.deepEqual(wire.model_options.response_format.schema.required,
+    ['format', 'version', 'activeTask', 'constraints', 'decisions', 'openWork', 'facts', 'pastTopics']);
+  assert.equal(Object.prototype.hasOwnProperty.call(wire.model_options.response_format.schema.properties, 'coverage'), false);
+  assert.doesNotMatch(review.messages[0]!.text + review.messages[1]!.text,
+    /private-review-receipt|private-review-state|functionsStateId/);
 
+  assert.equal(buildSemanticCompactionReviewRequest(review, sources, sourceRefs, candidate), null,
+    'a review request cannot recursively become another review');
+  assert.equal(buildSemanticCompactionReviewRequest(context.request, sources, sourceRefs.slice(0, -1), candidate), null,
+    'the supplied source inventory must exactly match the archived inventory');
+  const unknownSourceCandidate = JSON.stringify({
+    ...JSON.parse(candidate), activeTask: { text: 'Unknown source.', sourceRefs: ['m999'] },
+  });
+  assert.equal(buildSemanticCompactionReviewRequest(context.request, sources, sourceRefs, unknownSourceCandidate), null);
+  const invalidQuoteCandidate = JSON.stringify({
+    ...JSON.parse(candidate),
+    facts: [{ text: 'A fabricated quote.', sourceRefs: ['m1'], exactQuotes: [{ sourceRef: 'm1', text: 'not in source' }] }],
+  });
+  assert.equal(buildSemanticCompactionReviewRequest(context.request, sources, sourceRefs, invalidQuoteCandidate), null);
+  assert.equal(buildSemanticCompactionReviewRequest(context.request, sources, sourceRefs, '{'), null);
+  assert.equal(buildSemanticCompactionReviewRequest({ ...context.request, functionCallMode: 'auto' }, sources, sourceRefs, candidate), null);
+  assert.equal(buildSemanticCompactionReviewRequest({ ...context.request, usageKind: 'chat' }, sources, sourceRefs, candidate), null);
+
+  const changedSources = createCompactionSources([
+    { ...messages[0]!, text: 'Changed source.' }, messages[1]!,
+  ], [receipt], []);
+  assert.equal(buildSemanticCompactionReviewRequest(context.request, changedSources, sourceRefs, candidate), null,
+    'the archive cannot be reviewed against source data that changed');
+});
 test('rejects compact summaries without any Unicode letter or number but accepts Cyrillic, Latin, and numeric text', () => {
   for (const value of ['|', ' \t\n ', '…—!?', '🔥✨']) {
     assert.throws(() => validateCompactSummary(value), /Сводка должна быть непустым текстом/);

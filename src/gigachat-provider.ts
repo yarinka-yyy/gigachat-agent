@@ -9,7 +9,7 @@ import { discoveredModelRegistry, failedModelRegistry, isModelAvailable, require
 import { billingFamilyForUsageLabel, CHAT_MODEL_FAMILIES, isChatModelAvailable } from './model-catalog';
 import { attachmentContentType, inspectLocalAttachmentContent, LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES, PROVIDER_MEDIA_LIMIT_BYTES, PROVIDER_REQUEST_LIMIT_BYTES } from './attachment-policy';
 import { validateProviderV2FunctionWire } from './provider-wire';
-import { COMPACTION_OUTPUT_TOKEN_LIMIT, createSemanticCompactionRepairResponseFormat, SEMANTIC_COMPACTION_RESPONSE_FORMAT } from './compaction';
+import { COMPACTION_OUTPUT_TOKEN_LIMIT, SEMANTIC_COMPACTION_RESPONSE_FORMAT } from './compaction';
 
 export const GIGACHAT_API_BASE_URL = 'https://api.giga.chat/v1';
 const GIGACHAT_V2_CHAT_COMPLETIONS_URL = 'https://api.giga.chat/v2/chat/completions';
@@ -119,26 +119,9 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
   if (!modelId || !Array.isArray(request.system) || !Array.isArray(request.messages)) {
     throw new GigaChatProviderError('protocol');
   }
-  const hasCompactionRepair = Object.prototype.hasOwnProperty.call(request, 'compactionRepair');
-  if (request.compactionFormat !== undefined && ((request.compactionFormat !== 'semantic'
-    && request.compactionFormat !== 'semantic-repair-patch') || request.usageKind !== 'compaction'
-    || (request.compactionFormat === 'semantic-repair-patch' && request.functionCallMode !== 'none'))) {
+  if (request.compactionFormat !== undefined
+    && (request.compactionFormat !== 'semantic' || request.usageKind !== 'compaction')) {
     throw new GigaChatProviderError('protocol');
-  }
-  if ((request.compactionFormat === 'semantic-repair-patch') !== hasCompactionRepair) {
-    throw new GigaChatProviderError('protocol');
-  }
-  let semanticRepairResponseFormat: ReturnType<typeof createSemanticCompactionRepairResponseFormat> | undefined;
-  if (request.compactionFormat === 'semantic-repair-patch') {
-    try {
-      const repair = request.compactionRepair;
-      if (!repair || typeof repair !== 'object' || Array.isArray(repair)
-        || Object.keys(repair).length !== 2
-        || !Object.keys(repair).every((key) => key === 'patchRefSet' || key === 'requiredRetainRefs')) {
-        throw new Error('invalid repair metadata');
-      }
-      semanticRepairResponseFormat = createSemanticCompactionRepairResponseFormat(repair.patchRefSet, repair.requiredRetainRefs);
-    } catch { throw new GigaChatProviderError('protocol'); }
   }
   const maxOutputTokens = request.maxOutputTokens !== undefined
     ? request.maxOutputTokens
@@ -220,13 +203,11 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
       model_options: {
         parallel_tool_calls: false,
         ...(maxOutputTokens !== undefined ? { max_tokens: maxOutputTokens } : {}),
-        ...(request.compactionFormat === 'semantic' || request.compactionFormat === 'semantic-repair-patch'
-          ? { temperature: 0.0001 } : {}),
+        ...(request.compactionFormat === 'semantic' ? { temperature: 0.0001 } : {}),
         ...(request.usageKind === 'compaction' ? {
           response_format: request.compactionFormat === 'semantic'
             ? SEMANTIC_COMPACTION_RESPONSE_FORMAT
-            : request.compactionFormat === 'semantic-repair-patch'
-              ? semanticRepairResponseFormat : COMPACTION_RESPONSE_FORMAT,
+            : COMPACTION_RESPONSE_FORMAT,
         } : {}),
       },
       tool_config: { mode: functionsEnabled ? 'auto' : 'none' },
