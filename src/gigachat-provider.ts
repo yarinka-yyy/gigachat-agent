@@ -119,6 +119,12 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
   if (!modelId || !Array.isArray(request.system) || !Array.isArray(request.messages)) {
     throw new GigaChatProviderError('protocol');
   }
+  const maxOutputTokens = request.maxOutputTokens !== undefined
+    ? request.maxOutputTokens
+    : request.usageKind === 'compaction' ? COMPACTION_OUTPUT_TOKEN_LIMIT : undefined;
+  if (maxOutputTokens !== undefined && (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0)) {
+    throw new GigaChatProviderError('protocol');
+  }
   const systemPrompt = request.system.map((layer) => {
     if (!layer || typeof layer.label !== 'string' || typeof layer.text !== 'string') throw new GigaChatProviderError('protocol');
     return `[${layer.label}]\n${layer.text}`;
@@ -192,8 +198,8 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
       ...(tools ? { tools } : {}),
       model_options: {
         parallel_tool_calls: false,
+        ...(maxOutputTokens !== undefined ? { max_tokens: maxOutputTokens } : {}),
         ...(request.usageKind === 'compaction' ? {
-          max_tokens: COMPACTION_OUTPUT_TOKEN_LIMIT,
           response_format: COMPACTION_RESPONSE_FORMAT,
         } : {}),
       },

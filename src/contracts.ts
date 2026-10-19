@@ -178,6 +178,8 @@ export interface ProviderTurnRequest {
   attachments?: ProviderAttachmentReference[];
   permissionProfile: PermissionProfile;
   modelId: GigaChatModelId | null;
+  /** Explicit internal V2 output cap; omission keeps the request-kind default. */
+  maxOutputTokens?: number;
   usageKind?: UsageRequestKind;
   functionCallMode?: 'auto' | 'none';
 }

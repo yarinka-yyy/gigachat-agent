@@ -40,6 +40,22 @@ test('keeps a provider model ID outside the former static list in the accepted r
   assert.equal(request.modelId, 'vendor/model.v4:preview');
 });
 
+test('passes the internal output cap through the common request builder', () => {
+  const request = buildInstructionRequest({
+    globalText: '',
+    messages: [userMessage],
+    permissionProfile: 'ask',
+    modelId: 'GigaChat-3-Lightning',
+    maxOutputTokens: 256,
+  });
+  const wire = JSON.parse(serializeProviderTurnRequest(request).body) as {
+    model_options: Record<string, unknown>;
+  };
+
+  assert.equal(request.maxOutputTokens, 256);
+  assert.deepEqual(wire.model_options, { parallel_tool_calls: false, max_tokens: 256 });
+});
+
 test('keeps ordinary task instructions in the system after a prior summary', () => {
   const request = buildInstructionRequest({
     globalText: 'Global',

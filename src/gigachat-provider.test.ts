@@ -1456,23 +1456,29 @@ test('streams V2 SSE across split UTF-8, split CRLF, and a CR-only final delimit
   assert.equal(requestBody.messages.filter((message) => message.role === 'system').length, 1);
 });
 
-test('uses strict structured JSON output only for compaction requests', () => {
-  const serialized = serializeProviderTurnRequest({
+test('uses explicit output caps while preserving ordinary and compaction defaults', () => {
+  const compactionRequest: ProviderTurnRequest = {
     system: [{ source: 'runtime', label: 'Runtime', text: 'Runtime rules' }],
     messages: [{ id: 'compaction-task', role: 'user', text: 'Extract verified notes.', createdAt: '2026-10-18T00:00:00.000Z' }],
     permissionProfile: 'ask',
     modelId: 'GigaChat-3-Lightning',
     usageKind: 'compaction',
     functionCallMode: 'none',
-  });
+  };
+  const serialized = serializeProviderTurnRequest(compactionRequest);
   const body = JSON.parse(serialized.body) as { model_options: Record<string, unknown> };
-  const ordinarySerialized = serializeProviderTurnRequest({
+  const explicitCompaction = serializeProviderTurnRequest({ ...compactionRequest, maxOutputTokens: 256 });
+  const explicitCompactionBody = JSON.parse(explicitCompaction.body) as { model_options: Record<string, unknown> };
+  const ordinaryRequest: ProviderTurnRequest = {
     system: [],
     messages: [{ id: 'ordinary', role: 'user', text: 'Ordinary request.', createdAt: '2026-10-18T00:00:00.000Z' }],
     permissionProfile: 'ask',
     modelId: 'GigaChat-3-Lightning',
-  });
+  };
+  const ordinarySerialized = serializeProviderTurnRequest(ordinaryRequest);
   const ordinaryBody = JSON.parse(ordinarySerialized.body) as { model_options: Record<string, unknown> };
+  const explicitOrdinary = serializeProviderTurnRequest({ ...ordinaryRequest, maxOutputTokens: 512 });
+  const explicitOrdinaryBody = JSON.parse(explicitOrdinary.body) as { model_options: Record<string, unknown> };
 
   assert.deepEqual(body.model_options, {
     parallel_tool_calls: false,
@@ -1503,6 +1509,24 @@ test('uses strict structured JSON output only for compaction requests', () => {
     },
   });
   assert.deepEqual(ordinaryBody.model_options, { parallel_tool_calls: false });
+  assert.equal(explicitCompactionBody.model_options.max_tokens, 256,
+    'an explicit cap overrides the 4096 compaction default');
+  assert.deepEqual(explicitCompactionBody.model_options.response_format, body.model_options.response_format,
+    'an explicit cap does not change the compaction schema');
+  assert.deepEqual(explicitOrdinaryBody.model_options, { parallel_tool_calls: false, max_tokens: 512 });
+});
+
+test('rejects invalid explicit output caps at the provider wire boundary', () => {
+  const request: ProviderTurnRequest = {
+    system: [],
+    messages: [{ id: 'cap-validation', role: 'user', text: 'Question', createdAt: '2026-10-18T00:00:00.000Z' }],
+    permissionProfile: 'ask',
+    modelId: 'GigaChat-3-Lightning',
+  };
+  for (const maxOutputTokens of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => serializeProviderTurnRequest({ ...request, maxOutputTokens }),
+      (error) => error instanceof GigaChatProviderError && error.category === 'protocol');
+  }
 });
 
 test('accepts terminal-only V2 assistant metadata after validated text deltas', async () => {

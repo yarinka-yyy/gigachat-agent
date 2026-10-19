@@ -17,6 +17,7 @@ export interface InstructionInput {
   taskInstruction?: string;
   permissionProfile: PermissionProfile;
   modelId?: GigaChatModelId | null;
+  maxOutputTokens?: number;
   usageKind?: UsageRequestKind;
   functionCallMode?: 'auto' | 'none';
 }
@@ -93,6 +94,7 @@ export function buildInstructionRequest(input: InstructionInput): ProviderTurnRe
     protocolHistory: (input.protocolHistory ?? []).map((exchange) => structuredClone(exchange)),
     permissionProfile,
     modelId,
+    ...(input.maxOutputTokens !== undefined ? { maxOutputTokens: input.maxOutputTokens } : {}),
     ...(input.usageKind ? { usageKind: input.usageKind } : {}),
     ...(input.functionCallMode ? { functionCallMode: input.functionCallMode } : {}),
   };
