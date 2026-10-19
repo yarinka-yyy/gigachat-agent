@@ -1516,7 +1516,7 @@ test('uses explicit output caps while preserving ordinary and compaction default
   assert.deepEqual(explicitOrdinaryBody.model_options, { parallel_tool_calls: false, max_tokens: 512 });
 });
 
-test('serializes only semantic compaction with the strict memory schema and no tools', () => {
+test('serializes only semantic compaction with ordered coverage, strict memory schema and no tools', () => {
   const request: ProviderTurnRequest = {
     system: [{ source: 'runtime', label: 'Runtime', text: 'Runtime rules' }],
     messages: [{ id: 'semantic-task', role: 'user', text: 'Prepare semantic memory.', createdAt: '2026-10-18T00:00:00.000Z' }],
@@ -1534,20 +1534,33 @@ test('serializes only semantic compaction with the strict memory schema and no t
     } } };
   };
   const schema = body.model_options.response_format.schema;
-  const facts = schema.properties.facts as { maxItems: number; items: { required: string[]; properties: Record<string, unknown> } };
-  const activeTask = schema.properties.activeTask as { description: string; anyOf: Array<{ type: string }> };
-  const constraints = schema.properties.constraints as { description: string; maxItems: number };
-  const decisions = schema.properties.decisions as { description: string; maxItems: number };
-  const openWork = schema.properties.openWork as { description: string; maxItems: number };
-  const factsDescription = (schema.properties.facts as { description: string }).description;
-  const pastTopics = schema.properties.pastTopics as { description: string; maxItems: number };
+  const coverage = schema.properties.coverage as { type: string; minItems: number; maxItems: number;
+    items: { required: string[]; additionalProperties: boolean; properties: Record<string, { type?: string }> } };
+  const memory = schema.properties.memory as { required: string[]; additionalProperties: boolean;
+    properties: Record<string, Record<string, unknown>> };
+  const facts = memory.properties.facts as { maxItems: number; items: { required: string[]; properties: Record<string, unknown> } };
+  const activeTask = memory.properties.activeTask as { description: string; anyOf: Array<{ type: string }> };
+  const constraints = memory.properties.constraints as { description: string; maxItems: number };
+  const decisions = memory.properties.decisions as { description: string; maxItems: number };
+  const openWork = memory.properties.openWork as { description: string; maxItems: number };
+  const factsDescription = (memory.properties.facts as { description: string }).description as string;
+  const pastTopics = memory.properties.pastTopics as { description: string; maxItems: number };
 
   assert.equal(body.model_options.max_tokens, 4096);
   assert.equal(body.tool_config.mode, 'none', 'semantic compaction suppresses tool execution even for an auto caller');
   assert.equal(body.tools, undefined);
   assert.equal(body.model_options.response_format.strict, true);
-  assert.deepEqual(schema.required, ['format', 'version', 'activeTask', 'constraints', 'decisions', 'openWork', 'facts', 'pastTopics']);
+  assert.deepEqual(schema.required, ['coverage', 'memory']);
   assert.equal(schema.additionalProperties, false);
+  assert.equal(coverage.type, 'array');
+  assert.equal(coverage.minItems, 1);
+  assert.equal(coverage.maxItems, 64);
+  assert.deepEqual(coverage.items.required, ['sourceRef', 'retain']);
+  assert.equal(coverage.items.additionalProperties, false);
+  assert.equal(coverage.items.properties.sourceRef?.type, 'string');
+  assert.equal(coverage.items.properties.retain?.type, 'boolean');
+  assert.deepEqual(memory.required, ['format', 'version', 'activeTask', 'constraints', 'decisions', 'openWork', 'facts', 'pastTopics']);
+  assert.equal(memory.additionalProperties, false);
   assert.deepEqual(activeTask.anyOf.map((entry) => entry.type), ['object', 'null']);
   assert.match(activeTask.description, /текущая активная задача.*точные рабочие идентификаторы/i);
   assert.match(constraints.description, /действующие ограничения.*областью, условиями и исключениями/i);

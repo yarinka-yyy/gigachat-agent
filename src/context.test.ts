@@ -368,6 +368,7 @@ test('prepares a semantic request from the whole supplied raw prefix without exp
   const transcript = context.request.messages[0]?.text ?? '';
   const envelope = JSON.parse(transcript.slice(transcript.indexOf('\n') + 1)) as {
     previousMemory: unknown;
+    coverageRefSet: string[];
     messages: Array<{ sourceRef: string; role: string; text: string; attachments: Array<Record<string, unknown>> }>;
     tools: Array<{ sourceRef: string; anchorRef: string; name: string; result: string | null }>;
   };
@@ -375,8 +376,11 @@ test('prepares a semantic request from the whole supplied raw prefix without exp
   assert.equal(context.request.compactionFormat, 'semantic');
   assert.equal(context.request.functionCallMode, 'none');
   assert.equal(context.request.messages[1]?.text, SEMANTIC_COMPACTION_TASK_INSTRUCTION);
+  assert.match(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /coverageRefSet.*строго в указанном порядке/i);
+  assert.match(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /все такие ссылки должны быть представлены в sourceRefs памяти/i);
   assert.equal(context.request.system.some((layer) => layer.source === 'summary'), false);
   assert.equal(envelope.previousMemory, null, 'first semantic compaction starts from the supplied raw prefix');
+  assert.deepEqual(envelope.coverageRefSet, ['m0', 'm1', 'm2', 'm3', 't0', 't1']);
   assert.deepEqual(envelope.messages.map(({ sourceRef, role, text }) => [sourceRef, role, text]), [
     ['m0', 'user', 'Old raw request'], ['m1', 'assistant', 'Old raw answer'],
     ['m2', 'user', 'New request'], ['m3', 'assistant', 'New answer'],
@@ -447,6 +451,7 @@ test('rolls semantic compaction forward with stable global refs and only the new
   const transcript = context.request.messages[0]?.text ?? '';
   const envelope = JSON.parse(transcript.slice(transcript.indexOf('\n') + 1)) as {
     previousMemory: { activeTask: { sourceRefs: string[] }; facts: Array<{ sourceRefs: string[] }> };
+    coverageRefSet: string[];
     messages: Array<{ sourceRef: string; text: string }>;
     tools: Array<{ sourceRef: string; anchorRef: string; result: string | null }>;
   };
@@ -454,6 +459,7 @@ test('rolls semantic compaction forward with stable global refs and only the new
   assert.deepEqual(envelope.previousMemory, JSON.parse(priorSnapshot.text), 'the previous semantic memory, including valid source quotes, is carried forward');
   assert.deepEqual(envelope.previousMemory.activeTask.sourceRefs, ['m0']);
   assert.deepEqual(envelope.previousMemory.facts[0]?.sourceRefs, ['t0']);
+  assert.deepEqual(envelope.coverageRefSet, ['m0', 'm1', 't0', 'm2', 'm3', 't1']);
   assert.deepEqual(envelope.messages.map(({ sourceRef, text }) => [sourceRef, text]), [
     ['m2', 'New raw request.'], ['m3', 'New raw answer.'],
   ]);

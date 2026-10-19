@@ -9,6 +9,7 @@ const MAX_SEMANTIC_QUOTE_BYTES = 1024;
 const MAX_SEMANTIC_REFS_PER_ENTRY = 32;
 const MAX_SEMANTIC_QUOTES_PER_FACT = 8;
 const MAX_SEMANTIC_TOTAL_ENTRIES = 128;
+const MAX_SEMANTIC_COVERAGE_SOURCES = 64;
 const MAX_SEMANTIC_COUNTS = { constraints: 24, decisions: 32, openWork: 32, facts: 48, pastTopics: 8 } as const;
 export const COMPACTION_OUTPUT_TOKEN_LIMIT = 4096;
 const RETAINED_SOURCE_REFS_MARKER = 'retained-source-refs';
@@ -64,39 +65,61 @@ const semanticFactSchema = {
   additionalProperties: false,
 };
 
+const semanticMemorySchema = {
+  type: 'object',
+  properties: {
+    format: { type: 'string', enum: [SEMANTIC_COMPACTION_FORMAT] },
+    version: { type: 'integer', enum: [1] },
+    activeTask: {
+      description: 'Текущая активная задача и её состояние; сохраняй точные рабочие идентификаторы.',
+      anyOf: [semanticEntrySchema, { type: 'null' }],
+    },
+    constraints: {
+      description: 'Все действующие ограничения, запреты и разрешения с областью, условиями и исключениями; учитывай их независимо от возраста.',
+      type: 'array', maxItems: MAX_SEMANTIC_COUNTS.constraints, items: semanticConstraintSchema,
+    },
+    decisions: {
+      description: 'Актуальные решения; при явном исправлении используй последнюю подтверждённую версию.',
+      type: 'array', maxItems: MAX_SEMANTIC_COUNTS.decisions, items: semanticEntrySchema,
+    },
+    openWork: {
+      description: 'Только действительно незавершённые задачи и обязательства; не включай закрытые темы.',
+      type: 'array', maxItems: MAX_SEMANTIC_COUNTS.openWork, items: semanticEntrySchema,
+    },
+    facts: {
+      description: 'Подтверждённое текущее состояние, особенно точные идентификаторы и значения активной задачи.',
+      type: 'array', maxItems: MAX_SEMANTIC_COUNTS.facts, items: semanticFactSchema,
+    },
+    pastTopics: {
+      description: 'Краткие сгруппированные итоги закрытых неактивных тем; не перечисляй подробно каждый старый обмен.',
+      type: 'array', maxItems: MAX_SEMANTIC_COUNTS.pastTopics, items: semanticEntrySchema,
+    },
+  },
+  required: ['format', 'version', 'activeTask', 'constraints', 'decisions', 'openWork', 'facts', 'pastTopics'],
+  additionalProperties: false,
+};
+
+const semanticCoverageDecisionSchema = {
+  type: 'object',
+  properties: {
+    sourceRef: { type: 'string', pattern: '^(m|t)(0|[1-9][0-9]*)$' },
+    retain: { type: 'boolean' },
+  },
+  required: ['sourceRef', 'retain'],
+  additionalProperties: false,
+};
+
 export const SEMANTIC_COMPACTION_RESPONSE_FORMAT = {
   type: 'json_schema',
   schema: {
     type: 'object',
     properties: {
-      format: { type: 'string', enum: [SEMANTIC_COMPACTION_FORMAT] },
-      version: { type: 'integer', enum: [1] },
-      activeTask: {
-        description: 'Текущая активная задача и её состояние; сохраняй точные рабочие идентификаторы.',
-        anyOf: [semanticEntrySchema, { type: 'null' }],
+      coverage: {
+        type: 'array', minItems: 1, maxItems: MAX_SEMANTIC_COVERAGE_SOURCES, items: semanticCoverageDecisionSchema,
       },
-      constraints: {
-        description: 'Все действующие ограничения, запреты и разрешения с областью, условиями и исключениями; учитывай их независимо от возраста.',
-        type: 'array', maxItems: MAX_SEMANTIC_COUNTS.constraints, items: semanticConstraintSchema,
-      },
-      decisions: {
-        description: 'Актуальные решения; при явном исправлении используй последнюю подтверждённую версию.',
-        type: 'array', maxItems: MAX_SEMANTIC_COUNTS.decisions, items: semanticEntrySchema,
-      },
-      openWork: {
-        description: 'Только действительно незавершённые задачи и обязательства; не включай закрытые темы.',
-        type: 'array', maxItems: MAX_SEMANTIC_COUNTS.openWork, items: semanticEntrySchema,
-      },
-      facts: {
-        description: 'Подтверждённое текущее состояние, особенно точные идентификаторы и значения активной задачи.',
-        type: 'array', maxItems: MAX_SEMANTIC_COUNTS.facts, items: semanticFactSchema,
-      },
-      pastTopics: {
-        description: 'Краткие сгруппированные итоги закрытых неактивных тем; не перечисляй подробно каждый старый обмен.',
-        type: 'array', maxItems: MAX_SEMANTIC_COUNTS.pastTopics, items: semanticEntrySchema,
-      },
+      memory: semanticMemorySchema,
     },
-    required: ['format', 'version', 'activeTask', 'constraints', 'decisions', 'openWork', 'facts', 'pastTopics'],
+    required: ['coverage', 'memory'],
     additionalProperties: false,
   },
   strict: true,
@@ -129,6 +152,11 @@ export interface SemanticCompactionMemory {
   openWork: SemanticCompactionEntry[];
   facts: SemanticCompactionFact[];
   pastTopics: SemanticCompactionEntry[];
+}
+
+export interface SemanticCompactionCoverageDecision {
+  sourceRef: string;
+  retain: boolean;
 }
 
 export interface CompactionAttachmentSource {
@@ -265,10 +293,12 @@ export function serializeSemanticCompactionTranscript(
     content: tool.content,
     result: tool.result,
   }));
+  const coverageRefSet = getSemanticCompactionCoverageRefSet(sources, previousMemory, fromMessageIndex);
   const input = {
     format: 'gigachat-semantic-compaction-input',
     version: 1,
     previousMemory,
+    coverageRefSet,
     messages,
     tools,
   };
@@ -324,6 +354,66 @@ function semanticSourceTexts(sources: CompactionSources): Map<string, string[]> 
     add(tool.ref, [tool.content, tool.result].filter((text): text is string => typeof text === 'string'));
   }
   return byRef;
+}
+
+function validateSemanticCoverageRefSet(value: unknown, sourceTexts: ReadonlyMap<string, readonly string[]>): string[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_SEMANTIC_COVERAGE_SOURCES) {
+    throw new Error(`Список исходников semantic-сжатия должен содержать от 1 до ${MAX_SEMANTIC_COVERAGE_SOURCES} ссылок.`);
+  }
+  const seen = new Set<string>();
+  return value.map((ref) => {
+    if (typeof ref !== 'string' || !sourceTexts.has(ref) || seen.has(ref)) {
+      throw new Error('Список исходников semantic-сжатия содержит неизвестную или повторную ссылку.');
+    }
+    seen.add(ref);
+    return ref;
+  });
+}
+
+function semanticMemorySourceRefs(memory: SemanticCompactionMemory): string[] {
+  const refs: string[] = [];
+  const add = (entry: SemanticCompactionEntry): void => { refs.push(...entry.sourceRefs); };
+  if (memory.activeTask) add(memory.activeTask);
+  for (const entry of memory.constraints) add(entry);
+  for (const entry of memory.decisions) add(entry);
+  for (const entry of memory.openWork) add(entry);
+  for (const entry of memory.facts) {
+    add(entry);
+    for (const quote of entry.exactQuotes ?? []) refs.push(quote.sourceRef);
+  }
+  for (const entry of memory.pastTopics) add(entry);
+  return refs;
+}
+
+export function getSemanticCompactionCoverageRefSet(
+  sources: CompactionSources,
+  previousMemory: SemanticCompactionMemory | null = null,
+  fromMessageIndex = 0,
+): string[] {
+  if (!Number.isSafeInteger(fromMessageIndex) || fromMessageIndex < 0 || fromMessageIndex > sources.messages.length) {
+    throw new Error('Граница нового фрагмента истории сжатия некорректна.');
+  }
+  const sourceTexts = semanticSourceTexts(sources);
+  const orderedRefs: string[] = [];
+  const seen = new Set<string>();
+  const add = (ref: string): void => {
+    if (!sourceTexts.has(ref)) throw new Error('Исходник semantic-сжатия содержит неизвестную ссылку.');
+    if (!seen.has(ref)) {
+      seen.add(ref);
+      orderedRefs.push(ref);
+    }
+  };
+  if (previousMemory !== null) {
+    const validated = parseSemanticCompactionMemory(canonicalJson(previousMemory), sources);
+    for (const ref of semanticMemorySourceRefs(validated)) add(ref);
+  }
+  const suffixMessages = sources.messages.slice(fromMessageIndex);
+  const suffixRefs = new Set(suffixMessages.map((message) => message.ref));
+  for (const message of suffixMessages) add(message.ref);
+  for (const tool of sources.tools) {
+    if (suffixRefs.has(tool.anchorRef)) add(tool.ref);
+  }
+  return validateSemanticCoverageRefSet(orderedRefs, sourceTexts);
 }
 
 function validateSemanticSourceRefs(value: unknown, sourceTexts: ReadonlyMap<string, readonly string[]>): string[] {
@@ -456,6 +546,48 @@ export function validateSemanticCompactionMemory(value: unknown, sources: Compac
 
 export function compileSemanticCompactionMemory(value: unknown, sources: CompactionSources): string {
   return canonicalJson(parseSemanticCompactionMemory(value, sources));
+}
+
+export function compileCoveredSemanticCompactionMemory(
+  value: unknown,
+  sources: CompactionSources,
+  coverageRefSet: readonly string[],
+): string {
+  const sourceTexts = semanticSourceTexts(sources);
+  const expectedRefs = validateSemanticCoverageRefSet(coverageRefSet, sourceTexts);
+  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > MAX_COMPACTION_CANDIDATE_BYTES) {
+    throw new Error('Кандидат semantic-сжатия превышает допустимый размер.');
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); }
+  catch { throw new Error('Кандидат semantic-сжатия должен быть корректным JSON.'); }
+  if (!isRecord(parsed) || !hasOnlyKeys(parsed, ['coverage', 'memory'])) {
+    throw new Error('Кандидат semantic-сжатия должен содержать только coverage и memory.');
+  }
+  if (!Array.isArray(parsed.coverage) || parsed.coverage.length !== expectedRefs.length) {
+    throw new Error('Решения coverage должны перечислять каждый переданный исходник ровно один раз.');
+  }
+  const retainByRef = new Map<string, boolean>();
+  parsed.coverage.forEach((item, index) => {
+    if (!isRecord(item) || !hasOnlyKeys(item, ['sourceRef', 'retain'])
+      || typeof item.sourceRef !== 'string' || typeof item.retain !== 'boolean'
+      || item.sourceRef !== expectedRefs[index]) {
+      throw new Error('Решения coverage должны точно совпадать с переданными исходниками и их порядком.');
+    }
+    retainByRef.set(item.sourceRef, item.retain);
+  });
+
+  const compiledMemory = compileSemanticCompactionMemory(canonicalJson(parsed.memory), sources);
+  const memory = JSON.parse(compiledMemory) as SemanticCompactionMemory;
+  const citedRefs = new Set(semanticMemorySourceRefs(memory));
+  for (const ref of citedRefs) {
+    if (!expectedRefs.includes(ref)) throw new Error('Семантическая память ссылается на исходник вне переданного набора coverage.');
+    if (retainByRef.get(ref) !== true) throw new Error('Семантическая память ссылается на исходник, отмеченный retain=false.');
+  }
+  for (const [ref, retain] of retainByRef) {
+    if (retain && !citedRefs.has(ref)) throw new Error('Сохранённый исходник coverage не представлен в семантической памяти.');
+  }
+  return compiledMemory;
 }
 
 export function formatSemanticCompactionMemory(value: unknown, sources: CompactionSources): string {
