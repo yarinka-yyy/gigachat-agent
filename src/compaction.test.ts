@@ -9,6 +9,7 @@ import {
   formatSemanticCompactionMemory,
   selectRetainedCompactionMessages,
   serializeCompactionTranscript,
+  serializeSemanticCompactionTranscript,
   validateSemanticCompactionMemory,
 } from './compaction';
 
@@ -91,6 +92,51 @@ test('sends only message refs, roles and text while keeping tool and attachment 
   ]);
   assert.deepEqual(sources.messages[0]?.attachments, [{ name: 'notes.txt', sizeBytes: 12, sha256: 'a'.repeat(64) }]);
   assert.ok(Object.isFrozen(sources) && Object.isFrozen(sources.messages) && Object.isFrozen(sources.tools));
+});
+
+test('serializes semantic sources with ordered attachment/tool metadata and no private IDs', () => {
+  const messages = [user('semantic-source-user', 'Inspect the report.', ['semantic-source-file']), assistant('semantic-source-assistant', 'One fact.')];
+  const receipt: ChatToolReceipt = {
+    receiptId: 'private-semantic-receipt', anchorMessageId: messages[0]!.id, name: 'read', arguments: { path: 'report.txt' },
+    content: 'Read-only content.', functionsStateId: 'private-semantic-state', status: 'completed', result: 'Three rows.', createdAt: at,
+  };
+  const artifact: ChatArtifact = {
+    id: 'semantic-source-file', name: 'report.txt', storedName: 'private-local-storage-path', size: 25,
+    sha256: 'c'.repeat(64), createdAt: at, messageId: messages[0]!.id,
+  };
+  const sources = createCompactionSources(messages, [receipt], [artifact]);
+  const candidate = JSON.stringify({
+    format: 'gigachat-semantic-memory', version: 1,
+    activeTask: { text: 'Inspect the report.', sourceRefs: ['m0'] },
+    constraints: [], decisions: [], openWork: [],
+    facts: [{ text: 'The tool read the report.', sourceRefs: ['t0'], exactQuotes: [{ sourceRef: 't0', text: 'Read-only content.' }] }],
+    pastTopics: [],
+  });
+  const memory = validateSemanticCompactionMemory(candidate, sources);
+  const serialized = serializeSemanticCompactionTranscript(sources, memory);
+  const envelope = JSON.parse(serialized.slice(serialized.indexOf('\n') + 1)) as {
+    format: string; version: number; previousMemory: unknown;
+    messages: Array<{ sourceRef: string; role: string; text: string; attachments: unknown[] }>;
+    tools: Array<Record<string, unknown>>;
+  };
+
+  assert.equal(envelope.format, 'gigachat-semantic-compaction-input');
+  assert.equal(envelope.version, 1);
+  assert.deepEqual(envelope.previousMemory, memory);
+  assert.deepEqual(envelope.messages.map(({ sourceRef, role, text }) => [sourceRef, role, text]), [
+    ['m0', 'user', 'Inspect the report.'], ['m1', 'assistant', 'One fact.'],
+  ]);
+  assert.deepEqual(envelope.messages[0]?.attachments, [{
+    name: 'report.txt', sizeBytes: 25, sha256: 'c'.repeat(64), contentAvailable: false,
+  }]);
+  assert.deepEqual(envelope.tools, [{
+    sourceRef: 't0', anchorRef: 'm0', name: 'read', arguments: { path: 'report.txt' },
+    status: 'completed', content: 'Read-only content.', result: 'Three rows.',
+  }]);
+  for (const privateValue of ['semantic-source-user', 'private-semantic-receipt', 'private-semantic-state', 'private-local-storage-path']) {
+    assert.equal(serialized.includes(privateValue), false);
+  }
+  assert.throws(() => serializeSemanticCompactionTranscript(sources, null, 3), /Граница нового фрагмента/);
 });
 
 test('keeps both sides of an exchange when either its question or answer is selected', () => {
@@ -425,6 +471,9 @@ test('requires exact quotes to be nonempty substrings of the referenced source v
     exactQuotes: [{ sourceRef: 't0', text: 'Найдено 3 строки.' }] }] }), sources), /не связана/);
   assert.throws(() => validateSemanticCompactionMemory(semanticCandidate({ facts: [{ text: 'Combined tool values.', sourceRefs: ['t0'],
     exactQuotes: [{ sourceRef: 't0', text: 'Проверено чтением без записи.Найдено 3 строки.' }] }] }), sources), /не совпадает/);
+  assert.deepEqual(validateSemanticCompactionMemory(semanticCandidate({ facts: [{
+    text: 'The fact is paraphrased without a quote.', sourceRefs: ['m1'], exactQuotes: [],
+  }] }), sources).facts[0]?.exactQuotes, [], 'strict JSON may require an empty quote array when no exact quote is needed');
 });
 
 test('rejects unknown or duplicate refs, extra keys, malformed controls and invalid markers', () => {

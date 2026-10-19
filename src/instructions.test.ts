@@ -113,6 +113,25 @@ test('puts a compaction task after completed history as one deterministic reques
   assert.deepEqual(history, historyBefore, 'building the request leaves persisted source messages untouched');
 });
 
+test('passes the semantic compaction discriminator and disables tool mode', () => {
+  const request = buildInstructionRequest({
+    globalText: '',
+    messages: [userMessage],
+    taskInstruction: 'Prepare semantic memory.',
+    permissionProfile: 'ask',
+    modelId: 'GigaChat-3-Lightning',
+    usageKind: 'compaction',
+    compactionFormat: 'semantic',
+    functionCallMode: 'auto',
+  });
+
+  assert.equal(request.compactionFormat, 'semantic');
+  assert.equal(request.functionCallMode, 'none');
+  assert.throws(() => buildInstructionRequest({
+    globalText: '', messages: [userMessage], permissionProfile: 'ask', compactionFormat: 'semantic',
+  }), /только для запроса сжатия/);
+});
+
 test('rejects malformed project instruction sources', () => {
   assert.throws(() => buildInstructionRequest({
     globalText: '',

@@ -9,7 +9,7 @@ import { discoveredModelRegistry, failedModelRegistry, isModelAvailable, require
 import { billingFamilyForUsageLabel, CHAT_MODEL_FAMILIES, isChatModelAvailable } from './model-catalog';
 import { attachmentContentType, inspectLocalAttachmentContent, LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES, PROVIDER_MEDIA_LIMIT_BYTES, PROVIDER_REQUEST_LIMIT_BYTES } from './attachment-policy';
 import { validateProviderV2FunctionWire } from './provider-wire';
-import { COMPACTION_OUTPUT_TOKEN_LIMIT } from './compaction';
+import { COMPACTION_OUTPUT_TOKEN_LIMIT, SEMANTIC_COMPACTION_RESPONSE_FORMAT } from './compaction';
 
 export const GIGACHAT_API_BASE_URL = 'https://api.giga.chat/v1';
 const GIGACHAT_V2_CHAT_COMPLETIONS_URL = 'https://api.giga.chat/v2/chat/completions';
@@ -119,6 +119,9 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
   if (!modelId || !Array.isArray(request.system) || !Array.isArray(request.messages)) {
     throw new GigaChatProviderError('protocol');
   }
+  if (request.compactionFormat !== undefined && (request.compactionFormat !== 'semantic' || request.usageKind !== 'compaction')) {
+    throw new GigaChatProviderError('protocol');
+  }
   const maxOutputTokens = request.maxOutputTokens !== undefined
     ? request.maxOutputTokens
     : request.usageKind === 'compaction' ? COMPACTION_OUTPUT_TOKEN_LIMIT : undefined;
@@ -188,7 +191,7 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
   if (protocolHistory.some((exchange) => !request.messages.some((message) => message.role === 'user' && message.id === exchange.anchorMessageId))) {
     throw new GigaChatProviderError('protocol');
   }
-  const functionsEnabled = request.functionCallMode !== 'none';
+  const functionsEnabled = request.compactionFormat === 'semantic' ? false : request.functionCallMode !== 'none';
   const tools = functionsEnabled ? [{ functions: { specifications: GIGACHAT_FUNCTIONS } }] : undefined;
   let body: string;
   try {
@@ -200,7 +203,8 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
         parallel_tool_calls: false,
         ...(maxOutputTokens !== undefined ? { max_tokens: maxOutputTokens } : {}),
         ...(request.usageKind === 'compaction' ? {
-          response_format: COMPACTION_RESPONSE_FORMAT,
+          response_format: request.compactionFormat === 'semantic'
+            ? SEMANTIC_COMPACTION_RESPONSE_FORMAT : COMPACTION_RESPONSE_FORMAT,
         } : {}),
       },
       tool_config: { mode: functionsEnabled ? 'auto' : 'none' },

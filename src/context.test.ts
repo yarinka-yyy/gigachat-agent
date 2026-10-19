@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
 import { test } from 'node:test';
 import type { ChatArtifact, ChatDetail, ChatMessage, ChatToolReceipt, CompactSnapshot, ProviderProtocolExchange } from './contracts';
-import { assertCompactionWireReduction, buildNextTurnContext, COMPACTION_TASK_INSTRUCTION, countContextTextTokens, hashCompactionPrefix, validateCompactSummary } from './context';
+import { assertCompactionWireReduction, buildNextTurnContext, COMPACTION_TASK_INSTRUCTION, countContextTextTokens,
+  hashCompactionPrefix, SEMANTIC_COMPACTION_TASK_INSTRUCTION, validateCompactSummary } from './context';
 import { GigaChatProviderError, MAX_PROVIDER_REQUEST_BYTES, serializeProviderTurnRequest } from './gigachat-provider';
 import { compileExtractiveCompaction, compileSemanticCompactionMemory, createCompactionSources } from './compaction';
 
@@ -337,6 +338,159 @@ test('uses a v2 semantic archive only after covered-prefix hash and source valid
     compactSnapshot: snapshot,
     protocolHistory: [protocol],
   })), /нужны покрытые записи инструментов и вложений/);
+});
+
+test('prepares a semantic request from the whole supplied raw prefix without exposing local metadata', () => {
+  const messages: ChatMessage[] = [
+    { ...user('semantic-first-user', 'Old raw request'), attachmentIds: ['old-attachment'] },
+    assistant('semantic-first-assistant', 'Old raw answer'),
+    { ...user('semantic-second-user', 'New request'), attachmentIds: ['new-attachment'] },
+    assistant('semantic-second-assistant', 'New answer'),
+  ];
+  const receipts: ChatToolReceipt[] = [
+    { receiptId: 'private-receipt-old', anchorMessageId: messages[0]!.id, name: 'read', arguments: { path: 'old.txt' },
+      content: null, functionsStateId: 'private-state-old', status: 'completed', result: 'Old tool result.', createdAt: at },
+    { receiptId: 'private-receipt-new', anchorMessageId: messages[2]!.id, name: 'search', arguments: { query: 'new' },
+      content: 'Search content.', functionsStateId: 'private-state-new', status: 'completed', result: 'New tool result.', createdAt: at },
+  ];
+  const artifacts: ChatArtifact[] = [
+    { id: 'old-attachment', name: 'old.txt', storedName: 'private-old-path', size: 10, sha256: 'a'.repeat(64), createdAt: at, messageId: messages[0]!.id },
+    { id: 'new-attachment', name: 'new.txt', storedName: 'private-new-path', size: 20, sha256: 'b'.repeat(64), createdAt: at, messageId: messages[2]!.id },
+  ];
+  const context = buildNextTurnContext(input(messages, {
+    compactionFormat: 'semantic',
+    usageKind: 'compaction',
+    taskInstruction: COMPACTION_TASK_INSTRUCTION,
+    functionCallMode: 'auto',
+    compactionToolReceipts: receipts,
+    compactionArtifacts: artifacts,
+  }));
+  const transcript = context.request.messages[0]?.text ?? '';
+  const envelope = JSON.parse(transcript.slice(transcript.indexOf('\n') + 1)) as {
+    previousMemory: unknown;
+    messages: Array<{ sourceRef: string; role: string; text: string; attachments: Array<Record<string, unknown>> }>;
+    tools: Array<{ sourceRef: string; anchorRef: string; name: string; result: string | null }>;
+  };
+
+  assert.equal(context.request.compactionFormat, 'semantic');
+  assert.equal(context.request.functionCallMode, 'none');
+  assert.equal(context.request.messages[1]?.text, SEMANTIC_COMPACTION_TASK_INSTRUCTION);
+  assert.equal(context.request.system.some((layer) => layer.source === 'summary'), false);
+  assert.equal(envelope.previousMemory, null, 'first semantic compaction starts from the supplied raw prefix');
+  assert.deepEqual(envelope.messages.map(({ sourceRef, role, text }) => [sourceRef, role, text]), [
+    ['m0', 'user', 'Old raw request'], ['m1', 'assistant', 'Old raw answer'],
+    ['m2', 'user', 'New request'], ['m3', 'assistant', 'New answer'],
+  ]);
+  assert.deepEqual(envelope.messages[0]?.attachments, [{
+    name: 'old.txt', sizeBytes: 10, sha256: 'a'.repeat(64), contentAvailable: false,
+  }]);
+  assert.deepEqual(envelope.tools.map(({ sourceRef, anchorRef, name, result }) => ({ sourceRef, anchorRef, name, result })), [
+    { sourceRef: 't0', anchorRef: 'm0', name: 'read', result: 'Old tool result.' },
+    { sourceRef: 't1', anchorRef: 'm2', name: 'search', result: 'New tool result.' },
+  ]);
+  for (const privateValue of ['semantic-first-user', 'private-receipt-old', 'private-state-old', 'private-old-path']) {
+    assert.equal(transcript.includes(privateValue), false);
+  }
+
+  const legacySnapshot = snapshot(messages[0]!.id, messages[1]!.id, messages);
+  const migrated = buildNextTurnContext(input(messages, {
+    compactionFormat: 'semantic', usageKind: 'compaction', compactionToolReceipts: receipts,
+    compactionArtifacts: artifacts, compactSnapshot: legacySnapshot,
+  }));
+  const migratedInput = JSON.parse(migrated.request.messages[0]!.text.slice(migrated.request.messages[0]!.text.indexOf('\n') + 1)) as typeof envelope;
+  assert.equal(migratedInput.previousMemory, null, 'a v1 extractive snapshot migrates from raw messages, not its old selection');
+  assert.equal(migratedInput.messages.length, messages.length);
+});
+
+test('rolls semantic compaction forward with stable global refs and only the newly covered suffix', () => {
+  const covered = [user('rolling-old-user', 'Old raw request.'), assistant('rolling-old-assistant', 'Old raw answer.')];
+  const suffix = [user('rolling-new-user', 'New raw request.',), assistant('rolling-new-assistant', 'New raw answer.')];
+  const oldReceipt: ChatToolReceipt = {
+    receiptId: 'rolling-private-receipt-old', anchorMessageId: covered[0]!.id, name: 'read', arguments: { path: 'old.txt' },
+    content: 'Old result.', functionsStateId: 'rolling-private-state-old', status: 'completed', result: 'Old result.', createdAt: at,
+  };
+  const newReceipt: ChatToolReceipt = {
+    receiptId: 'rolling-private-receipt-new', anchorMessageId: suffix[0]!.id, name: 'read', arguments: { path: 'new.txt' },
+    content: 'New result.', functionsStateId: 'rolling-private-state-new', status: 'completed', result: 'New result.', createdAt: at,
+  };
+  const oldProtocol: ProviderProtocolExchange = {
+    anchorMessageId: covered[0]!.id, name: 'read', arguments: { path: 'old.txt' }, content: 'Old result.',
+    functionsStateId: 'rolling-private-state-old', result: 'Old result.',
+  };
+  const newProtocol: ProviderProtocolExchange = {
+    anchorMessageId: suffix[0]!.id, name: 'read', arguments: { path: 'new.txt' }, content: 'New result.',
+    functionsStateId: 'rolling-private-state-new', result: 'New result.',
+  };
+  const oldSources = createCompactionSources(covered, [oldReceipt, newReceipt], []);
+  const priorCandidate = JSON.stringify({
+    format: 'gigachat-semantic-memory', version: 1,
+    activeTask: { text: 'Continue the older active task.', sourceRefs: ['m0'] },
+    constraints: [], decisions: [], openWork: [{ text: 'Keep the old pending item.', sourceRefs: ['m1'] }],
+    facts: [{ text: 'The old tool returned its result.', sourceRefs: ['t0'], exactQuotes: [{ sourceRef: 't0', text: 'Old result.' }] }],
+    pastTopics: [],
+  });
+  const priorSnapshot: CompactSnapshot = {
+    id: 'rolling-v2-snapshot', version: 2, boundaryMessageId: covered[0]!.id,
+    coveredThroughMessageId: covered[1]!.id, coveredPrefixHash: prefixHash(covered, [oldProtocol]),
+    text: compileSemanticCompactionMemory(priorCandidate, oldSources), modelId: 'GigaChat-3-Lightning',
+    provenance: 'fixture', createdAt: at,
+  };
+  const allMessages = [...covered, ...suffix];
+  const context = buildNextTurnContext(input(allMessages, {
+    compactSnapshot: priorSnapshot,
+    protocolHistory: [oldProtocol, newProtocol],
+    compactionToolReceipts: [oldReceipt, newReceipt],
+    compactionArtifacts: [],
+    usageKind: 'compaction',
+    compactionFormat: 'semantic',
+  }));
+  const transcript = context.request.messages[0]?.text ?? '';
+  const envelope = JSON.parse(transcript.slice(transcript.indexOf('\n') + 1)) as {
+    previousMemory: { activeTask: { sourceRefs: string[] }; facts: Array<{ sourceRefs: string[] }> };
+    messages: Array<{ sourceRef: string; text: string }>;
+    tools: Array<{ sourceRef: string; anchorRef: string; result: string | null }>;
+  };
+
+  assert.deepEqual(envelope.previousMemory, JSON.parse(priorSnapshot.text), 'the previous semantic memory, including valid source quotes, is carried forward');
+  assert.deepEqual(envelope.previousMemory.activeTask.sourceRefs, ['m0']);
+  assert.deepEqual(envelope.previousMemory.facts[0]?.sourceRefs, ['t0']);
+  assert.deepEqual(envelope.messages.map(({ sourceRef, text }) => [sourceRef, text]), [
+    ['m2', 'New raw request.'], ['m3', 'New raw answer.'],
+  ]);
+  assert.deepEqual(envelope.tools.map(({ sourceRef, anchorRef, result }) => [sourceRef, anchorRef, result]), [['t1', 'm2', 'New result.']]);
+  assert.equal(envelope.messages.some(({ text }) => text.includes('Old raw request.') || text.includes('Old raw answer.')), false,
+    'prior raw messages are not sent again');
+  assert.equal(envelope.tools.some(({ result }) => result === 'Old result.'), false,
+    'prior tool records are not sent again even when a short exact quote remains in the memory');
+  const nextCandidate = JSON.stringify({
+    ...JSON.parse(priorSnapshot.text),
+    facts: [
+      ...(JSON.parse(priorSnapshot.text) as { facts: unknown[] }).facts,
+      { text: 'The new tool returned its result.', sourceRefs: ['t1'], exactQuotes: [{ sourceRef: 't1', text: 'New result.' }] },
+    ],
+  });
+  assert.doesNotThrow(() => compileSemanticCompactionMemory(nextCandidate, context.compactionSources!));
+
+  assert.throws(() => buildNextTurnContext(input(allMessages, {
+    compactSnapshot: { ...priorSnapshot, coveredPrefixHash: '0'.repeat(64) }, protocolHistory: [oldProtocol, newProtocol],
+    compactionToolReceipts: [oldReceipt, newReceipt], compactionArtifacts: [], usageKind: 'compaction', compactionFormat: 'semantic',
+  })), /предыдущей semantic-памятью изменилась/);
+  const invalidFutureRef = { ...priorSnapshot, text: JSON.stringify({ ...JSON.parse(priorSnapshot.text), openWork: [{ text: 'Future source', sourceRefs: ['m2'] }] }) };
+  assert.throws(() => buildNextTurnContext(input(allMessages, {
+    compactSnapshot: invalidFutureRef, protocolHistory: [oldProtocol, newProtocol], compactionToolReceipts: [oldReceipt, newReceipt],
+    compactionArtifacts: [], usageKind: 'compaction', compactionFormat: 'semantic',
+  })), /неизвестную или повторную ссылку/);
+  const invalidFutureQuote = { ...priorSnapshot, text: JSON.stringify({ ...JSON.parse(priorSnapshot.text), facts: [
+    { text: 'Old fact.', sourceRefs: ['m0'], exactQuotes: [{ sourceRef: 'm0', text: 'New raw request.' }] },
+  ] }) };
+  assert.throws(() => buildNextTurnContext(input(allMessages, {
+    compactSnapshot: invalidFutureQuote, protocolHistory: [oldProtocol, newProtocol], compactionToolReceipts: [oldReceipt, newReceipt],
+    compactionArtifacts: [], usageKind: 'compaction', compactionFormat: 'semantic',
+  })), /Точная цитата не совпадает/);
+  assert.throws(() => buildNextTurnContext(input(covered, {
+    compactSnapshot: priorSnapshot, protocolHistory: [oldProtocol], compactionToolReceipts: [oldReceipt], compactionArtifacts: [],
+    usageKind: 'compaction', compactionFormat: 'semantic',
+  })), /новый завершённый фрагмент истории/i);
 });
 
 test('rejects compact summaries without any Unicode letter or number but accepts Cyrillic, Latin, and numeric text', () => {

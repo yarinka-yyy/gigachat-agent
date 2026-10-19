@@ -1516,6 +1516,45 @@ test('uses explicit output caps while preserving ordinary and compaction default
   assert.deepEqual(explicitOrdinaryBody.model_options, { parallel_tool_calls: false, max_tokens: 512 });
 });
 
+test('serializes only semantic compaction with the strict memory schema and no tools', () => {
+  const request: ProviderTurnRequest = {
+    system: [{ source: 'runtime', label: 'Runtime', text: 'Runtime rules' }],
+    messages: [{ id: 'semantic-task', role: 'user', text: 'Prepare semantic memory.', createdAt: '2026-10-18T00:00:00.000Z' }],
+    permissionProfile: 'ask',
+    modelId: 'GigaChat-3-Lightning',
+    usageKind: 'compaction',
+    compactionFormat: 'semantic',
+    functionCallMode: 'auto',
+  };
+  const serialized = serializeProviderTurnRequest(request);
+  const body = JSON.parse(serialized.body) as {
+    tools?: unknown[]; tool_config: { mode: string };
+    model_options: { max_tokens: number; response_format: { strict: boolean; schema: {
+      properties: Record<string, unknown>; required: string[]; additionalProperties: boolean;
+    } } };
+  };
+  const schema = body.model_options.response_format.schema;
+  const facts = schema.properties.facts as { maxItems: number; items: { required: string[]; properties: Record<string, unknown> } };
+  const activeTask = schema.properties.activeTask as { anyOf: Array<{ type: string }> };
+
+  assert.equal(body.model_options.max_tokens, 4096);
+  assert.equal(body.tool_config.mode, 'none', 'semantic compaction suppresses tool execution even for an auto caller');
+  assert.equal(body.tools, undefined);
+  assert.equal(body.model_options.response_format.strict, true);
+  assert.deepEqual(schema.required, ['format', 'version', 'activeTask', 'constraints', 'decisions', 'openWork', 'facts', 'pastTopics']);
+  assert.equal(schema.additionalProperties, false);
+  assert.deepEqual(activeTask.anyOf.map((entry) => entry.type), ['object', 'null']);
+  assert.equal(facts.maxItems, 48);
+  assert.deepEqual(facts.items.required, ['text', 'sourceRefs', 'exactQuotes']);
+  const exactQuotes = facts.items.properties.exactQuotes as { minItems: number; maxItems: number };
+  assert.equal(exactQuotes.minItems, 0);
+  assert.equal(exactQuotes.maxItems, 8);
+
+  const ordinary = { ...request, usageKind: undefined } as unknown as ProviderTurnRequest;
+  assert.throws(() => serializeProviderTurnRequest(ordinary), (error: unknown) =>
+    error instanceof GigaChatProviderError && error.category === 'protocol');
+});
+
 test('rejects invalid explicit output caps at the provider wire boundary', () => {
   const request: ProviderTurnRequest = {
     system: [],

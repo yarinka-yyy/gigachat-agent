@@ -180,6 +180,7 @@ export interface ProviderTurnRequest {
   modelId: GigaChatModelId | null;
   /** Explicit internal V2 output cap; omission keeps the request-kind default. */
   maxOutputTokens?: number;
+  compactionFormat?: 'semantic';
   usageKind?: UsageRequestKind;
   functionCallMode?: 'auto' | 'none';
 }

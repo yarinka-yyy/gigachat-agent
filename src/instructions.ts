@@ -18,6 +18,7 @@ export interface InstructionInput {
   permissionProfile: PermissionProfile;
   modelId?: GigaChatModelId | null;
   maxOutputTokens?: number;
+  compactionFormat?: 'semantic';
   usageKind?: UsageRequestKind;
   functionCallMode?: 'auto' | 'none';
 }
@@ -52,6 +53,9 @@ function requestOnlyCompactionMessageId(messages: readonly ChatMessage[]): strin
 export function buildInstructionRequest(input: InstructionInput): ProviderTurnRequest {
   if (!Array.isArray(input.messages) || !Array.isArray(input.projectInstructions ?? [])) {
     throw new Error('Некорректные слои инструкций.');
+  }
+  if (input.compactionFormat !== undefined && (input.compactionFormat !== 'semantic' || input.usageKind !== 'compaction')) {
+    throw new Error('Семантический формат разрешён только для запроса сжатия.');
   }
   const permissionProfile = requirePermissionProfile(input.permissionProfile);
   const modelId = input.modelId === null || input.modelId === undefined ? null : requireModelId(input.modelId);
@@ -95,7 +99,9 @@ export function buildInstructionRequest(input: InstructionInput): ProviderTurnRe
     permissionProfile,
     modelId,
     ...(input.maxOutputTokens !== undefined ? { maxOutputTokens: input.maxOutputTokens } : {}),
+    ...(input.compactionFormat ? { compactionFormat: input.compactionFormat } : {}),
     ...(input.usageKind ? { usageKind: input.usageKind } : {}),
-    ...(input.functionCallMode ? { functionCallMode: input.functionCallMode } : {}),
+    ...(input.compactionFormat === 'semantic' ? { functionCallMode: 'none' as const }
+      : input.functionCallMode ? { functionCallMode: input.functionCallMode } : {}),
   };
 }
