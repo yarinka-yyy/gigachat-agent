@@ -548,46 +548,123 @@ export function compileSemanticCompactionMemory(value: unknown, sources: Compact
   return canonicalJson(parseSemanticCompactionMemory(value, sources));
 }
 
+export interface SemanticCompactionCoverageDiagnostics {
+  missingCoverageRefs: string[];
+  duplicateCoverageRefs: string[];
+  outOfOrder: boolean;
+  retainTrueUncitedRefs: string[];
+  citedFalseRefs: string[];
+}
+
+export type SemanticCompactionCoverageInspection =
+  | { status: 'valid'; compiledMemory: string }
+  | { status: 'repairable'; diagnostics: SemanticCompactionCoverageDiagnostics }
+  | { status: 'terminal'; reason: 'candidate-too-large' | 'invalid-json' | 'invalid-wrapper' | 'invalid-memory'
+    | 'invalid-expected-coverage-size' | 'invalid-expected-coverage' | 'unknown-coverage-ref' | 'invalid-coverage-row'
+    | 'memory-source-outside-coverage' };
+
+export function inspectCoveredSemanticCompactionCandidate(
+  value: unknown,
+  sources: CompactionSources,
+  coverageRefSet: readonly string[],
+): SemanticCompactionCoverageInspection {
+  const sourceTexts = semanticSourceTexts(sources);
+  if (!Array.isArray(coverageRefSet) || coverageRefSet.length === 0 || coverageRefSet.length > MAX_SEMANTIC_COVERAGE_SOURCES) {
+    return { status: 'terminal', reason: 'invalid-expected-coverage-size' };
+  }
+  let expectedRefs: string[];
+  try { expectedRefs = validateSemanticCoverageRefSet(coverageRefSet, sourceTexts); }
+  catch { return { status: 'terminal', reason: 'invalid-expected-coverage' }; }
+  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > MAX_COMPACTION_CANDIDATE_BYTES) {
+    return { status: 'terminal', reason: 'candidate-too-large' };
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); }
+  catch { return { status: 'terminal', reason: 'invalid-json' }; }
+  if (!isRecord(parsed) || !hasOnlyKeys(parsed, ['coverage', 'memory']) || !Array.isArray(parsed.coverage)
+    || parsed.coverage.length > MAX_SEMANTIC_COVERAGE_SOURCES) {
+    return { status: 'terminal', reason: 'invalid-wrapper' };
+  }
+
+  let compiledMemory: string;
+  try { compiledMemory = compileSemanticCompactionMemory(canonicalJson(parsed.memory), sources); }
+  catch { return { status: 'terminal', reason: 'invalid-memory' }; }
+  const memory = JSON.parse(compiledMemory) as SemanticCompactionMemory;
+  const citedRefs = new Set(semanticMemorySourceRefs(memory));
+  const expectedSet = new Set(expectedRefs);
+  if ([...citedRefs].some((ref) => !expectedSet.has(ref))) {
+    return { status: 'terminal', reason: 'memory-source-outside-coverage' };
+  }
+
+  const expectedIndex = new Map(expectedRefs.map((ref, index) => [ref, index]));
+  const decisions = new Map<string, boolean>();
+  const duplicateSet = new Set<string>();
+  let previousIndex = -1;
+  let outOfOrder = false;
+  for (const item of parsed.coverage) {
+    if (!isRecord(item) || !hasOnlyKeys(item, ['sourceRef', 'retain'])
+      || typeof item.sourceRef !== 'string' || typeof item.retain !== 'boolean') {
+      return { status: 'terminal', reason: 'invalid-coverage-row' };
+    }
+    const index = expectedIndex.get(item.sourceRef);
+    if (index === undefined) return { status: 'terminal', reason: 'unknown-coverage-ref' };
+    if (decisions.has(item.sourceRef)) {
+      duplicateSet.add(item.sourceRef);
+      continue;
+    }
+    if (index < previousIndex) outOfOrder = true;
+    previousIndex = index;
+    decisions.set(item.sourceRef, item.retain);
+  }
+  const missingCoverageRefs = expectedRefs.filter((ref) => !decisions.has(ref));
+  const duplicateCoverageRefs = expectedRefs.filter((ref) => duplicateSet.has(ref));
+  const retainTrueUncitedRefs = expectedRefs.filter((ref) => !duplicateSet.has(ref)
+    && decisions.get(ref) === true && !citedRefs.has(ref));
+  const citedFalseRefs = expectedRefs.filter((ref) => !duplicateSet.has(ref)
+    && decisions.get(ref) === false && citedRefs.has(ref));
+  const diagnostics = { missingCoverageRefs, duplicateCoverageRefs, outOfOrder, retainTrueUncitedRefs, citedFalseRefs };
+  if (missingCoverageRefs.length || duplicateCoverageRefs.length || outOfOrder
+    || retainTrueUncitedRefs.length || citedFalseRefs.length) {
+    return { status: 'repairable', diagnostics };
+  }
+  return { status: 'valid', compiledMemory };
+}
+
 export function compileCoveredSemanticCompactionMemory(
   value: unknown,
   sources: CompactionSources,
   coverageRefSet: readonly string[],
 ): string {
-  const sourceTexts = semanticSourceTexts(sources);
-  const expectedRefs = validateSemanticCoverageRefSet(coverageRefSet, sourceTexts);
-  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > MAX_COMPACTION_CANDIDATE_BYTES) {
-    throw new Error('Кандидат semantic-сжатия превышает допустимый размер.');
+  const inspection = inspectCoveredSemanticCompactionCandidate(value, sources, coverageRefSet);
+  if (inspection.status === 'valid') return inspection.compiledMemory;
+  if (inspection.status === 'terminal') {
+    if (inspection.reason === 'invalid-memory' && typeof value === 'string') {
+      const wrapper = JSON.parse(value) as { memory: unknown };
+      return compileSemanticCompactionMemory(canonicalJson(wrapper.memory), sources);
+    }
+    const messages: Record<typeof inspection.reason, string> = {
+      'candidate-too-large': 'Кандидат semantic-сжатия превышает допустимый размер.',
+      'invalid-json': 'Кандидат semantic-сжатия должен быть корректным JSON.',
+      'invalid-wrapper': 'Кандидат semantic-сжатия должен содержать только coverage и memory корректной структуры.',
+      'invalid-memory': 'Кандидат semantic-сжатия содержит некорректную semantic-память или цитаты.',
+      'invalid-expected-coverage-size': `Список исходников semantic-сжатия должен содержать от 1 до ${MAX_SEMANTIC_COVERAGE_SOURCES} ссылок.`,
+      'invalid-expected-coverage': 'Список исходников semantic-сжатия содержит неизвестную или повторную ссылку.',
+      'unknown-coverage-ref': 'Решения coverage содержат неизвестную ссылку.',
+      'invalid-coverage-row': 'Решение coverage имеет неверную структуру.',
+      'memory-source-outside-coverage': 'Семантическая память ссылается на исходник вне переданного набора coverage.',
+    };
+    throw new Error(messages[inspection.reason]);
   }
-  let parsed: unknown;
-  try { parsed = JSON.parse(value); }
-  catch { throw new Error('Кандидат semantic-сжатия должен быть корректным JSON.'); }
-  if (!isRecord(parsed) || !hasOnlyKeys(parsed, ['coverage', 'memory'])) {
-    throw new Error('Кандидат semantic-сжатия должен содержать только coverage и memory.');
-  }
-  if (!Array.isArray(parsed.coverage) || parsed.coverage.length !== expectedRefs.length) {
+  if (inspection.diagnostics.missingCoverageRefs.length) {
     throw new Error('Решения coverage должны перечислять каждый переданный исходник ровно один раз.');
   }
-  const retainByRef = new Map<string, boolean>();
-  parsed.coverage.forEach((item, index) => {
-    if (!isRecord(item) || !hasOnlyKeys(item, ['sourceRef', 'retain'])
-      || typeof item.sourceRef !== 'string' || typeof item.retain !== 'boolean'
-      || item.sourceRef !== expectedRefs[index]) {
-      throw new Error('Решения coverage должны точно совпадать с переданными исходниками и их порядком.');
-    }
-    retainByRef.set(item.sourceRef, item.retain);
-  });
-
-  const compiledMemory = compileSemanticCompactionMemory(canonicalJson(parsed.memory), sources);
-  const memory = JSON.parse(compiledMemory) as SemanticCompactionMemory;
-  const citedRefs = new Set(semanticMemorySourceRefs(memory));
-  for (const ref of citedRefs) {
-    if (!expectedRefs.includes(ref)) throw new Error('Семантическая память ссылается на исходник вне переданного набора coverage.');
-    if (retainByRef.get(ref) !== true) throw new Error('Семантическая память ссылается на исходник, отмеченный retain=false.');
+  if (inspection.diagnostics.duplicateCoverageRefs.length || inspection.diagnostics.outOfOrder) {
+    throw new Error('Решения coverage должны точно совпадать с переданными исходниками и их порядком.');
   }
-  for (const [ref, retain] of retainByRef) {
-    if (retain && !citedRefs.has(ref)) throw new Error('Сохранённый исходник coverage не представлен в семантической памяти.');
+  if (inspection.diagnostics.retainTrueUncitedRefs.length) {
+    throw new Error('Сохранённый исходник coverage не представлен в семантической памяти.');
   }
-  return compiledMemory;
+  throw new Error('Семантическая память ссылается на исходник, отмеченный retain=false.');
 }
 
 export function formatSemanticCompactionMemory(value: unknown, sources: CompactionSources): string {

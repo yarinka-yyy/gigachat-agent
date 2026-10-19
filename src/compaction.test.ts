@@ -9,6 +9,7 @@ import {
   formatArchivedCompactionNotes,
   formatSemanticCompactionMemory,
   getSemanticCompactionCoverageRefSet,
+  inspectCoveredSemanticCompactionCandidate,
   selectRetainedCompactionMessages,
   serializeCompactionTranscript,
   serializeSemanticCompactionTranscript,
@@ -470,8 +471,8 @@ test('compiles semantic memory only when ordered coverage decisions match the vi
 
   const invalid: Array<[string, unknown, readonly string[], RegExp]> = [
     ['missing decision', { coverage: coverage.slice(1), memory }, coverageRefSet, /ровно один раз/],
-    ['duplicate decision', { coverage: [coverage[0], coverage[1], coverage[1], coverage[3]], memory }, coverageRefSet, /порядком/],
-    ['unknown decision', { coverage: [...coverage.slice(0, 3), { sourceRef: 't9', retain: true }], memory }, coverageRefSet, /порядком/],
+    ['duplicate decision', { coverage: [coverage[0], coverage[1], coverage[1], coverage[3]], memory }, coverageRefSet, /ровно один раз/],
+    ['unknown decision', { coverage: [...coverage.slice(0, 3), { sourceRef: 't9', retain: true }], memory }, coverageRefSet, /неизвестную ссылку/],
     ['reordered decisions', { coverage: [coverage[1], coverage[0], coverage[2], coverage[3]], memory }, coverageRefSet, /порядком/],
     ['extra wrapper key', { coverage, memory, permission: 'allow' }, coverageRefSet, /только coverage и memory/],
     ['caller unknown ref', { coverage, memory }, ['m0', 'm1', 'm99'], /неизвестную или повторную ссылку/],
@@ -500,6 +501,70 @@ test('rejects semantic coverage over 64 sources before building a request', () =
   assert.throws(() => getSemanticCompactionCoverageRefSet(sources), /от 1 до 64/);
   assert.throws(() => serializeSemanticCompactionTranscript(sources), /от 1 до 64/);
   assert.throws(() => compileCoveredSemanticCompactionMemory('{}', sources, sources.messages.map(({ ref }) => ref)), /от 1 до 64/);
+});
+
+test('diagnoses only repairable coverage defects after validating semantic memory and exact quotes', () => {
+  const observedSources = new Map<number, string>([
+    [32, 'Public rankings remain excluded from the active scope.'], [33, 'The current plan still excludes public rankings.'],
+    [38, 'The current marker is ORION-9F2.'], [39, 'Use ORION-9F2 as the current marker.'],
+    [46, 'The build target is Windows 11 and version 0.9.4-rc2.'], [47, 'Prepare the Windows 11 build at version 0.9.4-rc2.'],
+    [51, 'The final source contains one more completed update.'],
+  ]);
+  const messages = Array.from({ length: 52 }, (_, index) => {
+    const text = observedSources.get(index) ?? `Synthetic source ${index}.`;
+    return index % 2 === 0 ? user(`coverage-user-${index}`, text) : assistant(`coverage-assistant-${index}`, text);
+  });
+  const sources = createCompactionSources(messages, [], []);
+  const coverageRefSet = messages.map((_, index) => `m${index}`);
+  const uncited = ['m32', 'm33', 'm38', 'm39', 'm46', 'm47'];
+  const coverage = coverageRefSet.slice(0, -1).map((sourceRef) => ({
+    sourceRef, retain: sourceRef === 'm0' || uncited.includes(sourceRef),
+  }));
+  const memory = JSON.parse(semanticCandidate({
+    activeTask: { text: 'Continue the current task.', sourceRefs: ['m0'] },
+    constraints: [], decisions: [], openWork: [], facts: [], pastTopics: [],
+  })) as Record<string, unknown>;
+  const candidate = JSON.stringify({ coverage, memory });
+  const inspection = inspectCoveredSemanticCompactionCandidate(candidate, sources, coverageRefSet);
+
+  assert.deepEqual(inspection, {
+    status: 'repairable',
+    diagnostics: {
+      missingCoverageRefs: ['m51'],
+      duplicateCoverageRefs: [],
+      outOfOrder: false,
+      retainTrueUncitedRefs: uncited,
+      citedFalseRefs: [],
+    },
+  });
+  assert.throws(() => compileCoveredSemanticCompactionMemory(candidate, sources, coverageRefSet), /ровно один раз/);
+
+  const duplicate = JSON.stringify({ coverage: [...coverage, coverage[0]], memory });
+  const duplicateInspection = inspectCoveredSemanticCompactionCandidate(duplicate, sources, coverageRefSet);
+  assert.equal(duplicateInspection.status, 'repairable');
+  if (duplicateInspection.status === 'repairable') assert.deepEqual(duplicateInspection.diagnostics.duplicateCoverageRefs, ['m0']);
+  const outOfOrder = JSON.stringify({ coverage: [coverage[1], coverage[0], ...coverage.slice(2)], memory });
+  const orderInspection = inspectCoveredSemanticCompactionCandidate(outOfOrder, sources, coverageRefSet);
+  assert.equal(orderInspection.status, 'repairable');
+  if (orderInspection.status === 'repairable') assert.equal(orderInspection.diagnostics.outOfOrder, true);
+});
+
+test('coverage inspection treats malformed JSON, invalid quotes, and unknown references as terminal', () => {
+  const sources = semanticSources();
+  const refs = getSemanticCompactionCoverageRefSet(sources);
+  const coverage = refs.map((sourceRef) => ({ sourceRef, retain: true }));
+  const memory = JSON.parse(semanticCandidate({ activeTask: { text: 'Continue.', sourceRefs: ['m0'] } })) as Record<string, unknown>;
+
+  assert.deepEqual(inspectCoveredSemanticCompactionCandidate('{', sources, refs), { status: 'terminal', reason: 'invalid-json' });
+  const invalidQuoteMemory = { ...memory, facts: [{ text: 'A fact.', sourceRefs: ['m1'], exactQuotes: [{ sourceRef: 'm1', text: 'absent' }] }] };
+  assert.deepEqual(inspectCoveredSemanticCompactionCandidate(JSON.stringify({ coverage, memory: invalidQuoteMemory }), sources, refs),
+    { status: 'terminal', reason: 'invalid-memory' });
+  const unknownCoverage = coverage.map((row, index) => index === 0 ? { ...row, sourceRef: 'm999' } : row);
+  assert.deepEqual(inspectCoveredSemanticCompactionCandidate(JSON.stringify({ coverage: unknownCoverage, memory }), sources, refs),
+    { status: 'terminal', reason: 'unknown-coverage-ref' });
+  const unknownMemory = { ...memory, activeTask: { text: 'Unknown source.', sourceRefs: ['m999'] } };
+  assert.deepEqual(inspectCoveredSemanticCompactionCandidate(JSON.stringify({ coverage, memory: unknownMemory }), sources, refs),
+    { status: 'terminal', reason: 'invalid-memory' });
 });
 
 test('allows no active task when sourced durable memory remains', () => {
