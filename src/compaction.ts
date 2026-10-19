@@ -71,12 +71,30 @@ export const SEMANTIC_COMPACTION_RESPONSE_FORMAT = {
     properties: {
       format: { type: 'string', enum: [SEMANTIC_COMPACTION_FORMAT] },
       version: { type: 'integer', enum: [1] },
-      activeTask: { anyOf: [semanticEntrySchema, { type: 'null' }] },
-      constraints: { type: 'array', maxItems: MAX_SEMANTIC_COUNTS.constraints, items: semanticConstraintSchema },
-      decisions: { type: 'array', maxItems: MAX_SEMANTIC_COUNTS.decisions, items: semanticEntrySchema },
-      openWork: { type: 'array', maxItems: MAX_SEMANTIC_COUNTS.openWork, items: semanticEntrySchema },
-      facts: { type: 'array', maxItems: MAX_SEMANTIC_COUNTS.facts, items: semanticFactSchema },
-      pastTopics: { type: 'array', maxItems: MAX_SEMANTIC_COUNTS.pastTopics, items: semanticEntrySchema },
+      activeTask: {
+        description: 'Текущая активная задача и её состояние; сохраняй точные рабочие идентификаторы.',
+        anyOf: [semanticEntrySchema, { type: 'null' }],
+      },
+      constraints: {
+        description: 'Все действующие ограничения, запреты и разрешения с областью, условиями и исключениями; учитывай их независимо от возраста.',
+        type: 'array', maxItems: MAX_SEMANTIC_COUNTS.constraints, items: semanticConstraintSchema,
+      },
+      decisions: {
+        description: 'Актуальные решения; при явном исправлении используй последнюю подтверждённую версию.',
+        type: 'array', maxItems: MAX_SEMANTIC_COUNTS.decisions, items: semanticEntrySchema,
+      },
+      openWork: {
+        description: 'Только действительно незавершённые задачи и обязательства; не включай закрытые темы.',
+        type: 'array', maxItems: MAX_SEMANTIC_COUNTS.openWork, items: semanticEntrySchema,
+      },
+      facts: {
+        description: 'Подтверждённое текущее состояние, особенно точные идентификаторы и значения активной задачи.',
+        type: 'array', maxItems: MAX_SEMANTIC_COUNTS.facts, items: semanticFactSchema,
+      },
+      pastTopics: {
+        description: 'Краткие сгруппированные итоги закрытых неактивных тем; не перечисляй подробно каждый старый обмен.',
+        type: 'array', maxItems: MAX_SEMANTIC_COUNTS.pastTopics, items: semanticEntrySchema,
+      },
     },
     required: ['format', 'version', 'activeTask', 'constraints', 'decisions', 'openWork', 'facts', 'pastTopics'],
     additionalProperties: false,

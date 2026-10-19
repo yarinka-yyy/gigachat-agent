@@ -1535,7 +1535,12 @@ test('serializes only semantic compaction with the strict memory schema and no t
   };
   const schema = body.model_options.response_format.schema;
   const facts = schema.properties.facts as { maxItems: number; items: { required: string[]; properties: Record<string, unknown> } };
-  const activeTask = schema.properties.activeTask as { anyOf: Array<{ type: string }> };
+  const activeTask = schema.properties.activeTask as { description: string; anyOf: Array<{ type: string }> };
+  const constraints = schema.properties.constraints as { description: string; maxItems: number };
+  const decisions = schema.properties.decisions as { description: string; maxItems: number };
+  const openWork = schema.properties.openWork as { description: string; maxItems: number };
+  const factsDescription = (schema.properties.facts as { description: string }).description;
+  const pastTopics = schema.properties.pastTopics as { description: string; maxItems: number };
 
   assert.equal(body.model_options.max_tokens, 4096);
   assert.equal(body.tool_config.mode, 'none', 'semantic compaction suppresses tool execution even for an auto caller');
@@ -1544,7 +1549,17 @@ test('serializes only semantic compaction with the strict memory schema and no t
   assert.deepEqual(schema.required, ['format', 'version', 'activeTask', 'constraints', 'decisions', 'openWork', 'facts', 'pastTopics']);
   assert.equal(schema.additionalProperties, false);
   assert.deepEqual(activeTask.anyOf.map((entry) => entry.type), ['object', 'null']);
+  assert.match(activeTask.description, /текущая активная задача.*точные рабочие идентификаторы/i);
+  assert.match(constraints.description, /действующие ограничения.*областью, условиями и исключениями/i);
+  assert.match(decisions.description, /при явном исправлении.*последнюю подтверждённую версию/i);
+  assert.match(openWork.description, /только действительно незавершённые.*не включай закрытые темы/i);
   assert.equal(facts.maxItems, 48);
+  assert.match(factsDescription, /подтверждённое текущее состояние.*точные идентификаторы и значения/i);
+  assert.match(pastTopics.description, /краткие сгруппированные итоги.*не перечисляй подробно каждый старый обмен/i);
+  assert.equal(constraints.maxItems, 24);
+  assert.equal(decisions.maxItems, 32);
+  assert.equal(openWork.maxItems, 32);
+  assert.equal(pastTopics.maxItems, 8);
   assert.deepEqual(facts.items.required, ['text', 'sourceRefs', 'exactQuotes']);
   const exactQuotes = facts.items.properties.exactQuotes as { minItems: number; maxItems: number };
   assert.equal(exactQuotes.minItems, 0);
