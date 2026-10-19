@@ -125,6 +125,37 @@ export const SEMANTIC_COMPACTION_RESPONSE_FORMAT = {
   strict: true,
 };
 
+const semanticCompactionRepairPatchSchema = {
+  type: 'object',
+  properties: {
+    sourceRef: { type: 'string', pattern: '^(m|t)(0|[1-9][0-9]*)$' },
+    retain: { type: 'boolean' },
+    section: { type: 'string', enum: ['constraints', 'decisions', 'openWork', 'facts', 'pastTopics', 'none'] },
+    scope: { anyOf: [{ type: 'string', minLength: 1, maxLength: MAX_SEMANTIC_SCOPE_BYTES }, { type: 'null' }] },
+    text: { type: 'string', maxLength: MAX_SEMANTIC_ENTRY_BYTES },
+  },
+  required: ['sourceRef', 'retain', 'section', 'scope', 'text'],
+  additionalProperties: false,
+};
+
+export const SEMANTIC_COMPACTION_REPAIR_RESPONSE_FORMAT = {
+  type: 'json_schema',
+  schema: {
+    type: 'object',
+    properties: {
+      format: { type: 'string', enum: ['gigachat-semantic-patch'] },
+      version: { type: 'integer', enum: [1] },
+      patches: {
+        type: 'array', minItems: 1, maxItems: MAX_SEMANTIC_COVERAGE_SOURCES,
+        items: semanticCompactionRepairPatchSchema,
+      },
+    },
+    required: ['format', 'version', 'patches'],
+    additionalProperties: false,
+  },
+  strict: true,
+};
+
 export interface SemanticCompactionEntry {
   text: string;
   sourceRefs: string[];
@@ -556,6 +587,28 @@ export interface SemanticCompactionCoverageDiagnostics {
   citedFalseRefs: string[];
 }
 
+export type SemanticCompactionPatchSection = 'constraints' | 'decisions' | 'openWork' | 'facts' | 'pastTopics' | 'none';
+
+export interface SemanticCompactionPatch {
+  sourceRef: string;
+  retain: boolean;
+  section: SemanticCompactionPatchSection;
+  scope: string | null;
+  text: string;
+}
+
+export interface SemanticCompactionPatchResponse {
+  format: 'gigachat-semantic-patch';
+  version: 1;
+  patches: SemanticCompactionPatch[];
+}
+
+export type SemanticCompactionRepairPlan =
+  | { status: 'valid'; compiledMemory: string }
+  | { status: 'normalize'; compiledMemory: string }
+  | { status: 'patches'; compiledMemory: string; patchRefSet: string[]; diagnostics: SemanticCompactionCoverageDiagnostics }
+  | { status: 'terminal'; reason: Extract<SemanticCompactionCoverageInspection, { status: 'terminal' }>['reason'] };
+
 export type SemanticCompactionCoverageInspection =
   | { status: 'valid'; compiledMemory: string }
   | { status: 'repairable'; diagnostics: SemanticCompactionCoverageDiagnostics }
@@ -630,6 +683,111 @@ export function inspectCoveredSemanticCompactionCandidate(
   return { status: 'valid', compiledMemory };
 }
 
+export function prepareSemanticCompactionRepairPlan(
+  value: unknown,
+  sources: CompactionSources,
+  coverageRefSet: readonly string[],
+): SemanticCompactionRepairPlan {
+  const inspection = inspectCoveredSemanticCompactionCandidate(value, sources, coverageRefSet);
+  if (inspection.status === 'terminal') return inspection;
+  if (inspection.status === 'valid') return inspection;
+
+  let wrapper: unknown;
+  try { wrapper = JSON.parse(value as string); }
+  catch { return { status: 'terminal', reason: 'invalid-json' }; }
+  if (!isRecord(wrapper) || !hasOnlyKeys(wrapper, ['coverage', 'memory'])) {
+    return { status: 'terminal', reason: 'invalid-wrapper' };
+  }
+  let compiledMemory: string;
+  let expectedRefs: string[];
+  try {
+    compiledMemory = compileSemanticCompactionMemory(canonicalJson(wrapper.memory), sources);
+    expectedRefs = validateSemanticCoverageRefSet(coverageRefSet, semanticSourceTexts(sources));
+  } catch {
+    return { status: 'terminal', reason: 'invalid-memory' };
+  }
+  const memory = JSON.parse(compiledMemory) as SemanticCompactionMemory;
+  const citedRefs = new Set(semanticMemorySourceRefs(memory));
+  const patchableRefs = new Set([
+    ...inspection.diagnostics.missingCoverageRefs,
+    ...inspection.diagnostics.duplicateCoverageRefs,
+    ...inspection.diagnostics.retainTrueUncitedRefs,
+  ]);
+  const patchRefSet = expectedRefs.filter((ref) => patchableRefs.has(ref) && !citedRefs.has(ref));
+  if (patchRefSet.length) {
+    return { status: 'patches', compiledMemory, patchRefSet, diagnostics: inspection.diagnostics };
+  }
+
+  const normalized = JSON.stringify({
+    coverage: expectedRefs.map((sourceRef) => ({ sourceRef, retain: citedRefs.has(sourceRef) })),
+    memory,
+  });
+  try {
+    return { status: 'normalize', compiledMemory: compileCoveredSemanticCompactionMemory(normalized, sources, expectedRefs) };
+  } catch {
+    return { status: 'terminal', reason: 'invalid-wrapper' };
+  }
+}
+
+export function compileSemanticCompactionRepairPatches(
+  candidate: unknown,
+  patchValue: unknown,
+  sources: CompactionSources,
+  coverageRefSet: readonly string[],
+): string {
+  const plan = prepareSemanticCompactionRepairPlan(candidate, sources, coverageRefSet);
+  if (plan.status !== 'patches') throw new Error('Кандидат не требует допустимого semantic patch-исправления.');
+  if (typeof patchValue !== 'string' || Buffer.byteLength(patchValue, 'utf8') > MAX_COMPACT_SUMMARY_BYTES) {
+    throw new Error('Ответ semantic patch превышает ограничение 32 КиБ.');
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(patchValue); }
+  catch { throw new Error('Ответ semantic patch должен быть корректным JSON.'); }
+  if (!isRecord(parsed) || !hasOnlyKeys(parsed, ['format', 'version', 'patches'])
+    || parsed.format !== 'gigachat-semantic-patch' || parsed.version !== 1 || !Array.isArray(parsed.patches)
+    || parsed.patches.length !== plan.patchRefSet.length || parsed.patches.length > MAX_SEMANTIC_COVERAGE_SOURCES) {
+    throw new Error('Ответ semantic patch имеет неверную версию или структуру.');
+  }
+
+  const memory = JSON.parse(plan.compiledMemory) as SemanticCompactionMemory;
+  const sectionNames = new Set<SemanticCompactionPatchSection>(['constraints', 'decisions', 'openWork', 'facts', 'pastTopics', 'none']);
+  for (let index = 0; index < plan.patchRefSet.length; index += 1) {
+    const row = parsed.patches[index];
+    if (!isRecord(row) || !hasOnlyKeys(row, ['sourceRef', 'retain', 'section', 'scope', 'text'])
+      || row.sourceRef !== plan.patchRefSet[index] || typeof row.retain !== 'boolean'
+      || typeof row.section !== 'string' || !sectionNames.has(row.section as SemanticCompactionPatchSection)
+      || (row.scope !== null && typeof row.scope !== 'string') || typeof row.text !== 'string') {
+      throw new Error('Semantic patch должен содержать ровно по одному упорядоченному исправлению для каждого исходника.');
+    }
+    if (!row.retain) {
+      if (row.section !== 'none' || row.scope !== null || row.text !== '') {
+        throw new Error('Отвергнутый semantic patch не должен содержать текст или раздел памяти.');
+      }
+      continue;
+    }
+    if (row.section === 'none') throw new Error('Сохраняемый semantic patch должен указывать раздел памяти.');
+    const text = validateSemanticText(row.text, MAX_SEMANTIC_ENTRY_BYTES);
+    if (row.section === 'constraints') {
+      const scope = validateSemanticText(row.scope, MAX_SEMANTIC_SCOPE_BYTES);
+      memory.constraints.push({ text, sourceRefs: [row.sourceRef as string], scope });
+    } else {
+      if (row.scope !== null) throw new Error('Область допускается только для semantic patch-ограничения.');
+      const entry = { text, sourceRefs: [row.sourceRef as string] };
+      if (row.section === 'decisions') memory.decisions.push(entry);
+      else if (row.section === 'openWork') memory.openWork.push(entry);
+      else if (row.section === 'facts') memory.facts.push(entry);
+      else memory.pastTopics.push(entry);
+    }
+  }
+
+  const citedRefs = new Set(semanticMemorySourceRefs(memory));
+  const normalized = JSON.stringify({
+    coverage: coverageRefSet.map((sourceRef) => ({ sourceRef, retain: citedRefs.has(sourceRef) })),
+    memory,
+  });
+  return compileCoveredSemanticCompactionMemory(normalized, sources, coverageRefSet);
+}
+
 export function compileCoveredSemanticCompactionMemory(
   value: unknown,
   sources: CompactionSources,
@@ -640,7 +798,8 @@ export function compileCoveredSemanticCompactionMemory(
   if (inspection.status === 'terminal') {
     if (inspection.reason === 'invalid-memory' && typeof value === 'string') {
       const wrapper = JSON.parse(value) as { memory: unknown };
-      return compileSemanticCompactionMemory(canonicalJson(wrapper.memory), sources);
+      compileSemanticCompactionMemory(canonicalJson(wrapper.memory), sources);
+      throw new Error('Кандидат semantic-сжатия содержит некорректную semantic-память или цитаты.');
     }
     const messages: Record<typeof inspection.reason, string> = {
       'candidate-too-large': 'Кандидат semantic-сжатия превышает допустимый размер.',

@@ -4,12 +4,14 @@ import type { ChatArtifact, ChatMessage, ChatToolReceipt } from './contracts';
 import {
   compileCoveredSemanticCompactionMemory,
   compileExtractiveCompaction,
+  compileSemanticCompactionRepairPatches,
   compileSemanticCompactionMemory,
   createCompactionSources,
   formatArchivedCompactionNotes,
   formatSemanticCompactionMemory,
   getSemanticCompactionCoverageRefSet,
   inspectCoveredSemanticCompactionCandidate,
+  prepareSemanticCompactionRepairPlan,
   selectRetainedCompactionMessages,
   serializeCompactionTranscript,
   serializeSemanticCompactionTranscript,
@@ -565,6 +567,119 @@ test('coverage inspection treats malformed JSON, invalid quotes, and unknown ref
   const unknownMemory = { ...memory, activeTask: { text: 'Unknown source.', sourceRefs: ['m999'] } };
   assert.deepEqual(inspectCoveredSemanticCompactionCandidate(JSON.stringify({ coverage, memory: unknownMemory }), sources, refs),
     { status: 'terminal', reason: 'invalid-memory' });
+});
+
+test('plans a source-ordered patch repair and preserves valid memory while rebuilding strict coverage', () => {
+  const sources = semanticSources();
+  const refs = getSemanticCompactionCoverageRefSet(sources);
+  const memory = JSON.parse(semanticCandidate()) as Record<string, unknown>;
+  const candidate = JSON.stringify({
+    coverage: [
+      { sourceRef: 'm1', retain: true }, { sourceRef: 'm0', retain: false },
+      { sourceRef: 'm2', retain: true }, { sourceRef: 't0', retain: false },
+    ],
+    memory,
+  });
+  const beforeCandidate = structuredClone(JSON.parse(candidate));
+  const plan = prepareSemanticCompactionRepairPlan(candidate, sources, refs);
+
+  assert.equal(plan.status, 'patches');
+  if (plan.status !== 'patches') return;
+  assert.deepEqual(plan.patchRefSet, ['m2']);
+  assert.deepEqual(plan.diagnostics, {
+    missingCoverageRefs: [], duplicateCoverageRefs: [], outOfOrder: true,
+    retainTrueUncitedRefs: ['m2'], citedFalseRefs: ['m0', 't0'],
+  });
+  const compiled = compileSemanticCompactionRepairPatches(candidate, JSON.stringify({
+    format: 'gigachat-semantic-patch', version: 1,
+    patches: [{ sourceRef: 'm2', retain: true, section: 'facts', scope: null, text: 'Диагностический символ сохранён.' }],
+  }), sources, refs);
+  const result = JSON.parse(compiled) as Record<string, unknown>;
+  const original = JSON.parse(compileSemanticCompactionMemory(JSON.stringify(memory), sources)) as Record<string, unknown>;
+  assert.deepEqual(result.activeTask, original.activeTask);
+  assert.deepEqual(result.constraints, original.constraints);
+  assert.deepEqual(result.decisions, original.decisions);
+  assert.deepEqual(result.openWork, original.openWork);
+  assert.deepEqual(result.pastTopics, original.pastTopics);
+  assert.deepEqual((result.facts as unknown[]).slice(0, (original.facts as unknown[]).length), original.facts);
+  assert.deepEqual(JSON.parse(candidate), beforeCandidate, 'repair must not mutate the received candidate');
+  assert.equal(compileCoveredSemanticCompactionMemory(JSON.stringify({
+    coverage: refs.map((sourceRef) => ({ sourceRef, retain: ['m0', 'm1', 'm2', 't0'].includes(sourceRef) })),
+    memory: result,
+  }), sources, refs), compiled);
+});
+
+test('normalizes only order and cited-false coverage without requesting a model patch', () => {
+  const sources = semanticSources();
+  const refs = getSemanticCompactionCoverageRefSet(sources);
+  const candidate = JSON.stringify({
+    coverage: [
+      { sourceRef: 'm1', retain: true }, { sourceRef: 'm0', retain: false },
+      { sourceRef: 'm2', retain: false }, { sourceRef: 't0', retain: false },
+    ],
+    memory: JSON.parse(semanticCandidate()),
+  });
+  const plan = prepareSemanticCompactionRepairPlan(candidate, sources, refs);
+
+  assert.equal(plan.status, 'normalize');
+  if (plan.status === 'normalize') {
+    assert.doesNotThrow(() => compileSemanticCompactionMemory(plan.compiledMemory, sources));
+  }
+});
+
+test('requires exact ordered patch coverage, validates patch shapes and enforces final memory limits', () => {
+  const sources = semanticSources();
+  const refs = getSemanticCompactionCoverageRefSet(sources);
+  const memory = {
+    ...JSON.parse(semanticCandidate()), constraints: [], decisions: [], openWork: [], facts: [], pastTopics: [],
+  };
+  const candidate = JSON.stringify({
+    coverage: [{ sourceRef: 'm0', retain: true }, { sourceRef: 'm1', retain: true }, { sourceRef: 't0', retain: false }],
+    memory,
+  });
+  const response = (patches: unknown[]) => JSON.stringify({ format: 'gigachat-semantic-patch', version: 1, patches });
+  const patch1 = { sourceRef: 'm1', retain: true, section: 'facts', scope: null, text: 'The report limit remains recorded.' };
+  const patch2 = { sourceRef: 'm2', retain: true, section: 'facts', scope: null, text: 'The marker remains recorded.' };
+  const compile = (value: string) => compileSemanticCompactionRepairPatches(candidate, value, sources, refs);
+
+  assert.throws(() => compile(response([])), /неверную версию или структуру/);
+  assert.throws(() => compile(response([patch1, patch1])), /упорядоченному исправлению/);
+  assert.throws(() => compile(response([patch2, patch1])), /упорядоченному исправлению/);
+  assert.throws(() => compile(response([{ ...patch1, sourceRef: 'm99' }, patch2])), /упорядоченному исправлению/);
+  assert.throws(() => compile(response([{ ...patch1, retain: false }, patch2])), /semantic patch не должен содержать/);
+  assert.throws(() => compile(response([{ ...patch1, section: 'none' }, patch2])), /должен указывать раздел/);
+  assert.throws(() => compile(response([{ ...patch1, scope: 'unexpected' }, patch2])), /Область допускается/);
+  assert.throws(() => compile(response([{ ...patch1, extra: true }, patch2])), /упорядоченному исправлению/);
+  assert.throws(() => compile(response([{ ...patch1, text: 'summary' }, patch2])), /служебный/);
+  assert.throws(() => compile(response([{ ...patch1, text: 'x'.repeat(33 * 1024) }, patch2])), /32 КиБ/);
+  assert.throws(() => compile(response([{ ...patch1, section: 'constraints', scope: null }, patch2])), /некорректный текст/);
+  assert.doesNotThrow(() => compile(response([
+    { sourceRef: 'm1', retain: false, section: 'none', scope: null, text: '' }, patch2,
+  ])));
+
+  const citedRefFalse = JSON.stringify({
+    format: 'gigachat-semantic-patch', version: 1,
+    patches: [{ sourceRef: 'm0', retain: false, section: 'none', scope: null, text: '' }, patch2],
+  });
+  assert.throws(() => compileSemanticCompactionRepairPatches(candidate, citedRefFalse, sources, refs), /упорядоченному исправлению/);
+  const invalidQuoteCandidate = JSON.stringify({
+    coverage: [{ sourceRef: 'm2', retain: true }],
+    memory: { ...JSON.parse(semanticCandidate()), facts: [{ text: 'Wrong quote.', sourceRefs: ['m1'], exactQuotes: [{ sourceRef: 'm1', text: 'not present' }] }] },
+  });
+  assert.equal(prepareSemanticCompactionRepairPlan(invalidQuoteCandidate, sources, refs).status, 'terminal');
+
+  const largeMemory = {
+    format: 'gigachat-semantic-memory', version: 1, activeTask: null, constraints: [], decisions: [], openWork: [],
+    facts: Array.from({ length: 7 }, () => ({ text: 'x'.repeat(4096), sourceRefs: ['m1'] })), pastTopics: [],
+  };
+  const largeCandidate = JSON.stringify({
+    coverage: [{ sourceRef: 'm0', retain: false }, { sourceRef: 'm1', retain: true }, { sourceRef: 't0', retain: false }],
+    memory: largeMemory,
+  });
+  assert.doesNotThrow(() => compileSemanticCompactionMemory(JSON.stringify(largeMemory), sources));
+  assert.throws(() => compileSemanticCompactionRepairPatches(largeCandidate, response([
+    { ...patch2, text: 'b'.repeat(4096) },
+  ]), sources, refs), /32 КиБ/);
 });
 
 test('allows no active task when sourced durable memory remains', () => {

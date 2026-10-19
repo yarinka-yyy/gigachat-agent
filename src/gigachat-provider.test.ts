@@ -21,6 +21,7 @@ import {
 import { validateProviderV2FunctionWire } from './provider-wire';
 import { createTurnRuntime } from './runtime';
 import type { LocalTools } from './local-tools';
+import { SEMANTIC_COMPACTION_REPAIR_RESPONSE_FORMAT } from './compaction';
 
 const FIXED_NOW = Date.UTC(2026, 9, 9, 12);
 
@@ -1580,6 +1581,49 @@ test('serializes only semantic compaction with ordered coverage, strict memory s
 
   const ordinary = { ...request, usageKind: undefined } as unknown as ProviderTurnRequest;
   assert.throws(() => serializeProviderTurnRequest(ordinary), (error: unknown) =>
+    error instanceof GigaChatProviderError && error.category === 'protocol');
+});
+
+test('serializes patch repair only as a tool-free compaction request with its strict patch schema', () => {
+  const request: ProviderTurnRequest = {
+    system: [{ source: 'runtime', label: 'Runtime', text: 'Runtime rules' }],
+    messages: [{ id: 'semantic-repair', role: 'user', text: 'Create source patches.', createdAt: '2026-10-18T00:00:00.000Z' }],
+    permissionProfile: 'ask',
+    modelId: 'GigaChat-3-Lightning',
+    usageKind: 'compaction',
+    compactionFormat: 'semantic-repair-patch',
+    functionCallMode: 'none',
+  };
+  const wire = JSON.parse(serializeProviderTurnRequest(request).body) as {
+    tools?: unknown[]; tool_config: { mode: string };
+    model_options: { max_tokens: number; response_format: { strict: boolean; schema: {
+      properties: Record<string, unknown>; required: string[]; additionalProperties: boolean;
+    } } };
+  };
+  const schema = wire.model_options.response_format.schema;
+  const patches = schema.properties.patches as { minItems: number; maxItems: number; items: {
+    required: string[]; additionalProperties: boolean; properties: Record<string, unknown>;
+  } };
+
+  assert.equal(wire.model_options.max_tokens, 4096);
+  assert.equal(wire.tool_config.mode, 'none');
+  assert.equal(wire.tools, undefined);
+  assert.equal(wire.model_options.response_format.strict, true);
+  assert.deepEqual(wire.model_options.response_format, SEMANTIC_COMPACTION_REPAIR_RESPONSE_FORMAT);
+  assert.deepEqual(schema.required, ['format', 'version', 'patches']);
+  assert.equal(schema.additionalProperties, false);
+  assert.deepEqual((schema.properties.format as { enum: string[] }).enum, ['gigachat-semantic-patch']);
+  assert.deepEqual((schema.properties.version as { enum: number[] }).enum, [1]);
+  assert.equal(patches.minItems, 1);
+  assert.equal(patches.maxItems, 64);
+  assert.deepEqual(patches.items.required, ['sourceRef', 'retain', 'section', 'scope', 'text']);
+  assert.equal(patches.items.additionalProperties, false);
+  assert.deepEqual((patches.items.properties.section as { enum: string[] }).enum,
+    ['constraints', 'decisions', 'openWork', 'facts', 'pastTopics', 'none']);
+
+  assert.throws(() => serializeProviderTurnRequest({ ...request, functionCallMode: 'auto' }), (error: unknown) =>
+    error instanceof GigaChatProviderError && error.category === 'protocol');
+  assert.throws(() => serializeProviderTurnRequest({ ...request, usageKind: 'chat' } as unknown as ProviderTurnRequest), (error: unknown) =>
     error instanceof GigaChatProviderError && error.category === 'protocol');
 });
 
