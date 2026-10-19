@@ -125,36 +125,76 @@ export const SEMANTIC_COMPACTION_RESPONSE_FORMAT = {
   strict: true,
 };
 
-const semanticCompactionRepairPatchSchema = {
-  type: 'object',
-  properties: {
-    sourceRef: { type: 'string', pattern: '^(m|t)(0|[1-9][0-9]*)$' },
-    retain: { type: 'boolean' },
-    section: { type: 'string', enum: ['constraints', 'decisions', 'openWork', 'facts', 'pastTopics', 'none'] },
-    scope: { anyOf: [{ type: 'string', minLength: 1, maxLength: MAX_SEMANTIC_SCOPE_BYTES }, { type: 'null' }] },
-    text: { type: 'string', maxLength: MAX_SEMANTIC_ENTRY_BYTES },
-  },
-  required: ['sourceRef', 'retain', 'section', 'scope', 'text'],
-  additionalProperties: false,
-};
+function validateSemanticCompactionRepairRefs(patchRefSet: readonly string[], requiredRetainRefs: readonly string[]): void {
+  const isRefList = (refs: readonly string[], allowEmpty = false) => (allowEmpty || refs.length > 0)
+    && refs.length <= MAX_SEMANTIC_COVERAGE_SOURCES
+    && refs.every((ref) => typeof ref === 'string' && /^(m|t)(0|[1-9]\d*)$/.test(ref))
+    && new Set(refs).size === refs.length;
+  if (!Array.isArray(patchRefSet) || !isRefList(patchRefSet)
+    || !Array.isArray(requiredRetainRefs) || requiredRetainRefs.length > patchRefSet.length
+    || !isRefList(requiredRetainRefs, true) || requiredRetainRefs.some((ref) => !patchRefSet.includes(ref))) {
+    throw new Error('Invalid semantic compaction repair refs.');
+  }
+}
 
-export const SEMANTIC_COMPACTION_REPAIR_RESPONSE_FORMAT = {
-  type: 'json_schema',
-  schema: {
+function semanticCompactionRepairValueSchema(requiredRetain: boolean) {
+  const common = {
+    retain: { type: 'boolean', enum: [true] },
+    text: { type: 'string', minLength: 1, maxLength: MAX_SEMANTIC_ENTRY_BYTES },
+  };
+  const retainedBranches = [
+    {
+      type: 'object',
+      properties: { ...common, section: { type: 'string', enum: ['constraints'] },
+        scope: { type: 'string', minLength: 1, maxLength: MAX_SEMANTIC_SCOPE_BYTES } },
+      required: ['retain', 'section', 'scope', 'text'], additionalProperties: false,
+    },
+    {
+      type: 'object',
+      properties: { ...common, section: { type: 'string', enum: ['decisions', 'openWork', 'facts', 'pastTopics'] },
+        scope: { type: 'null' } },
+      required: ['retain', 'section', 'scope', 'text'], additionalProperties: false,
+    },
+  ];
+  const branches = requiredRetain ? retainedBranches : [...retainedBranches, {
     type: 'object',
     properties: {
-      format: { type: 'string', enum: ['gigachat-semantic-patch'] },
-      version: { type: 'integer', enum: [1] },
-      patches: {
-        type: 'array', minItems: 1, maxItems: MAX_SEMANTIC_COVERAGE_SOURCES,
-        items: semanticCompactionRepairPatchSchema,
-      },
+      retain: { type: 'boolean', enum: [false] },
+      section: { type: 'string', enum: ['none'] },
+      scope: { type: 'null' },
+      text: { type: 'string', enum: [''] },
     },
-    required: ['format', 'version', 'patches'],
-    additionalProperties: false,
-  },
-  strict: true,
-};
+    required: ['retain', 'section', 'scope', 'text'], additionalProperties: false,
+  }];
+  return { anyOf: branches };
+}
+
+export function createSemanticCompactionRepairResponseFormat(
+  patchRefSet: readonly string[],
+  requiredRetainRefs: readonly string[],
+) {
+  validateSemanticCompactionRepairRefs(patchRefSet, requiredRetainRefs);
+  const requiredRetainSet = new Set(requiredRetainRefs);
+  return {
+    type: 'json_schema',
+    schema: {
+      type: 'object',
+      properties: {
+        format: { type: 'string', enum: ['gigachat-semantic-patch'] },
+        version: { type: 'integer', enum: [1] },
+        patches: {
+          type: 'object',
+          properties: Object.fromEntries(patchRefSet.map((ref) => [ref, semanticCompactionRepairValueSchema(requiredRetainSet.has(ref))])),
+          required: [...patchRefSet],
+          additionalProperties: false,
+        },
+      },
+      required: ['format', 'version', 'patches'],
+      additionalProperties: false,
+    },
+    strict: true,
+  };
+}
 
 export interface SemanticCompactionEntry {
   text: string;
@@ -590,7 +630,6 @@ export interface SemanticCompactionCoverageDiagnostics {
 export type SemanticCompactionPatchSection = 'constraints' | 'decisions' | 'openWork' | 'facts' | 'pastTopics' | 'none';
 
 export interface SemanticCompactionPatch {
-  sourceRef: string;
   retain: boolean;
   section: SemanticCompactionPatchSection;
   scope: string | null;
@@ -600,13 +639,14 @@ export interface SemanticCompactionPatch {
 export interface SemanticCompactionPatchResponse {
   format: 'gigachat-semantic-patch';
   version: 1;
-  patches: SemanticCompactionPatch[];
+  patches: Record<string, SemanticCompactionPatch>;
 }
 
 export type SemanticCompactionRepairPlan =
   | { status: 'valid'; compiledMemory: string }
   | { status: 'normalize'; compiledMemory: string }
-  | { status: 'patches'; compiledMemory: string; patchRefSet: string[]; diagnostics: SemanticCompactionCoverageDiagnostics }
+  | { status: 'patches'; compiledMemory: string; patchRefSet: string[]; requiredRetainRefSet: string[];
+    diagnostics: SemanticCompactionCoverageDiagnostics }
   | { status: 'terminal'; reason: Extract<SemanticCompactionCoverageInspection, { status: 'terminal' }>['reason'] };
 
 export type SemanticCompactionCoverageInspection =
@@ -715,7 +755,9 @@ export function prepareSemanticCompactionRepairPlan(
   ]);
   const patchRefSet = expectedRefs.filter((ref) => patchableRefs.has(ref) && !citedRefs.has(ref));
   if (patchRefSet.length) {
-    return { status: 'patches', compiledMemory, patchRefSet, diagnostics: inspection.diagnostics };
+    const requiredRetainRefSet = patchRefSet.filter((ref) =>
+      (wrapper.coverage as SemanticCompactionCoverageDecision[]).some((decision) => decision.sourceRef === ref && decision.retain));
+    return { status: 'patches', compiledMemory, patchRefSet, requiredRetainRefSet, diagnostics: inspection.diagnostics };
   }
 
   const normalized = JSON.stringify({
@@ -744,22 +786,29 @@ export function compileSemanticCompactionRepairPatches(
   try { parsed = JSON.parse(patchValue); }
   catch { throw new Error('Ответ semantic patch должен быть корректным JSON.'); }
   if (!isRecord(parsed) || !hasOnlyKeys(parsed, ['format', 'version', 'patches'])
-    || parsed.format !== 'gigachat-semantic-patch' || parsed.version !== 1 || !Array.isArray(parsed.patches)
-    || parsed.patches.length !== plan.patchRefSet.length || parsed.patches.length > MAX_SEMANTIC_COVERAGE_SOURCES) {
+    || parsed.format !== 'gigachat-semantic-patch' || parsed.version !== 1 || !isRecord(parsed.patches)) {
     throw new Error('Ответ semantic patch имеет неверную версию или структуру.');
+  }
+  const patchKeys = Object.keys(parsed.patches);
+  if (patchKeys.length !== plan.patchRefSet.length || patchKeys.some((ref) => !plan.patchRefSet.includes(ref))) {
+    throw new Error('Ответ semantic patch должен содержать ровно ключи исправляемых исходников.');
   }
 
   const memory = JSON.parse(plan.compiledMemory) as SemanticCompactionMemory;
   const sectionNames = new Set<SemanticCompactionPatchSection>(['constraints', 'decisions', 'openWork', 'facts', 'pastTopics', 'none']);
-  for (let index = 0; index < plan.patchRefSet.length; index += 1) {
-    const row = parsed.patches[index];
-    if (!isRecord(row) || !hasOnlyKeys(row, ['sourceRef', 'retain', 'section', 'scope', 'text'])
-      || row.sourceRef !== plan.patchRefSet[index] || typeof row.retain !== 'boolean'
+  const requiredRetainSet = new Set(plan.requiredRetainRefSet);
+  for (const sourceRef of plan.patchRefSet) {
+    const row = parsed.patches[sourceRef];
+    if (!isRecord(row) || !hasOnlyKeys(row, ['retain', 'section', 'scope', 'text'])
+      || typeof row.retain !== 'boolean'
       || typeof row.section !== 'string' || !sectionNames.has(row.section as SemanticCompactionPatchSection)
       || (row.scope !== null && typeof row.scope !== 'string') || typeof row.text !== 'string') {
-      throw new Error('Semantic patch должен содержать ровно по одному упорядоченному исправлению для каждого исходника.');
+      throw new Error('Semantic patch имеет неверную структуру для одного из исходников.');
     }
     if (!row.retain) {
+      if (requiredRetainSet.has(sourceRef)) {
+        throw new Error('Semantic patch не может отвергнуть исходник, который coverage пометил retain=true.');
+      }
       if (row.section !== 'none' || row.scope !== null || row.text !== '') {
         throw new Error('Отвергнутый semantic patch не должен содержать текст или раздел памяти.');
       }
@@ -769,10 +818,10 @@ export function compileSemanticCompactionRepairPatches(
     const text = validateSemanticText(row.text, MAX_SEMANTIC_ENTRY_BYTES);
     if (row.section === 'constraints') {
       const scope = validateSemanticText(row.scope, MAX_SEMANTIC_SCOPE_BYTES);
-      memory.constraints.push({ text, sourceRefs: [row.sourceRef as string], scope });
+      memory.constraints.push({ text, sourceRefs: [sourceRef], scope });
     } else {
       if (row.scope !== null) throw new Error('Область допускается только для semantic patch-ограничения.');
-      const entry = { text, sourceRefs: [row.sourceRef as string] };
+      const entry = { text, sourceRefs: [sourceRef] };
       if (row.section === 'decisions') memory.decisions.push(entry);
       else if (row.section === 'openWork') memory.openWork.push(entry);
       else if (row.section === 'facts') memory.facts.push(entry);

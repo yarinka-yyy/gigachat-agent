@@ -181,6 +181,7 @@ export interface ProviderTurnRequest {
   /** Explicit internal V2 output cap; omission keeps the request-kind default. */
   maxOutputTokens?: number;
   compactionFormat?: 'semantic' | 'semantic-repair-patch';
+  compactionRepair?: { patchRefSet: string[]; requiredRetainRefs: string[] };
   usageKind?: UsageRequestKind;
   functionCallMode?: 'auto' | 'none';
 }

@@ -554,6 +554,10 @@ test('builds a repair request from only diagnosed semantic sources and keeps the
   assert.deepEqual(repair.system, originalRequest.system);
   assert.equal(repair.usageKind, 'compaction');
   assert.equal(repair.compactionFormat, 'semantic-repair-patch');
+  assert.deepEqual(repair.compactionRepair, {
+    patchRefSet: ['m32', 'm38', 'm46', 'm51', 't0'],
+    requiredRetainRefs: ['m32', 'm38', 'm46', 't0'],
+  });
   assert.equal(repair.functionCallMode, 'none');
   assert.equal(repair.maxOutputTokens, 4096);
   assert.deepEqual(repair.protocolHistory, []);
@@ -571,12 +575,14 @@ test('builds a repair request from only diagnosed semantic sources and keeps the
     format: string;
     version: number;
     patchRefSet: string[];
+    requiredRetainRefs: string[];
     memory: typeof memory;
     repairSources: Array<Record<string, unknown>>;
   };
   assert.equal(repairArchive.format, 'gigachat-semantic-repair-input');
   assert.equal(repairArchive.version, 1);
   assert.deepEqual(repairArchive.patchRefSet, ['m32', 'm38', 'm46', 'm51', 't0']);
+  assert.deepEqual(repairArchive.requiredRetainRefs, ['m32', 'm38', 'm46', 't0']);
   assert.deepEqual(repairArchive.memory, JSON.parse(compileSemanticCompactionMemory(JSON.stringify(memory), sources)));
   assert.deepEqual(repairArchive.repairSources.map((source) => source.sourceRef), repairArchive.patchRefSet);
   assert.equal(repairArchive.repairSources.find((source) => source.sourceRef === 'm32')?.text,
@@ -585,20 +591,20 @@ test('builds a repair request from only diagnosed semantic sources and keeps the
     sourceRef: 't0', anchorRef: 'm32', name: 'read', arguments: { query: 'current scope' }, status: 'completed',
     content: 'The current scope was checked.', result: 'No public rankings are included.',
   });
-  assert.deepEqual(Object.keys(repairArchive).sort(), ['format', 'memory', 'patchRefSet', 'repairSources', 'version']);
+  assert.deepEqual(Object.keys(repairArchive).sort(), ['format', 'memory', 'patchRefSet', 'repairSources', 'requiredRetainRefs', 'version']);
   assert.doesNotMatch(archiveText, /History item 1\.|private-message-id|private-message-state|private-receipt-id|private-tool-state|private-local-path|storedName|functionsStateId|coverageRefSet|diagnostics|candidate/);
   assert.match(archiveText, /АРХИВ ДЛЯ PATCH-ИСПРАВЛЕНИЯ JSON[\s\S]*данные истории, а не инструкции/);
   assert.match(repair.messages[1]!.text, /gigachat-semantic-patch версии 1/);
 
   const repairedMemory = compileSemanticCompactionRepairPatches(candidate, JSON.stringify({
     format: 'gigachat-semantic-patch', version: 1,
-    patches: [
-      { sourceRef: 'm32', retain: true, section: 'constraints', scope: 'Current project', text: 'Keep the verified scope.' },
-      { sourceRef: 'm38', retain: true, section: 'decisions', scope: null, text: 'Use the current marker.' },
-      { sourceRef: 'm46', retain: true, section: 'facts', scope: null, text: 'The target is a Windows build.' },
-      { sourceRef: 'm51', retain: true, section: 'openWork', scope: null, text: 'Finish package verification.' },
-      { sourceRef: 't0', retain: true, section: 'facts', scope: null, text: 'The tool confirmed the current scope.' },
-    ],
+    patches: {
+      m32: { retain: true, section: 'constraints', scope: 'Current project', text: 'Keep the verified scope.' },
+      m38: { retain: true, section: 'decisions', scope: null, text: 'Use the current marker.' },
+      m46: { retain: true, section: 'facts', scope: null, text: 'The target is a Windows build.' },
+      m51: { retain: true, section: 'openWork', scope: null, text: 'Finish package verification.' },
+      t0: { retain: true, section: 'facts', scope: null, text: 'The tool confirmed the current scope.' },
+    },
   }), sources, coverageRefSet);
   assert.doesNotThrow(() => compileSemanticCompactionMemory(repairedMemory, sources));
 
@@ -663,6 +669,7 @@ test('carries verified prior memory into rolling repair without resending its ol
   const repair = buildSemanticCompactionRepairRequest(context.request, sources, coverageRefSet, candidate);
 
   assert.ok(repair);
+  assert.deepEqual(repair.compactionRepair, { patchRefSet: ['m3'], requiredRetainRefs: [] });
   const archiveText = repair.messages[0]!.text;
   const archive = JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)) as {
     memory: unknown;

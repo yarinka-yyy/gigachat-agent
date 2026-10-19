@@ -21,7 +21,7 @@ import {
 import { validateProviderV2FunctionWire } from './provider-wire';
 import { createTurnRuntime } from './runtime';
 import type { LocalTools } from './local-tools';
-import { SEMANTIC_COMPACTION_REPAIR_RESPONSE_FORMAT } from './compaction';
+import { createSemanticCompactionRepairResponseFormat } from './compaction';
 
 const FIXED_NOW = Date.UTC(2026, 9, 9, 12);
 
@@ -1592,6 +1592,7 @@ test('serializes patch repair only as a tool-free compaction request with its st
     modelId: 'GigaChat-3-Lightning',
     usageKind: 'compaction',
     compactionFormat: 'semantic-repair-patch',
+    compactionRepair: { patchRefSet: ['m1', 'm2'], requiredRetainRefs: ['m1'] },
     functionCallMode: 'none',
   };
   const wire = JSON.parse(serializeProviderTurnRequest(request).body) as {
@@ -1601,29 +1602,49 @@ test('serializes patch repair only as a tool-free compaction request with its st
     } } };
   };
   const schema = wire.model_options.response_format.schema;
-  const patches = schema.properties.patches as { minItems: number; maxItems: number; items: {
-    required: string[]; additionalProperties: boolean; properties: Record<string, unknown>;
-  } };
+  const patches = schema.properties.patches as {
+    properties: Record<string, { anyOf: Array<{ properties: Record<string, unknown>; required: string[]; additionalProperties: boolean }> }>;
+    required: string[]; additionalProperties: boolean;
+  };
 
   assert.equal(wire.model_options.max_tokens, 4096);
   assert.equal(wire.tool_config.mode, 'none');
   assert.equal(wire.tools, undefined);
   assert.equal(wire.model_options.response_format.strict, true);
-  assert.deepEqual(wire.model_options.response_format, SEMANTIC_COMPACTION_REPAIR_RESPONSE_FORMAT);
+  assert.deepEqual(wire.model_options.response_format,
+    createSemanticCompactionRepairResponseFormat(['m1', 'm2'], ['m1']));
   assert.deepEqual(schema.required, ['format', 'version', 'patches']);
   assert.equal(schema.additionalProperties, false);
   assert.deepEqual((schema.properties.format as { enum: string[] }).enum, ['gigachat-semantic-patch']);
   assert.deepEqual((schema.properties.version as { enum: number[] }).enum, [1]);
-  assert.equal(patches.minItems, 1);
-  assert.equal(patches.maxItems, 64);
-  assert.deepEqual(patches.items.required, ['sourceRef', 'retain', 'section', 'scope', 'text']);
-  assert.equal(patches.items.additionalProperties, false);
-  assert.deepEqual((patches.items.properties.section as { enum: string[] }).enum,
-    ['constraints', 'decisions', 'openWork', 'facts', 'pastTopics', 'none']);
+  assert.deepEqual(patches.required, ['m1', 'm2']);
+  assert.equal(patches.additionalProperties, false);
+  assert.equal(patches.properties.m1?.anyOf.length, 2, 'required retain refs have no false branch');
+  assert.equal(patches.properties.m2?.anyOf.length, 3, 'other refs can be explicitly dropped');
+  assert.equal(patches.properties.m1?.anyOf.every((branch) => branch.additionalProperties === false), true);
+  assert.deepEqual((patches.properties.m1?.anyOf[0]?.properties.section as { enum: string[] }).enum, ['constraints']);
 
   assert.throws(() => serializeProviderTurnRequest({ ...request, functionCallMode: 'auto' }), (error: unknown) =>
     error instanceof GigaChatProviderError && error.category === 'protocol');
   assert.throws(() => serializeProviderTurnRequest({ ...request, usageKind: 'chat' } as unknown as ProviderTurnRequest), (error: unknown) =>
+    error instanceof GigaChatProviderError && error.category === 'protocol');
+  assert.throws(() => serializeProviderTurnRequest({ ...request, compactionRepair: undefined } as unknown as ProviderTurnRequest),
+    (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
+  assert.throws(() => serializeProviderTurnRequest({ ...request, compactionRepair: {
+    patchRefSet: ['m1'], requiredRetainRefs: [], extra: true,
+  } } as unknown as ProviderTurnRequest), (error: unknown) =>
+    error instanceof GigaChatProviderError && error.category === 'protocol');
+  assert.throws(() => serializeProviderTurnRequest({ ...request, compactionRepair: {
+    patchRefSet: ['m1', 'm1'], requiredRetainRefs: [],
+  } }), (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
+  assert.throws(() => serializeProviderTurnRequest({ ...request, compactionRepair: {
+    patchRefSet: ['m1'], requiredRetainRefs: ['m2'],
+  } }), (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
+  assert.throws(() => serializeProviderTurnRequest({ ...request, compactionFormat: 'semantic' } as unknown as ProviderTurnRequest),
+    (error: unknown) => error instanceof GigaChatProviderError && error.category === 'protocol');
+  assert.throws(() => serializeProviderTurnRequest({
+    ...request, usageKind: 'chat', compactionFormat: undefined,
+  } as unknown as ProviderTurnRequest), (error: unknown) =>
     error instanceof GigaChatProviderError && error.category === 'protocol');
 });
 
