@@ -4,8 +4,12 @@ import { lstat, mkdir, mkdtemp, readFile, realpath, rm, rmdir, stat, writeFile }
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, safeStorage, screen, session, shell, systemPreferences, Tray, WebContentsView, type IpcMainInvokeEvent, type MediaAccessPermissionRequest } from 'electron';
 import { openStore, type LocalStore } from './store';
-import { assertCompactionWireReduction, COMPACTION_QUALITY_VERIFIED, COMPACTION_UNAVAILABLE_REASON, COMPACTION_TASK_INSTRUCTION, buildNextTurnContext, validateCompactSummary } from './context';
+import { assertCompactionWireReduction, COMPACTION_QUALITY_VERIFIED, COMPACTION_UNAVAILABLE_REASON, COMPACTION_TASK_INSTRUCTION,
+  buildNextTurnContext, countEstimatedContextTextTokens, createContextTextTokenCache, estimateProviderPromptTokens,
+  validateCompactSummary } from './context';
+import { isLitePromptOverMeasuredInputGuard, LITE_OPERATIONAL_PROFILE } from './context-budget';
 import { createContextPreview } from './context-preview';
+import { createLocalTextTokenCounter } from './local-tokenizer';
 import { createLocalTools, createPowerShellHelper, resolvePowerShellHelperPath } from './local-tools';
 import { createTurnRuntime, queueAcceptedTurnOrMarkNotSent, type PreparedCompactionContext, type TurnRuntime } from './runtime';
 import type { AcceptedTurnInput, AttachmentImportBatchResult, ChatArtifact, ChatPatch, CompactSnapshot, FolderOpener, HomeDraftAttachment, HookRunResult, ModelRegistrySnapshot, NotificationSettings, PreferredOpener, RuntimeAvailability, SettingsPatch, Theme, VoiceAvailability } from './contracts';
@@ -52,6 +56,12 @@ import {
 import { validateProjectFolder } from './project-paths';
 
 const COMPACTION_MODEL_ID = 'GigaChat-3-Lightning';
+const localContextTokenCache = createContextTextTokenCache();
+const localTextTokenCounter = createLocalTextTokenCounter({
+  appPath: app.getAppPath(),
+  isPackaged: app.isPackaged,
+  resourcesPath: process.resourcesPath,
+});
 
 declare const MAIN_WINDOW_WEBPACK_ENTRY: string;
 declare const MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY: string;
@@ -941,6 +951,16 @@ async function createMainRuntime(
       assertProviderStateOwner(owner, providerStateScopeGuard, signal);
       return prepared;
     },
+    preflightProviderRequest: async (_turn, request, signal, owner) => {
+      const estimate = await estimateProviderPromptTokens(
+        request, localTextTokenCounter.countTextTokens, signal, localContextTokenCache,
+      );
+      assertProviderStateOwner(owner, providerStateScopeGuard, signal);
+      if (request.modelId === LITE_OPERATIONAL_PROFILE.modelId && isLitePromptOverMeasuredInputGuard(request, estimate)) {
+        throw Object.assign(new Error('Контекст запроса превышает проверенный безопасный предел GigaChat Lite. Уменьшите запрос или историю и повторите ход.'),
+          { category: 'context' as const });
+      }
+    },
     consumeTurn: (turn: AcceptedTurnInput, signal) => store.consumeTurnReservation(turn, signal),
     releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),
     persistTurnRecord: (turn) => store.updateRuntimeTurn(turn),
@@ -1434,6 +1454,16 @@ async function registerIpcHandlers(
         if (chatId === null) return { messages: [], receipts: [], compact: null };
         return store.getProviderStateOwnership(chatId, accountScope);
       },
+      estimateTextTokens: async (context) => {
+        const estimated = await countEstimatedContextTextTokens(
+          context, localTextTokenCounter.countTextTokens, new AbortController().signal, localContextTokenCache,
+        );
+        if (estimated.textTokenCount === null) throw new Error('LOCAL_TOKENIZER_UNAVAILABLE');
+        return estimated.textTokenCount;
+      },
+      estimatePromptTokens: (context) => estimateProviderPromptTokens(
+        context.request, localTextTokenCounter.countTextTokens, new AbortController().signal, localContextTokenCache,
+      ),
     });
   }));
   handle('chats:get', (id) => store.getChat(id));

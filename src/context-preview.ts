@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type {
   ChatDetail,
   ContextBlockSize,
@@ -6,12 +6,17 @@ import type {
   ContextPreviewRequest,
   ContextPreviewUnknownReason,
   ContextPreviewView,
+  ContextPromptEstimate,
+  ContextPromptEstimateReason,
+  ContextWorkingBudgetView,
   HomeDraftRecord,
   Project,
   Settings,
 } from './contracts';
-import { buildNextTurnContext, hashCompactionPrefix, type BuildNextTurnContextOptions, type NextTurnContextInput } from './context';
+import { buildNextTurnContext, estimateProviderPromptTokens, hashCompactionPrefix, type BuildNextTurnContextOptions, type NextTurnContext, type NextTurnContextInput } from './context';
+import { calculateLiteWorkingBudget } from './context-budget';
 import { getModelContextLimit } from './model-capabilities';
+import { LOCAL_TOKENIZER_MODEL_ID } from './local-tokenizer';
 import type { LocalStore, ProviderStateOwnershipView } from './store';
 import type { SkillRegistry } from './skills';
 
@@ -34,6 +39,8 @@ export interface ContextPreviewDependencies {
   hasActiveTurn(chatId: string): boolean;
   getProviderStateOwnership(chatId: string | null): Promise<ProviderStateOwnershipView | null>;
   buildContext?: (input: NextTurnContextInput, options?: BuildNextTurnContextOptions) => ReturnType<typeof buildNextTurnContext>;
+  estimateTextTokens?: (context: NextTurnContext) => Promise<number>;
+  estimatePromptTokens?: (context: NextTurnContext) => Promise<ContextPromptEstimate>;
 }
 
 type PreviewSourceRecord = HomeDraftRecord | ChatDetail;
@@ -80,6 +87,12 @@ function sourceSignature(source: PreviewSourceRecord): string {
       attachments: source.attachments.map(({ id, size, sha256 }) => ({ id, size, sha256 })),
     });
   }
+  const compactionMaterialSignature = createHash('sha256').update(JSON.stringify({
+    toolReceipts: source.toolReceipts.map(({ anchorMessageId, name, arguments: callArguments, content, status, result }) => ({
+      anchorMessageId, name, arguments: callArguments, content, status, result,
+    })),
+    artifacts: source.artifacts.map(({ id, name, size, sha256, messageId }) => ({ id, name, size, sha256, messageId })),
+  })).digest('hex');
   return JSON.stringify({
     id: source.id,
     projectId: source.projectId,
@@ -91,6 +104,7 @@ function sourceSignature(source: PreviewSourceRecord): string {
     compactSnapshotId: source.compactSnapshot?.id ?? null,
     compactPrefixHash: source.compactSnapshot?.coveredPrefixHash ?? null,
     compactSummary: source.compactSnapshot?.text ?? null,
+    compactionMaterialSignature,
     draftAttachments: source.draftAttachments.map(({ id, size, sha256 }) => ({ id, size, sha256 })),
     activeStoredTurn: source.turns.some((turn) => turn.status === 'queued' || turn.status === 'running'),
   });
@@ -158,6 +172,36 @@ function historicalAttachmentSummary(detail: ChatDetail | null): { count: number
 
 function activeTurnExists(detail: ChatDetail, hasActiveTurn: (chatId: string) => boolean): boolean {
   return detail.turns.some((turn) => turn.status === 'queued' || turn.status === 'running') || hasActiveTurn(detail.id);
+}
+
+function unknownPromptEstimate(reason: ContextPromptEstimateReason = 'tokenizer-unavailable'): ContextPromptEstimate {
+  return {
+    status: 'unknown', tokens: null, knownTokens: null, provenance: 'unknown',
+    wireMessageCount: null, functionCallCount: null, unknownReasons: [reason],
+  };
+}
+
+function isOptionalLocalTokenizerFailure(error: unknown): boolean {
+  return error instanceof Error && ['LOCAL_TOKENIZER_UNAVAILABLE', 'LOCAL_TOKENIZER_RESOURCE_UNAVAILABLE',
+    'LOCAL_TOKENIZER_RESOURCE_INVALID'].includes(error.message);
+}
+
+function withAttachmentContentUnknown(estimate: ContextPromptEstimate): ContextPromptEstimate {
+  const unknownReasons = [...new Set([...estimate.unknownReasons, 'attachment-content' as const])];
+  return {
+    ...estimate,
+    status: estimate.status === 'unknown' ? 'unknown' : 'partial',
+    tokens: null,
+    provenance: estimate.status === 'unknown' ? 'unknown' : 'estimated',
+    unknownReasons,
+  };
+}
+
+function unknownWorkingBudget(): ContextWorkingBudgetView {
+  return {
+    status: 'unknown', budgetTokens: null, provenance: 'unknown',
+    compactionStatus: 'unknown', compactionOverheadTokens: null, operationalProfile: null,
+  };
 }
 
 export async function createContextPreview(
@@ -243,6 +287,78 @@ export async function createContextPreview(
     } : {}),
   });
 
+  let estimatedTokens: number | null = null;
+  if (context.request.modelId === LOCAL_TOKENIZER_MODEL_ID && dependencies.estimateTextTokens) {
+    try {
+      const candidate = await dependencies.estimateTextTokens(context);
+      if (Number.isSafeInteger(candidate) && candidate >= 0) estimatedTokens = candidate;
+    } catch (error) {
+      if (!isOptionalLocalTokenizerFailure(error)) throw error;
+    }
+  }
+
+  const historyAttachments = historicalAttachmentSummary(detail);
+  let promptEstimate = unknownPromptEstimate(modelId === LOCAL_TOKENIZER_MODEL_ID ? 'tokenizer-unavailable' : 'unsupported-model');
+  let compactionOverheadTokens: number | null | undefined = null;
+  if (modelId === LOCAL_TOKENIZER_MODEL_ID && dependencies.estimatePromptTokens) {
+    try {
+      promptEstimate = await dependencies.estimatePromptTokens(context);
+    } catch (error) {
+      if (!isOptionalLocalTokenizerFailure(error)) throw error;
+      promptEstimate = unknownPromptEstimate();
+    }
+    if (detail && historyAttachments.count === 0 && !historyAttachments.metadataMissing) {
+      let completedThrough = -1;
+      for (let index = detail.messages.length - 1; index >= 0; index--) {
+        if (detail.messages[index]?.role === 'assistant') { completedThrough = index; break; }
+      }
+      if (completedThrough >= 0) {
+        try {
+          const completedMessages = detail.messages.slice(0, completedThrough + 1);
+          const completedUserIds = new Set(completedMessages.filter((message) => message.role === 'user').map((message) => message.id));
+          const completedProtocol = protocolHistory.filter((exchange) => completedUserIds.has(exchange.anchorMessageId));
+          const compactContext = buildNextTurnContext({
+            globalText: '',
+            projectInstructions: [],
+            selectedSkill: null,
+            messages: completedMessages,
+            protocolHistory: completedProtocol,
+            compactSnapshot: detail.compactSnapshot,
+            compactionToolReceipts: detail.toolReceipts,
+            compactionArtifacts: detail.artifacts,
+            permissionProfile,
+            modelId,
+            usageKind: 'compaction',
+            compactionFormat: 'semantic',
+            functionCallMode: 'none',
+          });
+          const compactEstimate = await dependencies.estimatePromptTokens(compactContext);
+          if (promptEstimate.status === 'complete' && Number.isSafeInteger(promptEstimate.tokens)
+            && compactEstimate.status === 'complete' && Number.isSafeInteger(compactEstimate.tokens)) {
+            compactionOverheadTokens = Math.max(0, compactEstimate.tokens! - promptEstimate.tokens!);
+          } else compactionOverheadTokens = undefined;
+        } catch (error) {
+          if (!isOptionalLocalTokenizerFailure(error)) throw error;
+          compactionOverheadTokens = undefined;
+        }
+      }
+    } else if (detail) {
+      compactionOverheadTokens = undefined;
+    }
+  }
+  if (pendingAttachments.length > 0 || historyAttachments.count > 0 || historyAttachments.metadataMissing) {
+    promptEstimate = withAttachmentContentUnknown(promptEstimate);
+    if (historyAttachments.count > 0 || historyAttachments.metadataMissing) compactionOverheadTokens = undefined;
+  }
+  const promptShape = {
+    wireMessageCount: promptEstimate.wireMessageCount,
+    functionCallCount: promptEstimate.functionCallCount,
+  };
+  const workingBudget = modelId === LOCAL_TOKENIZER_MODEL_ID
+    ? calculateLiteWorkingBudget(promptEstimate.status === 'complete' && promptEstimate.provenance === 'estimated'
+      ? compactionOverheadTokens : undefined, promptShape)
+    : unknownWorkingBudget();
+
   const [latestSettings, latestSource, latestProjects, latestGlobalText, latestProjectInstructions, latestSkill, latestProtocolHistory, latestOwnership] = await Promise.all([
     store.getSettings(),
     input.source === 'home' ? store.getHomeDraft() : store.getChat(input.chatId),
@@ -271,8 +387,9 @@ export async function createContextPreview(
   }
 
   const modelLimit = getModelContextLimit(modelId);
-  const historyAttachments = historicalAttachmentSummary(detail);
-  const unknownReasons = new Set<ContextPreviewUnknownReason>(['token-estimate-unavailable']);
+  const unknownReasons = new Set<ContextPreviewUnknownReason>();
+  if (estimatedTokens === null) unknownReasons.add('token-estimate-unavailable');
+  unknownReasons.add('prompt-framing-unmeasured');
   if (modelLimit.limitTokens === null) unknownReasons.add('model-limit-undocumented');
   if (pendingAttachments.length > 0) unknownReasons.add('pending-attachment-content');
   if (historyAttachments.count > 0) unknownReasons.add('historical-attachment-content');
@@ -290,8 +407,11 @@ export async function createContextPreview(
       source: modelLimit.source,
       verifiedAt: modelLimit.verifiedAt,
     },
-    estimatedTokens: null,
-    tokenEstimateProvenance: 'unknown',
+    estimatedTokens,
+    tokenEstimateProvenance: estimatedTokens === null ? 'unknown' : 'estimated',
+    tokenEstimateScope: estimatedTokens === null ? null : 'text-blocks',
+    promptEstimate,
+    workingBudget,
     preparationWireBytes: providerStateOwnership === null ? null : context.wireBytes,
     maximumWireBytes: context.maxWireBytes,
     preparationWireBytesIncludeAttachments: false,

@@ -25,6 +25,7 @@ import { LocalToolError, type LocalToolEvent, type LocalTools } from './local-to
 import { HookDispatchAbortError } from './hooks';
 import { MAX_USAGE_COUNT, mergeUsageReceipt } from './usage';
 import { compileExtractiveCompaction, type CompactionSources } from './compaction';
+import { withLiteNormalOutputCap } from './context-budget';
 import { MISSING_REMOTE_ATTACHMENT_MESSAGE, MissingRemoteAttachmentError } from './attachments';
 import { HISTORICAL_PROVIDER_STATE_ATTACHMENTS_MESSAGE, HistoricalProviderStateAttachmentsError } from './provider-state';
 import type { ProviderStateOwner } from './provider-state';
@@ -73,6 +74,8 @@ export interface TurnRuntimeOptions {
   prepareTurn(turn: AcceptedTurnInput, signal: AbortSignal): Promise<ProviderTurnRequest | PreparedTurn>;
   prepareProviderRequest?(turn: AcceptedTurnInput, request: ProviderTurnRequest, signal: AbortSignal,
     providerStateOwner?: ProviderStateOwner): Promise<ProviderTurnRequest>;
+  preflightProviderRequest?(turn: AcceptedTurnInput, request: ProviderTurnRequest, signal: AbortSignal,
+    providerStateOwner?: ProviderStateOwner): Promise<void>;
   assertProviderStateOwner?(providerStateOwner: ProviderStateOwner | undefined, signal: AbortSignal): void;
   consumeTurn(turn: AcceptedTurnInput, signal: AbortSignal): Promise<void>;
   releaseTurn(turn: AcceptedTurnInput): void;
@@ -195,6 +198,7 @@ function runtimeErrorCategory(error: unknown, turnTimedOut = false): ProviderErr
   if (!(error instanceof Error)) return undefined;
   switch (error.message) {
     case 'MODEL_NOT_SELECTED': return 'model';
+    case 'PROMPT_PREFLIGHT_TIMEOUT': return 'context';
     case 'TURN_PREPARE_TIMEOUT':
     case 'COMPACTION_CONTEXT_UNAVAILABLE':
     case 'COMPACTION_CANDIDATE_REJECTED':
@@ -914,6 +918,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         providerStateOwner = prepared.providerStateOwner;
         imageGeneration = prepared.imageGeneration ?? null;
       } else request = prepared;
+      request = withLiteNormalOutputCap(request);
       imageGenerationTurn = imageGeneration !== null;
       if (imageGeneration && (compactionContext || turn.input.operation === 'compaction')) {
         throw Object.assign(new Error('IMAGE_GENERATION_PROTOCOL'), { category: 'protocol' as const });
@@ -955,6 +960,27 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         await flushTurnPersistence();
         if (controller.signal.aborted) throw abortError();
         if (stopState.pendingToolIds.size || stopState.pendingOperationCount > 0) throw new Error('TOOL_STOP_STATE');
+        if (options.preflightProviderRequest && !imageGeneration) {
+          const requestBeforePreflight = request;
+          const requestSnapshot = JSON.stringify(request);
+          if (requestSnapshot === undefined) throw Object.assign(new Error('Контекст запроса нельзя проверить перед отправкой.'), { category: 'context' as const });
+          options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
+          const preflight = Promise.resolve().then(() =>
+            options.preflightProviderRequest!(turn.input, request, controller.signal, providerStateOwner));
+          await waitTracked(
+            preflight,
+            operationTimeoutMs,
+            'PROMPT_PREFLIGHT_TIMEOUT',
+            'Проверка размера контекста не завершена; очередь ожидает её остановки.',
+          );
+          if (controller.signal.aborted) throw abortError();
+          options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
+          let requestAfterSnapshot: string | undefined;
+          try { requestAfterSnapshot = JSON.stringify(request); } catch { requestAfterSnapshot = undefined; }
+          if (request !== requestBeforePreflight || requestAfterSnapshot === undefined || requestAfterSnapshot !== requestSnapshot) {
+            throw Object.assign(new Error('Контекст запроса изменился во время проверки; ход не отправлен.'), { category: 'context' as const });
+          }
+        }
         stopState.streamConfirmed = true;
         stopState.streamStop = null;
         naturallyDone = false;
@@ -1372,6 +1398,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
                 ? 'Выберите модель GigaChat для следующего хода.'
                 : terminalError instanceof Error && terminalError.message === 'TURN_PREPARE_TIMEOUT'
                   ? 'Подготовка хода превысила ограниченное время ожидания.'
+                  : terminalError instanceof Error && terminalError.message === 'PROMPT_PREFLIGHT_TIMEOUT'
+                    ? 'Проверка контекста превысила ограниченное время; запрос не отправлен.'
                   : terminalError instanceof Error && terminalError.message === 'COMPACTION_CANDIDATE_REJECTED'
                     ? 'Сжатие отклонено; прежний контекст сохранён.'
                   : terminalError instanceof Error && terminalError.message === 'COMPACTION_NO_REDUCTION'

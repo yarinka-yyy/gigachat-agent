@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -10,7 +11,8 @@ import type { LocalTools, LocalToolsOptions, PowerShellRequest } from './local-t
 import { createLocalTools, LocalToolError } from './local-tools';
 import { createHookApprovalGate, createHookDispatcher, createHookRegistry, HookDispatchAbortError, type HookExecutionContext } from './hooks';
 import { createTurnRuntime, queueAcceptedTurnOrMarkNotSent, type PreparedCompactionContext, type PreparedTurn, type ToolReceiptInput, type ToolReceiptStart, type TurnRuntimeOptions } from './runtime';
-import { COMPACTION_TASK_INSTRUCTION } from './context';
+import { COMPACTION_TASK_INSTRUCTION, estimateProviderPromptTokens } from './context';
+import { isLitePromptOverMeasuredInputGuard, liteHardInputLimit, withLiteNormalOutputCap } from './context-budget';
 import { createCompactionSources, serializeCompactionTranscript, type CompactionSources } from './compaction';
 import { mergeUsageReceipt } from './usage';
 import { createBalanceScopeGuard } from './usage-view';
@@ -118,6 +120,8 @@ function makeRuntime(provider: GigaChatProvider | null, options: {
   appendAssistantPrepared?: TurnRuntimeOptions['appendAssistant'];
   prepareTurn?: TurnRuntimeOptions['prepareTurn'];
   prepareProviderRequest?: TurnRuntimeOptions['prepareProviderRequest'];
+  preflightProviderRequest?: TurnRuntimeOptions['preflightProviderRequest'];
+  assertProviderStateOwner?: TurnRuntimeOptions['assertProviderStateOwner'];
   tools?: LocalTools;
   beginToolReceipt?: TurnRuntimeOptions['beginToolReceipt'];
   completeToolReceipt?: TurnRuntimeOptions['completeToolReceipt'];
@@ -135,6 +139,8 @@ function makeRuntime(provider: GigaChatProvider | null, options: {
     tools: options.tools ?? testTools,
     prepareTurn: options.prepareTurn ?? (async (turn) => requestFor(turn)),
     ...(options.prepareProviderRequest ? { prepareProviderRequest: options.prepareProviderRequest } : {}),
+    ...(options.preflightProviderRequest ? { preflightProviderRequest: options.preflightProviderRequest } : {}),
+    ...(options.assertProviderStateOwner ? { assertProviderStateOwner: options.assertProviderStateOwner } : {}),
     consumeTurn: async () => undefined,
     releaseTurn: options.releaseTurn ?? (() => undefined),
     appendAssistant: options.appendAssistantPrepared ?? (options.appendAssistant
@@ -376,6 +382,262 @@ function functionCall(name: string, args: Record<string, unknown>, functionsStat
     functionCall: { name, arguments: args, content: null, functionsStateId, terminalReason: 'function_call' },
   };
 }
+
+test('blocks an oversized initial Lite request before any provider call or usage receipt', async () => {
+  let providerCalls = 0;
+  const receipts: UsageReceipt[] = [];
+  const provider = makeProvider(async function* () {
+    providerCalls++;
+    yield { type: 'text-delta', text: 'unexpected' };
+    yield { type: 'completed' };
+  });
+  const runtime = makeRuntime(provider, {
+    prepareTurn: async (turn) => ({ ...requestFor(turn), modelId: 'GigaChat-3-Lightning' }),
+    preflightProviderRequest: async (_turn, request) => {
+      assert.equal(request.maxOutputTokens, 8_192);
+      throw Object.assign(new Error('oversized'), { category: 'context' as const });
+    },
+    recordUsageReceipt: async (receipt) => { receipts.push(structuredClone(receipt)); },
+  });
+
+  runtime.enqueue(turnFor('lite-initial-preflight'));
+  await runtime.whenIdle();
+
+  assert.equal(runtime.list('lite-initial-preflight')[0]?.status, 'failed');
+  assert.equal(runtime.list('lite-initial-preflight')[0]?.errorCategory, 'context');
+  assert.equal(providerCalls, 0);
+  assert.deepEqual(receipts, []);
+});
+
+test('preflights each tool continuation and keeps the completed tool receipt without a phantom usage receipt', async () => {
+  let providerCalls = 0;
+  let preflightCalls = 0;
+  let attachmentPreparations = 0;
+  const receipts: UsageReceipt[] = [];
+  const toolReceipts = makeReceiptStore();
+  const provider = makeProvider(async function* () {
+    providerCalls++;
+    yield functionCall('read', { path: 'fixture.txt' });
+  });
+  const runtime = makeRuntime(provider, {
+    prepareTurn: async (turn) => ({ ...requestFor(turn), modelId: 'GigaChat-3-Lightning', functionCallMode: 'auto' }),
+    prepareProviderRequest: async (_turn, request) => { attachmentPreparations++; return request; },
+    preflightProviderRequest: async (_turn, request) => {
+      preflightCalls++;
+      assert.equal(request.maxOutputTokens, 8_192);
+      if (preflightCalls === 2) throw Object.assign(new Error('continuation too large'), { category: 'context' as const });
+    },
+    tools: { read: async () => ({ contents: 'fixture result' }) } as unknown as LocalTools,
+    beginToolReceipt: toolReceipts.begin,
+    completeToolReceipt: async (turn, receiptId, status, result) => {
+      await toolReceipts.complete(turn, receiptId, status, result);
+    },
+    recordUsageReceipt: async (receipt) => {
+      const index = receipts.findIndex((item) => item.localRequestId === receipt.localRequestId);
+      if (index < 0) receipts.push(structuredClone(receipt));
+      else receipts[index] = structuredClone(receipt);
+    },
+  });
+
+  runtime.enqueue(turnFor('lite-tool-continuation'));
+  await runtime.whenIdle();
+
+  assert.equal(runtime.list('lite-tool-continuation')[0]?.status, 'failed');
+  assert.equal(runtime.list('lite-tool-continuation')[0]?.errorCategory, 'context');
+  assert.equal(providerCalls, 1);
+  assert.equal(preflightCalls, 2);
+  assert.equal(attachmentPreparations, 1, 'attachment preparation remains once per accepted turn');
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0]?.status, 'completed');
+  assert.equal(toolReceipts.receipts.size, 1);
+  assert.equal([...toolReceipts.receipts.values()][0]?.status, 'completed');
+});
+
+test('cancel, account-owner change, and request mutation during preflight never dispatch a provider call', async () => {
+  for (const mode of ['cancel', 'owner-change', 'request-mutation'] as const) {
+    let providerCalls = 0;
+    let ownerChecks = 0;
+    const preflightStarted = deferred();
+    const finishPreflight = deferred();
+    const receipts: UsageReceipt[] = [];
+    const provider = makeProvider(async function* () {
+      providerCalls++;
+      yield { type: 'text-delta', text: 'unexpected' };
+      yield { type: 'completed' };
+    });
+    const runtime = makeRuntime(provider, {
+      prepareTurn: async (turn) => ({ ...requestFor(turn), modelId: 'GigaChat-3-Lightning' }),
+      preflightProviderRequest: async (_turn, request) => {
+        preflightStarted.resolve();
+        if (mode === 'cancel') await finishPreflight.promise;
+        if (mode === 'request-mutation') request.messages[0]!.text += ' changed';
+      },
+      assertProviderStateOwner: () => {
+        ownerChecks++;
+        if (mode === 'owner-change' && ownerChecks === 3) throw new Error('account owner changed');
+      },
+      recordUsageReceipt: async (receipt) => { receipts.push(structuredClone(receipt)); },
+    });
+    const turnId = runtime.enqueue(turnFor(`lite-preflight-${mode}`));
+    assert.ok(turnId);
+    await preflightStarted.promise;
+    if (mode === 'cancel') {
+      assert.equal(runtime.cancel(turnId), true);
+      await waitUntil(() => runtime.list(`lite-preflight-${mode}`)[0]?.error
+        ?.includes('очередь ожидает её остановки') === true);
+      finishPreflight.resolve();
+      await waitUntil(() => runtime.list(`lite-preflight-${mode}`)[0]?.status === 'cancelled');
+    }
+    await runtime.whenIdle();
+    assert.equal(providerCalls, 0, mode);
+    assert.deepEqual(receipts, [], mode);
+  }
+});
+
+test('a real serialized Lite estimate blocks only a tool continuation whose result crosses the measured input guard', async () => {
+  const byteCounter = async (_model: string, texts: readonly string[]) => texts.map((text) => Buffer.byteLength(text, 'utf8'));
+  const seedRequest = withLiteNormalOutputCap({
+    ...requestFor(turnFor('lite-budget-seed', 'x')),
+    modelId: 'GigaChat-3-Lightning',
+    functionCallMode: 'auto' as const,
+  });
+  const seedEstimate = await estimateProviderPromptTokens(seedRequest, byteCounter, new AbortController().signal);
+  assert.equal(seedEstimate.status, 'complete');
+  const limit = liteHardInputLimit(seedRequest, {
+    wireMessageCount: seedEstimate.wireMessageCount,
+    functionCallCount: seedEstimate.functionCallCount,
+  });
+  assert.ok(limit !== null);
+  const initialTextLength = limit - 100 - seedEstimate.tokens! + 1;
+  assert.ok(initialTextLength > 0);
+
+  let providerCalls = 0;
+  let preflightCalls = 0;
+  const estimates: number[] = [];
+  const usageReceipts: UsageReceipt[] = [];
+  const toolReceipts = makeReceiptStore();
+  const provider = makeProvider(async function* () {
+    providerCalls++;
+    yield functionCall('read', { path: 'fixture.txt' });
+  });
+  const runtime = makeRuntime(provider, {
+    prepareTurn: async (turn) => withLiteNormalOutputCap({
+      ...requestFor(turn), modelId: 'GigaChat-3-Lightning', functionCallMode: 'auto' as const,
+    }),
+    preflightProviderRequest: async (_turn, request, signal) => {
+      preflightCalls++;
+      const estimate = await estimateProviderPromptTokens(request, byteCounter, signal);
+      assert.equal(estimate.status, 'complete');
+      estimates.push(estimate.tokens!);
+      if (isLitePromptOverMeasuredInputGuard(request, estimate)) {
+        throw Object.assign(new Error('measured input over Lite guard'), { category: 'context' as const });
+      }
+    },
+    tools: { read: async () => ({ contents: 'tool-result-'.repeat(100) }) } as unknown as LocalTools,
+    beginToolReceipt: toolReceipts.begin,
+    completeToolReceipt: toolReceipts.complete,
+    recordUsageReceipt: async (receipt) => {
+      const index = usageReceipts.findIndex((item) => item.localRequestId === receipt.localRequestId);
+      if (index < 0) usageReceipts.push(structuredClone(receipt));
+      else usageReceipts[index] = structuredClone(receipt);
+    },
+  });
+
+  runtime.enqueue(turnFor('lite-real-estimator', 'x'.repeat(initialTextLength)));
+  await runtime.whenIdle();
+
+  assert.equal(estimates.length, 2);
+  assert.ok(estimates[0]! < limit, 'the initial serialized prompt is below the measured guard');
+  assert.ok(estimates[1]! > limit, 'the actual serialized tool result pushes the continuation over the guard');
+  assert.equal(preflightCalls, 2);
+  assert.equal(providerCalls, 1, 'the over-budget continuation is refused before a second stream');
+  assert.equal(runtime.list('lite-real-estimator')[0]?.status, 'failed');
+  assert.equal(runtime.list('lite-real-estimator')[0]?.errorCategory, 'context');
+  assert.equal(usageReceipts.length, 1, 'the rejected continuation creates no phantom usage receipt');
+  assert.equal(usageReceipts[0]?.status, 'completed');
+  assert.equal(toolReceipts.receipts.size, 1);
+  assert.equal([...toolReceipts.receipts.values()][0]?.status, 'completed');
+});
+
+test('a native resource-integrity denial keeps the optional prompt estimate unknown and allows the normal runtime path', async () => {
+  let providerCalls = 0;
+  const usageReceipts = new Map<string, UsageReceipt>();
+  const provider = makeProvider(async function* () {
+    providerCalls++;
+    yield { type: 'text-delta', text: 'normal response' };
+    yield { type: 'completed' };
+  });
+  const runtime = makeRuntime(provider, {
+    prepareTurn: async (turn) => withLiteNormalOutputCap({
+      ...requestFor(turn), modelId: 'GigaChat-3-Lightning', functionCallMode: 'auto' as const,
+    }),
+    preflightProviderRequest: async (_turn, request, signal) => {
+      const estimate = await estimateProviderPromptTokens(request, async () => {
+        throw new Error('LOCAL_TOKENIZER_RESOURCE_INVALID');
+      }, signal);
+      assert.equal(estimate.status, 'unknown');
+      assert.equal(estimate.provenance, 'unknown');
+      assert.equal(isLitePromptOverMeasuredInputGuard(request, estimate), false,
+        'an unknown optional estimate cannot become a hard refusal');
+    },
+    recordUsageReceipt: async (receipt) => saveUsageReceipt(usageReceipts, receipt),
+  });
+
+  runtime.enqueue(turnFor('lite-resource-invalid-fallback', 'small prompt'));
+  await runtime.whenIdle();
+
+  assert.equal(providerCalls, 1);
+  assert.equal(runtime.list('lite-resource-invalid-fallback')[0]?.status, 'completed');
+  assert.equal(runtime.list('lite-resource-invalid-fallback')[0]?.errorCategory, undefined);
+  assert.equal([...usageReceipts.values()][0]?.status, 'completed');
+});
+
+test('a timed-out or cancelled unresolved preflight holds FIFO and recovers only after late completion', async () => {
+  for (const mode of ['timeout', 'cancel'] as const) {
+    const entered = deferred();
+    const finish = deferred();
+    let providerCalls = 0;
+    const receipts: UsageReceipt[] = [];
+    const provider = makeProvider(async function* () {
+      providerCalls++;
+      yield { type: 'text-delta', text: 'second turn response' };
+      yield { type: 'completed' };
+    });
+    const runtime = makeRuntime(provider, {
+      prepareTurn: async (turn) => ({ ...requestFor(turn), modelId: 'GigaChat-3-Lightning' }),
+      preflightProviderRequest: async (turn) => {
+        if (turn.chatId === `preflight-${mode}-blocked`) {
+          entered.resolve();
+          await finish.promise;
+        }
+      },
+      recordUsageReceipt: async (receipt) => {
+        const index = receipts.findIndex((item) => item.localRequestId === receipt.localRequestId);
+        if (index < 0) receipts.push(structuredClone(receipt));
+        else receipts[index] = structuredClone(receipt);
+      },
+      timeouts: { operationMs: 25 },
+    });
+    const blockedId = runtime.enqueue(turnFor(`preflight-${mode}-blocked`));
+    assert.ok(blockedId);
+    runtime.enqueue(turnFor(`preflight-${mode}-next`));
+    await entered.promise;
+    if (mode === 'cancel') assert.equal(runtime.cancel(blockedId), true);
+    await waitUntil(() => runtime.list(`preflight-${mode}-blocked`)[0]?.error
+      ?.includes('очередь ожидает её остановки') === true);
+    assert.equal(providerCalls, 0);
+    assert.equal(receipts.length, 0);
+    assert.equal(runtime.list(`preflight-${mode}-next`)[0]?.status, 'queued');
+
+    finish.resolve();
+    await waitUntil(() => runtime.list(`preflight-${mode}-blocked`)[0]?.status === (mode === 'cancel' ? 'cancelled' : 'failed')
+      && runtime.list(`preflight-${mode}-next`)[0]?.status === 'completed');
+    assert.equal(runtime.list(`preflight-${mode}-blocked`)[0]?.errorCategory, mode === 'cancel' ? 'cancel' : 'context');
+    assert.equal(providerCalls, 1, 'only the next queued turn streams after the preflight operation settles');
+    assert.equal(receipts.length, 1);
+    assert.equal(receipts[0]?.chatId, `preflight-${mode}-next`);
+  }
+});
 
 test('runtime keeps the FIFO turn running until assistant and completed turn persist atomically', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'gigachat-runtime-turn-commit-'));

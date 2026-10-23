@@ -1,2 +1,3 @@
 resources/voice/LICENSE.silero-vad -text
 vendor/braces/** -text
+resources/tokenizer/tokenizer.json -text

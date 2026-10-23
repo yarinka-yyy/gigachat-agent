@@ -2,9 +2,12 @@ import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
 import { test } from 'node:test';
 import type { ChatArtifact, ChatDetail, ChatMessage, ChatToolReceipt, CompactSnapshot, ProviderProtocolExchange } from './contracts';
-import { assertCompactionWireReduction, buildNextTurnContext, buildSemanticCompactionReviewRequest, COMPACTION_TASK_INSTRUCTION, countContextTextTokens,
-  hashCompactionPrefix, SEMANTIC_COMPACTION_TASK_INSTRUCTION, validateCompactSummary } from './context';
+import { assertCompactionWireReduction, buildNextTurnContext, buildSemanticCompactionReviewRequest, COMPACTION_TASK_INSTRUCTION,
+  countContextTextTokens, countEstimatedContextTextTokens, createContextTextTokenCache, hashCompactionPrefix,
+  estimateProviderPromptTokens, estimateSerializedProviderPrompt, readContextTextTokenCacheCoverage,
+  SEMANTIC_COMPACTION_TASK_INSTRUCTION, validateCompactSummary } from './context';
 import { GigaChatProviderError, MAX_PROVIDER_REQUEST_BYTES, serializeProviderTurnRequest } from './gigachat-provider';
+import { calculateLiteWorkingBudget, isLitePromptOverMeasuredInputGuard, liteHardInputLimit } from './context-budget';
 import { compileExtractiveCompaction, compileSemanticCompactionMemory,
   createCompactionSources, getSemanticCompactionCoverageRefSet } from './compaction';
 
@@ -35,6 +38,12 @@ function input(messages: ChatMessage[], extra: Partial<Parameters<typeof buildNe
     modelId: 'vendor/model.v4:preview',
     ...extra,
   };
+}
+
+function textCountContext(textInputs: string[], modelId = 'cache-model') {
+  const context = buildNextTurnContext(input([user('text-count-anchor')], { modelId }));
+  context.textInputs = textInputs;
+  return context;
 }
 
 function stateDetail(messages: ChatMessage[], toolReceipts: ChatDetail['toolReceipts'] = []): ChatDetail {
@@ -376,7 +385,18 @@ test('prepares a semantic request from the whole supplied raw prefix without exp
 
   assert.equal(context.request.compactionFormat, 'semantic');
   assert.equal(context.request.functionCallMode, 'none');
-  assert.equal(context.request.messages[1]?.text, SEMANTIC_COMPACTION_TASK_INSTRUCTION);
+  assert.equal(context.request.messages.length, 1, 'the archive is the only source user message');
+  assert.equal(context.request.messages[0]?.text, transcript);
+  assert.deepEqual(context.request.system[context.request.system.length - 1], {
+    source: 'runtime', label: 'Задача текущего запроса', text: SEMANTIC_COMPACTION_TASK_INSTRUCTION,
+  });
+  assert.equal(context.request.system.filter((layer) => layer.text === SEMANTIC_COMPACTION_TASK_INSTRUCTION).length, 1);
+  const semanticWire = JSON.parse(serializeProviderTurnRequest(context.request).body) as {
+    messages: Array<{ role: string; content: Array<{ text?: string }> }>;
+  };
+  assert.deepEqual(semanticWire.messages.map(({ role }) => role), ['system', 'user']);
+  assert.equal(semanticWire.messages[1]?.content[0]?.text, transcript);
+  assert.equal((semanticWire.messages[0]?.content[0]?.text ?? '').split(SEMANTIC_COMPACTION_TASK_INSTRUCTION).length - 1, 1);
   assert.match(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /не обязательно ссылаться на каждый исходник/i);
   assert.doesNotMatch(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /coverageRefSet|retain=true|решение на каждое сообщение/i);
   assert.match(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /действующее ограничение.*сохраняй в constraints/i);
@@ -407,6 +427,30 @@ test('prepares a semantic request from the whole supplied raw prefix without exp
   const migratedInput = JSON.parse(migrated.request.messages[0]!.text.slice(migrated.request.messages[0]!.text.indexOf('\n') + 1)) as typeof envelope;
   assert.equal(migratedInput.previousMemory, null, 'a v1 extractive snapshot migrates from raw messages, not its old selection');
   assert.equal(migratedInput.messages.length, messages.length);
+});
+
+test('preflights the complete provider wire for semantic archives with more than 64 source refs', () => {
+  const messages = Array.from({ length: 66 }, (_, index) => index % 2 === 0
+    ? user(`semantic-large-user-${index}`, `History item ${index}.`)
+    : assistant(`semantic-large-assistant-${index}`, `History item ${index}.`));
+  const receipts: ChatToolReceipt[] = [0, 64].map((index) => ({
+    receiptId: `semantic-large-receipt-${index}`, anchorMessageId: messages[index]!.id, name: 'read', arguments: { index },
+    content: `Read content ${index}.`, functionsStateId: null, status: 'completed',
+    result: `Tool result ${index}.`, createdAt: at,
+  }));
+  const context = buildNextTurnContext(input(messages, {
+    usageKind: 'compaction', compactionFormat: 'semantic',
+    compactionToolReceipts: receipts, compactionArtifacts: [],
+  }));
+  const archive = context.request.messages[0]?.text ?? '';
+  const envelope = JSON.parse(archive.slice(archive.indexOf('\n') + 1)) as { coverageRefSet: string[] };
+  const serialized = serializeProviderTurnRequest(context.request);
+
+  assert.deepEqual(envelope.coverageRefSet, [...messages.map((_, index) => `m${index}`), 't0', 't1']);
+  assert.equal(context.wireBytes, serialized.wireBytes);
+  assert.equal(context.maxWireBytes, MAX_PROVIDER_REQUEST_BYTES);
+  assert.deepEqual(context.textInputs, serialized.textInputs);
+  assert.ok(serialized.wireBytes <= MAX_PROVIDER_REQUEST_BYTES);
 });
 
 test('rolls semantic compaction forward with stable global refs and only the newly covered suffix', () => {
@@ -541,29 +585,43 @@ test('builds an independent semantic review from the exact current archive and a
   const review = buildSemanticCompactionReviewRequest(context.request, sources, sourceRefs, candidate);
 
   assert.ok(review);
+  const reviewTaskLayer = review.system[review.system.length - 1]!;
   assert.deepEqual(context.request, originalRequest, 'review preparation does not mutate the original request');
-  assert.deepEqual(review.system, originalRequest.system);
+  assert.deepEqual(review.system.slice(0, -1), originalRequest.system.slice(0, -1));
+  assert.equal(review.system.length, originalRequest.system.length);
+  assert.equal(reviewTaskLayer.source, 'runtime');
+  assert.equal(reviewTaskLayer.label, 'Задача текущего запроса');
+  assert.match(reviewTaskLayer.text, /^Независимо проверь черновик semantic-памяти/);
+  assert.notEqual(reviewTaskLayer.text, SEMANTIC_COMPACTION_TASK_INSTRUCTION);
+  assert.equal(review.system.filter((layer) => layer.label === 'Задача текущего запроса').length, 1);
+  assert.equal(review.system.filter((layer) => layer.text === SEMANTIC_COMPACTION_TASK_INSTRUCTION).length, 0);
   assert.equal(review.modelId, originalRequest.modelId);
+  assert.equal(review.permissionProfile, originalRequest.permissionProfile);
   assert.equal(review.usageKind, 'compaction');
   assert.equal(review.compactionFormat, 'semantic');
   assert.equal(Object.prototype.hasOwnProperty.call(review, 'compactionRepair'), false);
   assert.equal(review.functionCallMode, 'none');
   assert.equal(review.maxOutputTokens, 4096);
-  assert.equal(review.messages.length, 3);
-  assert.deepEqual(review.messages.map(({ role }) => role), ['user', 'user', 'user']);
+  assert.equal(review.messages.length, 2);
+  assert.deepEqual(review.messages.map(({ role }) => role), ['user', 'user']);
   assert.equal(review.messages[0]?.text, context.request.messages[0]?.text, 'review reuses the exact source archive');
   assert.match(review.messages[1]?.text ?? '', /^ЧЕРНОВИК SEMANTIC-ПАМЯТИ JSON/);
   assert.match(review.messages[1]?.text ?? '', /Review the Windows build/);
-  assert.match(review.messages[2]?.text ?? '', /Независимо проверь черновик semantic-памяти/);
+  assert.doesNotMatch(review.messages.map(({ text }) => text).join('\n'), /Независимо проверь черновик semantic-памяти/);
 
   const reviewWire = serializeProviderTurnRequest(review);
   assert.ok(reviewWire.wireBytes <= MAX_PROVIDER_REQUEST_BYTES);
   const wire = JSON.parse(reviewWire.body) as {
     tools?: unknown[]; tool_config: { mode: string };
-    messages: Array<{ role: string }>;
+    messages: Array<{ role: string; content: Array<{ text?: string }> }>;
     model_options: { response_format: { schema: { required: string[]; properties: Record<string, unknown> } } };
   };
-  assert.deepEqual(wire.messages.map(({ role }) => role), ['system', 'user', 'user', 'user']);
+  assert.deepEqual(wire.messages.map(({ role }) => role), ['system', 'user', 'user']);
+  const systemText = wire.messages[0]?.content[0]?.text ?? '';
+  assert.equal(systemText.split(reviewTaskLayer.text).length - 1, 1);
+  assert.equal(systemText.split(SEMANTIC_COMPACTION_TASK_INSTRUCTION).length - 1, 0);
+  assert.equal(wire.messages[1]?.content[0]?.text, review.messages[0]?.text);
+  assert.equal(wire.messages[2]?.content[0]?.text, review.messages[1]?.text);
   assert.equal(wire.tool_config.mode, 'none');
   assert.equal(wire.tools, undefined);
   assert.deepEqual(wire.model_options.response_format.schema.required,
@@ -588,6 +646,22 @@ test('builds an independent semantic review from the exact current archive and a
   assert.equal(buildSemanticCompactionReviewRequest(context.request, sources, sourceRefs, '{'), null);
   assert.equal(buildSemanticCompactionReviewRequest({ ...context.request, functionCallMode: 'auto' }, sources, sourceRefs, candidate), null);
   assert.equal(buildSemanticCompactionReviewRequest({ ...context.request, usageKind: 'chat' }, sources, sourceRefs, candidate), null);
+  const taskLayer = originalRequest.system[originalRequest.system.length - 1]!;
+  const invalidTaskRequests = [
+    { ...originalRequest, system: [...originalRequest.system, { ...taskLayer }] },
+    { ...originalRequest, system: originalRequest.system.map((layer) => layer === taskLayer ? { ...layer, text: 'Changed task' } : layer) },
+    { ...originalRequest, system: originalRequest.system.map((layer) => layer === taskLayer ? { ...layer, source: 'global' as const } : layer) },
+    { ...originalRequest, system: originalRequest.system.map((layer) => layer === taskLayer ? { ...layer, scope: 'project' } : layer) },
+    { ...originalRequest, system: [...originalRequest.system.slice(0, -1), { ...taskLayer, label: 'Другой слой' }] },
+  ];
+  for (const invalidRequest of invalidTaskRequests) {
+    assert.equal(buildSemanticCompactionReviewRequest(invalidRequest, sources, sourceRefs, candidate), null,
+      'review rejects duplicate or noncanonical service task layers');
+  }
+  const invalidArchiveRequest = { ...originalRequest, messages: [
+    { ...originalRequest.messages[0]!, text: undefined as unknown as string },
+  ] };
+  assert.equal(buildSemanticCompactionReviewRequest(invalidArchiveRequest, sources, sourceRefs, candidate), null);
 
   const changedSources = createCompactionSources([
     { ...messages[0]!, text: 'Changed source.' }, messages[1]!,
@@ -676,11 +750,531 @@ test('bounds the complete wire payload including all function schemas and counts
   assert.equal(context.blocks.find((block) => block.source === 'function-schema')?.label, 'Схема инструментов');
 
   const measured = await countContextTextTokens(context, {
-    countTokens: async (_model, inputs) => inputs.map((text) => ({ object: 'tokens' as const, tokens: 2, characters: text.length })),
+    countTokens: async (_model, inputs) => inputs.map((text) => ({ object: 'tokens' as const, tokens: 2, characters: [...text].length })),
   }, new AbortController().signal);
   assert.equal(measured.textTokenCount, serialized.textInputs.length * 2);
   assert.equal(measured.textCountProvenance, 'verified');
   assert.equal(measured.provenance, 'unknown');
+});
+
+test('estimates actual serialized wire text, function calls, results, tool schema, and framing once', async () => {
+  const request = buildNextTurnContext(input([user('estimate-user', 'Read the file.')], {
+    modelId: 'GigaChat-3-Lightning',
+    protocolHistory: [{
+      anchorMessageId: 'estimate-user', name: 'read', arguments: { path: 'notes.txt' }, content: null,
+      functionsStateId: null, result: '{"ok":true,"result":"Found the requested note."}',
+    }],
+  })).request;
+  const serialized = serializeProviderTurnRequest(request);
+  const payload = JSON.parse(serialized.body) as {
+    messages: Array<{ role: string; content: Array<Record<string, unknown>> }>;
+    tools: Array<{ functions: { specifications: unknown[] } }>;
+  };
+  const countedTexts: string[] = [];
+  const countTextTokens = async (_model: string, texts: readonly string[]) => {
+    countedTexts.push(...texts);
+    return texts.map((text) => [...text].length);
+  };
+  const estimate = await estimateProviderPromptTokens(request, countTextTokens, new AbortController().signal,
+    createContextTextTokenCache());
+  const visibleTexts = payload.messages.flatMap((message) => message.content.flatMap((part) => {
+    if (typeof part.text === 'string') return [part.text];
+    if (typeof part.function_call === 'object' && part.function_call !== null) {
+      const call = part.function_call as { name: string; arguments: unknown };
+      return [call.name, JSON.stringify(call.arguments)];
+    }
+    if (typeof part.function_result === 'object' && part.function_result !== null) {
+      return [(part.function_result as { result: string }).result];
+    }
+    return [];
+  }));
+  const schemaText = JSON.stringify(payload.tools);
+  const visibleTokens = [...visibleTexts, schemaText].reduce((sum, text) => sum + [...text].length, 0);
+
+  assert.deepEqual(estimate, {
+    status: 'complete', tokens: visibleTokens + 7 + 5 * payload.messages.length - 44 + 14,
+    knownTokens: visibleTokens, provenance: 'estimated', wireMessageCount: payload.messages.length,
+    functionCallCount: 1, unknownReasons: [],
+  });
+  assert.ok(countedTexts.includes('read'));
+  assert.ok(countedTexts.includes('{"path":"notes.txt"}'));
+  assert.ok(countedTexts.includes('{"ok":true,"result":"Found the requested note."}'));
+  assert.ok(countedTexts.includes(schemaText));
+  assert.equal(request.maxOutputTokens, 8_192);
+  assert.equal(serialized.body, serializeProviderTurnRequest(request).body, 'estimation leaves the provider serializer input untouched');
+
+  const callWithOpaqueField = JSON.parse(serialized.body) as {
+    messages: Array<{ content: Array<Record<string, unknown>>; tools_state_id?: string }>;
+  };
+  const functionPart = callWithOpaqueField.messages.flatMap((message) => message.content)
+    .find((part) => typeof part.function_call === 'object' && part.function_call !== null)!;
+  (functionPart.function_call as Record<string, unknown>).id = 'opaque-call-id';
+  const opaqueCallEstimate = await estimateSerializedProviderPrompt(JSON.stringify(callWithOpaqueField), request,
+    countTextTokens, new AbortController().signal);
+  assert.equal(opaqueCallEstimate.status, 'partial');
+  assert.ok(opaqueCallEstimate.unknownReasons.includes('unsupported-wire-component'));
+
+  const longHistory = JSON.parse(serialized.body) as { messages: Array<{ role: string; content: Array<Record<string, unknown>> }> };
+  const oneMessage = longHistory.messages.find((message) => message.role === 'user')!;
+  longHistory.messages = Array.from({ length: 47 }, () => structuredClone(oneMessage));
+  const outsideDomain = await estimateSerializedProviderPrompt(JSON.stringify(longHistory), request,
+    countTextTokens, new AbortController().signal);
+  assert.equal(outsideDomain.status, 'complete');
+  assert.equal(outsideDomain.provenance, 'estimated');
+  assert.equal(outsideDomain.tokens, outsideDomain.knownTokens! + 7 + 5 * longHistory.messages.length - 44);
+  assert.equal(outsideDomain.wireMessageCount, 47);
+  assert.equal(outsideDomain.functionCallCount, 0);
+  assert.deepEqual(outsideDomain.unknownReasons, []);
+  assert.ok(outsideDomain.knownTokens !== null);
+
+  const messageOverflow = JSON.parse(serialized.body) as typeof payload;
+  messageOverflow.messages = Array.from({ length: 2_051 }, () => structuredClone(oneMessage));
+  const longEstimate = await estimateSerializedProviderPrompt(JSON.stringify(messageOverflow), request,
+    countTextTokens, new AbortController().signal);
+  assert.equal(longEstimate.status, 'complete');
+  assert.equal(longEstimate.provenance, 'estimated');
+  assert.equal(longEstimate.wireMessageCount, 2_051);
+  assert.equal(longEstimate.functionCallCount, 0);
+  assert.deepEqual(longEstimate.unknownReasons, []);
+  const longShape = { wireMessageCount: longEstimate.wireMessageCount, functionCallCount: longEstimate.functionCallCount };
+  const longBudget = calculateLiteWorkingBudget(null, longShape);
+  assert.equal(longBudget.status, 'available');
+  assert.equal(longBudget.operationalProfile?.calibrationDomainStatus, 'extrapolated');
+  assert.equal(longBudget.operationalProfile?.appliedErrorReserveTokens, 12_073);
+  assert.equal(liteHardInputLimit(request, longShape), null);
+  assert.equal(isLitePromptOverMeasuredInputGuard(request, longEstimate), false,
+    'the extrapolated prompt gets a soft operational budget but no unvalidated hard refusal');
+
+  const callOverflow = JSON.parse(serialized.body) as typeof payload;
+  callOverflow.messages = Array.from({ length: 33 }, () => [
+    { role: 'assistant', content: [{ function_call: { name: 'read', arguments: { path: 'notes.txt' } } }] },
+    { role: 'tool', content: [{ function_result: { name: 'read', result: 'Found the requested note.' } }] },
+  ]).flat();
+  const callEstimate = await estimateSerializedProviderPrompt(JSON.stringify(callOverflow), request,
+    countTextTokens, new AbortController().signal);
+  assert.equal(callEstimate.status, 'complete');
+  assert.equal(callEstimate.wireMessageCount, 66);
+  assert.equal(callEstimate.functionCallCount, 33);
+  assert.deepEqual(callEstimate.unknownReasons, []);
+  const callBudget = calculateLiteWorkingBudget(null, {
+    wireMessageCount: callEstimate.wireMessageCount, functionCallCount: callEstimate.functionCallCount,
+  });
+  assert.equal(callBudget.operationalProfile?.calibrationDomainStatus, 'extrapolated');
+  assert.equal(callBudget.operationalProfile?.appliedErrorReserveTokens, 2_582);
+  assert.equal(liteHardInputLimit(request, {
+    wireMessageCount: callEstimate.wireMessageCount, functionCallCount: callEstimate.functionCallCount,
+  }), null);
+});
+
+test('includes response schema in semantic estimates and marks unknown wire, file, state, and schema components partial', async () => {
+  const semanticContext = buildNextTurnContext(input([user('semantic-estimate', 'Archive this prefix.')], {
+    modelId: 'GigaChat-3-Lightning', usageKind: 'compaction', compactionFormat: 'semantic',
+    functionCallMode: 'none', compactionToolReceipts: [], compactionArtifacts: [],
+  }));
+  const semanticBody = serializeProviderTurnRequest(semanticContext.request).body;
+  const semanticPayload = JSON.parse(semanticBody) as { model_options: { response_format: unknown } };
+  const counted: string[] = [];
+  const counter = async (_model: string, texts: readonly string[]) => {
+    counted.push(...texts);
+    return texts.map((text) => [...text].length);
+  };
+  const semanticEstimate = await estimateProviderPromptTokens(semanticContext.request, counter, new AbortController().signal);
+  assert.equal(semanticEstimate.status, 'complete');
+  assert.equal(semanticEstimate.provenance, 'estimated');
+  assert.ok(counted.includes(JSON.stringify(semanticPayload.model_options.response_format)));
+  const tamperedResponse = JSON.parse(semanticBody) as { model_options: { response_format: Record<string, unknown> } };
+  tamperedResponse.model_options.response_format.extra = true;
+  const responseEstimate = await estimateSerializedProviderPrompt(JSON.stringify(tamperedResponse), semanticContext.request,
+    counter, new AbortController().signal);
+  assert.equal(responseEstimate.status, 'partial');
+  assert.ok(responseEstimate.unknownReasons.includes('unrecognized-response-schema'));
+
+  const normalContext = buildNextTurnContext(input([user('tamper-user', 'Question')], {
+    modelId: 'GigaChat-3-Lightning', functionCallMode: 'none',
+  }));
+  const normalRequest = normalContext.request;
+  const base = JSON.parse(serializeProviderTurnRequest(normalRequest).body) as Record<string, unknown> & {
+    messages: Array<{ role: string; content: Array<Record<string, unknown>>; tools_state_id?: string }>;
+    tools?: Array<{ functions: { specifications: Array<Record<string, unknown>> } }>;
+  };
+  const variants: Array<{ body: string; reason: string }> = [];
+  const withFile = structuredClone(base);
+  withFile.messages.find((message) => message.role === 'user')!.content.push({ files: [{ id: 'opaque-file' }] });
+  variants.push({ body: JSON.stringify(withFile), reason: 'attachment-content' });
+  const withOpaqueState = structuredClone(base);
+  withOpaqueState.messages[0]!.tools_state_id = 'opaque-state';
+  variants.push({ body: JSON.stringify(withOpaqueState), reason: 'opaque-function-state' });
+  const withUnknownTopLevel = { ...base, future_field: { private: true } };
+  variants.push({ body: JSON.stringify(withUnknownTopLevel), reason: 'unsupported-wire-component' });
+  const withTamperedOptions = structuredClone(base);
+  withTamperedOptions.model_options = { parallel_tool_calls: false, max_tokens: 8_191 };
+  variants.push({ body: JSON.stringify(withTamperedOptions), reason: 'unsupported-wire-component' });
+  for (const variant of variants) {
+    const partial = await estimateSerializedProviderPrompt(variant.body, normalRequest, counter, new AbortController().signal);
+    assert.equal(partial.status, 'partial');
+    assert.equal(partial.tokens, null);
+    assert.equal(partial.provenance, 'estimated');
+    assert.ok(partial.unknownReasons.includes(variant.reason as typeof partial.unknownReasons[number]));
+  }
+
+  const withUnknownToolSchema = JSON.parse(serializeProviderTurnRequest(
+    buildNextTurnContext(input([user('tool-schema-user')], { modelId: 'GigaChat-3-Lightning' })).request,
+  ).body) as Record<string, unknown> & { tools: Array<{ functions: { specifications: Array<Record<string, unknown>> } }> };
+  withUnknownToolSchema.tools[0]!.functions.specifications[0]!.description = 'Schema changed';
+  const unknownSchema = await estimateSerializedProviderPrompt(JSON.stringify(withUnknownToolSchema), {
+    ...buildNextTurnContext(input([user('tool-schema-user')], { modelId: 'GigaChat-3-Lightning' })).request,
+  }, counter, new AbortController().signal);
+  assert.equal(unknownSchema.status, 'partial');
+  assert.ok(unknownSchema.unknownReasons.includes('unrecognized-tool-schema'));
+});
+
+test('reuses bounded prompt-token cache, validates request snapshots, cancellation, unsupported models, and overflow', async () => {
+  const request = buildNextTurnContext(input([user('estimate-cache', 'A short request.')], {
+    modelId: 'GigaChat-3-Lightning', functionCallMode: 'none',
+  })).request;
+  const cache = createContextTextTokenCache();
+  let calls = 0;
+  const counter = async (_model: string, texts: readonly string[]) => { calls++; return texts.map((text) => [...text].length); };
+  const first = await estimateProviderPromptTokens(request, counter, new AbortController().signal, cache);
+  const second = await estimateProviderPromptTokens(request, counter, new AbortController().signal, cache);
+  assert.deepEqual(second, first);
+  assert.equal(calls, 1, 'a second full prompt estimate reuses each exact text cache entry');
+
+  const changingRequest = structuredClone(request);
+  await assert.rejects(estimateProviderPromptTokens(changingRequest, async (_model, texts) => {
+    changingRequest.messages[0]!.text += ' changed while counting';
+    return texts.map((text) => [...text].length);
+  }, new AbortController().signal, createContextTextTokenCache()), /Контекст изменился во время подсчёта/);
+
+  const changedThenUnavailable = structuredClone(request);
+  await assert.rejects(estimateProviderPromptTokens(changedThenUnavailable, async () => {
+    changedThenUnavailable.messages[0]!.text += ' changed before native failure';
+    throw new Error('LOCAL_TOKENIZER_UNAVAILABLE');
+  }, new AbortController().signal), /Контекст изменился во время подсчёта/,
+  'native technical failures cannot hide a mutated prompt snapshot');
+
+  const changedThenResourceInvalid = structuredClone(request);
+  await assert.rejects(estimateProviderPromptTokens(changedThenResourceInvalid, async () => {
+    changedThenResourceInvalid.messages[0]!.text += ' changed before resource denial';
+    throw new Error('LOCAL_TOKENIZER_RESOURCE_INVALID');
+  }, new AbortController().signal), /Контекст изменился во время подсчёта/,
+  'resource integrity denial cannot hide a mutated prompt snapshot');
+
+  let unsupportedCounterCalls = 0;
+  const unsupported = await estimateProviderPromptTokens({ ...request, modelId: 'GigaChat-3-Pro' }, async () => {
+    unsupportedCounterCalls++;
+    return [];
+  }, new AbortController().signal);
+  assert.equal(unsupported.status, 'unknown');
+  assert.deepEqual(unsupported.unknownReasons, ['unsupported-model']);
+  assert.equal(unsupportedCounterCalls, 0);
+
+  const tokenizerUnavailable = await estimateProviderPromptTokens(request, async () => {
+    throw new Error('LOCAL_TOKENIZER_UNAVAILABLE');
+  }, new AbortController().signal);
+  assert.equal(tokenizerUnavailable.status, 'unknown');
+  assert.deepEqual(tokenizerUnavailable.unknownReasons, ['tokenizer-unavailable']);
+  await assert.rejects(estimateProviderPromptTokens(request, async (_model, texts) => {
+    if (texts.length) throw new Error('LOCAL_TOKENIZER_COUNT_INVALID');
+    return [];
+  }, new AbortController().signal), /LOCAL_TOKENIZER_COUNT_INVALID/,
+  'invalid native counts are not downgraded to an unavailable estimate');
+  const tokenizerResourceInvalid = await estimateProviderPromptTokens(request, async () => {
+    throw new Error('LOCAL_TOKENIZER_RESOURCE_INVALID');
+  }, new AbortController().signal);
+  assert.equal(tokenizerResourceInvalid.status, 'unknown');
+  assert.equal(tokenizerResourceInvalid.provenance, 'unknown');
+  assert.deepEqual(tokenizerResourceInvalid.unknownReasons, ['tokenizer-unavailable']);
+  await assert.rejects(estimateProviderPromptTokens(request, async () => {
+    throw new Error('LOCAL_TOKENIZER_RESOURCE_INVALID_EXTRA');
+  }, new AbortController().signal), /LOCAL_TOKENIZER_RESOURCE_INVALID_EXTRA/,
+  'only the exact native resource denial is neutralized');
+
+  const controller = new AbortController();
+  await assert.rejects(estimateProviderPromptTokens(request, async (_model, texts, signal) => {
+    controller.abort();
+    signal.throwIfAborted();
+    return texts.map(() => 0);
+  }, controller.signal, createContextTextTokenCache()), (error: unknown) => error instanceof Error && error.name === 'AbortError');
+  await assert.rejects(estimateProviderPromptTokens(request, async (_model, texts) =>
+    texts.map(() => Number.MAX_SAFE_INTEGER), new AbortController().signal, createContextTextTokenCache()), /некорректное количество/);
+});
+
+test('reuses verified counts by exact model and text, deduping misses while preserving repeated blocks', async () => {
+  const cache = createContextTextTokenCache();
+  const calls: Array<{ modelId: string; texts: string[] }> = [];
+  const provider = {
+    countTokens: async (modelId: string, texts: readonly string[]) => {
+      calls.push({ modelId, texts: [...texts] });
+      return texts.map((text) => ({ object: 'tokens' as const, tokens: text.length, characters: [...text].length }));
+    },
+  };
+
+  const first = await countContextTextTokens(textCountContext(['same', 'same', 'other']), provider, new AbortController().signal, cache);
+  assert.equal(first.textTokenCount, 13);
+  assert.equal(first.textCountProvenance, 'verified');
+  assert.equal(first.provenance, 'unknown');
+  assert.deepEqual(calls, [{ modelId: 'cache-model', texts: ['same', 'other'] }]);
+
+  const repeated = await countContextTextTokens(textCountContext(['same', 'same', 'other']), provider, new AbortController().signal, cache);
+  assert.equal(repeated.textTokenCount, 13);
+  assert.equal(calls.length, 1, 'a full cache hit makes no provider call');
+
+  await countContextTextTokens(textCountContext(['same', 'changed']), provider, new AbortController().signal, cache);
+  await countContextTextTokens(textCountContext(['same', 'changed'], 'another-model'), provider, new AbortController().signal, cache);
+  await countContextTextTokens(textCountContext(['same', 'changed']), provider, new AbortController().signal, createContextTextTokenCache());
+  assert.deepEqual(calls.slice(1), [
+    { modelId: 'cache-model', texts: ['changed'] },
+    { modelId: 'another-model', texts: ['same', 'changed'] },
+    { modelId: 'cache-model', texts: ['same', 'changed'] },
+  ], 'content, model, and cache-instance changes cannot reuse another count');
+  assert.equal(JSON.stringify(cache).includes('same'), false, 'the cache object does not serialize its text keys');
+});
+
+test('keeps local estimates separate from verified counts and labels their provenance', async () => {
+  const estimatedCache = createContextTextTokenCache();
+  const verifiedCache = createContextTextTokenCache();
+  const context = textCountContext(['same', 'same', 'other']);
+  const localCalls: string[][] = [];
+  const estimated = await countEstimatedContextTextTokens(context, async (_model, texts) => {
+    localCalls.push([...texts]);
+    return texts.map((text) => text.length);
+  }, new AbortController().signal, estimatedCache);
+
+  assert.equal(estimated.textTokenCount, 13);
+  assert.equal(estimated.textCountProvenance, 'estimated');
+  assert.equal(estimated.provenance, 'unknown');
+  assert.deepEqual(localCalls, [['same', 'other']], 'only distinct text misses reach the local tokenizer');
+  assert.deepEqual(readContextTextTokenCacheCoverage(context, estimatedCache), {
+    knownTokenCount: 13, missingDistinctTextCount: 0, complete: true,
+  });
+
+  let providerCalls = 0;
+  const verified = await countContextTextTokens(context, {
+    countTokens: async (_model, texts) => {
+      providerCalls++;
+      return texts.map((text) => ({ object: 'tokens' as const, tokens: 1, characters: [...text].length }));
+    },
+  }, new AbortController().signal, verifiedCache);
+  assert.equal(verified.textTokenCount, 3);
+  assert.equal(verified.textCountProvenance, 'verified');
+  assert.equal(providerCalls, 1, 'verified counts do not reuse locally estimated cache entries');
+});
+
+test('does not cache invalid or cancelled local estimate batches', async () => {
+  const cache = createContextTextTokenCache();
+  const context = textCountContext(['first', 'second']);
+  const coverage = () => readContextTextTokenCacheCoverage(context, cache);
+  await assert.rejects(countEstimatedContextTextTokens(context, async () => [3, Number.NaN],
+    new AbortController().signal, cache), /некорректное количество/);
+  assert.deepEqual(coverage(), { knownTokenCount: 0, missingDistinctTextCount: 2, complete: false });
+
+  const controller = new AbortController();
+  let resolveCounts!: (counts: number[]) => void;
+  const pending = countEstimatedContextTextTokens(context,
+    async () => new Promise((resolve) => { resolveCounts = resolve; }), controller.signal, cache);
+  controller.abort();
+  resolveCounts([1, 2]);
+  await assert.rejects(pending, (error: unknown) => error instanceof Error && error.name === 'AbortError');
+  assert.deepEqual(coverage(), { knownTokenCount: 0, missingDistinctTextCount: 2, complete: false });
+});
+
+test('keeps distinct UTF-16 strings separate when UTF-8 would replace a lone surrogate', async () => {
+  const cache = createContextTextTokenCache();
+  const loneSurrogate = String.fromCharCode(0xd800);
+  const replacementCharacter = String.fromCharCode(0xfffd);
+  const calls: string[][] = [];
+  const provider = {
+    countTokens: async (_model: string, texts: readonly string[]) => {
+      calls.push([...texts]);
+      return texts.map((text) => ({
+        object: 'tokens' as const,
+        tokens: text === loneSurrogate ? 5 : 9,
+        characters: [...text].length,
+      }));
+    },
+  };
+
+  const first = await countContextTextTokens(textCountContext([loneSurrogate]), provider, new AbortController().signal, cache);
+  const second = await countContextTextTokens(textCountContext([replacementCharacter]), provider, new AbortController().signal, cache);
+  assert.equal(first.textTokenCount, 5);
+  assert.equal(second.textTokenCount, 9);
+  assert.deepEqual(calls, [[loneSurrogate], [replacementCharacter]]);
+});
+
+test('reads partial cache coverage locally and counts known duplicate blocks in the subtotal', async () => {
+  const cache = createContextTextTokenCache();
+  let calls = 0;
+  const provider = { countTokens: async (_model: string, texts: readonly string[]) => {
+    calls++;
+    return texts.map((text) => ({ object: 'tokens' as const, tokens: text.length, characters: [...text].length }));
+  } };
+  await countContextTextTokens(textCountContext(['known']), provider, new AbortController().signal, cache);
+
+  const coverage = readContextTextTokenCacheCoverage(textCountContext(['known', 'known', 'missing', 'missing']), cache);
+  assert.deepEqual(coverage, { knownTokenCount: 10, missingDistinctTextCount: 1, complete: false });
+  assert.equal(calls, 1, 'coverage reads only local cache state');
+});
+
+test('marks an empty text input as a verified zero without calling the provider', async () => {
+  let calls = 0;
+  const cache = createContextTextTokenCache();
+  const measured = await countContextTextTokens(textCountContext([]), {
+    countTokens: async () => { calls++; return []; },
+  }, new AbortController().signal, cache);
+
+  assert.equal(measured.textTokenCount, 0);
+  assert.equal(measured.textCountProvenance, 'verified');
+  assert.equal(measured.provenance, 'unknown');
+  assert.deepEqual(readContextTextTokenCacheCoverage(textCountContext([]), cache), {
+    knownTokenCount: 0, missingDistinctTextCount: 0, complete: true,
+  });
+  assert.equal(calls, 0);
+});
+
+test('does not cache partial, mismatched, or numerically invalid provider rows', async () => {
+  const cache = createContextTextTokenCache();
+  const context = textCountContext(['short', 'much-longer']);
+  const coverage = () => readContextTextTokenCacheCoverage(context, cache);
+  await assert.rejects(countContextTextTokens(context, {
+    countTokens: async (_model, texts) => texts.slice(0, 1).map((text) => ({
+      object: 'tokens' as const, tokens: 1, characters: [...text].length,
+    })),
+  }, new AbortController().signal, cache), /не совпал/);
+  assert.deepEqual(coverage(), { knownTokenCount: 0, missingDistinctTextCount: 2, complete: false });
+
+  await assert.rejects(countContextTextTokens(context, {
+    countTokens: async () => [
+      { object: 'tokens' as const, tokens: 99, characters: 'much-longer'.length },
+      { object: 'tokens' as const, tokens: 1, characters: 'short'.length },
+    ],
+  }, new AbortController().signal, cache), /некорректное количество/);
+  assert.deepEqual(coverage(), { knownTokenCount: 0, missingDistinctTextCount: 2, complete: false });
+
+  await assert.rejects(countContextTextTokens(context, {
+    countTokens: async (_model, texts) => texts.map((text, index) => ({
+      object: 'tokens' as const, tokens: index === 0 ? Number.NaN : 1, characters: [...text].length,
+    })),
+  }, new AbortController().signal, cache), /некорректное количество/);
+  assert.deepEqual(coverage(), { knownTokenCount: 0, missingDistinctTextCount: 2, complete: false });
+
+  const unicodeContext = textCountContext(['🙂']);
+  await assert.rejects(countContextTextTokens(unicodeContext, {
+    countTokens: async (_model, texts) => texts.map((text) => ({ object: 'tokens' as const, tokens: 1, characters: text.length })),
+  }, new AbortController().signal, cache), /некорректное количество/);
+  assert.deepEqual(readContextTextTokenCacheCoverage(unicodeContext, cache), {
+    knownTokenCount: 0, missingDistinctTextCount: 1, complete: false,
+  });
+  const unicodeMeasured = await countContextTextTokens(unicodeContext, {
+    countTokens: async (_model, texts) => texts.map((text) => ({ object: 'tokens' as const, tokens: 1, characters: [...text].length })),
+  }, new AbortController().signal, cache);
+  assert.equal(unicodeMeasured.textTokenCount, 1, 'provider character counts use Unicode code points, not UTF-16 units');
+
+  let validCallCount = 0;
+  const measured = await countContextTextTokens(context, {
+    countTokens: async (_model, texts) => {
+      validCallCount++;
+      return texts.map((text) => ({ object: 'tokens' as const, tokens: 1, characters: [...text].length }));
+    },
+  }, new AbortController().signal, cache);
+  assert.equal(validCallCount, 1, 'a failed batch leaves both distinct misses uncached');
+  assert.equal(measured.textTokenCount, 2);
+  assert.deepEqual(coverage(), { knownTokenCount: 2, missingDistinctTextCount: 0, complete: true });
+});
+
+test('rejects an aborted count before publishing rows returned afterward', async () => {
+  const cache = createContextTextTokenCache();
+  const controller = new AbortController();
+  let resolveRows!: (rows: Array<{ object: 'tokens'; tokens: number; characters: number }>) => void;
+  const pending = countContextTextTokens(textCountContext(['cancelled']), {
+    countTokens: async () => new Promise((resolve) => { resolveRows = resolve; }),
+  }, controller.signal, cache);
+  controller.abort();
+  resolveRows([{ object: 'tokens', tokens: 3, characters: 9 }]);
+  await assert.rejects(pending, (error: unknown) => error instanceof Error && error.name === 'AbortError');
+  assert.deepEqual(readContextTextTokenCacheCoverage(textCountContext(['cancelled']), cache), {
+    knownTokenCount: 0, missingDistinctTextCount: 1, complete: false,
+  });
+});
+
+test('rejects overflow before caching a provider result', async () => {
+  const cache = createContextTextTokenCache();
+  const context = textCountContext(['huge', 'huge']);
+  await assert.rejects(countContextTextTokens(context, {
+    countTokens: async () => [{ object: 'tokens', tokens: Number.MAX_SAFE_INTEGER, characters: 4 }],
+  }, new AbortController().signal, cache), /некорректное количество/);
+  assert.deepEqual(readContextTextTokenCacheCoverage(context, cache), {
+    knownTokenCount: 0, missingDistinctTextCount: 1, complete: false,
+  });
+});
+
+test('rejects a changed model or text snapshot instead of publishing stale counts', async () => {
+  const cache = createContextTextTokenCache();
+  const context = textCountContext(['original']);
+  let resolveRows!: (rows: Array<{ object: 'tokens'; tokens: number; characters: number }>) => void;
+  const pending = countContextTextTokens(context, {
+    countTokens: async () => new Promise((resolve) => { resolveRows = resolve; }),
+  }, new AbortController().signal, cache);
+  context.textInputs[0] = 'changed';
+  context.request.modelId = 'new-model';
+  resolveRows([{ object: 'tokens', tokens: 8, characters: 'original'.length }]);
+  await assert.rejects(pending, /Контекст изменился/);
+  assert.deepEqual(readContextTextTokenCacheCoverage(textCountContext(['original']), cache), {
+    knownTokenCount: 0, missingDistinctTextCount: 1, complete: false,
+  });
+  assert.deepEqual(readContextTextTokenCacheCoverage(textCountContext(['changed'], 'new-model'), cache), {
+    knownTokenCount: 0, missingDistinctTextCount: 1, complete: false,
+  });
+});
+
+test('rejects an in-place nested provider request change before caching an async count', async () => {
+  const cache = createContextTextTokenCache();
+  const context = textCountContext(['nested-race']);
+  const request = context.request;
+  const system = context.request.system;
+  const textInputs = context.textInputs;
+  const modelId = context.request.modelId;
+  let resolveRows!: (rows: Array<{ object: 'tokens'; tokens: number; characters: number }>) => void;
+  const pending = countContextTextTokens(context, {
+    countTokens: async () => new Promise((resolve) => { resolveRows = resolve; }),
+  }, new AbortController().signal, cache);
+  context.request.system[0]!.text += ' changed while awaiting count';
+  assert.strictEqual(context.request, request);
+  assert.strictEqual(context.request.system, system);
+  assert.strictEqual(context.textInputs, textInputs);
+  assert.equal(context.request.modelId, modelId);
+  resolveRows([{ object: 'tokens', tokens: 3, characters: 'nested-race'.length }]);
+
+  await assert.rejects(pending, /Контекст изменился/);
+  assert.deepEqual(readContextTextTokenCacheCoverage(context, cache), {
+    knownTokenCount: 0, missingDistinctTextCount: 1, complete: false,
+  });
+});
+
+test('evicts cache entries within entry and byte bounds without rejecting context counts', async () => {
+  const cache = createContextTextTokenCache();
+  const provider = {
+    countTokens: async (_model: string, texts: readonly string[]) => texts.map((text) => ({
+      object: 'tokens' as const, tokens: 1, characters: [...text].length,
+    })),
+  };
+  const entryTexts = Array.from({ length: 257 }, (_, index) => `entry-${index}`);
+  const measured = await countContextTextTokens(textCountContext(entryTexts, 'entry-model'), provider, new AbortController().signal, cache);
+  assert.equal(measured.textTokenCount, 257, 'cache limits do not reject a larger history');
+  assert.deepEqual(readContextTextTokenCacheCoverage(textCountContext(['entry-0', 'entry-256'], 'entry-model'), cache), {
+    knownTokenCount: 1, missingDistinctTextCount: 1, complete: false,
+  });
+
+  const byteBoundTexts = Array.from({ length: 100 }, (_, index) => `byte-${index}`);
+  const byteBoundModelId = 'm'.repeat(500);
+  const byteBoundContext = textCountContext(byteBoundTexts);
+  byteBoundContext.request.modelId = byteBoundModelId;
+  await countContextTextTokens(byteBoundContext, provider, new AbortController().signal, cache);
+  const byteCoverageContext = textCountContext(['byte-0', 'byte-99']);
+  byteCoverageContext.request.modelId = byteBoundModelId;
+  assert.deepEqual(readContextTextTokenCacheCoverage(byteCoverageContext, cache), {
+    knownTokenCount: 1, missingDistinctTextCount: 1, complete: false,
+  }, 'larger model keys trigger the byte bound and evict older entries');
 });
 
 test('serializes two images and a document in one V2 user message with tools disabled', () => {

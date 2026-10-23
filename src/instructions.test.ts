@@ -132,6 +132,49 @@ test('passes the semantic compaction discriminator and disables tool mode', () =
   }), /только для запроса сжатия/);
 });
 
+test('keeps a semantic service task in one runtime system layer and leaves the archive untouched', () => {
+  const history = [{ ...userMessage, text: 'Archived source data.' }];
+  const input = {
+    globalText: 'Global',
+    projectInstructions: [{ scope: 'project', text: 'Project' }],
+    compactSnapshot: { text: 'Prior memory' },
+    taskInstruction: 'Prepare semantic memory.',
+    messages: history,
+    permissionProfile: 'ask' as const,
+    modelId: 'GigaChat-3-Lightning' as const,
+    usageKind: 'compaction' as const,
+    compactionFormat: 'semantic' as const,
+    functionCallMode: 'auto' as const,
+  };
+  const inputBefore = structuredClone(input);
+  const request = buildInstructionRequest(input);
+  const repeated = buildInstructionRequest(input);
+  const serialized = serializeProviderTurnRequest(request);
+  const repeatedSerialized = serializeProviderTurnRequest(repeated);
+  const wire = JSON.parse(serialized.body) as { messages: Array<{ role: string; content: Array<{ text?: string }> }> };
+  const systemText = wire.messages[0]?.content[0]?.text ?? '';
+  const serviceLayers = request.system.filter((layer) => layer.label === 'Задача текущего запроса');
+
+  assert.deepEqual(serviceLayers, [{ source: 'runtime', label: 'Задача текущего запроса', text: input.taskInstruction }]);
+  assert.equal(request.system[request.system.length - 1], serviceLayers[0], 'the task follows all baseline instruction layers');
+  assert.deepEqual(request.messages, history);
+  assert.equal(request.messages.length, 1);
+  assert.equal(request.messages.some((message) => message.text === input.taskInstruction), false);
+  assert.deepEqual(wire.messages.map(({ role }) => role), ['system', 'user']);
+  assert.equal(wire.messages[1]?.content[0]?.text, history[0]?.text);
+  assert.equal(systemText.split(input.taskInstruction).length - 1, 1);
+  assert.equal(serialized.body, repeatedSerialized.body, 'repeated builds have identical provider wire');
+  assert.equal(request.permissionProfile, input.permissionProfile);
+  assert.equal(request.modelId, input.modelId);
+  assert.equal(request.compactionFormat, 'semantic');
+  assert.equal(request.functionCallMode, 'none');
+  assert.deepEqual(input, inputBefore, 'building a request does not mutate caller input');
+
+  const emptyTask = buildInstructionRequest({ ...input, taskInstruction: ' \t ' });
+  assert.deepEqual(emptyTask.messages, history);
+  assert.equal(emptyTask.system.some((layer) => layer.label === 'Задача текущего запроса'), false);
+});
+
 test('rejects malformed project instruction sources', () => {
   assert.throws(() => buildInstructionRequest({
     globalText: '',

@@ -88,11 +88,68 @@ export type ContextPreviewSource = 'home' | 'chat';
 
 export type ContextPreviewUnknownReason =
   | 'token-estimate-unavailable'
+  | 'prompt-framing-unmeasured'
   | 'model-limit-undocumented'
   | 'pending-attachment-content'
   | 'historical-attachment-content'
   | 'historical-attachment-metadata'
   | 'opaque-function-state';
+
+export type ContextPromptEstimateReason =
+  | 'unsupported-model'
+  | 'invalid-wire-request'
+  | 'unsupported-wire-component'
+  | 'attachment-content'
+  | 'opaque-function-state'
+  | 'unrecognized-tool-schema'
+  | 'unrecognized-response-schema'
+  /** @deprecated Supported wire length is not an unknown component; retained for stored legacy reason values. */
+  | 'outside-calibration-domain'
+  | 'tokenizer-unavailable';
+
+export interface ContextPromptEstimate {
+  status: 'complete' | 'partial' | 'unknown';
+  tokens: number | null;
+  knownTokens: number | null;
+  provenance: 'estimated' | 'unknown';
+  wireMessageCount: number | null;
+  functionCallCount: number | null;
+  unknownReasons: ContextPromptEstimateReason[];
+}
+
+export interface ContextWorkingBudgetView {
+  status: 'available' | 'exhausted' | 'unknown';
+  budgetTokens: number | null;
+  provenance: 'estimated' | 'unknown';
+  compactionStatus: 'available' | 'not-applicable' | 'unknown';
+  compactionOverheadTokens: number | null;
+  operationalProfile: ContextLiteOperationalProfileView | null;
+}
+
+export interface ContextLiteOperationalProfileView {
+  profileId: string;
+  modelId: string;
+  providerVersion: string;
+  provenance: 'tested-operational-profile';
+  officialContextLimitTokens: null;
+  normalMeasuredInputTokens: number;
+  normalOutputCapTokens: number;
+  normalOperationalTotalTokens: number;
+  semanticMeasuredInputTokens: number;
+  semanticOutputCapTokens: number;
+  semanticOperationalTotalTokens: number;
+  baseErrorReserveTokens: number;
+  appliedErrorReserveTokens: number | null;
+  scaledReserveBasis: '5-per-message-and-14-per-call-beyond-reserve-basis';
+  reserveBasisMaxWireMessages: number;
+  reserveBasisMaxFunctionCalls: number;
+  observedBoundMaxWireMessages: number;
+  observedBoundMaxFunctionCalls: number;
+  calibrationDomainStatus: 'within-tested-bounds' | 'extrapolated' | 'unknown';
+  observedWireMessageCount: number | null;
+  observedFunctionCallCount: number | null;
+  workingCeilingTokens: number;
+}
 
 export type ContextPreviewBlockSource = ContextBlockSize['source'];
 
@@ -114,8 +171,11 @@ export interface ContextPreviewView {
     source: string | null;
     verifiedAt: string | null;
   };
-  estimatedTokens: null;
-  tokenEstimateProvenance: 'unknown';
+  estimatedTokens: number | null;
+  tokenEstimateProvenance: 'estimated' | 'unknown';
+  tokenEstimateScope: 'text-blocks' | null;
+  promptEstimate: ContextPromptEstimate;
+  workingBudget: ContextWorkingBudgetView;
   preparationWireBytes: number | null;
   maximumWireBytes: number;
   preparationWireBytesIncludeAttachments: false;

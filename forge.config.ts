@@ -21,6 +21,7 @@ const config: ForgeConfig = {
       'resources/gigachat/',
       ...(process.platform === 'win32' ? ['resources/native/LocalPowerShell.exe'] : []),
       ...(process.platform === 'win32' ? ['resources/voice/'] : []),
+      ...(process.platform === 'win32' ? ['resources/tokenizer/'] : []),
     ],
   },
   rebuildConfig: {},

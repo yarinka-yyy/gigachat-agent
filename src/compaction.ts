@@ -9,7 +9,6 @@ const MAX_SEMANTIC_QUOTE_BYTES = 1024;
 const MAX_SEMANTIC_REFS_PER_ENTRY = 32;
 const MAX_SEMANTIC_QUOTES_PER_FACT = 8;
 const MAX_SEMANTIC_TOTAL_ENTRIES = 128;
-const MAX_SEMANTIC_COVERAGE_SOURCES = 64;
 const MAX_SEMANTIC_COUNTS = { constraints: 24, decisions: 32, openWork: 32, facts: 48, pastTopics: 8 } as const;
 const MAX_GENERATED_PAST_TOPICS = 2;
 const MAX_GENERATED_PAST_TOPIC_CHARS = 256;
@@ -343,8 +342,8 @@ function semanticSourceTexts(sources: CompactionSources): Map<string, string[]> 
 }
 
 function validateSemanticCoverageRefSet(value: unknown, sourceTexts: ReadonlyMap<string, readonly string[]>): string[] {
-  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_SEMANTIC_COVERAGE_SOURCES) {
-    throw new Error(`Список исходников semantic-сжатия должен содержать от 1 до ${MAX_SEMANTIC_COVERAGE_SOURCES} ссылок.`);
+  if (!Array.isArray(value) || value.length === 0 || value.length > sourceTexts.size) {
+    throw new Error('Список исходников semantic-сжатия должен быть непустым и не превышать количество проверенных исходников.');
   }
   const seen = new Set<string>();
   return value.map((ref) => {

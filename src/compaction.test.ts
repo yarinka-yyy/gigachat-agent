@@ -46,6 +46,22 @@ function semanticSources() {
   return createCompactionSources(messages, [receipt], []);
 }
 
+function largeSemanticSources() {
+  const messages = Array.from({ length: 66 }, (_, index) => {
+    if (index === 0) return user('inventory-task', 'Продолжить подготовку отчёта.');
+    if (index === 1) return assistant('inventory-fact', 'Лимит 7300 ₽ согласован. Не изменять исходный файл.');
+    return index % 2 === 0
+      ? user(`inventory-user-${index}`, `History item ${index}.`)
+      : assistant(`inventory-assistant-${index}`, `History item ${index}.`);
+  });
+  const receipts: ChatToolReceipt[] = [0, 64].map((index) => ({
+    receiptId: `inventory-tool-${index}`, anchorMessageId: messages[index]!.id, name: 'read', arguments: { index },
+    content: `Проверено чтением ${index}.`, functionsStateId: null, status: 'completed',
+    result: `Результат инструмента ${index}.`, createdAt: at,
+  }));
+  return { messages, sources: createCompactionSources(messages, receipts, []) };
+}
+
 function semanticCandidate(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({
     format: 'gigachat-semantic-memory',
@@ -467,25 +483,52 @@ test('limits semantic candidate refs to the current archive inventory while pres
     /неизвестную или повторную ссылку/);
   assert.throws(() => compileSemanticCompactionMemory(candidate, sources, ['m0', 'm1', 't99']),
     /неизвестную или повторную ссылку/);
+  assert.throws(() => compileSemanticCompactionMemory(candidate, sources, [...sourceRefs, 'm99']),
+    /не превышать количество проверенных исходников/);
 });
 
-test('rejects semantic archive inventories over 64 refs before serialization or candidate compilation', () => {
-  const messages = Array.from({ length: 65 }, (_, index) => {
-    if (index === 0) return user('inventory-task', 'Продолжить подготовку отчёта.');
-    if (index === 1) return assistant('inventory-fact', 'Лимит 7300 ₽ согласован. Не изменять исходный файл.');
-    return index % 2 === 0 ? user(`inventory-user-${index}`, `History item ${index}.`) : assistant(`inventory-assistant-${index}`, `History item ${index}.`);
-  });
-  const receipt: ChatToolReceipt = {
-    receiptId: 'inventory-tool', anchorMessageId: messages[0]!.id, name: 'read', arguments: { path: 'report.txt' },
-    content: 'Проверено чтением без записи.', functionsStateId: null, status: 'completed',
-    result: 'Найдено 3 строки.', createdAt: at,
+test('serializes and compiles complete semantic inventories above 64 message and tool refs', () => {
+  const { messages, sources } = largeSemanticSources();
+  const sourceRefs = getSemanticCompactionCoverageRefSet(sources);
+  const expectedRefs = [...messages.map((_, index) => `m${index}`), 't0', 't1'];
+  const serialized = serializeSemanticCompactionTranscript(sources);
+  const envelope = JSON.parse(serialized.slice(serialized.indexOf('\n') + 1)) as {
+    coverageRefSet: string[];
+    messages: Array<{ sourceRef: string }>;
+    tools: Array<{ sourceRef: string }>;
   };
-  const sources = createCompactionSources(messages, [receipt], []);
-  const oversizedInventory = [...messages.map((_, index) => `m${index}`), 't0'];
 
-  assert.throws(() => getSemanticCompactionCoverageRefSet(sources), /от 1 до 64/);
-  assert.throws(() => serializeSemanticCompactionTranscript(sources), /от 1 до 64/);
-  assert.throws(() => compileSemanticCompactionMemory(semanticCandidate(), sources, oversizedInventory), /от 1 до 64/);
+  assert.equal(sourceRefs.length, 68);
+  assert.deepEqual(sourceRefs, expectedRefs);
+  assert.deepEqual(envelope.coverageRefSet, expectedRefs);
+  assert.deepEqual(envelope.messages.map(({ sourceRef }) => sourceRef), expectedRefs.slice(0, messages.length));
+  assert.deepEqual(envelope.tools.map(({ sourceRef }) => sourceRef), ['t0', 't1']);
+  assert.equal(compileSemanticCompactionMemory(semanticCandidate(), sources, sourceRefs),
+    compileSemanticCompactionMemory(semanticCandidate(), sources));
+});
+
+test('keeps prior memory refs and the new suffix messages and tools in rolling coverage', () => {
+  const { sources } = largeSemanticSources();
+  const previousMemory = validateSemanticCompactionMemory(semanticCandidate(), sources);
+  const sourceRefs = getSemanticCompactionCoverageRefSet(sources, previousMemory, 64);
+  const serialized = serializeSemanticCompactionTranscript(sources, previousMemory, 64);
+  const envelope = JSON.parse(serialized.slice(serialized.indexOf('\n') + 1)) as {
+    coverageRefSet: string[];
+    messages: Array<{ sourceRef: string }>;
+    tools: Array<{ sourceRef: string }>;
+  };
+  const nextCandidate = JSON.stringify({
+    ...previousMemory,
+    facts: [...previousMemory.facts, {
+      text: 'The latest tool returned a result.', sourceRefs: ['t1'], exactQuotes: [{ sourceRef: 't1', text: 'Результат инструмента 64.' }],
+    }],
+  });
+
+  assert.deepEqual(sourceRefs, ['m0', 'm1', 't0', 'm64', 'm65', 't1']);
+  assert.deepEqual(envelope.coverageRefSet, sourceRefs);
+  assert.deepEqual(envelope.messages.map(({ sourceRef }) => sourceRef), ['m64', 'm65']);
+  assert.deepEqual(envelope.tools.map(({ sourceRef }) => sourceRef), ['t1']);
+  assert.doesNotThrow(() => compileSemanticCompactionMemory(nextCandidate, sources, sourceRefs));
 });
 test('allows no active task when sourced durable memory remains', () => {
   const sources = semanticSources();

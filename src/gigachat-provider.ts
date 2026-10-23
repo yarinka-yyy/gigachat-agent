@@ -24,7 +24,7 @@ const MAX_RESPONSE_EVENT_COUNT = 4096;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_REQUEST_TIMEOUT_MS = 90_000;
 const MAX_FUNCTION_ARGUMENT_BYTES = 1_900_000;
-const COMPACTION_RESPONSE_FORMAT = {
+export const COMPACTION_RESPONSE_FORMAT = {
   type: 'json_schema',
   schema: {
     type: 'object',

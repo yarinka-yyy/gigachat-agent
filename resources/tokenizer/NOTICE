@@ -1,0 +1,13 @@
+The tokenizer runtime includes the Windows x64 native binding from
+Hugging Face tokenizers 0.23.2, source revision
+c2b33f8e16dac92ac530bf3ebd8d6c60ab7607c4. The Rust tokenizers project is
+licensed under Apache-2.0; see LICENSE-APACHE-2.0.txt. The bundled N-API for
+Rust license text is also retained in LICENSE-NAPI-MIT.txt.
+
+The tokenizer.json asset comes from ai-sage/GigaChat3-10B-A1.8B at revision
+ecd95ae859b0536fc23c5a11e497e9e5e0deb959. Its model card declares MIT; see
+https://huggingface.co/ai-sage/GigaChat3-10B-A1.8B/tree/ecd95ae859b0536fc23c5a11e497e9e5e0deb959.
+
+SHA-256:
+tokenizers.win32-x64-msvc.node  f5fbacb63b8686de39c943548eb0297bd0d37b8f0a3403636ca31bd3530f5ae4
+tokenizer.json                 3fdb3c045850a565109244ef3b89475cc2582769417647a41c46da14a3782aa5

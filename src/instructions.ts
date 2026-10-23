@@ -80,7 +80,9 @@ export function buildInstructionRequest(input: InstructionInput): ProviderTurnRe
   }
   if (input.taskInstruction !== undefined) {
     if (typeof input.taskInstruction !== 'string') throw new Error('Некорректная задача контекста.');
-    if (input.usageKind === 'compaction') {
+    if (input.compactionFormat === 'semantic') {
+      addLayer(layers, 'runtime', 'Задача текущего запроса', input.taskInstruction);
+    } else if (input.usageKind === 'compaction') {
       if (input.taskInstruction.trim()) {
         messages.push({
           id: requestOnlyCompactionMessageId(messages),

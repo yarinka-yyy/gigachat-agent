@@ -4,7 +4,7 @@ import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import type { ChatDetail, ChatMessage, ChatToolReceipt, CompactSnapshot, HomeDraftRecord, Project, RuntimeTurnSnapshot, Settings } from './contracts';
+import type { ChatDetail, ChatMessage, ChatToolReceipt, CompactSnapshot, ContextPromptEstimate, HomeDraftRecord, Project, RuntimeTurnSnapshot, Settings } from './contracts';
 import { buildNextTurnContext, hashCompactionPrefix, type NextTurnContext, type NextTurnContextInput } from './context';
 import { createContextPreview, type ContextPreviewDependencies } from './context-preview';
 import { openStore, type LocalStore, type ProviderStateOwnershipView } from './store';
@@ -77,6 +77,7 @@ function createFixture(options: {
   projects?: Project[];
   enabledSkill?: typeof skill | null;
   active?: boolean;
+  onReadGlobalInstructions?: (call: number) => string;
   onGetChat?: (call: number) => ChatDetail;
   onGetHomeDraft?: (call: number) => HomeDraftRecord;
   onListProjects?: (call: number) => Project[];
@@ -117,7 +118,10 @@ function createFixture(options: {
       const call = count('listProjects');
       return structuredClone(options.onListProjects?.(call) ?? sourceProjects);
     },
-    readGlobalInstructions: async () => { count('readGlobalInstructions'); return 'Private global instructions.'; },
+    readGlobalInstructions: async () => {
+      const call = count('readGlobalInstructions');
+      return options.onReadGlobalInstructions?.(call) ?? 'Private global instructions.';
+    },
     readProjectInstructions: async (id: string) => { count('readProjectInstructions'); assert.equal(id, project.id); return 'Private project instructions.'; },
     getToolProtocolThrough: async (chatId: string, messageId: string) => {
       count('getToolProtocolThrough');
@@ -184,6 +188,7 @@ test('home preview uses visible text and main defaults without creating or consu
   assert.equal(preview.contextLimit.tokens, 128_000);
   assert.equal(preview.estimatedTokens, null);
   assert.equal(preview.tokenEstimateProvenance, 'unknown');
+  assert.equal(preview.tokenEstimateScope, null);
   assert.equal(preview.pendingAttachments.count, 0);
   assert.equal(fixture.calls.createChat ?? 0, 0);
   assert.equal(fixture.calls.acceptHomeDraft ?? 0, 0);
@@ -209,6 +214,7 @@ test('home preview uses visible text and main defaults without creating or consu
   assert.equal(neutralPreview.preparationWireBytes, null);
   assert.equal(neutralPreview.estimatedTokens, null);
   assert.equal(neutralPreview.tokenEstimateProvenance, 'unknown');
+  assert.equal(neutralPreview.tokenEstimateScope, null);
   assert.deepEqual(noKeyHome.ownershipChatIds, [null, null]);
   assert.equal(noKeyHome.calls.getChat ?? 0, 0);
   assert.equal(noKeyHome.calls.createChat ?? 0, 0);
@@ -246,7 +252,8 @@ test('chat preview assembles the same persisted sources plus current text and re
   assert.equal(preview.historicalAttachments.count, 1);
   assert.equal(preview.historicalAttachments.sizeBytes, 512);
   assert.deepEqual(preview.unknownReasons, [
-    'token-estimate-unavailable', 'pending-attachment-content', 'historical-attachment-content', 'opaque-function-state',
+    'token-estimate-unavailable', 'prompt-framing-unmeasured', 'pending-attachment-content',
+    'historical-attachment-content', 'opaque-function-state',
   ]);
   const safeDto = JSON.stringify(preview);
   for (const privateValue of [
@@ -290,6 +297,332 @@ test('empty text still previews runtime/schema context; null/future models stay 
   assert.ok(Number.isSafeInteger(future.preparationWireBytes));
 });
 
+test('publishes only a labeled Lite text-block estimate while preserving the unknown framing and window', async () => {
+  const fixture = createFixture({ home: homeDraft({ projectId: null, skillId: null, modelId: 'GigaChat-3-Lightning' }) });
+  let countedContext: NextTurnContext | undefined;
+  const preview = await createContextPreview({ source: 'home', visibleText: 'Visible prompt.' }, {
+    ...fixture.dependencies,
+    estimateTextTokens: async (context) => { countedContext = context; return 19; },
+    estimatePromptTokens: async (context) => {
+      assert.equal(fixture.calls.getSettings, 1, 'source/settings rechecks follow every asynchronous estimator');
+      assert.equal(context.request.maxOutputTokens, 8_192);
+      return {
+        status: 'complete', tokens: 32, knownTokens: 15, provenance: 'estimated',
+        wireMessageCount: 2, functionCallCount: 0, unknownReasons: [],
+      };
+    },
+  });
+
+  assert.equal(countedContext?.request.modelId, 'GigaChat-3-Lightning');
+  assert.ok((countedContext?.textInputs.length ?? 0) > 0);
+  assert.equal(preview.estimatedTokens, 19);
+  assert.equal(preview.tokenEstimateProvenance, 'estimated');
+  assert.equal(preview.tokenEstimateScope, 'text-blocks');
+  assert.equal(preview.contextLimit.tokens, null, 'a text estimate does not invent a window size');
+  assert.ok(preview.unknownReasons.includes('prompt-framing-unmeasured'));
+  assert.ok(preview.unknownReasons.includes('model-limit-undocumented'));
+  assert.equal(preview.unknownReasons.includes('token-estimate-unavailable'), false);
+  assert.deepEqual(preview.promptEstimate, {
+    status: 'complete', tokens: 32, knownTokens: 15, provenance: 'estimated',
+    wireMessageCount: 2, functionCallCount: 0, unknownReasons: [],
+  });
+  assert.equal(preview.workingBudget.status, 'available');
+  assert.equal(preview.workingBudget.budgetTokens, 90_000);
+  assert.equal(preview.workingBudget.compactionStatus, 'not-applicable');
+  assert.equal(preview.workingBudget.operationalProfile?.normalMeasuredInputTokens, 101_905);
+  assert.equal(preview.workingBudget.operationalProfile?.normalOutputCapTokens, 8_192);
+  assert.equal(preview.workingBudget.operationalProfile?.semanticMeasuredInputTokens, 108_762);
+  assert.equal(preview.workingBudget.operationalProfile?.semanticOutputCapTokens, 4_096);
+  assert.equal(preview.workingBudget.operationalProfile?.baseErrorReserveTokens, 2_048);
+  assert.equal(preview.workingBudget.operationalProfile?.appliedErrorReserveTokens, 2_048);
+  assert.equal(preview.workingBudget.operationalProfile?.provenance, 'tested-operational-profile');
+  assert.equal(preview.workingBudget.operationalProfile?.officialContextLimitTokens, null);
+  assert.equal(fixture.calls.getSettings, 2);
+  assert.equal(preview.contextLimit.tokens, null, 'an operational budget does not invent an official model limit');
+  assert.equal(JSON.stringify(preview).includes('Visible prompt.'), false, 'preview returns aggregates, not prompt text');
+});
+
+test('derives Lite working budget from actual semantic-prefix and next-normal envelopes only', async () => {
+  const liteChat: ChatDetail = {
+    ...detail,
+    projectId: null,
+    modelId: 'GigaChat-3-Lightning',
+    nextTurnSkillId: null,
+    messages: [lastUser, lastAssistant],
+    toolReceipts: [],
+    artifacts: [],
+    draftAttachments: [],
+    compactSnapshot: null,
+  };
+  const fixture = createFixture({ chat: liteChat, projects: [], ownership: { messages: [], receipts: [], compact: null } });
+  const seen: NextTurnContext[] = [];
+  const complete = (tokens: number): ContextPromptEstimate => ({
+    status: 'complete', tokens, knownTokens: tokens - 10, provenance: 'estimated',
+    wireMessageCount: 2, functionCallCount: 0, unknownReasons: [],
+  });
+  const preview = await createContextPreview({ source: 'chat', chatId: liteChat.id, visibleText: 'next request' }, {
+    ...fixture.dependencies,
+    estimatePromptTokens: async (context) => {
+      seen.push(context);
+      return context.request.usageKind === 'compaction' ? complete(20_500) : complete(500);
+    },
+  });
+
+  assert.equal(seen.length, 2);
+  assert.equal(seen[0]?.request.maxOutputTokens, 8_192);
+  assert.equal(seen[1]?.request.usageKind, 'compaction');
+  assert.equal(seen[1]?.request.compactionFormat, 'semantic', 'semantic builder is used only as a read-only envelope');
+  assert.equal(preview.promptEstimate.tokens, 500);
+  assert.equal(preview.workingBudget.compactionOverheadTokens, 20_000);
+  assert.equal(preview.workingBudget.budgetTokens, 78_522);
+  assert.equal(preview.contextLimit.tokens, null);
+  assert.equal(JSON.stringify(preview).includes('next request'), false);
+
+  const partialFixture = createFixture({ chat: liteChat, projects: [], ownership: { messages: [], receipts: [], compact: null } });
+  const partial = await createContextPreview({ source: 'chat', chatId: liteChat.id, visibleText: 'next request' }, {
+    ...partialFixture.dependencies,
+    estimatePromptTokens: async (context) => context.request.usageKind === 'compaction'
+      ? { ...complete(20_500), status: 'partial', tokens: null, unknownReasons: ['attachment-content'] }
+      : complete(500),
+  });
+  assert.equal(partial.workingBudget.status, 'unknown', 'partial compact envelopes cannot create a confident budget');
+  assert.equal(partial.workingBudget.budgetTokens, null);
+});
+
+test('failed local estimation retains the byte preview and unsupported models stay unestimated', async () => {
+  const liteFixture = createFixture({ home: homeDraft({ projectId: null, skillId: null, modelId: 'GigaChat-3-Lightning' }) });
+  const failed = await createContextPreview({ source: 'home', visibleText: 'Visible prompt.' }, {
+    ...liteFixture.dependencies,
+    estimateTextTokens: async () => { throw new Error('LOCAL_TOKENIZER_UNAVAILABLE'); },
+  });
+  assert.equal(failed.estimatedTokens, null);
+  assert.equal(failed.tokenEstimateProvenance, 'unknown');
+  assert.equal(failed.tokenEstimateScope, null);
+  assert.ok(Number.isSafeInteger(failed.preparationWireBytes));
+  assert.ok(failed.unknownReasons.includes('token-estimate-unavailable'));
+  assert.ok(failed.unknownReasons.includes('prompt-framing-unmeasured'));
+  assert.equal(failed.workingBudget.status, 'unknown', 'an unavailable full prompt cannot yield a working budget without a compact prefix');
+  assert.equal(failed.workingBudget.operationalProfile?.provenance, 'tested-operational-profile');
+
+  const futureFixture = createFixture({
+    settings: { ...settings, defaultModelId: 'future/model-v5' },
+    home: homeDraft({ projectId: null, skillId: null }),
+  });
+  let estimatorCalls = 0;
+  const future = await createContextPreview({ source: 'home', visibleText: 'Visible prompt.' }, {
+    ...futureFixture.dependencies,
+    estimateTextTokens: async () => { estimatorCalls++; return 7; },
+  });
+  assert.equal(estimatorCalls, 0);
+  assert.equal(future.estimatedTokens, null);
+  assert.equal(future.contextLimit.tokens, null);
+});
+
+test('rejects a stale source or account generation that changes while local estimation awaits', async () => {
+  const source = homeDraft({ projectId: null, skillId: null, modelId: 'GigaChat-3-Lightning' });
+  const fixture = createFixture({ home: source, onGetHomeDraft: (call) => call === 2 ? { ...source, revision: source.revision + 1 } : source });
+  let releaseEstimate!: () => void;
+  let enteredEstimate!: () => void;
+  const estimateGate = new Promise<void>((resolve) => { releaseEstimate = resolve; });
+  const estimateEntered = new Promise<void>((resolve) => { enteredEstimate = resolve; });
+  const pending = createContextPreview({ source: 'home', visibleText: 'Visible prompt.' }, {
+    ...fixture.dependencies,
+    estimateTextTokens: async () => { enteredEstimate(); await estimateGate; return 7; },
+  });
+  await estimateEntered;
+  releaseEstimate();
+  await assert.rejects(pending, /изменился во время предпросмотра/);
+  assert.equal(fixture.calls.getHomeDraft, 2, 'latest source is re-read after estimator completion');
+
+  const accountFixture = createFixture({ home: source });
+  const guard = createBalanceScopeGuard();
+  await assert.rejects(guard.runStable(() => createContextPreview(
+    { source: 'home', visibleText: 'Visible prompt.' }, {
+      ...accountFixture.dependencies,
+      estimateTextTokens: async () => {
+        const changeAccount = guard.beginTransition();
+        changeAccount();
+        return 7;
+      },
+    },
+  )), /Ключ аккаунта изменился/);
+});
+
+test('final source, global, and ownership rechecks follow normal and compact estimates, including estimator failures', async () => {
+  const liteChat: ChatDetail = {
+    ...detail,
+    projectId: null,
+    modelId: 'GigaChat-3-Lightning',
+    nextTurnSkillId: null,
+    messages: [lastUser, { ...lastAssistant, functionsStateId: undefined }],
+    toolReceipts: [], artifacts: [], draftAttachments: [], compactSnapshot: null,
+  };
+  const emptyOwnership: ProviderStateOwnershipView = { messages: [], receipts: [], compact: null };
+  const complete: ContextPromptEstimate = {
+    status: 'complete', tokens: 300, knownTokens: 280, provenance: 'estimated',
+    wireMessageCount: 2, functionCallCount: 0, unknownReasons: [],
+  };
+
+  for (const phase of ['normal', 'compaction'] as const) {
+    for (const failingEstimate of [false, true]) {
+      for (const mutation of ['source', 'global', 'ownership'] as const) {
+        const isHome = phase === 'normal';
+        let fixture: ReturnType<typeof createFixture>;
+        if (mutation === 'source' && isHome) {
+          const source = homeDraft({ projectId: null, skillId: null, modelId: 'GigaChat-3-Lightning' });
+          fixture = createFixture({ home: source, onGetHomeDraft: (call) => call === 1 ? source : { ...source, revision: source.revision + 1 } });
+        } else if (mutation === 'source') {
+          fixture = createFixture({ chat: liteChat, onGetChat: (call) => call === 1 ? liteChat : {
+            ...liteChat,
+            messages: [{ ...lastUser, text: 'Changed during prompt counting.' }, { ...lastAssistant, functionsStateId: undefined }],
+          } });
+        } else if (mutation === 'global') {
+          fixture = createFixture({
+            ...(isHome ? { home: homeDraft({ projectId: null, skillId: null, modelId: 'GigaChat-3-Lightning' }) }
+              : { chat: liteChat }),
+            onReadGlobalInstructions: (call) => call === 1 ? 'Private global instructions.' : 'Changed global instructions.',
+          });
+        } else {
+          fixture = createFixture({
+            ...(isHome ? { home: homeDraft({ projectId: null, skillId: null, modelId: 'GigaChat-3-Lightning' }) }
+              : { chat: liteChat }),
+            ownership: emptyOwnership,
+            onGetOwnership: (_chatId, call) => call === 1 ? emptyOwnership : null,
+          });
+        }
+
+        const input = isHome ? { source: 'home' as const, visibleText: 'visible' }
+          : { source: 'chat' as const, chatId: liteChat.id, visibleText: 'visible' };
+        const pending = createContextPreview(input, {
+          ...fixture.dependencies,
+          estimatePromptTokens: async (context) => {
+            const isCompact = context.request.usageKind === 'compaction';
+            const shouldFail = failingEstimate && (phase === 'normal' ? !isCompact : isCompact);
+            if ((phase === 'normal' && !isCompact) || (phase === 'compaction' && isCompact)) {
+              if (shouldFail) throw new Error(mutation === 'source'
+                ? 'LOCAL_TOKENIZER_RESOURCE_INVALID' : 'LOCAL_TOKENIZER_UNAVAILABLE');
+            }
+            return complete;
+          },
+        });
+        await assert.rejects(pending, /изменился во время предпросмотра/,
+          `${mutation} mutation during ${phase} estimate (failure=${failingEstimate}) must reject, not return a neutral estimate`);
+        assert.equal(fixture.calls.getSettings, 2);
+      }
+    }
+  }
+});
+
+test('resource-invalid optional tokenizer failure stays neutral in preview, but validation errors still propagate', async () => {
+  const fixture = createFixture({ home: homeDraft({ projectId: null, skillId: null, modelId: 'GigaChat-3-Lightning' }) });
+  const preview = await createContextPreview({ source: 'home', visibleText: 'visible' }, {
+    ...fixture.dependencies,
+    estimateTextTokens: async () => { throw new Error('LOCAL_TOKENIZER_RESOURCE_INVALID'); },
+    estimatePromptTokens: async () => { throw new Error('LOCAL_TOKENIZER_RESOURCE_INVALID'); },
+  });
+  assert.equal(preview.estimatedTokens, null);
+  assert.equal(preview.tokenEstimateProvenance, 'unknown');
+  assert.equal(preview.promptEstimate.status, 'unknown');
+  assert.deepEqual(preview.promptEstimate.unknownReasons, ['tokenizer-unavailable']);
+  assert.equal(preview.workingBudget.status, 'unknown');
+  assert.equal(fixture.calls.getSettings, 2, 'final source checks still run after an optional resource failure');
+
+  await assert.rejects(createContextPreview({ source: 'home', visibleText: 'visible' }, {
+    ...fixture.dependencies,
+    estimatePromptTokens: async () => { throw new Error('LOCAL_TOKENIZER_COUNT_INVALID'); },
+  }), /LOCAL_TOKENIZER_COUNT_INVALID/);
+});
+
+test('preview exposes observed-bounds versus extrapolated Lite metadata with the fixed reserve basis', async () => {
+  const cases = [
+    { wireMessageCount: 2_050, functionCallCount: 0, status: 'within-tested-bounds', reserve: 12_068, budget: 89_837 },
+    { wireMessageCount: 2_051, functionCallCount: 0, status: 'extrapolated', reserve: 12_073, budget: 89_832 },
+    { wireMessageCount: 130, functionCallCount: 32, status: 'within-tested-bounds', reserve: 2_888, budget: 90_000 },
+  ] as const;
+  for (const shape of cases) {
+    const fixture = createFixture({ home: homeDraft({ projectId: null, skillId: null, modelId: 'GigaChat-3-Lightning' }) });
+    const preview = await createContextPreview({ source: 'home', visibleText: 'visible' }, {
+      ...fixture.dependencies,
+      estimatePromptTokens: async () => ({
+        status: 'complete', tokens: 10_000, knownTokens: 9_980, provenance: 'estimated',
+        wireMessageCount: shape.wireMessageCount, functionCallCount: shape.functionCallCount, unknownReasons: [],
+      }),
+    });
+    const profile = preview.workingBudget.operationalProfile;
+    assert.equal(preview.workingBudget.status, 'available');
+    assert.equal(preview.workingBudget.budgetTokens, shape.budget);
+    assert.equal(profile?.calibrationDomainStatus, shape.status);
+    assert.equal(profile?.baseErrorReserveTokens, 2_048);
+    assert.equal(profile?.appliedErrorReserveTokens, shape.reserve);
+    assert.equal(profile?.reserveBasisMaxWireMessages, 46);
+    assert.equal(profile?.reserveBasisMaxFunctionCalls, 2);
+    assert.equal(profile?.observedBoundMaxWireMessages, 2_050);
+    assert.equal(profile?.observedBoundMaxFunctionCalls, 32);
+    assert.equal(profile?.officialContextLimitTokens, null);
+  }
+});
+
+test('final source signature covers compaction receipt and artifact metadata used by prompt estimates', async () => {
+  const liteBase: ChatDetail = {
+    ...detail,
+    projectId: null,
+    modelId: 'GigaChat-3-Lightning',
+    nextTurnSkillId: null,
+    messages: [{ ...oldUser, attachmentIds: [] }, oldAssistant, lastUser, { ...lastAssistant, functionsStateId: undefined }],
+    toolReceipts: [], artifacts: [], draftAttachments: [], compactSnapshot: null,
+  };
+  const failedReceipt: ChatToolReceipt = {
+    receiptId: 'failed-compaction-receipt', anchorMessageId: oldUser.id, name: 'read', arguments: { path: 'old.txt' },
+    content: null, functionsStateId: null, status: 'unknown', result: 'Original uncertain result.', createdAt: at,
+  };
+  const receiptChat: ChatDetail = { ...liteBase, toolReceipts: [failedReceipt] };
+  const artifact = {
+    id: 'compaction-artifact', name: 'archive.txt', storedName: 'local-archive.txt', size: 64,
+    sha256: 'f'.repeat(64), createdAt: at, messageId: oldUser.id,
+  };
+  const artifactChat: ChatDetail = {
+    ...liteBase,
+    messages: [{ ...oldUser, attachmentIds: [artifact.id] }, oldAssistant, lastUser, { ...lastAssistant, functionsStateId: undefined }],
+    artifacts: [artifact],
+  };
+  const cases = [
+    {
+      chat: receiptChat,
+      changed: { ...receiptChat, toolReceipts: [{ ...failedReceipt, result: 'Changed uncertain result.' }] },
+      expectedEstimatorCalls: ['normal', 'compaction'],
+      label: 'non-protocol tool receipt changed during prospective compact counting',
+    },
+    {
+      chat: artifactChat,
+      changed: { ...artifactChat, artifacts: [{ ...artifact, size: artifact.size + 1 }] },
+      expectedEstimatorCalls: ['normal'],
+      label: 'historical artifact size changed during normal prompt counting',
+    },
+  ];
+  const complete: ContextPromptEstimate = {
+    status: 'complete', tokens: 300, knownTokens: 280, provenance: 'estimated',
+    wireMessageCount: 2, functionCallCount: 0, unknownReasons: [],
+  };
+
+  for (const scenario of cases) {
+    const fixture = createFixture({
+      chat: scenario.chat,
+      ownership: { messages: [], receipts: [], compact: null },
+      onGetChat: (call) => call === 1 ? scenario.chat : scenario.changed,
+    });
+    const estimatorCalls: string[] = [];
+    await assert.rejects(createContextPreview({ source: 'chat', chatId: scenario.chat.id, visibleText: 'visible' }, {
+      ...fixture.dependencies,
+      estimatePromptTokens: async (context) => {
+        estimatorCalls.push(context.request.usageKind === 'compaction' ? 'compaction' : 'normal');
+        return complete;
+      },
+    }), /изменился во время предпросмотра/, scenario.label);
+    assert.deepEqual(estimatorCalls, scenario.expectedEstimatorCalls, scenario.label);
+    assert.equal(fixture.calls.getChat, 2, scenario.label);
+  }
+});
+
 test('rejects extra renderer-supplied instructions/history/paths and oversized or malformed requests', async () => {
   const fixture = createFixture();
   await assert.rejects(createContextPreview({ source: 'home', visibleText: 'x', globalText: 'override' }, fixture.dependencies), /дополнительные поля/);
@@ -322,8 +655,14 @@ test('fails closed for missing projects, disabled or cross-project Skills, activ
 
 test('a draft-only file selection gains the same files-only task but remains unknown and local', async () => {
   const file = { id: 'home-file-id', name: 'private-name.txt', storedName: 'private-stored-name.txt', size: 2048, sha256: 'c'.repeat(64), createdAt: at };
-  const fixture = createFixture({ home: homeDraft({ projectId: null, skillId: null, attachments: [file] }) });
-  const preview = await createContextPreview({ source: 'home', visibleText: '' }, fixture.dependencies);
+  const fixture = createFixture({ home: homeDraft({ projectId: null, skillId: null, modelId: 'GigaChat-3-Lightning', attachments: [file] }) });
+  const preview = await createContextPreview({ source: 'home', visibleText: '' }, {
+    ...fixture.dependencies,
+    estimatePromptTokens: async () => ({
+      status: 'complete', tokens: 30, knownTokens: 20, provenance: 'estimated',
+      wireMessageCount: 2, functionCallCount: 0, unknownReasons: [],
+    }),
+  });
   const assembled = fixture.assemblies[0]!;
 
   const lastMessage = assembled.messages[assembled.messages.length - 1];
@@ -334,8 +673,51 @@ test('a draft-only file selection gains the same files-only task but remains unk
   assert.equal(preview.pendingAttachments.count, 1);
   assert.equal(preview.pendingAttachments.sizeBytes, file.size);
   assert.ok(preview.unknownReasons.includes('pending-attachment-content'));
+  assert.equal(preview.promptEstimate.status, 'partial');
+  assert.equal(preview.promptEstimate.tokens, null);
+  assert.equal(preview.promptEstimate.knownTokens, 20);
+  assert.ok(preview.promptEstimate.unknownReasons.includes('attachment-content'));
+  assert.equal(preview.workingBudget.status, 'unknown');
+  assert.equal(preview.workingBudget.budgetTokens, null);
   assert.equal(JSON.stringify(preview).includes(file.id), false);
   assert.equal(JSON.stringify(preview).includes(file.name), false);
+});
+
+test('attachment bytes and missing historical metadata keep the full prompt and working budgets unknown', async () => {
+  const file = { id: 'budget-file', name: 'private.txt', storedName: 'local-private.txt', size: 64,
+    sha256: 'e'.repeat(64), createdAt: at };
+  const complete: ContextPromptEstimate = {
+    status: 'complete', tokens: 400, knownTokens: 380, provenance: 'estimated',
+    wireMessageCount: 2, functionCallCount: 0, unknownReasons: [],
+  };
+  const historicalChat = (artifacts: ChatDetail['artifacts']): ChatDetail => ({
+    ...detail, projectId: null, modelId: 'GigaChat-3-Lightning', nextTurnSkillId: null,
+    messages: [{ ...oldUser, attachmentIds: [file.id] }, oldAssistant, lastUser, { ...lastAssistant, functionsStateId: undefined }],
+    toolReceipts: [], artifacts, draftAttachments: [], compactSnapshot: null,
+  });
+  const cases: Array<{ source: 'home' | 'chat'; chatId?: string; visibleText: string; fixture: ReturnType<typeof createFixture> }> = [
+    { source: 'home' as const, visibleText: 'visible', fixture: createFixture({
+      home: homeDraft({ projectId: null, skillId: null, modelId: 'GigaChat-3-Lightning', attachments: [file] }),
+    }) },
+    { source: 'chat' as const, chatId: detail.id, visibleText: 'visible', fixture: createFixture({
+      chat: historicalChat([{ ...file, messageId: oldUser.id }]), ownership: { messages: [], receipts: [], compact: null },
+    }) },
+    { source: 'chat' as const, chatId: detail.id, visibleText: 'visible', fixture: createFixture({
+      chat: historicalChat([]), ownership: { messages: [], receipts: [], compact: null },
+    }) },
+  ];
+  for (const { source, chatId, visibleText, fixture } of cases) {
+    const preview = await createContextPreview({ source, ...(chatId ? { chatId } : {}), visibleText }, {
+      ...fixture.dependencies,
+      estimatePromptTokens: async () => complete,
+    });
+    assert.equal(preview.promptEstimate.status, 'partial');
+    assert.equal(preview.promptEstimate.tokens, null);
+    assert.equal(preview.promptEstimate.knownTokens, 380);
+    assert.ok(preview.promptEstimate.unknownReasons.includes('attachment-content'));
+    assert.equal(preview.workingBudget.status, 'unknown');
+    assert.equal(preview.workingBudget.budgetTokens, null);
+  }
 });
 
 test('preview reads an enabled Skill without provisioning missing Skill folders or changing its files', async (t) => {
