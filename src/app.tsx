@@ -57,6 +57,7 @@ import type {
   ChatDetail,
   ChatSummary,
   ChatKind,
+  ContextPreviewRequest,
   ChatPatch,
   FolderOpener,
   HookEvent,
@@ -93,6 +94,7 @@ import { createHomeDraftSaveQueue, mergeHomeDraftPersistence } from './composer-
 import ConnectionSetup from './components/ConnectionSetup';
 import VoiceCaptureControl, { getCaptureError } from './components/VoiceCaptureControl';
 import ContextRing from './components/ContextRing';
+import ContextIndicator from './components/ContextIndicator';
 import BrowserPanel from './components/BrowserPanel';
 import { createPreviewExitTimer, maxSidebarWidth as computeMaxSidebarWidth } from './sidebar-behavior';
 import { sidebarSections } from './sidebar-sections';
@@ -1726,6 +1728,45 @@ export default function App() {
     : activeHomeDraftRecord ? activeHomeDraftRecord.skillId
       : route.page === 'home' && pendingSkillChatIdRef.current === null ? pendingSkillId : null;
   const selectedComposerSkill = skillRegistry.skills.find((skill) => skill.id === selectedComposerSkillId && skill.enabled) ?? null;
+  const contextPreviewHasActiveTurn = route.page === 'chat' && Boolean(route.id) && (
+    (chatDetail !== null && chatDetail.id === route.id && chatDetail.turns.some((turn) => turn.status === 'queued' || turn.status === 'running'))
+    || runtimeTurns.some((turn) => turn.chatId === route.id && (turn.status === 'queued' || turn.status === 'running'))
+  );
+  const contextPreviewSourceReady = route.page === 'home'
+    ? homeDraftRecord !== null
+    : route.page === 'chat' && Boolean(route.id) && chatComposerReady;
+  const contextPreviewReady = runtimeMode === 'api' && !composerIsImageChat
+    && composerModelId === 'GigaChat-3-Lightning' && contextPreviewSourceReady && !loading
+    && !contextPreviewHasActiveTurn && !sendingOnCurrentRoute && !closePending && !closeFailure
+    && !homeDraftBusy && !chatDraftBusy;
+  const contextPreviewRequest: ContextPreviewRequest | null = contextPreviewReady
+    ? route.page === 'chat' && route.id
+      ? { source: 'chat', chatId: route.id, visibleText: draft }
+      : { source: 'home', visibleText: draft }
+    : null;
+  const contextPreviewUnavailableReason = closePending || closeFailure
+    ? 'Оценка недоступна во время закрытия приложения.'
+    : runtimeMode !== 'api'
+      ? 'Оценка доступна для режима GigaChat API.'
+      : composerIsImageChat
+        ? 'Оценка текстового контекста недоступна для чата изображений.'
+        : composerModelId !== 'GigaChat-3-Lightning'
+          ? 'Для выбранной модели нет проверенного локального профиля оценки.'
+          : contextPreviewHasActiveTurn || sendingOnCurrentRoute
+            ? 'Оценка обновится после завершения текущего хода.'
+            : !contextPreviewSourceReady || loading || homeDraftBusy || chatDraftBusy
+              ? 'Оценка рабочего бюджета сейчас недоступна.'
+              : undefined;
+  const contextPreviewScope = useMemo(() => ({}), [
+    route.page, route.id, draft, chatDetail, homeDraftRecord, selectedProjectId,
+    composerProjectId, composerModelId, composerPermissionProfile, selectedComposerSkillId,
+    settings, globalInstructions, globalInstructionsStatus,
+    globalInstructionsReady, globalInstructionsLoading, projectInstructions,
+    projectInstructionsStatus, projectInstructionsReady, projectInstructionsLoading,
+    skillRegistry, modelRegistry, runtimeAvailability, runtimeMode, sendingOnCurrentRoute,
+    contextPreviewHasActiveTurn, closePending, closeFailure, chatComposerReady,
+    homeDraftBusy, chatDraftBusy, loading,
+  ]);
   const composerCompletion = completionDismissed ? null : getComposerCompletion(draft, composerCaret, composerSkills, composerProjectId, compactionSuggestionAvailable);
 
   function insertComposerSuggestion(suggestion: ComposerSuggestion, caret = composerInputRef.current?.selectionStart ?? composerCaret): void {
@@ -4086,7 +4127,7 @@ export default function App() {
                       </div>}
                     </div>
                   </ActionMenu>
-                  <span className="context-indicator" role="img" tabIndex={0} aria-label="Размер контекста неизвестен" title="Точный размер следующего контекста пока неизвестен."><ContextRing /></span>
+                  <ContextIndicator request={contextPreviewRequest} scopeKey={contextPreviewScope} unavailableReason={contextPreviewUnavailableReason} />
                   <VoiceCaptureControl
                     key={route.page === 'chat' ? route.id ?? 'chat' : `home-${homeVoiceGeneration}`}
                     available={voiceAvailability.available && chatComposerReady && !sending && !homeDraftBusy}
