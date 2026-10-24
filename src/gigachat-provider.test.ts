@@ -1577,7 +1577,7 @@ test('serializes semantic compaction as strict plain memory and disables tools',
   assert.equal(pastTopics.items.properties.sourceRefs?.uniqueItems, true);
   assert.deepEqual(facts.items.required, ['text', 'sourceRefs', 'exactQuotes']);
   const exactQuotes = facts.items.properties.exactQuotes as { minItems: number; maxItems: number };
-  assert.equal(exactQuotes.minItems, 0);
+  assert.equal(exactQuotes.minItems, 1);
   assert.equal(exactQuotes.maxItems, 8);
 
   const wrongUsageKind = { ...request, usageKind: undefined } as unknown as ProviderTurnRequest;

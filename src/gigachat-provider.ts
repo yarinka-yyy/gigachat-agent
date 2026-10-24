@@ -9,7 +9,7 @@ import { discoveredModelRegistry, failedModelRegistry, isModelAvailable, require
 import { billingFamilyForUsageLabel, CHAT_MODEL_FAMILIES, isChatModelAvailable } from './model-catalog';
 import { attachmentContentType, inspectLocalAttachmentContent, LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES, PROVIDER_MEDIA_LIMIT_BYTES, PROVIDER_REQUEST_LIMIT_BYTES } from './attachment-policy';
 import { validateProviderV2FunctionWire } from './provider-wire';
-import { COMPACTION_OUTPUT_TOKEN_LIMIT, SEMANTIC_COMPACTION_RESPONSE_FORMAT } from './compaction';
+import { COMPACTION_OUTPUT_TOKEN_LIMIT, SEMANTIC_COMPACTION_RESPONSE_FORMAT, splitSemanticCompactionTranscript } from './compaction';
 
 export const GIGACHAT_API_BASE_URL = 'https://api.giga.chat/v1';
 const GIGACHAT_V2_CHAT_COMPLETIONS_URL = 'https://api.giga.chat/v2/chat/completions';
@@ -159,6 +159,13 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
       // eslint-disable-next-line no-control-regex -- Reject control characters in provider protocol state IDs.
       || /[\u0000-\u001f\u007f]/.test(message.functionsStateId))) throw new GigaChatProviderError('protocol');
     const messageAttachments = attachmentsByMessage.get(message.id) ?? [];
+    if (request.compactionFormat === 'semantic' && message.id === 'request-compaction-transcript') {
+      if (message.role !== 'user' || messageAttachments.length || exchanges.get(message.id)?.length) throw new GigaChatProviderError('protocol');
+      try {
+        for (const text of splitSemanticCompactionTranscript(message.text)) messages.push({ role: 'user', content: [{ text }] });
+      } catch { throw new GigaChatProviderError('protocol'); }
+      continue;
+    }
     const content: Array<Record<string, unknown>> = [{ text: message.text }];
     if (messageAttachments.length) content.push({ files: messageAttachments.map(({ fileId }) => ({ id: fileId })) });
     messages.push({

@@ -24,7 +24,7 @@ import { isImageProtocolDiagnostic, PROVIDER_ERROR_CATEGORIES } from './contract
 import { LocalToolError, type LocalToolEvent, type LocalTools } from './local-tools';
 import { HookDispatchAbortError } from './hooks';
 import { MAX_USAGE_COUNT, mergeUsageReceipt } from './usage';
-import { COMPACTION_OUTPUT_TOKEN_LIMIT, MAX_COMPACT_SUMMARY_BYTES, compileExtractiveCompaction, compileSemanticCompactionMemory, type CompactionSources } from './compaction';
+import { COMPACTION_OUTPUT_TOKEN_LIMIT, MAX_COMPACT_SUMMARY_BYTES, compileExtractiveCompaction, compileGeneratedSemanticCompactionMemory, type CompactionSources } from './compaction';
 import { buildSemanticCompactionReviewRequest, getSemanticCompactionRequestSourceRefs } from './context';
 import { isCurrentChatModelId } from './model-catalog';
 import { withLiteNormalOutputCap } from './context-budget';
@@ -233,7 +233,7 @@ function runtimeErrorCategory(error: unknown, turnTimedOut = false): ProviderErr
 
 function compileCompactionCandidate(value: string, sources: CompactionSources, semanticSourceRefs: readonly string[] | null): string {
   try { return semanticSourceRefs === null ? compileExtractiveCompaction(value, sources)
-    : compileSemanticCompactionMemory(value, sources, semanticSourceRefs); }
+    : compileGeneratedSemanticCompactionMemory(value, sources, semanticSourceRefs); }
   catch {
     throw Object.assign(new Error('COMPACTION_CANDIDATE_REJECTED'), { category: 'context' as const });
   }
@@ -937,7 +937,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           || compactionContext.sources.messages.length === 0 || !Array.isArray(compactionContext.sources.tools)
           || request.usageKind !== 'compaction' || request.functionCallMode !== 'none'
           || (request.protocolHistory?.length ?? 0) !== 0
-          || request.messages.length !== (request.compactionFormat === 'semantic' ? 1 : 2)
+          || request.messages.length !== 2
           || request.messages.some((message) => message.role !== 'user')) {
           throw new Error('COMPACTION_CONTEXT_UNAVAILABLE');
         }

@@ -939,7 +939,8 @@ test('semantic compaction reviews once on the selected model and accounts for bo
     const requests: ProviderTurnRequest[] = [], preflights: ProviderTurnRequest[] = [];
     const receipts: UsageReceipt[] = [], saved: string[] = [], hooks: string[] = [];
     const memory = (text: string) => JSON.stringify({ format: 'gigachat-semantic-memory', version: 1,
-      activeTask: { text, sourceRefs: ['m0'] }, constraints: [], decisions: [], openWork: [], facts: [], pastTopics: [] });
+      activeTask: { text, sourceRefs: ['m0'] }, constraints: [], decisions: [], openWork: [],
+      facts: [{ text: input.messages[0]!.text, sourceRefs: ['m0'], exactQuotes: [{ sourceRef: 'm0', text: input.messages[0]!.text }] }], pastTopics: [] });
     const runtime = createTurnRuntime({
       provider: makeProvider(async function* (request) {
         assert.equal(preflights[preflights.length - 1], request, 'each exact request must pass its preflight before dispatch');
@@ -961,7 +962,7 @@ test('semantic compaction reviews once on the selected model and accounts for bo
         if (reservation) {
           assert.equal(requests.length, 0, 'reserve review before spending the first completion');
           assert.equal(reservation.additionalInputTokenReserve, 32768);
-          assert.equal(request.messages.length, 2);
+          assert.equal(request.messages.length, input.messages.length + 3);
         }
         preflights.push(request);
       },
@@ -986,8 +987,10 @@ test('semantic compaction reviews once on the selected model and accounts for bo
     assert.equal(preflights.length, 3, 'reserve review, exact draft, exact review');
     assert.equal(saved.length, 1);
     assert.equal(JSON.parse(saved[0]!).activeTask.text, 'Reviewed');
-    assert.match(requests[1]!.messages[1]!.text, /Draft/);
-    assert.equal(requests[1]!.messages[0]!.text, requests[0]!.messages[0]!.text);
+    assert.match(requests[1]!.messages[0]!.text, /Draft/);
+    const sourceRecord = JSON.parse(requests[1]!.messages[2]!.text.split('\n').slice(1).join('\n')) as { text: string };
+    assert.equal(sourceRecord.text, input.messages[0]!.text);
+    assert.equal(requests[1]!.messages[requests[1]!.messages.length - 1]!.id, 'request-semantic-review-task');
     assert.equal(receipts.length, 2);
     assert.ok(receipts.every(receipt => receipt.status === 'completed' && receipt.requestKind === 'compaction'
       && receipt.modelId === currentId && receipt.totalTokens === 15));
@@ -998,8 +1001,8 @@ test('semantic compaction reviews once on the selected model and accounts for bo
 });
 
 test('semantic failures keep the previous checkpoint and never retry the draft or review', async (t) => {
-  for (const fault of ['missing-preflight', 'reserve-budget', 'reserve-mutation', 'model-switch', 'changed-archive', 'invalid-draft', 'invalid-review',
-    'review-budget', 'review-network', 'review-cancel', 'unexpected-function'] as const) await t.test(fault, async () => {
+  for (const fault of ['missing-preflight', 'reserve-budget', 'reserve-mutation', 'model-switch', 'changed-archive', 'changed-service-task', 'invalid-draft', 'invalid-review',
+    'unquoted-draft', 'unquoted-review', 'review-budget', 'review-network', 'review-cancel', 'unexpected-function'] as const) await t.test(fault, async () => {
     const input = { ...compactionTurnFor(`semantic-fault-${fault}`), modelId: 'GigaChat-3-Lightning' };
     const memory = JSON.stringify({ format: 'gigachat-semantic-memory', version: 1,
       activeTask: { text: 'Keep the current task.', sourceRefs: ['m0'] }, constraints: [], decisions: [], openWork: [], facts: [], pastTopics: [] });
@@ -1010,7 +1013,9 @@ test('semantic failures keep the previous checkpoint and never retry the draft o
         if (fault === 'unexpected-function') { yield functionCall('write', { path: 'forbidden.txt', contents: 'no' }); return; }
         if (calls === 2 && fault === 'review-network') { yield { type: 'error', category: 'network', retryable: true }; return; }
         if (calls === 2 && fault === 'review-cancel') { runtime.cancel(runtime.list()[0]!.id); return; }
-        yield { type: 'text-delta', text: fault === 'invalid-draft' || calls === 2 && fault === 'invalid-review' ? '{}' : memory };
+        const candidate = fault === 'unquoted-draft' || calls === 2 && fault === 'unquoted-review'
+          ? JSON.stringify({ ...JSON.parse(memory), facts: [{ text: 'Unquoted fact.', sourceRefs: ['m0'], exactQuotes: [] }] }) : memory;
+        yield { type: 'text-delta', text: fault === 'invalid-draft' || calls === 2 && fault === 'invalid-review' ? '{}' : candidate };
         yield { type: 'completed' };
       }), tools: testTools,
       prepareTurn: async turn => {
@@ -1019,6 +1024,7 @@ test('semantic failures keep the previous checkpoint and never retry the draft o
           functionCallMode: 'none', compactionToolReceipts: [], compactionArtifacts: [] }).request;
         if (fault === 'model-switch') request.modelId = 'GigaChat-3-Pro';
         if (fault === 'changed-archive') request.messages[0]!.text += 'tampered';
+        if (fault === 'changed-service-task') request.messages[1]!.text += 'tampered';
         return { request, compaction: preparedCompactionContext(turn) };
       },
       ...(fault === 'missing-preflight' ? {} : { preflightProviderRequest: async (_turn, _request, _signal, _owner, reservation) => {
@@ -1039,8 +1045,8 @@ test('semantic failures keep the previous checkpoint and never retry the draft o
     await runtime.whenIdle();
     assert.equal(saves, 0);
     assert.equal(runtime.list()[0]?.status, fault === 'review-cancel' ? 'cancelled' : 'failed');
-    assert.equal(calls, ['missing-preflight', 'reserve-budget', 'reserve-mutation', 'model-switch', 'changed-archive'].includes(fault) ? 0
-      : ['invalid-draft', 'review-budget', 'unexpected-function'].includes(fault) ? 1 : 2);
+    assert.equal(calls, ['missing-preflight', 'reserve-budget', 'reserve-mutation', 'model-switch', 'changed-archive', 'changed-service-task'].includes(fault) ? 0
+      : ['invalid-draft', 'unquoted-draft', 'review-budget', 'unexpected-function'].includes(fault) ? 1 : 2);
   });
 });
 

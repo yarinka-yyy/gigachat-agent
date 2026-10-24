@@ -8,6 +8,7 @@ import { assertCompactionWireReduction, buildNextTurnContext, buildSemanticCompa
   SEMANTIC_COMPACTION_TASK_INSTRUCTION, validateCompactSummary } from './context';
 import { GigaChatProviderError, MAX_PROVIDER_REQUEST_BYTES, serializeProviderTurnRequest } from './gigachat-provider';
 import { calculateLiteWorkingBudget, isLitePromptOverMeasuredInputGuard, liteHardInputLimit } from './context-budget';
+import { CHAT_MODEL_FAMILIES } from './model-catalog';
 import { compileExtractiveCompaction, compileSemanticCompactionMemory,
   createCompactionSources, getSemanticCompactionCoverageRefSet } from './compaction';
 
@@ -385,7 +386,8 @@ test('prepares a semantic request from the whole supplied raw prefix without exp
 
   assert.equal(context.request.compactionFormat, 'semantic');
   assert.equal(context.request.functionCallMode, 'none');
-  assert.equal(context.request.messages.length, 1, 'the archive is the only source user message');
+  assert.equal(context.request.messages.length, 2, 'one source archive followed by the service task');
+  assert.equal(context.request.messages[1]?.id, 'request-semantic-draft-task');
   assert.equal(context.request.messages[0]?.text, transcript);
   assert.deepEqual(context.request.system[context.request.system.length - 1], {
     source: 'runtime', label: 'Задача текущего запроса', text: SEMANTIC_COMPACTION_TASK_INSTRUCTION,
@@ -394,8 +396,11 @@ test('prepares a semantic request from the whole supplied raw prefix without exp
   const semanticWire = JSON.parse(serializeProviderTurnRequest(context.request).body) as {
     messages: Array<{ role: string; content: Array<{ text?: string }> }>;
   };
-  assert.deepEqual(semanticWire.messages.map(({ role }) => role), ['system', 'user']);
-  assert.equal(semanticWire.messages[1]?.content[0]?.text, transcript);
+  assert.equal(semanticWire.messages.length, envelope.messages.length + 3);
+  assert.ok(semanticWire.messages.slice(1).every(message => message.role === 'user'));
+  const decodeWire = (text: string) => JSON.parse(text.slice(text.indexOf('\n') + 1)) as Record<string, unknown>;
+  assert.deepEqual({ ...decodeWire(semanticWire.messages[1]!.content[0]!.text!),
+    messages: semanticWire.messages.slice(2, -1).map(message => decodeWire(message.content[0]!.text!)) }, envelope);
   assert.equal((semanticWire.messages[0]?.content[0]?.text ?? '').split(SEMANTIC_COMPACTION_TASK_INSTRUCTION).length - 1, 1);
   assert.match(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /не обязательно ссылаться на каждый исходник/i);
   assert.doesNotMatch(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /coverageRefSet|retain=true|решение на каждое сообщение/i);
@@ -525,13 +530,16 @@ test('rolls semantic compaction forward with stable global refs and only the new
   assert.doesNotThrow(() => compileSemanticCompactionMemory(nextCandidate, context.compactionSources!));
   const review = buildSemanticCompactionReviewRequest(context.request, context.compactionSources!, envelope.coverageRefSet, nextCandidate);
   assert.ok(review);
-  const reviewEnvelope = JSON.parse(review.messages[0]!.text.slice(review.messages[0]!.text.indexOf('\n') + 1)) as typeof envelope;
+  const reviewEnvelope = JSON.parse(review.messages[1]!.text.slice(review.messages[1]!.text.indexOf('\n') + 1)) as typeof envelope;
   assert.deepEqual(reviewEnvelope.previousMemory, envelope.previousMemory);
-  assert.deepEqual(reviewEnvelope.messages, envelope.messages, 'the review sees only the new raw suffix');
+  assert.deepEqual(reviewEnvelope.tools, envelope.tools);
+  const reviewMessages = review.messages.slice(2, -1).map(message => JSON.parse(message.text.slice(message.text.indexOf('\n') + 1)) as { sourceRef: string; text: string });
+  assert.deepEqual({ ...reviewEnvelope, messages: reviewMessages }, envelope, 'segmented review preserves the full rolling archive without replaying old sources');
+  assert.deepEqual(reviewMessages, envelope.messages, 'the review sees only the new raw suffix');
   assert.deepEqual(reviewEnvelope.tools, envelope.tools, 'the review sees only suffix tool records');
-  assert.match(review.messages[1]!.text, /The old tool returned its result\./,
+  assert.match(review.messages[0]!.text, /The old tool returned its result\./,
     'validated prior memory may be reviewed without resending the old raw tool record');
-  assert.doesNotMatch(reviewEnvelope.messages.map(({ text }) => text).join('\n'), /Old raw request\.|Old raw answer\./);
+  assert.doesNotMatch(reviewMessages.map(({ text }) => text).join('\n'), /Old raw request\.|Old raw answer\./);
   assert.equal(buildSemanticCompactionReviewRequest(review, context.compactionSources!, envelope.coverageRefSet, nextCandidate), null);
 
   assert.throws(() => buildNextTurnContext(input(allMessages, {
@@ -554,6 +562,37 @@ test('rolls semantic compaction forward with stable global refs and only the new
     compactSnapshot: priorSnapshot, protocolHistory: [oldProtocol], compactionToolReceipts: [oldReceipt], compactionArtifacts: [],
     usageKind: 'compaction', compactionFormat: 'semantic',
   })), /новый завершённый фрагмент истории/i);
+});
+
+test('both semantic wire requests preserve source distinctions for all four selected models', async (t) => {
+  const messages = [
+    user('scope', 'Do not publish ownerCode values; the field name may appear in the report.'),
+    assistant('permission', 'This is discussion only. Do not read or write local files before permission.'),
+    user('observed', 'The copy was read on Linux build 4.2. Hash comparison passed; import is untested.'),
+  ];
+  for (const { currentId } of CHAT_MODEL_FAMILIES) await t.test(currentId, () => {
+    const context = buildNextTurnContext(input(messages, { modelId: currentId, usageKind: 'compaction',
+      compactionFormat: 'semantic', functionCallMode: 'none', compactionToolReceipts: [], compactionArtifacts: [] }));
+    const sources = context.compactionSources!;
+    const candidate = JSON.stringify({ format: 'gigachat-semantic-memory', version: 1,
+      activeTask: { text: 'Continue validation.', sourceRefs: ['m2'] }, constraints: [], decisions: [], openWork: [], pastTopics: [],
+      facts: [{ text: messages[2]!.text, sourceRefs: ['m2'], exactQuotes: [{ sourceRef: 'm2', text: 'Hash comparison passed' }] }] });
+    const review = buildSemanticCompactionReviewRequest(context.request, sources, getSemanticCompactionCoverageRefSet(sources), candidate);
+    assert.ok(review);
+    const decode = (text: string) => JSON.parse(text.slice(text.indexOf('\n') + 1)) as Record<string, unknown>;
+    const archive = decode(context.request.messages[0]!.text);
+    for (const request of [context.request, review]) {
+      const wire = JSON.parse(serializeProviderTurnRequest(request).body) as {
+        model: string; messages: Array<{ role: string; content: Array<{ text: string }> }>; tool_config: { mode: string };
+      };
+      const start = request === context.request ? 1 : 2;
+      assert.equal(wire.model, currentId);
+      assert.equal(wire.tool_config.mode, 'none');
+      assert.deepEqual({ ...decode(wire.messages[start]!.content[0]!.text),
+        messages: wire.messages.slice(start + 1, -1).map(message => decode(message.content[0]!.text)) }, archive);
+      assert.ok(wire.messages.slice(1).every(message => message.role === 'user'));
+    }
+  });
 });
 
 test('builds an independent semantic review from the exact current archive and a validated candidate', () => {
@@ -602,11 +641,15 @@ test('builds an independent semantic review from the exact current archive and a
   assert.equal(Object.prototype.hasOwnProperty.call(review, 'compactionRepair'), false);
   assert.equal(review.functionCallMode, 'none');
   assert.equal(review.maxOutputTokens, 4096);
-  assert.equal(review.messages.length, 2);
-  assert.deepEqual(review.messages.map(({ role }) => role), ['user', 'user']);
-  assert.equal(review.messages[0]?.text, context.request.messages[0]?.text, 'review reuses the exact source archive');
-  assert.match(review.messages[1]?.text ?? '', /^ЧЕРНОВИК SEMANTIC-ПАМЯТИ JSON/);
-  assert.match(review.messages[1]?.text ?? '', /Review the Windows build/);
+  assert.equal(review.messages.length, messages.length + 3);
+  assert.ok(review.messages.every(message => message.role === 'user'), 'historical roles never become current instructions');
+  const decode = (text: string) => JSON.parse(text.slice(text.indexOf('\n') + 1)) as Record<string, unknown>;
+  assert.deepEqual({ ...decode(review.messages[1]!.text), messages: review.messages.slice(2, -1).map(message => decode(message.text)) },
+    decode(context.request.messages[0]!.text), 'review reconstructs every exact source record after the candidate');
+  assert.match(review.messages[0]?.text ?? '', /^ЧЕРНОВИК SEMANTIC-ПАМЯТИ JSON/);
+  assert.match(review.messages[0]?.text ?? '', /Review the Windows build/);
+  assert.equal(review.messages[review.messages.length - 1]?.id, 'request-semantic-review-task');
+  assert.match(review.messages[review.messages.length - 1]?.text ?? '', /При расхождении опирайся на архив/);
   assert.doesNotMatch(review.messages.map(({ text }) => text).join('\n'), /Независимо проверь черновик semantic-памяти/);
 
   const reviewWire = serializeProviderTurnRequest(review);
@@ -616,12 +659,14 @@ test('builds an independent semantic review from the exact current archive and a
     messages: Array<{ role: string; content: Array<{ text?: string }> }>;
     model_options: { response_format: { schema: { required: string[]; properties: Record<string, unknown> } } };
   };
-  assert.deepEqual(wire.messages.map(({ role }) => role), ['system', 'user', 'user']);
+  assert.deepEqual(wire.messages.map(({ role }) => role), ['system', ...review.messages.map(message => message.role)]);
   const systemText = wire.messages[0]?.content[0]?.text ?? '';
   assert.equal(systemText.split(reviewTaskLayer.text).length - 1, 1);
   assert.equal(systemText.split(SEMANTIC_COMPACTION_TASK_INSTRUCTION).length - 1, 0);
   assert.equal(wire.messages[1]?.content[0]?.text, review.messages[0]?.text);
   assert.equal(wire.messages[2]?.content[0]?.text, review.messages[1]?.text);
+  assert.equal(wire.messages[3]?.content[0]?.text, review.messages[2]?.text);
+  assert.equal(wire.messages[wire.messages.length - 1]?.content[0]?.text, review.messages[review.messages.length - 1]?.text);
   assert.equal(wire.tool_config.mode, 'none');
   assert.equal(wire.tools, undefined);
   assert.deepEqual(wire.model_options.response_format.schema.required,

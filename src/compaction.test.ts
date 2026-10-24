@@ -4,6 +4,7 @@ import type { ChatArtifact, ChatMessage, ChatToolReceipt } from './contracts';
 import {
   compileExtractiveCompaction,
   compileSemanticCompactionMemory,
+  compileGeneratedSemanticCompactionMemory,
   createCompactionSources,
   formatArchivedCompactionNotes,
   formatSemanticCompactionMemory,
@@ -11,6 +12,7 @@ import {
   selectRetainedCompactionMessages,
   serializeCompactionTranscript,
   serializeSemanticCompactionTranscript,
+  splitSemanticCompactionTranscript,
   validateSemanticCompactionMemory,
 } from './compaction';
 
@@ -554,6 +556,26 @@ test('requires exact quotes to be nonempty substrings of the referenced source v
   assert.deepEqual(validateSemanticCompactionMemory(semanticCandidate({ facts: [{
     text: 'The fact is paraphrased without a quote.', sourceRefs: ['m1'], exactQuotes: [],
   }] }), sources).facts[0]?.exactQuotes, [], 'strict JSON may require an empty quote array when no exact quote is needed');
+});
+
+test('segmented semantic input reconstructs every source and rejects malformed envelopes', () => {
+  const archive = serializeSemanticCompactionTranscript(semanticSources());
+  const decode = (text: string) => JSON.parse(text.slice(text.indexOf('\n') + 1)) as Record<string, unknown>;
+  const [metadata, ...records] = splitSemanticCompactionTranscript(archive);
+  assert.deepEqual({ ...decode(metadata!), messages: records.map(decode) }, decode(archive));
+  assert.throws(() => splitSemanticCompactionTranscript('not an archive'));
+  assert.throws(() => splitSemanticCompactionTranscript('archive\n{"format":"wrong","version":1,"messages":[{}]}'));
+  assert.throws(() => splitSemanticCompactionTranscript('archive\n{"format":"gigachat-semantic-compaction-input","version":1,"messages":[]}'));
+});
+
+test('new generated facts require evidence while old stored memories still accept missing quotes', () => {
+  const sources = semanticSources();
+  const value = semanticCandidate({ facts: [{ text: 'An unsupported paraphrase.', sourceRefs: ['m1'], exactQuotes: [] }] });
+  assert.doesNotThrow(() => validateSemanticCompactionMemory(value, sources));
+  assert.throws(() => compileGeneratedSemanticCompactionMemory(value, sources, ['m0', 'm1', 'm2', 't0']), /дословное основание/);
+  const quoted = semanticCandidate({ facts: [{ text: 'The tool content was read.', sourceRefs: ['t0'],
+    exactQuotes: [{ sourceRef: 't0', text: 'Проверено чтением' }] }] });
+  assert.doesNotThrow(() => compileGeneratedSemanticCompactionMemory(quoted, sources, ['m0', 'm1', 'm2', 't0']));
 });
 
 test('rejects unknown or duplicate refs, extra keys, malformed controls and invalid markers', () => {
