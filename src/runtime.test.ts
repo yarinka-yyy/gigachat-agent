@@ -957,7 +957,14 @@ test('semantic compaction reviews once on the selected model and accounts for bo
         modelId: turn.modelId, permissionProfile: turn.permissionProfile, usageKind: 'compaction',
         compactionFormat: 'semantic', functionCallMode: 'none', compactionToolReceipts: [], compactionArtifacts: [] }).request,
       compaction: preparedCompactionContext(turn) }),
-      preflightProviderRequest: async (_turn, request) => { preflights.push(request); },
+      preflightProviderRequest: async (_turn, request, _signal, _owner, reservation) => {
+        if (reservation) {
+          assert.equal(requests.length, 0, 'reserve review before spending the first completion');
+          assert.equal(reservation.additionalInputTokenReserve, 32768);
+          assert.equal(request.messages.length, 2);
+        }
+        preflights.push(request);
+      },
       consumeTurn: async () => undefined, releaseTurn: () => undefined,
       appendAssistant: async () => { assert.fail('a compact candidate must not become a visible assistant reply'); },
       appendCompaction: async (_turn, text, _signal, _context, _terminal, state) => {
@@ -976,6 +983,7 @@ test('semantic compaction reviews once on the selected model and accounts for bo
     await runtime.whenIdle();
     assert.equal(runtime.list()[0]?.status, 'completed');
     assert.equal(requests.length, 2);
+    assert.equal(preflights.length, 3, 'reserve review, exact draft, exact review');
     assert.equal(saved.length, 1);
     assert.equal(JSON.parse(saved[0]!).activeTask.text, 'Reviewed');
     assert.match(requests[1]!.messages[1]!.text, /Draft/);
@@ -990,7 +998,7 @@ test('semantic compaction reviews once on the selected model and accounts for bo
 });
 
 test('semantic failures keep the previous checkpoint and never retry the draft or review', async (t) => {
-  for (const fault of ['missing-preflight', 'model-switch', 'changed-archive', 'invalid-draft', 'invalid-review',
+  for (const fault of ['missing-preflight', 'reserve-budget', 'reserve-mutation', 'model-switch', 'changed-archive', 'invalid-draft', 'invalid-review',
     'review-budget', 'review-network', 'review-cancel', 'unexpected-function'] as const) await t.test(fault, async () => {
     const input = { ...compactionTurnFor(`semantic-fault-${fault}`), modelId: 'GigaChat-3-Lightning' };
     const memory = JSON.stringify({ format: 'gigachat-semantic-memory', version: 1,
@@ -1013,7 +1021,13 @@ test('semantic failures keep the previous checkpoint and never retry the draft o
         if (fault === 'changed-archive') request.messages[0]!.text += 'tampered';
         return { request, compaction: preparedCompactionContext(turn) };
       },
-      ...(fault === 'missing-preflight' ? {} : { preflightProviderRequest: async () => {
+      ...(fault === 'missing-preflight' ? {} : { preflightProviderRequest: async (_turn, _request, _signal, _owner, reservation) => {
+        if (reservation) {
+          assert.equal(reservation.additionalInputTokenReserve, 32768);
+          if (fault === 'reserve-budget') throw Object.assign(new Error('reserve over budget'), { category: 'context' });
+          if (fault === 'reserve-mutation') _request.messages[0]!.text += 'tampered';
+          return;
+        }
         if (++preflights === 2 && fault === 'review-budget') throw Object.assign(new Error('over budget'), { category: 'context' });
       } }),
       consumeTurn: async () => undefined, releaseTurn: () => undefined,
@@ -1025,7 +1039,7 @@ test('semantic failures keep the previous checkpoint and never retry the draft o
     await runtime.whenIdle();
     assert.equal(saves, 0);
     assert.equal(runtime.list()[0]?.status, fault === 'review-cancel' ? 'cancelled' : 'failed');
-    assert.equal(calls, ['missing-preflight', 'model-switch', 'changed-archive'].includes(fault) ? 0
+    assert.equal(calls, ['missing-preflight', 'reserve-budget', 'reserve-mutation', 'model-switch', 'changed-archive'].includes(fault) ? 0
       : ['invalid-draft', 'review-budget', 'unexpected-function'].includes(fault) ? 1 : 2);
   });
 });

@@ -11,6 +11,7 @@ import { compileExtractiveCompaction, compileSemanticCompactionMemory, createCom
 import { instructionFileHash } from './instruction-documents';
 import { createTurnRuntime, type PreparedTurn } from './runtime';
 import { IMAGE_GENERATION_MODEL_ID } from './image-mode';
+import { CHAT_MODEL_FAMILIES } from './model-catalog';
 
 const timestamp = '2026-09-24T10:00:00.000Z';
 
@@ -1239,6 +1240,61 @@ test('inserts a queued reply after its user anchor and assembles only history th
     'user1', 'answer1', 'user2',
   ]);
   for (const turn of [first.turn, second.turn, third.turn]) store.releaseTurnReservation(turn.turnId);
+});
+
+test('full-history semantic snapshots include the final answer, reopen with an empty suffix, and preserve raw messages', async (t) => {
+  for (const { currentId: modelId } of CHAT_MODEL_FAMILIES) await t.test(modelId, async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'gigachat-full-compact-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const store = await openStore(directory);
+    const chat = await store.createChat();
+    await store.updateChat(chat.id, { modelId });
+    const first = await store.acceptLocalMessage(chat.id, 'Keep the task.', 'full-user');
+    await assert.rejects(store.acceptCompactionTurn(chat.id, 'incomplete-compact', first.turn.messageId), /завершения/);
+    await appendAcceptedAnswer(store, first.turn, 'The final answer is still open.');
+    const before = await store.getChat(chat.id);
+    const compact = await store.acceptCompactionTurn(chat.id, 'full-compact', first.turn.messageId);
+    const prefix = await store.getCompactionPrefix(chat.id, compact.turn.messageId);
+    assert.deepEqual(prefix.messages, before.messages);
+    const finalMessageId = before.messages[before.messages.length - 1]!.id;
+    assert.equal(prefix.coveredThroughMessageId, finalMessageId);
+    const sources = createCompactionSources(prefix.messages, [], []);
+    const text = compileSemanticCompactionMemory(JSON.stringify({ format: 'gigachat-semantic-memory', version: 1,
+      activeTask: { text: 'Keep the task.', sourceRefs: ['m0'] }, constraints: [], decisions: [], facts: [], pastTopics: [],
+      openWork: [{ text: 'The final answer is still open.', sourceRefs: ['m1'] }] }), sources, ['m0', 'm1']);
+    const snapshot: CompactSnapshot = { id: 'full-snapshot', version: 2, boundaryMessageId: first.turn.messageId,
+      coveredThroughMessageId: prefix.coveredThroughMessageId, coveredPrefixHash: prefix.coveredPrefixHash,
+      text, modelId, provenance: 'fixture', createdAt: timestamp };
+    const accepted = (await store.getChat(chat.id)).turns.find(turn => turn.turnId === compact.turn.turnId)!;
+    await store.commitCompactSnapshot(chat.id, snapshot, null, undefined,
+      completedCompactionTurn(compact.turn, accepted.createdAt));
+    const reopened = await (await openStore(directory)).getChat(chat.id);
+    assert.deepEqual(reopened.messages, before.messages);
+    assert.deepEqual(reopened.compactSnapshot, snapshot);
+    const context = buildNextTurnContext({ globalText: '', messages: reopened.messages, modelId,
+      permissionProfile: 'ask', compactSnapshot: snapshot, compactionToolReceipts: [], compactionArtifacts: [] });
+    assert.equal(context.request.messages.some(message => message.id === finalMessageId), false);
+    store.releaseTurnReservation(compact.turn.turnId);
+    await assert.rejects(store.acceptCompactionTurn(chat.id, 'repeat-compact', first.turn.messageId), /Нет нового/);
+  });
+});
+
+test('full-history acceptance rejects a pending tool even after an assistant answer exists', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-pending-compact-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const first = await store.acceptLocalMessage(chat.id, 'Keep pending tool pairing.', 'pending-source');
+  const receiptId = 'a'.repeat(64);
+  await store.beginToolReceipt(chat.id, first.turn.messageId, {
+    receiptId, name: 'read', arguments: { path: 'example.txt' }, content: null, functionsStateId: 'pending-state',
+  });
+  await appendAcceptedAnswer(store, first.turn, 'An answer does not complete the pending tool.');
+  await assert.rejects(store.acceptCompactionTurn(chat.id, 'pending-compact', first.turn.messageId), /завершения ответа и инструментов/);
+  await store.completeToolReceipt(chat.id, first.turn.messageId, receiptId, 'completed', JSON.stringify({ text: 'done' }));
+  const compact = await store.acceptCompactionTurn(chat.id, 'ready-compact', first.turn.messageId);
+  assert.equal(compact.turn.operation, 'compaction');
+  store.releaseTurnReservation(compact.turn.turnId);
 });
 
 test('manual compaction captures the selected boundary, keeps tool pairing, and persists without hiding messages', async (t) => {

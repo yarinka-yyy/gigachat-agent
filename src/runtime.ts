@@ -24,7 +24,7 @@ import { isImageProtocolDiagnostic, PROVIDER_ERROR_CATEGORIES } from './contract
 import { LocalToolError, type LocalToolEvent, type LocalTools } from './local-tools';
 import { HookDispatchAbortError } from './hooks';
 import { MAX_USAGE_COUNT, mergeUsageReceipt } from './usage';
-import { COMPACTION_OUTPUT_TOKEN_LIMIT, compileExtractiveCompaction, compileSemanticCompactionMemory, type CompactionSources } from './compaction';
+import { COMPACTION_OUTPUT_TOKEN_LIMIT, MAX_COMPACT_SUMMARY_BYTES, compileExtractiveCompaction, compileSemanticCompactionMemory, type CompactionSources } from './compaction';
 import { buildSemanticCompactionReviewRequest, getSemanticCompactionRequestSourceRefs } from './context';
 import { isCurrentChatModelId } from './model-catalog';
 import { withLiteNormalOutputCap } from './context-budget';
@@ -77,7 +77,8 @@ export interface TurnRuntimeOptions {
   prepareProviderRequest?(turn: AcceptedTurnInput, request: ProviderTurnRequest, signal: AbortSignal,
     providerStateOwner?: ProviderStateOwner): Promise<ProviderTurnRequest>;
   preflightProviderRequest?(turn: AcceptedTurnInput, request: ProviderTurnRequest, signal: AbortSignal,
-    providerStateOwner?: ProviderStateOwner): Promise<void>;
+    // Reservation is a conservative byte-level token bound for the canonical candidate, in addition to the review envelope.
+    providerStateOwner?: ProviderStateOwner, reservation?: { additionalInputTokenReserve: number }): Promise<void>;
   assertProviderStateOwner?(providerStateOwner: ProviderStateOwner | undefined, signal: AbortSignal): void;
   consumeTurn(turn: AcceptedTurnInput, signal: AbortSignal): Promise<void>;
   releaseTurn(turn: AcceptedTurnInput): void;
@@ -974,24 +975,32 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         if (controller.signal.aborted) throw abortError();
         if (stopState.pendingToolIds.size || stopState.pendingOperationCount > 0) throw new Error('TOOL_STOP_STATE');
         if (options.preflightProviderRequest && !imageGeneration) {
-          const requestBeforePreflight = request;
-          const requestSnapshot = JSON.stringify(request);
-          if (requestSnapshot === undefined) throw Object.assign(new Error('Контекст запроса нельзя проверить перед отправкой.'), { category: 'context' as const });
-          options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
-          const preflight = Promise.resolve().then(() =>
-            options.preflightProviderRequest!(turn.input, request, controller.signal, providerStateOwner));
-          await waitTracked(
-            preflight,
-            operationTimeoutMs,
-            'PROMPT_PREFLIGHT_TIMEOUT',
-            'Проверка размера контекста не завершена; очередь ожидает её остановки.',
-          );
-          if (controller.signal.aborted) throw abortError();
-          options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
-          let requestAfterSnapshot: string | undefined;
-          try { requestAfterSnapshot = JSON.stringify(request); } catch { requestAfterSnapshot = undefined; }
-          if (request !== requestBeforePreflight || requestAfterSnapshot === undefined || requestAfterSnapshot !== requestSnapshot) {
-            throw Object.assign(new Error('Контекст запроса изменился во время проверки; ход не отправлен.'), { category: 'context' as const });
+          const reservedReview = semanticSourceRefs && !semanticReviewStarted
+            ? buildSemanticCompactionReviewRequest(request, compactionContext!.sources, semanticSourceRefs, null) : null;
+          if (semanticSourceRefs && !semanticReviewStarted && !reservedReview) throw new Error('COMPACTION_CONTEXT_UNAVAILABLE');
+          for (const checkedRequest of reservedReview ? [reservedReview, request] : [request]) {
+            const requestBeforePreflight = request;
+            const originalSnapshot = JSON.stringify(request);
+            const requestSnapshot = JSON.stringify(checkedRequest);
+            if (requestSnapshot === undefined) throw Object.assign(new Error('Контекст запроса нельзя проверить перед отправкой.'), { category: 'context' as const });
+            options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
+            const preflight = Promise.resolve().then(() =>
+              options.preflightProviderRequest!(turn.input, checkedRequest, controller.signal, providerStateOwner,
+                checkedRequest === reservedReview ? { additionalInputTokenReserve: MAX_COMPACT_SUMMARY_BYTES } : undefined));
+            await waitTracked(
+              preflight,
+              operationTimeoutMs,
+              'PROMPT_PREFLIGHT_TIMEOUT',
+              'Проверка размера контекста не завершена; очередь ожидает её остановки.',
+            );
+            if (controller.signal.aborted) throw abortError();
+            options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
+            let unchanged = false;
+            try { unchanged = JSON.stringify(checkedRequest) === requestSnapshot && JSON.stringify(request) === originalSnapshot; }
+            catch { /* Unserializable mutation is rejected below. */ }
+            if (request !== requestBeforePreflight || !unchanged) {
+              throw Object.assign(new Error('Контекст запроса изменился во время проверки; ход не отправлен.'), { category: 'context' as const });
+            }
           }
         }
         stopState.streamConfirmed = true;

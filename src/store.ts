@@ -3439,18 +3439,19 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         if (detail.draftAttachments.length > 0) {
           throw new Error('Сначала удалите файлы из черновика перед сжатием контекста.');
         }
-        const expectedBoundary = users.length >= 3 ? users[users.length - 3] : undefined;
-        if (!expectedBoundary || boundaryMessage.id !== expectedBoundary.id) {
-          throw new Error('Для сжатия нужно сохранить два последних обмена без изменений.');
+        const prefix = buildCompactionPrefix(detail, boundaryMessage.id);
+        const anchors = new Set(prefix.messages.filter(message => message.role === 'user').map(message => message.id));
+        if (prefix.messages[prefix.messages.length - 1]?.role !== 'assistant'
+          || detail.toolReceipts.some(receipt => anchors.has(receipt.anchorMessageId) && receipt.status === 'pending')) {
+          throw new Error('Дождитесь завершения ответа и инструментов перед сжатием контекста.');
         }
         if (detail.compactSnapshot) {
           const coveredIndex = detail.messages.findIndex((message) => message.id === detail.compactSnapshot?.coveredThroughMessageId);
-          const boundaryIndex = detail.messages.findIndex((message) => message.id === boundaryMessage.id);
-          if (coveredIndex < 0 || boundaryIndex <= coveredIndex) {
+          const nextCoveredIndex = detail.messages.findIndex((message) => message.id === prefix.coveredThroughMessageId);
+          if (coveredIndex < 0 || nextCoveredIndex <= coveredIndex) {
             throw new Error('Нет нового старого префикса для сжатия; сохранённый контекст не изменён.');
           }
         }
-        const prefix = buildCompactionPrefix(detail, boundaryMessage.id);
         if (prefix.messages.some((message) => message.role === 'user' && (message.attachmentIds?.length ?? 0) > 0)) {
           throw new Error('Сжатие истории с прикреплёнными файлами пока не проверено; исходная история сохранена.');
         }

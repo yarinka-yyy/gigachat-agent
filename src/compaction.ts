@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer';
 import type { ChatArtifact, ChatMessage, ChatToolReceipt } from './contracts';
 
-const MAX_COMPACT_SUMMARY_BYTES = 32 * 1024;
+export const MAX_COMPACT_SUMMARY_BYTES = 32 * 1024;
 const MAX_COMPACTION_CANDIDATE_BYTES = 64 * 1024;
 const MAX_SEMANTIC_ENTRY_BYTES = 4 * 1024;
 const MAX_SEMANTIC_SCOPE_BYTES = 128;

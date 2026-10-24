@@ -334,7 +334,7 @@ export function buildSemanticCompactionReviewRequest(
   request: ProviderTurnRequest,
   sources: CompactionSources,
   expectedSourceRefs: readonly string[],
-  candidate: string,
+  candidate: string | null,
 ): ProviderTurnRequest | null {
   const sourceRefs = getSemanticCompactionRequestSourceRefs(request, sources);
   if (!sourceRefs || !Array.isArray(expectedSourceRefs) || sourceRefs.length !== expectedSourceRefs.length
@@ -342,7 +342,8 @@ export function buildSemanticCompactionReviewRequest(
   const taskLayer = request.system[request.system.length - 1]!;
   const archiveText = request.messages[0]!.text;
   let compiledCandidate: string;
-  try { compiledCandidate = compileSemanticCompactionMemory(candidate, sources, sourceRefs); }
+  // null builds the review envelope for the pre-draft byte-bound reservation only.
+  try { compiledCandidate = candidate === null ? '' : compileSemanticCompactionMemory(candidate, sources, sourceRefs); }
   catch { return null; }
   const archiveMessage = request.messages[0];
   if (!archiveMessage) return null;

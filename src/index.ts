@@ -7,7 +7,7 @@ import { openStore, type LocalStore } from './store';
 import { assertCompactionWireReduction, COMPACTION_QUALITY_VERIFIED, COMPACTION_UNAVAILABLE_REASON, COMPACTION_TASK_INSTRUCTION,
   buildNextTurnContext, countEstimatedContextTextTokens, createContextTextTokenCache, estimateProviderPromptTokens,
   validateCompactSummary } from './context';
-import { isLitePromptOverMeasuredInputGuard, LITE_OPERATIONAL_PROFILE } from './context-budget';
+import { isLitePromptOverMeasuredInputGuard, liteHardInputLimit, LITE_OPERATIONAL_PROFILE } from './context-budget';
 import { createContextPreview } from './context-preview';
 import { createLocalTextTokenCounter } from './local-tokenizer';
 import { createLocalTools, createPowerShellHelper, resolvePowerShellHelperPath } from './local-tools';
@@ -951,12 +951,19 @@ async function createMainRuntime(
       assertProviderStateOwner(owner, providerStateScopeGuard, signal);
       return prepared;
     },
-    preflightProviderRequest: async (_turn, request, signal, owner) => {
+    preflightProviderRequest: async (_turn, request, signal, owner, reservation) => {
       const estimate = await estimateProviderPromptTokens(
         request, localTextTokenCounter.countTextTokens, signal, localContextTokenCache,
       );
       assertProviderStateOwner(owner, providerStateScopeGuard, signal);
-      if (request.modelId === LITE_OPERATIONAL_PROFILE.modelId && isLitePromptOverMeasuredInputGuard(request, estimate)) {
+      if (request.compactionFormat === 'semantic' && (request.modelId !== LITE_OPERATIONAL_PROFILE.modelId || estimate.status !== 'complete'
+        || estimate.provenance !== 'estimated' || estimate.tokens === null || estimate.unknownReasons.length > 0
+        || liteHardInputLimit(request, estimate) === null)) {
+        throw Object.assign(new Error('Бюджет semantic-запроса не подтверждён для выбранной модели; сжатие не отправлено.'), { category: 'context' as const });
+      }
+      const reservedEstimate = reservation && estimate.tokens !== null
+        ? { ...estimate, tokens: estimate.tokens + reservation.additionalInputTokenReserve } : estimate;
+      if (request.modelId === LITE_OPERATIONAL_PROFILE.modelId && isLitePromptOverMeasuredInputGuard(request, reservedEstimate)) {
         throw Object.assign(new Error('Контекст запроса превышает проверенный безопасный предел GigaChat Lite. Уменьшите запрос или историю и повторите ход.'),
           { category: 'context' as const });
       }
