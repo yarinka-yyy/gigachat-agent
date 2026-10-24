@@ -276,13 +276,11 @@ export function buildNextTurnContext(
   };
 }
 
-export function buildSemanticCompactionReviewRequest(
+export function getSemanticCompactionRequestSourceRefs(
   request: ProviderTurnRequest,
   sources: CompactionSources,
-  expectedSourceRefs: readonly string[],
-  candidate: string,
-): ProviderTurnRequest | null {
-  if (!Array.isArray(expectedSourceRefs) || !Array.isArray(request.system) || !Array.isArray(request.messages)
+): string[] | null {
+  if (!Array.isArray(request.system) || !Array.isArray(request.messages)
     || request.usageKind !== 'compaction'
     || request.compactionFormat !== 'semantic' || !request.modelId
     || request.functionCallMode !== 'none' || request.protocolHistory?.length
@@ -307,8 +305,7 @@ export function buildSemanticCompactionReviewRequest(
   const inputRecord = originalInput as Record<string, unknown>;
   if (inputRecord.format !== 'gigachat-semantic-compaction-input' || inputRecord.version !== 1
     || !Array.isArray(inputRecord.coverageRefSet) || !Array.isArray(inputRecord.messages)
-    || inputRecord.messages.length === 0 || inputRecord.coverageRefSet.length !== expectedSourceRefs.length
-    || inputRecord.coverageRefSet.some((ref, index) => ref !== expectedSourceRefs[index])) return null;
+    || inputRecord.messages.length === 0) return null;
   const fromMessageIndex = sources.messages.length - inputRecord.messages.length;
   if (!Number.isSafeInteger(fromMessageIndex) || fromMessageIndex < 0) return null;
   let previousMemory: SemanticCompactionMemory | null = null;
@@ -323,12 +320,27 @@ export function buildSemanticCompactionReviewRequest(
     catch { return null; }
   }
   let sourceRefs: string[];
+  const archivedSourceRefs = inputRecord.coverageRefSet;
   try {
     sourceRefs = getSemanticCompactionCoverageRefSet(sources, previousMemory, fromMessageIndex);
-    if (sourceRefs.length !== expectedSourceRefs.length
-      || sourceRefs.some((ref, index) => ref !== expectedSourceRefs[index])) return null;
+    if (sourceRefs.length !== archivedSourceRefs.length
+      || sourceRefs.some((ref, index) => ref !== archivedSourceRefs[index])) return null;
     if (serializeSemanticCompactionTranscript(sources, previousMemory, fromMessageIndex) !== archiveText) return null;
   } catch { return null; }
+  return sourceRefs;
+}
+
+export function buildSemanticCompactionReviewRequest(
+  request: ProviderTurnRequest,
+  sources: CompactionSources,
+  expectedSourceRefs: readonly string[],
+  candidate: string,
+): ProviderTurnRequest | null {
+  const sourceRefs = getSemanticCompactionRequestSourceRefs(request, sources);
+  if (!sourceRefs || !Array.isArray(expectedSourceRefs) || sourceRefs.length !== expectedSourceRefs.length
+    || sourceRefs.some((ref, index) => ref !== expectedSourceRefs[index])) return null;
+  const taskLayer = request.system[request.system.length - 1]!;
+  const archiveText = request.messages[0]!.text;
   let compiledCandidate: string;
   try { compiledCandidate = compileSemanticCompactionMemory(candidate, sources, sourceRefs); }
   catch { return null; }

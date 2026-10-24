@@ -11,7 +11,8 @@ import type { LocalTools, LocalToolsOptions, PowerShellRequest } from './local-t
 import { createLocalTools, LocalToolError } from './local-tools';
 import { createHookApprovalGate, createHookDispatcher, createHookRegistry, HookDispatchAbortError, type HookExecutionContext } from './hooks';
 import { createTurnRuntime, queueAcceptedTurnOrMarkNotSent, type PreparedCompactionContext, type PreparedTurn, type ToolReceiptInput, type ToolReceiptStart, type TurnRuntimeOptions } from './runtime';
-import { COMPACTION_TASK_INSTRUCTION, estimateProviderPromptTokens } from './context';
+import { buildNextTurnContext, COMPACTION_TASK_INSTRUCTION, estimateProviderPromptTokens } from './context';
+import { CHAT_MODEL_FAMILIES } from './model-catalog';
 import { isLitePromptOverMeasuredInputGuard, liteHardInputLimit, withLiteNormalOutputCap } from './context-budget';
 import { createCompactionSources, serializeCompactionTranscript, type CompactionSources } from './compaction';
 import { mergeUsageReceipt } from './usage';
@@ -929,6 +930,104 @@ test('a rejected compaction append skips the after hook and releases FIFO only a
   assert.equal(runtime.list('chat-compact-rejected-save')[0]?.status, 'failed');
   assert.deepEqual(started, ['Сожми историю', 'chat-after-rejected-compact']);
   assert.equal(hookEvents.includes('after-compaction'), false);
+});
+
+test('semantic compaction reviews once on the selected model and accounts for both requests', async (t) => {
+  for (const { currentId } of CHAT_MODEL_FAMILIES) await t.test(currentId, async () => {
+    const input = { ...compactionTurnFor(`semantic-${currentId}`), modelId: currentId };
+    const original = structuredClone(input);
+    const requests: ProviderTurnRequest[] = [], preflights: ProviderTurnRequest[] = [];
+    const receipts: UsageReceipt[] = [], saved: string[] = [], hooks: string[] = [];
+    const memory = (text: string) => JSON.stringify({ format: 'gigachat-semantic-memory', version: 1,
+      activeTask: { text, sourceRefs: ['m0'] }, constraints: [], decisions: [], openWork: [], facts: [], pastTopics: [] });
+    const runtime = createTurnRuntime({
+      provider: makeProvider(async function* (request) {
+        assert.equal(preflights[preflights.length - 1], request, 'each exact request must pass its preflight before dispatch');
+        requests.push(request);
+        assert.equal(request.modelId, currentId);
+        assert.equal(request.maxOutputTokens, 4096);
+        assert.equal(request.functionCallMode, 'none');
+        assert.deepEqual(request.protocolHistory, []);
+        yield { type: 'text-delta', text: memory(requests.length === 1 ? 'Draft' : 'Reviewed') };
+        yield { type: 'usage', promptTokens: 10, completionTokens: 5, totalTokens: 15, precachedPromptTokens: 0 };
+        yield { type: 'completed', functionsStateId: requests.length === 1 ? 'draft-state' : 'review-state' };
+      }),
+      tools: testTools,
+      prepareTurn: async turn => ({ request: buildNextTurnContext({ globalText: '', messages: turn.messages,
+        modelId: turn.modelId, permissionProfile: turn.permissionProfile, usageKind: 'compaction',
+        compactionFormat: 'semantic', functionCallMode: 'none', compactionToolReceipts: [], compactionArtifacts: [] }).request,
+      compaction: preparedCompactionContext(turn) }),
+      preflightProviderRequest: async (_turn, request) => { preflights.push(request); },
+      consumeTurn: async () => undefined, releaseTurn: () => undefined,
+      appendAssistant: async () => { assert.fail('a compact candidate must not become a visible assistant reply'); },
+      appendCompaction: async (_turn, text, _signal, _context, _terminal, state) => {
+        assert.equal(requests.length, 2);
+        assert.equal(state, 'review-state');
+        saved.push(text);
+      },
+      compactionEnabled: true,
+      recordUsageReceipt: async receipt => {
+        const index = receipts.findIndex(item => item.localRequestId === receipt.localRequestId);
+        if (index < 0) receipts.push(receipt); else receipts[index] = receipt;
+      },
+      runHooks: async (_turn, hook) => { hooks.push(hook.event); return []; },
+    });
+    assert.ok(runtime.enqueueCompaction(input));
+    await runtime.whenIdle();
+    assert.equal(runtime.list()[0]?.status, 'completed');
+    assert.equal(requests.length, 2);
+    assert.equal(saved.length, 1);
+    assert.equal(JSON.parse(saved[0]!).activeTask.text, 'Reviewed');
+    assert.match(requests[1]!.messages[1]!.text, /Draft/);
+    assert.equal(requests[1]!.messages[0]!.text, requests[0]!.messages[0]!.text);
+    assert.equal(receipts.length, 2);
+    assert.ok(receipts.every(receipt => receipt.status === 'completed' && receipt.requestKind === 'compaction'
+      && receipt.modelId === currentId && receipt.totalTokens === 15));
+    assert.equal(hooks.filter(event => event === 'before-compaction').length, 1);
+    assert.equal(hooks.filter(event => event === 'after-compaction').length, 1);
+    assert.deepEqual(input, original);
+  });
+});
+
+test('semantic failures keep the previous checkpoint and never retry the draft or review', async (t) => {
+  for (const fault of ['missing-preflight', 'model-switch', 'changed-archive', 'invalid-draft', 'invalid-review',
+    'review-budget', 'review-network', 'review-cancel', 'unexpected-function'] as const) await t.test(fault, async () => {
+    const input = { ...compactionTurnFor(`semantic-fault-${fault}`), modelId: 'GigaChat-3-Lightning' };
+    const memory = JSON.stringify({ format: 'gigachat-semantic-memory', version: 1,
+      activeTask: { text: 'Keep the current task.', sourceRefs: ['m0'] }, constraints: [], decisions: [], openWork: [], facts: [], pastTopics: [] });
+    let calls = 0, preflights = 0, saves = 0;
+    const runtime = createTurnRuntime({
+      provider: makeProvider(async function* () {
+        calls++;
+        if (fault === 'unexpected-function') { yield functionCall('write', { path: 'forbidden.txt', contents: 'no' }); return; }
+        if (calls === 2 && fault === 'review-network') { yield { type: 'error', category: 'network', retryable: true }; return; }
+        if (calls === 2 && fault === 'review-cancel') { runtime.cancel(runtime.list()[0]!.id); return; }
+        yield { type: 'text-delta', text: fault === 'invalid-draft' || calls === 2 && fault === 'invalid-review' ? '{}' : memory };
+        yield { type: 'completed' };
+      }), tools: testTools,
+      prepareTurn: async turn => {
+        const request = buildNextTurnContext({ globalText: '', messages: turn.messages, modelId: turn.modelId,
+          permissionProfile: turn.permissionProfile, usageKind: 'compaction', compactionFormat: 'semantic',
+          functionCallMode: 'none', compactionToolReceipts: [], compactionArtifacts: [] }).request;
+        if (fault === 'model-switch') request.modelId = 'GigaChat-3-Pro';
+        if (fault === 'changed-archive') request.messages[0]!.text += 'tampered';
+        return { request, compaction: preparedCompactionContext(turn) };
+      },
+      ...(fault === 'missing-preflight' ? {} : { preflightProviderRequest: async () => {
+        if (++preflights === 2 && fault === 'review-budget') throw Object.assign(new Error('over budget'), { category: 'context' });
+      } }),
+      consumeTurn: async () => undefined, releaseTurn: () => undefined,
+      appendAssistant: async () => { assert.fail('no assistant append'); },
+      appendCompaction: async () => { saves++; }, compactionEnabled: true,
+      recordUsageReceipt: async () => undefined,
+    });
+    assert.ok(runtime.enqueueCompaction(input));
+    await runtime.whenIdle();
+    assert.equal(saves, 0);
+    assert.equal(runtime.list()[0]?.status, fault === 'review-cancel' ? 'cancelled' : 'failed');
+    assert.equal(calls, ['missing-preflight', 'model-switch', 'changed-archive'].includes(fault) ? 0
+      : ['invalid-draft', 'review-budget', 'unexpected-function'].includes(fault) ? 1 : 2);
+  });
 });
 
 test('keeps production compaction disabled and refuses unexpected summarizer function calls', async () => {
