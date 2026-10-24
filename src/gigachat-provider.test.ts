@@ -1575,10 +1575,9 @@ test('serializes semantic compaction as strict plain memory and disables tools',
   assert.equal(pastTopics.items.properties.text?.maxLength, 256);
   assert.equal(pastTopics.items.properties.sourceRefs?.maxItems, 32);
   assert.equal(pastTopics.items.properties.sourceRefs?.uniqueItems, true);
-  assert.deepEqual(facts.items.required, ['text', 'sourceRefs', 'exactQuotes']);
-  const exactQuotes = facts.items.properties.exactQuotes as { minItems: number; maxItems: number };
-  assert.equal(exactQuotes.minItems, 1);
-  assert.equal(exactQuotes.maxItems, 8);
+  assert.deepEqual(facts.items.required, ['sourceRefs']);
+  assert.equal(Object.prototype.hasOwnProperty.call(facts.items.properties, 'text'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(facts.items.properties, 'exactQuotes'), false);
 
   const wrongUsageKind = { ...request, usageKind: undefined } as unknown as ProviderTurnRequest;
   assert.throws(() => serializeProviderTurnRequest(wrongUsageKind), (error: unknown) =>

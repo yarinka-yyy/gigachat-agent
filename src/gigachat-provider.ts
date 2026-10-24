@@ -9,7 +9,7 @@ import { discoveredModelRegistry, failedModelRegistry, isModelAvailable, require
 import { billingFamilyForUsageLabel, CHAT_MODEL_FAMILIES, isChatModelAvailable } from './model-catalog';
 import { attachmentContentType, inspectLocalAttachmentContent, LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES, PROVIDER_MEDIA_LIMIT_BYTES, PROVIDER_REQUEST_LIMIT_BYTES } from './attachment-policy';
 import { validateProviderV2FunctionWire } from './provider-wire';
-import { COMPACTION_OUTPUT_TOKEN_LIMIT, SEMANTIC_COMPACTION_RESPONSE_FORMAT, splitSemanticCompactionTranscript } from './compaction';
+import { COMPACTION_OUTPUT_TOKEN_LIMIT, splitSemanticCompactionTranscript, semanticCompactionResponseFormat } from './compaction';
 
 export const GIGACHAT_API_BASE_URL = 'https://api.giga.chat/v1';
 const GIGACHAT_V2_CHAT_COMPLETIONS_URL = 'https://api.giga.chat/v2/chat/completions';
@@ -213,7 +213,10 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
         ...(request.compactionFormat === 'semantic' ? { temperature: 0.0001 } : {}),
         ...(request.usageKind === 'compaction' ? {
           response_format: request.compactionFormat === 'semantic'
-            ? SEMANTIC_COMPACTION_RESPONSE_FORMAT
+            ? semanticCompactionResponseFormat(request.messages[0]?.id === 'request-compaction-transcript' ? request.messages[0].text : undefined,
+              request.messages[0]?.id === 'request-semantic-review-candidate' ? request.messages[1]?.text : undefined,
+              request.messages[0]?.id === 'request-semantic-review-candidate' ? request.messages[0].text : undefined,
+              request.messages[0]?.id === 'request-semantic-review-candidate' ? request.messages.slice(2, -1).map(message => message.text) : undefined)
             : COMPACTION_RESPONSE_FORMAT,
         } : {}),
       },

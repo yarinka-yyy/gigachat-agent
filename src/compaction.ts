@@ -12,6 +12,11 @@ const MAX_SEMANTIC_TOTAL_ENTRIES = 128;
 const MAX_SEMANTIC_COUNTS = { constraints: 24, decisions: 32, openWork: 32, facts: 48, pastTopics: 8 } as const;
 const MAX_GENERATED_PAST_TOPICS = 2;
 const MAX_GENERATED_PAST_TOPIC_CHARS = 256;
+const MAX_SEMANTIC_TOPIC_CHARS = 32;
+const SEMANTIC_TOPIC_PATTERN = '^(?:__global__|[A-Za-zА-Яа-яЁё0-9 -]{1,32})$';
+const semanticTopicStateSchema = {
+  type: 'string', enum: ['open', 'closed'], description: 'open=current/unresolved; closed=explicitly finished/inactive',
+};
 export const COMPACTION_OUTPUT_TOKEN_LIMIT = 4096;
 const RETAINED_SOURCE_REFS_MARKER = 'retained-source-refs';
 export const SEMANTIC_COMPACTION_FORMAT = 'gigachat-semantic-memory' as const;
@@ -115,6 +120,211 @@ export const SEMANTIC_COMPACTION_RESPONSE_FORMAT = {
   schema: semanticMemorySchema,
   strict: true,
 };
+
+const semanticAnchorSchema = {
+  type: 'object', properties: { sourceRefs: semanticSourceRefsSchema }, required: ['sourceRefs'], additionalProperties: false,
+};
+const semanticAnchoredResponseFormat = {
+  type: 'json_schema', strict: true,
+  schema: { ...semanticMemorySchema, properties: { ...semanticMemorySchema.properties,
+    constraints: { ...semanticMemorySchema.properties.constraints, items: {
+      type: 'object', properties: { scope: semanticConstraintSchema.properties.scope, sourceRefs: semanticSourceRefsSchema },
+      required: ['scope', 'sourceRefs'], additionalProperties: false,
+    } },
+    facts: { ...semanticMemorySchema.properties.facts, items: semanticAnchorSchema },
+  } },
+};
+
+export function semanticSourceNotesResponseFormat(sourceRefs: readonly string[]) {
+  const topics = { type: 'object', properties: Object.fromEntries(sourceRefs.map(ref => [ref, {
+    type: 'string', minLength: 1, maxLength: MAX_SEMANTIC_TOPIC_CHARS, pattern: SEMANTIC_TOPIC_PATTERN,
+    description: 'Shared topic name only (1-3 words). Not a per-message summary.',
+  }])), required: [...sourceRefs], additionalProperties: false };
+  return {
+    type: 'json_schema', strict: true,
+    schema: { type: 'object', properties: { notes: {
+      type: 'object', properties: Object.fromEntries(sourceRefs.map(ref => [ref, { type: 'string', minLength: 1, maxLength: 640 }])),
+      required: [...sourceRefs], additionalProperties: false,
+    }, verbatim: { type: 'object', properties: Object.fromEntries(sourceRefs.map(ref => [ref, {
+      type: 'boolean', description: 'Preserve exact wording for permissions, prohibitions, exceptions, exact project values or observed verification results. Ordinary explanation may be paraphrased.',
+    }])), required: [...sourceRefs], additionalProperties: false }, topics }, required: ['notes', 'verbatim', 'topics'], additionalProperties: false },
+  };
+}
+
+export function semanticReviewInputReserve(sourceCount: number): number {
+  // Notes appear twice; each distinct topic may additionally occur in the schema's enum.
+  return 2 * MAX_COMPACT_SUMMARY_BYTES
+    + (Buffer.byteLength(JSON.stringify(semanticTopicStateSchema), 'utf8') + 2 * (4 * MAX_SEMANTIC_TOPIC_CHARS + 3)) * sourceCount;
+}
+
+export function semanticSourceResolutionResponseFormat(sourceRefs: readonly string[], notes: Record<string, string> = {}, topics: Record<string, string> = {}, roles: Record<string, string> = {}) {
+  const topicNames = [...new Set(Object.values(topics))].filter(topic => topic !== '__global__');
+  const assistantRefs = sourceRefs.filter(ref => roles[ref] === 'assistant');
+  return { type: 'json_schema', strict: true, schema: {
+    type: 'object', properties: {
+      reconciliation: { type: 'string', minLength: 1, maxLength: 1024,
+        description: 'Сначала краткий проверяемый итог: текущая задача, явно закрытые темы, последние исправления, действующие границы, частичный результат и непроверенный этап. Это итог сверки источников, не ход рассуждений. Затем выбери источники ниже по этому итогу.',
+      },
+      activeTask: { type: 'string', enum: [...sourceRefs, 'none'], description: 'Первичный источник текущей незавершённой задачи; none только если текущей задачи нет.' },
+      topicStates: { type: 'object', properties: Object.fromEntries(topicNames.map(topic => [topic, semanticTopicStateSchema])), required: topicNames, additionalProperties: false },
+      novelty: { type: 'object', properties: Object.fromEntries(assistantRefs.map(ref => [ref, {
+        type: 'string', enum: ['new', 'restatement'],
+        description: 'new: independent information beyond the preceding user source. restatement: acknowledgement/paraphrase of that source; prefer original user wording.',
+      }])), required: assistantRefs, additionalProperties: false },
+      dispositions: { type: 'object', properties: Object.fromEntries(sourceRefs.map(ref => [ref, {
+        type: 'string', enum: ['constraint', 'fact', 'decision', 'openWork', 'omit'],
+        description: `Автор: ${roles[ref] ?? 'предыдущая память'}. Тема: ${topics[ref] ?? ''}. Выбери роль с учётом ВСЕЙ последующей истории. Закрытые/отменённые сведения и assistant-повтор user-источника — omit. Смысл: ${notes[ref] ?? ''}`,
+      }])), required: [...sourceRefs], additionalProperties: false },
+    }, required: ['reconciliation', 'activeTask', 'topicStates', 'novelty', 'dispositions'], additionalProperties: false,
+  } };
+}
+
+export function compileResolvedSemanticCompactionMemory(value: unknown, notesValue: string, sources: CompactionSources, sourceRefs: readonly string[], archiveText: string): string {
+  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > MAX_COMPACTION_CANDIDATE_BYTES) throw new Error('Некорректное разрешение смыслов.');
+  const resolution: unknown = JSON.parse(value);
+  if (!isRecord(resolution) || !hasOnlyKeys(resolution, ['reconciliation', 'activeTask', 'topicStates', 'novelty', 'dispositions']) || !isRecord(resolution.dispositions)
+    || Object.keys(resolution.dispositions).length !== sourceRefs.length
+    || sourceRefs.some(ref => !Object.prototype.hasOwnProperty.call(resolution.dispositions, ref))
+    || typeof resolution.activeTask !== 'string' || resolution.activeTask !== 'none' && !sourceRefs.includes(resolution.activeTask)) {
+    throw new Error('Каждый источник должен получить явное решение об актуальности.');
+  }
+  const { notes, topics, verbatim } = JSON.parse(compileSemanticSourceNotes(notesValue, sourceRefs)) as { notes: Record<string, string>; topics: Record<string, string>; verbatim: Record<string, boolean> };
+  const archive = JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)) as { messages: Array<{ sourceRef: string; role: string }> };
+  const assistantRefs = archive.messages.filter(record => record.role === 'assistant').map(record => record.sourceRef);
+  const novelty = resolution.novelty;
+  if (!isRecord(novelty) || Object.keys(novelty).length !== assistantRefs.length
+    || assistantRefs.some(ref => !['new', 'restatement'].includes(novelty[ref] as string))) throw new Error('Новизна ответов ассистента должна быть определена явно.');
+  const reconciliation = validateSemanticText(resolution.reconciliation, MAX_SEMANTIC_ENTRY_BYTES);
+  if ([...reconciliation].length > 1024) throw new Error('Итог сверки слишком длинный.');
+  const topicNames = [...new Set(Object.values(topics))].filter(topic => topic !== '__global__');
+  const topicStates = resolution.topicStates;
+  if (!isRecord(topicStates) || Object.keys(topicStates).length !== topicNames.length
+    || topicNames.some(topic => !['open', 'closed'].includes(topicStates[topic] as string))) throw new Error('Состояния тем должны быть полными и известными.');
+  const closedTopics = new Set(topicNames.filter(topic => topicStates[topic] === 'closed'));
+  if (resolution.activeTask !== 'none' && closedTopics.has(topics[resolution.activeTask as string])) throw new Error('Активная задача относится к закрытой теме.');
+  const memory = { format: SEMANTIC_COMPACTION_FORMAT, version: 1,
+    activeTask: resolution.activeTask === 'none' ? null : { text: notes[resolution.activeTask as string]!, sourceRefs: [resolution.activeTask] },
+    constraints: [] as unknown[], facts: [] as unknown[], decisions: [] as SemanticCompactionEntry[], openWork: [] as SemanticCompactionEntry[], pastTopics: [],
+  };
+  for (const ref of sourceRefs) {
+    const kind = resolution.dispositions[ref];
+    if (typeof kind !== 'string' || !['constraint', 'fact', 'decision', 'openWork', 'omit'].includes(kind)) throw new Error('Неизвестная роль смысловой заметки.');
+    if (kind !== 'omit' && novelty[ref] !== 'restatement' && (kind === 'constraint' || !closedTopics.has(topics[ref]))) {
+      if (kind === 'constraint') memory.constraints.push({ scope: `Источник ${ref}`, sourceRefs: [ref] });
+      else if (kind === 'fact') memory.facts.push({ sourceRefs: [ref] });
+      else memory[kind === 'decision' ? 'decisions' : 'openWork'].push({ text: notes[ref]!, sourceRefs: [ref] });
+    }
+  }
+  return compileAnchoredSemanticCompactionMemory(canonicalJson(memory), sources, sourceRefs, archiveText,
+    sourceRefs.filter(ref => verbatim[ref]));
+}
+
+export function semanticCompactionResponseFormat(archiveText?: string, reviewMetadata?: string, reviewNotes?: string, reviewRecords: readonly string[] = []) {
+  if (archiveText === undefined && reviewMetadata === undefined) return semanticAnchoredResponseFormat;
+  // Reuse archive validation before deriving the exact dynamic schema for counting and dispatch.
+  const metadata = archiveText === undefined ? reviewMetadata! : splitSemanticCompactionTranscript(archiveText)[0]!;
+  const refs: unknown = (JSON.parse(metadata.slice(metadata.indexOf('\n') + 1)) as Record<string, unknown>).coverageRefSet;
+  if (!Array.isArray(refs) || !refs.length || new Set(refs).size !== refs.length
+    || refs.some(ref => typeof ref !== 'string' || !/^(m|t)(0|[1-9][0-9]*)$/.test(ref))) throw new Error('Некорректные источники заметок.');
+  if (archiveText !== undefined) return semanticSourceNotesResponseFormat(refs);
+  const candidate = reviewNotes?.slice(reviewNotes.indexOf('\n') + 1);
+  const data = candidate ? JSON.parse(compileSemanticSourceNotes(candidate, refs)) as { notes: Record<string, string>; topics: Record<string, string> } : { notes: {}, topics: {} };
+  const roles: Record<string, string> = {};
+  for (const record of reviewRecords) {
+    const parsed = JSON.parse(record.slice(record.indexOf('\n') + 1)) as { sourceRef: string; role: string };
+    roles[parsed.sourceRef] = parsed.role;
+  }
+  return semanticSourceResolutionResponseFormat(refs, data.notes, data.topics, roles);
+}
+
+export function compileSemanticSourceNotes(value: unknown, sourceRefs: readonly string[]): string {
+  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > MAX_COMPACT_SUMMARY_BYTES) throw new Error('Некорректные смысловые заметки.');
+  const parsed: unknown = JSON.parse(value);
+  if (!isRecord(parsed) || !hasOnlyKeys(parsed, ['notes', 'verbatim', 'topics']) || !isRecord(parsed.notes) || !isRecord(parsed.topics) || !isRecord(parsed.verbatim)
+    || Object.keys(parsed.notes).length !== sourceRefs.length || Object.keys(parsed.topics).length !== sourceRefs.length
+    || Object.keys(parsed.verbatim).length !== sourceRefs.length
+    || sourceRefs.some(ref => !Object.prototype.hasOwnProperty.call(parsed.notes, ref) || !Object.prototype.hasOwnProperty.call(parsed.topics, ref) || typeof (parsed.verbatim as Record<string, unknown>)[ref] !== 'boolean')) {
+    throw new Error('Смысловые заметки должны покрывать каждый переданный источник ровно один раз.');
+  }
+  const notes: Record<string, string> = {};
+  const topics: Record<string, string> = {};
+  const verbatim: Record<string, boolean> = {};
+  for (const ref of sourceRefs) {
+    const text = validateSemanticText(parsed.notes[ref], MAX_SEMANTIC_ENTRY_BYTES);
+    if ([...text].length > 640) throw new Error('Смысловая заметка слишком длинная.');
+    notes[ref] = text;
+    const topic = validateSemanticText(parsed.topics[ref], MAX_SEMANTIC_ENTRY_BYTES);
+    if ([...topic].length > MAX_SEMANTIC_TOPIC_CHARS || !new RegExp(SEMANTIC_TOPIC_PATTERN, 'u').test(topic)) throw new Error('Некорректное имя темы.');
+    topics[ref] = topic;
+    verbatim[ref] = parsed.verbatim[ref] as boolean;
+  }
+  const compiled = canonicalJson({ notes, verbatim, topics });
+  if (Buffer.byteLength(compiled, 'utf8') > MAX_COMPACT_SUMMARY_BYTES) throw new Error('Смысловые заметки превышают резерв review.');
+  return compiled;
+}
+
+export function compileAnchoredSemanticCompactionMemory(value: unknown, sources: CompactionSources, sourceRefs: readonly string[], archiveText: string, exactRefs: readonly string[] = []): string {
+  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > MAX_COMPACTION_CANDIDATE_BYTES) throw new Error('Некорректный результат сжатия.');
+  const memory: unknown = JSON.parse(value);
+  if (!isRecord(memory) || !Array.isArray(memory.constraints) || !Array.isArray(memory.facts)) throw new Error('Некорректные якоря памяти.');
+  splitSemanticCompactionTranscript(archiveText);
+  const archive = JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)) as {
+    messages: Array<{ sourceRef: string; text: string }>;
+    tools: Array<{ sourceRef: string; content?: string; result?: string }>;
+    previousMemory: SemanticCompactionMemory | null;
+  };
+  const texts = new Map<string, string[]>(), quotes = new Map<string, SemanticCompactionQuote[]>();
+  const add = (ref: string, text: string, evidence: SemanticCompactionQuote[]) => {
+    texts.set(ref, [...(texts.get(ref) ?? []), text]);
+    quotes.set(ref, [...(quotes.get(ref) ?? []), ...evidence]);
+  };
+  const literalQuotes = (sourceRef: string, text: string): SemanticCompactionQuote[] => {
+    const chunks: SemanticCompactionQuote[] = [];
+    let chunk = '';
+    for (const char of text) {
+      if (Buffer.byteLength(chunk + char, 'utf8') > MAX_SEMANTIC_QUOTE_BYTES) {
+        chunks.push({ sourceRef, text: chunk }); chunk = '';
+      }
+      chunk += char;
+    }
+    if (chunk) chunks.push({ sourceRef, text: chunk });
+    return chunks;
+  };
+  // Rolling anchors use only the available memory, never hidden old raw messages.
+  if (archive.previousMemory) {
+    const prior = archive.previousMemory;
+    for (const entry of [prior.activeTask, ...prior.constraints, ...prior.decisions, ...prior.openWork, ...prior.facts, ...prior.pastTopics]) {
+      if (entry) for (const ref of entry.sourceRefs) add(ref, entry.text, 'exactQuotes' in entry
+        ? (entry as SemanticCompactionFact).exactQuotes?.filter(quote => quote.sourceRef === ref) ?? [] : []);
+    }
+  }
+  for (const record of archive.messages) add(record.sourceRef, record.text, literalQuotes(record.sourceRef, record.text));
+  for (const record of archive.tools) for (const text of [record.content, record.result]) {
+    if (typeof text === 'string' && text) add(record.sourceRef, text, literalQuotes(record.sourceRef, text));
+  }
+  const anchor = (entry: unknown, constraint: boolean) => {
+    if (!isRecord(entry) || !hasOnlyKeys(entry, constraint ? ['scope', 'sourceRefs'] : ['sourceRefs'])) throw new Error('Якорь не может содержать пересказ.');
+    const refs = validateSemanticSourceRefs(entry.sourceRefs, semanticSourceTexts(sources));
+    if (refs.some(ref => !sourceRefs.includes(ref) || !texts.has(ref))) throw new Error('Якорь ссылается на недоступный источник.');
+    const text = [...new Set(refs.flatMap(ref => texts.get(ref)!))].join('\n');
+    return constraint ? { scope: entry.scope, sourceRefs: refs, text }
+      : { sourceRefs: refs, text, exactQuotes: refs.flatMap(ref => quotes.get(ref) ?? []) };
+  };
+  const preserveCritical = (entries: unknown) => {
+    if (!Array.isArray(entries)) throw new Error('Некорректный список смысловой памяти.');
+    return entries.map(entry => {
+      const parsed = validateSemanticEntry(entry, semanticSourceTexts(sources));
+      if (!parsed.sourceRefs.some(ref => exactRefs.includes(ref))) return parsed;
+      if (parsed.sourceRefs.some(ref => !texts.has(ref))) throw new Error('Критичный источник недоступен.');
+      return { ...parsed, text: [...new Set(parsed.sourceRefs.flatMap(ref => texts.get(ref)!))].join('\n') };
+    });
+  };
+  return compileGeneratedSemanticCompactionMemory(canonicalJson({ ...memory,
+    activeTask: memory.activeTask === null ? null : preserveCritical([memory.activeTask])[0],
+    constraints: memory.constraints.map(entry => anchor(entry, true)), facts: memory.facts.map(entry => anchor(entry, false)),
+    decisions: preserveCritical(memory.decisions), openWork: preserveCritical(memory.openWork),
+  }), sources, sourceRefs);
+}
 
 export interface SemanticCompactionEntry {
   text: string;

@@ -24,7 +24,7 @@ import { isImageProtocolDiagnostic, PROVIDER_ERROR_CATEGORIES } from './contract
 import { LocalToolError, type LocalToolEvent, type LocalTools } from './local-tools';
 import { HookDispatchAbortError } from './hooks';
 import { MAX_USAGE_COUNT, mergeUsageReceipt } from './usage';
-import { COMPACTION_OUTPUT_TOKEN_LIMIT, MAX_COMPACT_SUMMARY_BYTES, compileExtractiveCompaction, compileGeneratedSemanticCompactionMemory, type CompactionSources } from './compaction';
+import { COMPACTION_OUTPUT_TOKEN_LIMIT, semanticReviewInputReserve, compileExtractiveCompaction, compileResolvedSemanticCompactionMemory, type CompactionSources } from './compaction';
 import { buildSemanticCompactionReviewRequest, getSemanticCompactionRequestSourceRefs } from './context';
 import { isCurrentChatModelId } from './model-catalog';
 import { withLiteNormalOutputCap } from './context-budget';
@@ -231,9 +231,9 @@ function runtimeErrorCategory(error: unknown, turnTimedOut = false): ProviderErr
   }
 }
 
-function compileCompactionCandidate(value: string, sources: CompactionSources, semanticSourceRefs: readonly string[] | null): string {
+function compileCompactionCandidate(value: string, sources: CompactionSources, semanticSourceRefs: readonly string[] | null, archiveText?: string, notes?: string): string {
   try { return semanticSourceRefs === null ? compileExtractiveCompaction(value, sources)
-    : compileGeneratedSemanticCompactionMemory(value, sources, semanticSourceRefs); }
+    : compileResolvedSemanticCompactionMemory(value, notes!, sources, semanticSourceRefs, archiveText!); }
   catch {
     throw Object.assign(new Error('COMPACTION_CANDIDATE_REJECTED'), { category: 'context' as const });
   }
@@ -915,6 +915,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       let request: ProviderTurnRequest;
       let compactionContext: PreparedCompactionContext | null = null;
       let semanticSourceRefs: string[] | null = null;
+      let semanticArchiveText: string | undefined;
+      let semanticNotes: string | undefined;
       let semanticReviewStarted = false;
       let providerStateOwner: ProviderStateOwner | undefined;
       let imageGeneration: AsyncIterable<ProviderEvent> | null = null;
@@ -947,6 +949,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           request = { ...request, maxOutputTokens: request.maxOutputTokens ?? COMPACTION_OUTPUT_TOKEN_LIMIT };
           semanticSourceRefs = getSemanticCompactionRequestSourceRefs(request, compactionContext.sources);
           if (!semanticSourceRefs) throw new Error('COMPACTION_CONTEXT_UNAVAILABLE');
+          semanticArchiveText = request.messages[0]!.text;
         }
         const beforeResults = await runHookEvent({ event: 'before-compaction', projectId: turn.input.projectId });
         const rejected = beforeResults.find((result) => result.status !== 'completed' || result.decision === 'block');
@@ -986,7 +989,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
             options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
             const preflight = Promise.resolve().then(() =>
               options.preflightProviderRequest!(turn.input, checkedRequest, controller.signal, providerStateOwner,
-                checkedRequest === reservedReview ? { additionalInputTokenReserve: MAX_COMPACT_SUMMARY_BYTES } : undefined));
+                checkedRequest === reservedReview ? { additionalInputTokenReserve: semanticReviewInputReserve(semanticSourceRefs!.length) } : undefined));
             await waitTracked(
               preflight,
               operationTimeoutMs,
@@ -1307,6 +1310,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         if (semanticSourceRefs !== null && !semanticReviewStarted) {
           const review = buildSemanticCompactionReviewRequest(request, compactionContext!.sources, semanticSourceRefs, answer);
           if (!review) throw Object.assign(new Error('COMPACTION_CANDIDATE_REJECTED'), { category: 'context' as const });
+          semanticNotes = answer;
           request = review;
           semanticReviewStarted = true;
           if (draftTimer) clearTimeout(draftTimer);
@@ -1334,7 +1338,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
         const appendOperation = turn.input.operation === 'compaction'
           ? options.appendCompaction && compactionContext
-            ? options.appendCompaction(turn.input, compileCompactionCandidate(answer, compactionContext.sources, semanticSourceRefs), controller.signal, compactionContext,
+            ? options.appendCompaction(turn.input, compileCompactionCandidate(answer, compactionContext.sources, semanticSourceRefs, semanticArchiveText, semanticNotes), controller.signal, compactionContext,
               terminalTurn, completedFunctionsStateId, providerStateOwner)
               .then(async () => {
                 await runHookEvent({ event: 'after-compaction', projectId: turn.input.projectId }, new AbortController().signal, turn.input, terminalTurn).catch(() => undefined);

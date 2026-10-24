@@ -10,7 +10,7 @@ import { GigaChatProviderError, MAX_PROVIDER_REQUEST_BYTES, serializeProviderTur
 import { calculateLiteWorkingBudget, isLitePromptOverMeasuredInputGuard, liteHardInputLimit } from './context-budget';
 import { CHAT_MODEL_FAMILIES } from './model-catalog';
 import { compileExtractiveCompaction, compileSemanticCompactionMemory,
-  createCompactionSources, getSemanticCompactionCoverageRefSet } from './compaction';
+  compileResolvedSemanticCompactionMemory, createCompactionSources, getSemanticCompactionCoverageRefSet } from './compaction';
 
 const at = '2026-10-09T12:00:00.000Z';
 const user = (id: string, text = id): ChatMessage => ({ id, role: 'user', text, createdAt: at });
@@ -402,10 +402,9 @@ test('prepares a semantic request from the whole supplied raw prefix without exp
   assert.deepEqual({ ...decodeWire(semanticWire.messages[1]!.content[0]!.text!),
     messages: semanticWire.messages.slice(2, -1).map(message => decodeWire(message.content[0]!.text!)) }, envelope);
   assert.equal((semanticWire.messages[0]?.content[0]?.text ?? '').split(SEMANTIC_COMPACTION_TASK_INSTRUCTION).length - 1, 1);
-  assert.match(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /не обязательно ссылаться на каждый исходник/i);
-  assert.doesNotMatch(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /coverageRefSet|retain=true|решение на каждое сообщение/i);
-  assert.match(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /действующее ограничение.*сохраняй в constraints/i);
-  assert.match(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /не более чем в две записи по 256 символов каждая/i);
+  assert.match(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /каждого sourceRef из coverageRefSet/i);
+  assert.doesNotMatch(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /retain=true|сохраняй в constraints/i);
+  assert.match(SEMANTIC_COMPACTION_TASK_INSTRUCTION, /ещё не итоговая память/i);
   assert.equal(context.request.system.some((layer) => layer.source === 'summary'), false);
   assert.equal(envelope.previousMemory, null, 'first semantic compaction starts from the supplied raw prefix');
   assert.deepEqual(envelope.coverageRefSet, ['m0', 'm1', 'm2', 'm3', 't0', 't1']);
@@ -528,7 +527,8 @@ test('rolls semantic compaction forward with stable global refs and only the new
     ],
   });
   assert.doesNotThrow(() => compileSemanticCompactionMemory(nextCandidate, context.compactionSources!));
-  const review = buildSemanticCompactionReviewRequest(context.request, context.compactionSources!, envelope.coverageRefSet, nextCandidate);
+  const notes = JSON.stringify({ notes: Object.fromEntries(envelope.coverageRefSet.map(ref => [ref, 'The old tool returned its result.'])), verbatim: Object.fromEntries(envelope.coverageRefSet.map(ref => [ref, false])), topics: Object.fromEntries(envelope.coverageRefSet.map(ref => [ref, '__global__'])) });
+  const review = buildSemanticCompactionReviewRequest(context.request, context.compactionSources!, envelope.coverageRefSet, notes);
   assert.ok(review);
   const reviewEnvelope = JSON.parse(review.messages[1]!.text.slice(review.messages[1]!.text.indexOf('\n') + 1)) as typeof envelope;
   assert.deepEqual(reviewEnvelope.previousMemory, envelope.previousMemory);
@@ -574,11 +574,16 @@ test('both semantic wire requests preserve source distinctions for all four sele
     const context = buildNextTurnContext(input(messages, { modelId: currentId, usageKind: 'compaction',
       compactionFormat: 'semantic', functionCallMode: 'none', compactionToolReceipts: [], compactionArtifacts: [] }));
     const sources = context.compactionSources!;
-    const candidate = JSON.stringify({ format: 'gigachat-semantic-memory', version: 1,
-      activeTask: { text: 'Continue validation.', sourceRefs: ['m2'] }, constraints: [], decisions: [], openWork: [], pastTopics: [],
-      facts: [{ text: messages[2]!.text, sourceRefs: ['m2'], exactQuotes: [{ sourceRef: 'm2', text: 'Hash comparison passed' }] }] });
+    const candidate = JSON.stringify({ notes: { m0: 'Do not publish ownerCode.', m1: 'Read may be permitted.', m2: 'Copy validated.' }, verbatim: { m0: true, m1: true, m2: true }, topics: { m0: '__global__', m1: '__global__', m2: '__global__' } });
     const review = buildSemanticCompactionReviewRequest(context.request, sources, getSemanticCompactionCoverageRefSet(sources), candidate);
     assert.ok(review);
+    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ reconciliation: 'Preserve boundaries and the limited outcome.',
+      activeTask: 'm2', topicStates: {}, novelty: { m1: 'new' }, dispositions: { m0: 'decision', m1: 'constraint', m2: 'fact' } }),
+    candidate, sources, getSemanticCompactionCoverageRefSet(sources), context.request.messages[0]!.text));
+    assert.equal(compiled.decisions[0].text, messages[0]!.text);
+    assert.equal(compiled.constraints[0].text, messages[1]!.text);
+    assert.equal(compiled.facts[0].text, messages[2]!.text);
+    assert.equal(compiled.activeTask.text, messages[2]!.text);
     const decode = (text: string) => JSON.parse(text.slice(text.indexOf('\n') + 1)) as Record<string, unknown>;
     const archive = decode(context.request.messages[0]!.text);
     for (const request of [context.request, review]) {
@@ -611,14 +616,7 @@ test('builds an independent semantic review from the exact current archive and a
   }));
   const sources = context.compactionSources!;
   const sourceRefs = getSemanticCompactionCoverageRefSet(sources);
-  const candidate = JSON.stringify({
-    format: 'gigachat-semantic-memory', version: 1,
-    activeTask: { text: 'Continue package validation.', sourceRefs: ['m0'] },
-    constraints: [], decisions: [], openWork: [{ text: 'Review the Windows build.', sourceRefs: ['m1'] }],
-    facts: [{ text: 'The read confirmed the build is ready.', sourceRefs: ['t0'],
-      exactQuotes: [{ sourceRef: 't0', text: 'The build is ready.' }] }],
-    pastTopics: [],
-  });
+  const candidate = JSON.stringify({ notes: { m0: 'Continue package validation.', m1: 'Review the Windows build.', t0: 'The build is ready.' }, verbatim: { m0: false, m1: false, t0: false }, topics: { m0: 'm0', m1: 'm0', t0: 'm0' } });
   const originalRequest = structuredClone(context.request);
 
   const review = buildSemanticCompactionReviewRequest(context.request, sources, sourceRefs, candidate);
@@ -630,7 +628,7 @@ test('builds an independent semantic review from the exact current archive and a
   assert.equal(review.system.length, originalRequest.system.length);
   assert.equal(reviewTaskLayer.source, 'runtime');
   assert.equal(reviewTaskLayer.label, 'Задача текущего запроса');
-  assert.match(reviewTaskLayer.text, /^Независимо проверь черновик semantic-памяти/);
+  assert.match(reviewTaskLayer.text, /^Определи актуальность каждой/);
   assert.notEqual(reviewTaskLayer.text, SEMANTIC_COMPACTION_TASK_INSTRUCTION);
   assert.equal(review.system.filter((layer) => layer.label === 'Задача текущего запроса').length, 1);
   assert.equal(review.system.filter((layer) => layer.text === SEMANTIC_COMPACTION_TASK_INSTRUCTION).length, 0);
@@ -646,7 +644,7 @@ test('builds an independent semantic review from the exact current archive and a
   const decode = (text: string) => JSON.parse(text.slice(text.indexOf('\n') + 1)) as Record<string, unknown>;
   assert.deepEqual({ ...decode(review.messages[1]!.text), messages: review.messages.slice(2, -1).map(message => decode(message.text)) },
     decode(context.request.messages[0]!.text), 'review reconstructs every exact source record after the candidate');
-  assert.match(review.messages[0]?.text ?? '', /^ЧЕРНОВИК SEMANTIC-ПАМЯТИ JSON/);
+  assert.match(review.messages[0]?.text ?? '', /^ПОИСТОЧНИКОВЫЕ СМЫСЛОВЫЕ ЗАМЕТКИ JSON/);
   assert.match(review.messages[0]?.text ?? '', /Review the Windows build/);
   assert.equal(review.messages[review.messages.length - 1]?.id, 'request-semantic-review-task');
   assert.match(review.messages[review.messages.length - 1]?.text ?? '', /При расхождении опирайся на архив/);
@@ -669,9 +667,7 @@ test('builds an independent semantic review from the exact current archive and a
   assert.equal(wire.messages[wire.messages.length - 1]?.content[0]?.text, review.messages[review.messages.length - 1]?.text);
   assert.equal(wire.tool_config.mode, 'none');
   assert.equal(wire.tools, undefined);
-  assert.deepEqual(wire.model_options.response_format.schema.required,
-    ['format', 'version', 'activeTask', 'constraints', 'decisions', 'openWork', 'facts', 'pastTopics']);
-  assert.equal(Object.prototype.hasOwnProperty.call(wire.model_options.response_format.schema.properties, 'coverage'), false);
+  assert.deepEqual(wire.model_options.response_format.schema.required, ['reconciliation', 'activeTask', 'topicStates', 'novelty', 'dispositions']);
   assert.doesNotMatch(review.messages[0]!.text + review.messages[1]!.text,
     /private-review-receipt|private-review-state|functionsStateId/);
 

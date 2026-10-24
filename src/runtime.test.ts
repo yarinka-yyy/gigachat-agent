@@ -938,9 +938,6 @@ test('semantic compaction reviews once on the selected model and accounts for bo
     const original = structuredClone(input);
     const requests: ProviderTurnRequest[] = [], preflights: ProviderTurnRequest[] = [];
     const receipts: UsageReceipt[] = [], saved: string[] = [], hooks: string[] = [];
-    const memory = (text: string) => JSON.stringify({ format: 'gigachat-semantic-memory', version: 1,
-      activeTask: { text, sourceRefs: ['m0'] }, constraints: [], decisions: [], openWork: [],
-      facts: [{ text: input.messages[0]!.text, sourceRefs: ['m0'], exactQuotes: [{ sourceRef: 'm0', text: input.messages[0]!.text }] }], pastTopics: [] });
     const runtime = createTurnRuntime({
       provider: makeProvider(async function* (request) {
         assert.equal(preflights[preflights.length - 1], request, 'each exact request must pass its preflight before dispatch');
@@ -949,7 +946,9 @@ test('semantic compaction reviews once on the selected model and accounts for bo
         assert.equal(request.maxOutputTokens, 4096);
         assert.equal(request.functionCallMode, 'none');
         assert.deepEqual(request.protocolHistory, []);
-        yield { type: 'text-delta', text: memory(requests.length === 1 ? 'Draft' : 'Reviewed') };
+        yield { type: 'text-delta', text: requests.length === 1
+          ? JSON.stringify({ notes: Object.fromEntries(input.messages.map((message, index) => [`m${index}`, `Draft: ${message.text}`])), verbatim: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, false])), topics: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, '__global__'])) })
+          : JSON.stringify({ reconciliation: 'The task remains open.', activeTask: 'm0', topicStates: {}, novelty: Object.fromEntries(input.messages.flatMap((message, index) => message.role === 'assistant' ? [[`m${index}`, 'new']] : [])), dispositions: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, 'fact'])) }) };
         yield { type: 'usage', promptTokens: 10, completionTokens: 5, totalTokens: 15, precachedPromptTokens: 0 };
         yield { type: 'completed', functionsStateId: requests.length === 1 ? 'draft-state' : 'review-state' };
       }),
@@ -961,7 +960,7 @@ test('semantic compaction reviews once on the selected model and accounts for bo
       preflightProviderRequest: async (_turn, request, _signal, _owner, reservation) => {
         if (reservation) {
           assert.equal(requests.length, 0, 'reserve review before spending the first completion');
-          assert.equal(reservation.additionalInputTokenReserve, 32768);
+          assert.ok(reservation.additionalInputTokenReserve > 65536 && reservation.additionalInputTokenReserve < 65536 + 1024 * input.messages.length);
           assert.equal(request.messages.length, input.messages.length + 3);
         }
         preflights.push(request);
@@ -986,7 +985,7 @@ test('semantic compaction reviews once on the selected model and accounts for bo
     assert.equal(requests.length, 2);
     assert.equal(preflights.length, 3, 'reserve review, exact draft, exact review');
     assert.equal(saved.length, 1);
-    assert.equal(JSON.parse(saved[0]!).activeTask.text, 'Reviewed');
+    assert.equal(JSON.parse(saved[0]!).activeTask.text, `Draft: ${input.messages[0]!.text}`);
     assert.match(requests[1]!.messages[0]!.text, /Draft/);
     const sourceRecord = JSON.parse(requests[1]!.messages[2]!.text.split('\n').slice(1).join('\n')) as { text: string };
     assert.equal(sourceRecord.text, input.messages[0]!.text);
@@ -1002,7 +1001,7 @@ test('semantic compaction reviews once on the selected model and accounts for bo
 
 test('semantic failures keep the previous checkpoint and never retry the draft or review', async (t) => {
   for (const fault of ['missing-preflight', 'reserve-budget', 'reserve-mutation', 'model-switch', 'changed-archive', 'changed-service-task', 'invalid-draft', 'invalid-review',
-    'unquoted-draft', 'unquoted-review', 'review-budget', 'review-network', 'review-cancel', 'unexpected-function'] as const) await t.test(fault, async () => {
+    'missing-source-note', 'unquoted-review', 'review-budget', 'review-network', 'review-cancel', 'unexpected-function'] as const) await t.test(fault, async () => {
     const input = { ...compactionTurnFor(`semantic-fault-${fault}`), modelId: 'GigaChat-3-Lightning' };
     const memory = JSON.stringify({ format: 'gigachat-semantic-memory', version: 1,
       activeTask: { text: 'Keep the current task.', sourceRefs: ['m0'] }, constraints: [], decisions: [], openWork: [], facts: [], pastTopics: [] });
@@ -1013,8 +1012,10 @@ test('semantic failures keep the previous checkpoint and never retry the draft o
         if (fault === 'unexpected-function') { yield functionCall('write', { path: 'forbidden.txt', contents: 'no' }); return; }
         if (calls === 2 && fault === 'review-network') { yield { type: 'error', category: 'network', retryable: true }; return; }
         if (calls === 2 && fault === 'review-cancel') { runtime.cancel(runtime.list()[0]!.id); return; }
-        const candidate = fault === 'unquoted-draft' || calls === 2 && fault === 'unquoted-review'
-          ? JSON.stringify({ ...JSON.parse(memory), facts: [{ text: 'Unquoted fact.', sourceRefs: ['m0'], exactQuotes: [] }] }) : memory;
+        const candidate = calls === 1
+          ? JSON.stringify({ notes: Object.fromEntries(input.messages.slice(fault === 'missing-source-note' ? 1 : 0).map(message => [`m${input.messages.indexOf(message)}`, message.text])), verbatim: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, false])), topics: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, '__global__'])) })
+          : fault === 'unquoted-review'
+            ? JSON.stringify({ ...JSON.parse(memory), facts: [{ text: 'Unquoted fact.', sourceRefs: ['m0'], exactQuotes: [] }] }) : memory;
         yield { type: 'text-delta', text: fault === 'invalid-draft' || calls === 2 && fault === 'invalid-review' ? '{}' : candidate };
         yield { type: 'completed' };
       }), tools: testTools,
@@ -1029,7 +1030,7 @@ test('semantic failures keep the previous checkpoint and never retry the draft o
       },
       ...(fault === 'missing-preflight' ? {} : { preflightProviderRequest: async (_turn, _request, _signal, _owner, reservation) => {
         if (reservation) {
-          assert.equal(reservation.additionalInputTokenReserve, 32768);
+          assert.ok(reservation.additionalInputTokenReserve > 65536 && reservation.additionalInputTokenReserve < 65536 + 1024 * input.messages.length);
           if (fault === 'reserve-budget') throw Object.assign(new Error('reserve over budget'), { category: 'context' });
           if (fault === 'reserve-mutation') _request.messages[0]!.text += 'tampered';
           return;
@@ -1046,7 +1047,7 @@ test('semantic failures keep the previous checkpoint and never retry the draft o
     assert.equal(saves, 0);
     assert.equal(runtime.list()[0]?.status, fault === 'review-cancel' ? 'cancelled' : 'failed');
     assert.equal(calls, ['missing-preflight', 'reserve-budget', 'reserve-mutation', 'model-switch', 'changed-archive', 'changed-service-task'].includes(fault) ? 0
-      : ['invalid-draft', 'unquoted-draft', 'review-budget', 'unexpected-function'].includes(fault) ? 1 : 2);
+      : ['invalid-draft', 'missing-source-note', 'review-budget', 'unexpected-function'].includes(fault) ? 1 : 2);
   });
 });
 

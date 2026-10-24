@@ -5,6 +5,10 @@ import {
   compileExtractiveCompaction,
   compileSemanticCompactionMemory,
   compileGeneratedSemanticCompactionMemory,
+  compileSemanticSourceNotes,
+  semanticSourceNotesResponseFormat,
+  compileAnchoredSemanticCompactionMemory,
+  compileResolvedSemanticCompactionMemory,
   createCompactionSources,
   formatArchivedCompactionNotes,
   formatSemanticCompactionMemory,
@@ -556,6 +560,62 @@ test('requires exact quotes to be nonempty substrings of the referenced source v
   assert.deepEqual(validateSemanticCompactionMemory(semanticCandidate({ facts: [{
     text: 'The fact is paraphrased without a quote.', sourceRefs: ['m1'], exactQuotes: [],
   }] }), sources).facts[0]?.exactQuotes, [], 'strict JSON may require an empty quote array when no exact quote is needed');
+});
+
+test('source notes cover every source before compression without becoming a snapshot', () => {
+  const refs = ['m0', 'm1', 't0'];
+  const notes = { m0: 'Earlier restriction stays active.', m1: 'Discussion closed.', t0: 'Read passed; import untested.' };
+  const topics = Object.fromEntries(refs.map(ref => [ref, '__global__']));
+  const verbatim = Object.fromEntries(refs.map(ref => [ref, false]));
+  assert.deepEqual(JSON.parse(compileSemanticSourceNotes(JSON.stringify({ notes, verbatim, topics }), refs)), { notes, verbatim, topics });
+  assert.deepEqual(semanticSourceNotesResponseFormat(refs).schema.properties.notes.required, refs);
+  for (const invalid of [{ notes: { m0: notes.m0 } }, { notes: { ...notes, unknown: 'extra' } },
+    { notes: { ...notes, m1: '' } }, { notes: { ...notes, m1: 'x'.repeat(641) } }, { notes, facts: [] }]) {
+    assert.throws(() => compileSemanticSourceNotes(JSON.stringify({ topics, verbatim, ...invalid }), refs));
+  }
+  assert.throws(() => validateSemanticCompactionMemory(JSON.stringify({ notes }), semanticSources()));
+});
+
+test('critical anchors are materialized without model paraphrases and reject unavailable refs', () => {
+  const sources = semanticSources(), refs = getSemanticCompactionCoverageRefSet(sources);
+  const archive = serializeSemanticCompactionTranscript(sources);
+  const value = { format: 'gigachat-semantic-memory', version: 1, activeTask: null,
+    constraints: [{ scope: 'Boundary', sourceRefs: ['m0'] }], facts: [{ sourceRefs: ['t0'] }], decisions: [], openWork: [], pastTopics: [] };
+  const memory = JSON.parse(compileAnchoredSemanticCompactionMemory(JSON.stringify(value), sources, refs, archive));
+  assert.equal(memory.constraints[0].text, sources.messages[0]!.text);
+  assert.ok(memory.facts[0].exactQuotes.length > 0);
+  assert.throws(() => compileAnchoredSemanticCompactionMemory(JSON.stringify({ ...value,
+    constraints: [{ ...value.constraints[0], text: 'A broader restriction.' }] }), sources, refs, archive));
+  assert.throws(() => compileAnchoredSemanticCompactionMemory(JSON.stringify(value), sources, ['t0'], archive));
+});
+
+test('resolution cannot rewrite notes or silently leave a source unaccounted for', () => {
+  const sources = semanticSources(), refs = getSemanticCompactionCoverageRefSet(sources);
+  const archive = serializeSemanticCompactionTranscript(sources);
+  const topics = Object.fromEntries(refs.map(ref => [ref, ref === 'm0' ? '__global__' : ref === 'm2' ? 'm2' : 'm1']));
+  const notes = JSON.stringify({ notes: Object.fromEntries(refs.map(ref => [ref, `Meaning of ${ref}.`])), verbatim: Object.fromEntries(refs.map(ref => [ref, ref === 'm2'])), topics });
+  const resolution = { reconciliation: 'Working is open.', activeTask: 'm1', topicStates: { m1: 'open', m2: 'open' }, novelty: { m1: 'new' }, dispositions: Object.fromEntries(refs.map(ref => [ref,
+    ref === 'm0' ? 'constraint' : ref === 't0' ? 'fact' : ref === 'm2' ? 'openWork' : 'omit'])) };
+  const memory = JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify(resolution), notes, sources, refs, archive));
+  assert.equal(memory.activeTask.text, 'Meaning of m1.');
+  assert.equal(memory.openWork[0].text, sources.messages[2]!.text);
+  assert.equal(memory.constraints[0].text, sources.messages[0]!.text);
+  const closed = JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...resolution, topicStates: { m1: 'open', m2: 'closed' } }), notes, sources, refs, archive));
+  assert.deepEqual(closed.openWork, []);
+  assert.equal(closed.constraints[0].text, memory.constraints[0].text);
+  assert.throws(() => compileResolvedSemanticCompactionMemory(JSON.stringify({ ...resolution, topicStates: { ...resolution.topicStates, __global__: 'closed' } }), notes, sources, refs, archive));
+  const scopedNotes = JSON.stringify({ ...JSON.parse(notes), topics: { ...topics, m0: 'm0' } });
+  const scoped = JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...resolution,
+    topicStates: { m0: 'closed', m1: 'open', m2: 'closed' } }), scopedNotes, sources, refs, archive));
+  assert.equal(scoped.constraints[0].text, sources.messages[0]!.text, 'closing a topic cannot silently revoke a selected constraint');
+  const repeated = JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...resolution, activeTask: 'm0',
+    novelty: { m1: 'restatement' }, dispositions: { ...resolution.dispositions, m1: 'fact' } }), notes, sources, refs, archive));
+  assert.ok(repeated.facts.every((entry: { sourceRefs: string[] }) => !entry.sourceRefs.includes('m1')));
+  for (const dispositions of [{ ...resolution.dispositions, m0: ['constraint', 'constraint'] },
+    { ...resolution.dispositions, m0: ['unknown'] }, { ...resolution.dispositions, m999: [] }, {}]) {
+    assert.throws(() => compileResolvedSemanticCompactionMemory(JSON.stringify({ ...resolution, dispositions }), notes, sources, refs, archive));
+  }
+  assert.throws(() => compileResolvedSemanticCompactionMemory(JSON.stringify({ ...resolution, text: 'rewrite' }), notes, sources, refs, archive));
 });
 
 test('segmented semantic input reconstructs every source and rejects malformed envelopes', () => {
