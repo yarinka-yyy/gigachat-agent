@@ -601,13 +601,14 @@ test('topic closure removes all its details and defect state survives compilatio
   const notes = JSON.stringify({ taskSubject: 'Upload', state: 'Chart closed; upload unresolved.', activeTask: 'm2', closedTopics: 'm4:m1,m3', notes: Object.fromEntries(refs.map(ref => [ref, `Note ${ref}`])), verbatim: Object.fromEntries(refs.map(ref => [ref, true])) });
   const index = semanticReviewEvidenceIndex(archive);
   const idsFor = (ref: string) => Object.keys(index).filter(id => index[id]!.sourceRef === ref);
-  const resolution = { activeTask: 'm2', classifications: { m0: 'C', m1: 'CF', m2: 'W', m3: 'F', m4: '-', m5: 'F' },
+  const resolution = { activeTask: 'm2', classifications: { m0: 'constraint', m1: 'constraint+fact', m2: 'openWork', m3: 'fact', m4: 'drop', m5: 'fact' },
     pastTopics: `${idsFor('m4')[0]}:m1,m3`, unresolvedDefects: idsFor('m5').join(',') };
   const format = semanticSourceResolutionResponseFormat(refs, ['m0', 'm1', 'm2', 'm4', 'm5']);
   assert.ok(!format.schema.properties.activeTask.enum.includes('m3'));
   assert.ok(!format.schema.properties.activeTask.enum.includes('keep'));
   assert.deepEqual(format.schema.properties.classifications.required, refs);
-  assert.ok(!format.schema.properties.classifications.properties.m3!.enum.includes('W'));
+  assert.ok(!format.schema.properties.classifications.properties.m3!.enum.includes('openWork'));
+  assert.ok(!format.schema.properties.classifications.properties.m3!.enum.includes('defect'));
   assert.ok(!new RegExp(format.schema.properties.pastTopics.pattern).test('keep'));
   assert.ok(!new RegExp(format.schema.properties.pastTopics.pattern).test(''));
   const emptyDraft = JSON.stringify({ ...JSON.parse(notes), activeTask: 'none', closedTopics: '' });
@@ -620,6 +621,10 @@ test('topic closure removes all its details and defect state survives compilatio
   assert.deepEqual(JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson(resolution), mistakenDraft, sources, refs, archive)).closedTopics,
     corrected.closedTopics, 'uncommitted draft closure cannot replace independent literal review proof');
   const memory = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson(resolution), notes, sources, refs, archive));
+  const automaticDefect = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ ...resolution,
+    classifications: { ...resolution.classifications, m5: 'defect' }, unresolvedDefects: '' }),
+  JSON.stringify({ ...JSON.parse(notes), verbatim: { ...JSON.parse(notes).verbatim, m5: false } }), sources, refs, archive));
+  assert.deepEqual(automaticDefect, memory, 'a defect label must materialize exact state even without a second quote selection');
   assert.deepEqual(memory.constraints[0].sourceRefs, ['m0']);
   assert.equal(memory.constraints[0].text, sources.messages[0]!.text);
   assert.deepEqual(memory.facts.map((entry: { sourceRefs: string[] }) => entry.sourceRefs), [['m5']]);
@@ -634,8 +639,9 @@ test('topic closure removes all its details and defect state survives compilatio
   assert.doesNotMatch(formatted, /Compare chart widths|small chart legend|Дословная цитата m5:/);
   for (const change of [{ unresolvedDefects: undefined }, { observedDefect: true, defectEvidence: '' },
     { unresolvedDefects: 'q999' }, { activeTask: 'm999' }, { activeTask: '' }, { activeTask: 'none' }, { activeTask: 'm3' }, { activeTask: 'keep' },
-    { pastTopics: '' }, { pastTopics: 'keep' }, { openWork: 'q2,q3' }, { classifications: { m0: 'C' } },
-    { classifications: { ...resolution.classifications, m3: 'W' } }, { classifications: { ...resolution.classifications, m2: 'q2' } },
+    { pastTopics: '' }, { pastTopics: 'keep' }, { openWork: 'q2,q3' }, { classifications: { m0: 'constraint' } },
+    { classifications: { ...resolution.classifications, m3: 'openWork' } }, { classifications: { ...resolution.classifications, m3: 'defect' } },
+    { classifications: { ...resolution.classifications, m2: 'q2' } }, { pastTopics: 'none', classifications: { ...resolution.classifications, m1: 'closed' } },
     { pastTopics: 'm3:m1,m3' }, { pastTopics: `${idsFor('m0')[0]}:m1,m3` },
     { unresolvedDefects: ';' }, { unresolvedDefects: [{ sourceRefs: ['m5'], exactQuotes: [] }] }]) {
     assert.throws(() => compileResolvedSemanticCompactionMemory(reviewJson({ ...resolution, ...change }), notes, sources, refs, archive));
@@ -652,7 +658,7 @@ test('topic closure removes all its details and defect state survives compilatio
   const rollingNotes = JSON.stringify({ taskSubject: 'Upload', state: 'Mismatch still unresolved.', activeTask: 'm2', closedTopics: '',
     notes: Object.fromEntries(rollingRefs.map(ref => [ref, 'Available memory.'])), verbatim: Object.fromEntries(rollingRefs.map(ref => [ref, true])) });
   const rollingIndex = semanticReviewEvidenceIndex(rollingArchive);
-  const rolling = { ...resolution, classifications: { ...resolution.classifications, m6: 'W' }, pastTopics: 'none', unresolvedDefects: Object.keys(rollingIndex).filter(id => rollingIndex[id]!.sourceRef === 'm5').join(',') };
+  const rolling = { ...resolution, classifications: { ...resolution.classifications, m6: 'openWork' }, pastTopics: 'none', unresolvedDefects: Object.keys(rollingIndex).filter(id => rollingIndex[id]!.sourceRef === 'm5').join(',') };
   const continued = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson(rolling), rollingNotes, rollingSources, rollingRefs, rollingArchive));
   assert.deepEqual(continued.closedTopics, memory.closedTopics, 'later review cannot silently reopen closed details');
   assert.deepEqual(continued.unresolvedDefects, memory.unresolvedDefects, 'state survives a second compaction without prefix accumulation');

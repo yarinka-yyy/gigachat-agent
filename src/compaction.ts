@@ -169,14 +169,16 @@ export function semanticReviewInputReserve(): number {
   return MAX_COMPACT_SUMMARY_BYTES;
 }
 
-const SOURCE_CLASSES = ['-', 'C', 'D', 'W', 'F', 'CD', 'CW', 'CF', 'DW', 'DF', 'WF', 'CDW', 'CDF', 'CWF', 'DWF', 'CDWF'];
+const SOURCE_CATEGORIES = ['constraint', 'decision', 'openWork', 'fact'];
+const SOURCE_CLASSES = ['drop', 'closed', 'defect', ...Array.from({ length: 15 }, (_, mask) =>
+  SOURCE_CATEGORIES.filter((_category, bit) => (mask + 1) & (1 << bit)).join('+'))];
 
 export function semanticSourceResolutionResponseFormat(sourceRefs: readonly string[] = [], primarySourceRefs: readonly string[] = sourceRefs) {
   return { type: 'json_schema', strict: true, schema: { type: 'object',
-    properties: { activeTask: { type: 'string', enum: [...primarySourceRefs, 'none'] },
-      classifications: { type: 'object', properties: Object.fromEntries(sourceRefs.map(ref => [ref, { type: 'string', enum: SOURCE_CLASSES.filter(value => !value.includes('W') || primarySourceRefs.includes(ref) || ref.startsWith('t')) }])), required: [...sourceRefs], additionalProperties: false },
-      pastTopics: { type: 'string', maxLength: 512, pattern: `^(?:none|${CLOSED_REVIEW_PATTERN}(?:;${CLOSED_REVIEW_PATTERN})?)$` },
-      unresolvedDefects: { type: 'string', maxLength: 512, pattern: `^(?:${QUOTE_LIST_PATTERN}(?:;${QUOTE_LIST_PATTERN})*)?$` } },
+    properties: { pastTopics: { type: 'string', maxLength: 512, pattern: `^(?:none|${CLOSED_REVIEW_PATTERN}(?:;${CLOSED_REVIEW_PATTERN})?)$` },
+      unresolvedDefects: { type: 'string', maxLength: 512, pattern: `^(?:${QUOTE_LIST_PATTERN}(?:;${QUOTE_LIST_PATTERN})*)?$` },
+      activeTask: { type: 'string', enum: [...primarySourceRefs, 'none'] },
+      classifications: { type: 'object', properties: Object.fromEntries(sourceRefs.map(ref => [ref, { type: 'string', enum: SOURCE_CLASSES.filter(value => !value.includes('openWork') && value !== 'defect' || primarySourceRefs.includes(ref) || ref.startsWith('t')) }])), required: [...sourceRefs], additionalProperties: false } },
     required: [...SEMANTIC_REVIEW_FIELDS], additionalProperties: false } };
 }
 
@@ -220,6 +222,28 @@ export function semanticReviewEvidenceIndex(archiveText: string): Record<string,
   return index;
 }
 
+export function formatSemanticReviewSources(archiveText: string, candidateText: string): { candidate: string; records: string[] } {
+  const offset = candidateText.indexOf('\n') + 1;
+  const candidate = candidateText.slice(offset);
+  const { notes = {}, verbatim = {}, ...state } = candidate ? JSON.parse(candidate) : {};
+  const records = splitSemanticCompactionTranscript(archiveText);
+  const metadata = JSON.parse(records[0]!.slice(records[0]!.indexOf('\n') + 1));
+  const index = metadata.evidenceIndex as Record<string, { sourceRef: string }>;
+  const evidenceIds = Object.keys(index).sort((left, right) => Number(left.slice(1)) - Number(right.slice(1)));
+  const review = (ref: string) => ({ note: notes[ref] ?? null, verbatim: verbatim[ref] ?? null,
+    evidenceRefs: evidenceIds.filter(id => index[id]!.sourceRef === ref) });
+  const messageRefs = new Set<string>();
+  const aligned = records.slice(1).map(record => {
+    const value = JSON.parse(record.slice(record.indexOf('\n') + 1));
+    messageRefs.add(value.sourceRef);
+    return record.slice(0, record.indexOf('\n') + 1) + JSON.stringify({ ...value, review: review(value.sourceRef) });
+  });
+  metadata.sourceReviews = Object.fromEntries((metadata.coverageRefSet as string[]).filter(ref => !messageRefs.has(ref)).map(ref => [ref, review(ref)]));
+  return { candidate: candidateText.slice(0, offset) + (candidate ? JSON.stringify(state) : ''), records: [
+    records[0]!.slice(0, records[0]!.indexOf('\n') + 1) + JSON.stringify(metadata), ...aligned,
+  ] };
+}
+
 export function compileResolvedSemanticCompactionMemory(value: string, notesValue: string, sources: CompactionSources, sourceRefs: readonly string[], archiveText: string): string {
   const draft = JSON.parse(compileSemanticSourceNotes(notesValue, sourceRefs)) as { notes: Record<string, string>; verbatim: Record<string, boolean>; activeTask: string; closedTopics: string };
   const { notes, verbatim } = draft;
@@ -239,14 +263,14 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
     ...(previous?.activeTask?.sourceRefs ?? []), ...(previous?.openWork ?? []).flatMap(entry => entry.sourceRefs)]);
   if (selection.activeTask !== 'none' && !primaryRefs.has(selection.activeTask as string)) throw new Error('Активная задача требует первичного user-источника, а не assistant-пересказа.');
   const classes = selection.classifications as Record<string, string>;
-  if (sourceRefs.some(ref => classes[ref]!.includes('W') && !primaryRefs.has(ref) && !ref.startsWith('t'))) throw new Error('Открытая работа требует первичного источника обязательства.');
+  if (sourceRefs.some(ref => (classes[ref]!.includes('openWork') || classes[ref] === 'defect') && !primaryRefs.has(ref) && !ref.startsWith('t'))) throw new Error('Открытая работа и дефект требуют первичного источника.');
   const list = (text: string, allowed: readonly string[], limit: number): string[] => {
     const refs = text ? text.split(',').map(ref => ref.trim()) : [];
     if (refs.length > limit || new Set(refs).size !== refs.length || refs.some(ref => !allowed.includes(ref))) throw new Error('Некорректные или повторные ссылки review.');
     return refs;
   };
   const field = (code: string, limit: number) => {
-    const refs = sourceRefs.filter(ref => classes[ref]!.includes(code));
+    const refs = sourceRefs.filter(ref => classes[ref]!.split('+').includes(code));
     if (refs.length > limit) throw new Error('Слишком много источников в категории review.');
     return refs;
   };
@@ -260,10 +284,10 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
   const active = activeChoice === 'none' ? [] : list(activeChoice, sourceRefs, 1);
   const review = { format: SEMANTIC_COMPACTION_FORMAT, version: 1,
     activeTask: active.length ? entry(active[0]!) : null,
-    constraints: field('C', MAX_SEMANTIC_COUNTS.constraints).map(ref => ({ scope: `Источник ${ref}`, sourceRefs: [ref] })),
-    decisions: field('D', MAX_SEMANTIC_COUNTS.decisions).map(entry),
-    openWork: field('W', MAX_SEMANTIC_COUNTS.openWork).map(entry),
-    facts: field('F', MAX_SEMANTIC_COUNTS.facts).map(ref => ({ sourceRefs: [ref] })),
+    constraints: field('constraint', MAX_SEMANTIC_COUNTS.constraints).map(ref => ({ scope: `Источник ${ref}`, sourceRefs: [ref] })),
+    decisions: field('decision', MAX_SEMANTIC_COUNTS.decisions).map(entry),
+    openWork: field('openWork', MAX_SEMANTIC_COUNTS.openWork).map(entry),
+    facts: field('fact', MAX_SEMANTIC_COUNTS.facts).map(ref => ({ sourceRefs: [ref] })),
     pastTopics: selection.pastTopics === 'none' ? [] : groups('pastTopics', MAX_GENERATED_PAST_TOPICS).map(group => {
       const [id, members, extra] = group.split(':'), proof = evidenceIndex[id?.trim() ?? ''];
       if (extra !== undefined || members === undefined || !proof || proof.role !== 'user') throw new Error('Закрытие требует индексированного user-основания.');
@@ -277,6 +301,13 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
       return { sourceRefs: [...new Set(exactQuotes.map(quote => quote.sourceRef))], exactQuotes };
     }),
   };
+  for (const ref of sourceRefs.filter(ref => classes[ref] === 'defect')) {
+    const quotes = Object.values(evidenceIndex).filter(quote => quote.sourceRef === ref).map(({ sourceRef, text }) => ({ sourceRef, text }));
+    if (!quotes.length) throw new Error('Дефект требует доступного дословного свидетельства.');
+    const existing = review.unresolvedDefects.find(defect => defect.sourceRefs.includes(ref));
+    if (existing) existing.exactQuotes = [...new Map([...existing.exactQuotes, ...quotes].map(quote => [canonicalJson(quote), quote])).values()];
+    else review.unresolvedDefects.push({ sourceRefs: [ref], exactQuotes: quotes });
+  }
   if (!Array.isArray(review.pastTopics)) throw new Error('Некорректные закрытые темы.');
   const reviewedClosed = validateClosedTopics(review.pastTopics.map(topic => {
     if (!isRecord(topic) || !hasOnlyKeys(topic, ['text', 'sourceRefs', 'closureEvidence'])) throw new Error('Закрытие требует дословного основания.');
@@ -293,6 +324,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
     ...reviewedClosed,
   ], sources);
   const closed = new Set(closedTopics.flatMap(topic => topic.sourceRefs.filter(ref => ref !== topic.closedBy)));
+  if (sourceRefs.some(ref => classes[ref] === 'closed' && !closed.has(ref))) throw new Error('Метка closed требует подтверждённого закрытия темы.');
   if (draft.activeTask !== 'none' && !active.length && !closed.has(draft.activeTask)) throw new Error('Review не может стереть активную задачу без подтверждённого закрытия.');
   const sourceTexts = semanticSourceTexts(sources);
   const defects = review.unresolvedDefects.map(entry => {

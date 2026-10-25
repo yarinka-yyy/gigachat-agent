@@ -9,7 +9,7 @@ import { discoveredModelRegistry, failedModelRegistry, isModelAvailable, require
 import { billingFamilyForUsageLabel, CHAT_MODEL_FAMILIES, isChatModelAvailable } from './model-catalog';
 import { attachmentContentType, inspectLocalAttachmentContent, LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES, PROVIDER_MEDIA_LIMIT_BYTES, PROVIDER_REQUEST_LIMIT_BYTES } from './attachment-policy';
 import { validateProviderV2FunctionWire } from './provider-wire';
-import { COMPACTION_OUTPUT_TOKEN_LIMIT, splitSemanticCompactionTranscript, semanticCompactionResponseFormat } from './compaction';
+import { COMPACTION_OUTPUT_TOKEN_LIMIT, splitSemanticCompactionTranscript, formatSemanticReviewSources, semanticCompactionResponseFormat } from './compaction';
 
 export const GIGACHAT_API_BASE_URL = 'https://api.giga.chat/v1';
 const GIGACHAT_V2_CHAT_COMPLETIONS_URL = 'https://api.giga.chat/v2/chat/completions';
@@ -150,6 +150,11 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
   const messages: Array<Record<string, unknown>> = [
     ...(systemPrompt ? [{ role: 'system', content: [{ text: systemPrompt }] }] : []),
   ];
+  let reviewSources: ReturnType<typeof formatSemanticReviewSources> | undefined;
+  if (request.compactionFormat === 'semantic' && request.messages[0]?.id === 'request-semantic-review-candidate') {
+    try { reviewSources = formatSemanticReviewSources(request.messages[1]!.text, request.messages[0].text); }
+    catch { throw new GigaChatProviderError('protocol'); }
+  }
   for (const message of request.messages) {
     if (!message || (message.role !== 'user' && message.role !== 'assistant') || typeof message.text !== 'string') {
       throw new GigaChatProviderError('protocol');
@@ -159,6 +164,11 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
       // eslint-disable-next-line no-control-regex -- Reject control characters in provider protocol state IDs.
       || /[\u0000-\u001f\u007f]/.test(message.functionsStateId))) throw new GigaChatProviderError('protocol');
     const messageAttachments = attachmentsByMessage.get(message.id) ?? [];
+    if (reviewSources && (message.id === 'request-semantic-review-candidate' || message.id === 'request-semantic-review-archive')) {
+      if (message.role !== 'user' || messageAttachments.length || exchanges.get(message.id)?.length) throw new GigaChatProviderError('protocol');
+      for (const text of message.id === 'request-semantic-review-candidate' ? [reviewSources.candidate] : reviewSources.records) messages.push({ role: 'user', content: [{ text }] });
+      continue;
+    }
     if (request.compactionFormat === 'semantic' && message.id === 'request-compaction-transcript') {
       if (message.role !== 'user' || messageAttachments.length || exchanges.get(message.id)?.length) throw new GigaChatProviderError('protocol');
       try {
