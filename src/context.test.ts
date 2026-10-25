@@ -580,8 +580,7 @@ test('both semantic wire requests preserve source distinctions for all four sele
     const candidate = JSON.stringify({ taskSubject: 'Current task', state: 'Current task.', activeTask: 'm2', closedTopics: '', notes: { m0: 'Do not publish ownerCode.', m1: 'Read may be permitted.', m2: 'Copy validated.' }, verbatim: { m0: true, m1: true, m2: true } });
     const review = buildSemanticCompactionReviewRequest(context.request, sources, getSemanticCompactionCoverageRefSet(sources), candidate);
     assert.ok(review);
-    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ activeTask: 'm2', decisions: 'm0',
-      constraints: 'm1', facts: 'm2', openWork: '', pastTopics: 'none', unresolvedDefects: '' }),
+    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ activeTask: 'm2', classifications: { m0: 'D', m1: 'C', m2: 'F' }, pastTopics: 'none', unresolvedDefects: '' }),
     candidate, sources, getSemanticCompactionCoverageRefSet(sources), context.request.messages[0]!.text));
     assert.equal(compiled.decisions[0].text, messages[0]!.text);
     assert.equal(compiled.constraints[0].text, messages[1]!.text);
@@ -622,9 +621,8 @@ test('all four semantic models close subtopics while retaining interleaved work 
     assert.equal(wire.model, currentId); assert.equal(wire.tool_config.mode, 'none');
     assert.equal(wire.model_options.response_format.type, 'json_schema');
     const index = semanticReviewEvidenceIndex(context.request.messages[0]!.text);
-    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ activeTask: 'keep', constraints: 'm0',
-      facts: 'm1,m2', decisions: '', openWork: 'm3,m5',
-      pastTopics: 'keep',
+    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ activeTask: 'm5', classifications: { m0: 'C', m1: 'F', m2: 'F', m3: 'W', m4: '-', m5: 'W', m6: 'F' },
+      pastTopics: `${Object.keys(index).find(id => index[id]!.sourceRef === 'm4')}:m1,m2`,
       unresolvedDefects: Object.keys(index).filter(id => index[id]!.sourceRef === 'm6').join(',') }),
     candidate, sources, refs, context.request.messages[0]!.text));
     assert.deepEqual(compiled.facts.map((entry: { sourceRefs: string[] }) => entry.sourceRefs), [['m6']]);

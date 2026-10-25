@@ -948,8 +948,7 @@ test('semantic compaction reviews once on the selected model and accounts for bo
         assert.deepEqual(request.protocolHistory, []);
         yield { type: 'text-delta', text: requests.length === 1
           ? JSON.stringify({ taskSubject: 'Current task', state: 'Task remains open.', activeTask: 'm0', closedTopics: '', notes: Object.fromEntries(input.messages.map((message, index) => [`m${index}`, `Draft: ${message.text}`])), verbatim: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, false])) })
-          : JSON.stringify({ activeTask: 'keep', constraints: '', decisions: '', openWork: '', pastTopics: 'keep', unresolvedDefects: '',
-            facts: input.messages.map((_message, index) => `m${index}`).join(',') }) };
+          : JSON.stringify({ activeTask: 'm0', classifications: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, 'F'])), pastTopics: 'none', unresolvedDefects: '' }) };
         yield { type: 'usage', promptTokens: 10, completionTokens: 5, totalTokens: 15, precachedPromptTokens: 0 };
         yield { type: 'completed', functionsStateId: requests.length === 1 ? 'draft-state' : 'review-state' };
       }),
