@@ -947,8 +947,8 @@ test('semantic compaction reviews once on the selected model and accounts for bo
         assert.equal(request.functionCallMode, 'none');
         assert.deepEqual(request.protocolHistory, []);
         yield { type: 'text-delta', text: requests.length === 1
-          ? JSON.stringify({ taskSubject: 'Current task', state: 'Task remains open.', notes: Object.fromEntries(input.messages.map((message, index) => [`m${index}`, `Draft: ${message.text}`])), verbatim: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, false])) })
-          : JSON.stringify({ activeTask: 'm0', constraints: '', decisions: '', openWork: '', pastTopics: '', unresolvedDefects: '',
+          ? JSON.stringify({ taskSubject: 'Current task', state: 'Task remains open.', activeTask: 'm0', closedTopics: '', notes: Object.fromEntries(input.messages.map((message, index) => [`m${index}`, `Draft: ${message.text}`])), verbatim: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, false])) })
+          : JSON.stringify({ activeTask: 'keep', constraints: '', decisions: '', openWork: '', pastTopics: 'keep', unresolvedDefects: '',
             facts: input.messages.map((_message, index) => `m${index}`).join(',') }) };
         yield { type: 'usage', promptTokens: 10, completionTokens: 5, totalTokens: 15, precachedPromptTokens: 0 };
         yield { type: 'completed', functionsStateId: requests.length === 1 ? 'draft-state' : 'review-state' };
@@ -1014,7 +1014,7 @@ test('semantic failures keep the previous checkpoint and never retry the draft o
         if (calls === 2 && fault === 'review-network') { yield { type: 'error', category: 'network', retryable: true }; return; }
         if (calls === 2 && fault === 'review-cancel') { runtime.cancel(runtime.list()[0]!.id); return; }
         const candidate = calls === 1
-          ? JSON.stringify({ taskSubject: 'Current task', state: 'Task remains open.', notes: Object.fromEntries(input.messages.slice(fault === 'missing-source-note' ? 1 : 0).map(message => [`m${input.messages.indexOf(message)}`, message.text])), verbatim: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, false])) })
+          ? JSON.stringify({ taskSubject: 'Current task', state: 'Task remains open.', activeTask: 'm0', closedTopics: '', notes: Object.fromEntries(input.messages.slice(fault === 'missing-source-note' ? 1 : 0).map(message => [`m${input.messages.indexOf(message)}`, message.text])), verbatim: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, false])) })
           : fault === 'unquoted-review'
             ? JSON.stringify({ ...JSON.parse(memory), unresolvedDefects: [], facts: [{ text: 'Unquoted fact.', sourceRefs: ['m0'], exactQuotes: [] }] }) : memory;
         yield { type: 'text-delta', text: fault === 'invalid-draft' || calls === 2 && fault === 'invalid-review' ? '{}' : candidate };

@@ -528,7 +528,7 @@ test('rolls semantic compaction forward with stable global refs and only the new
     ],
   });
   assert.doesNotThrow(() => compileSemanticCompactionMemory(nextCandidate, context.compactionSources!));
-  const notes = JSON.stringify({ taskSubject: 'Current task', state: 'Current task.', notes: Object.fromEntries(envelope.coverageRefSet.map(ref => [ref, 'The old tool returned its result.'])), verbatim: Object.fromEntries(envelope.coverageRefSet.map(ref => [ref, false])) });
+  const notes = JSON.stringify({ taskSubject: 'Current task', state: 'Current task.', activeTask: 'm2', closedTopics: '', notes: Object.fromEntries(envelope.coverageRefSet.map(ref => [ref, 'The old tool returned its result.'])), verbatim: Object.fromEntries(envelope.coverageRefSet.map(ref => [ref, false])) });
   const review = buildSemanticCompactionReviewRequest(context.request, context.compactionSources!, envelope.coverageRefSet, notes);
   assert.ok(review);
   const { evidenceIndex, ...reviewEnvelope } = JSON.parse(review.messages[1]!.text.slice(review.messages[1]!.text.indexOf('\n') + 1)) as typeof envelope & { evidenceIndex: unknown };
@@ -577,11 +577,11 @@ test('both semantic wire requests preserve source distinctions for all four sele
     const context = buildNextTurnContext(input(messages, { modelId: currentId, usageKind: 'compaction',
       compactionFormat: 'semantic', functionCallMode: 'none', compactionToolReceipts: [], compactionArtifacts: [] }));
     const sources = context.compactionSources!;
-    const candidate = JSON.stringify({ taskSubject: 'Current task', state: 'Current task.', notes: { m0: 'Do not publish ownerCode.', m1: 'Read may be permitted.', m2: 'Copy validated.' }, verbatim: { m0: true, m1: true, m2: true } });
+    const candidate = JSON.stringify({ taskSubject: 'Current task', state: 'Current task.', activeTask: 'm2', closedTopics: '', notes: { m0: 'Do not publish ownerCode.', m1: 'Read may be permitted.', m2: 'Copy validated.' }, verbatim: { m0: true, m1: true, m2: true } });
     const review = buildSemanticCompactionReviewRequest(context.request, sources, getSemanticCompactionCoverageRefSet(sources), candidate);
     assert.ok(review);
     const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ activeTask: 'm2', decisions: 'm0',
-      constraints: 'm1', facts: 'm2', openWork: '', pastTopics: '', unresolvedDefects: '' }),
+      constraints: 'm1', facts: 'm2', openWork: '', pastTopics: 'none', unresolvedDefects: '' }),
     candidate, sources, getSemanticCompactionCoverageRefSet(sources), context.request.messages[0]!.text));
     assert.equal(compiled.decisions[0].text, messages[0]!.text);
     assert.equal(compiled.constraints[0].text, messages[1]!.text);
@@ -611,7 +611,7 @@ test('all four semantic models close subtopics while retaining interleaved work 
     user('closed', 'Chart styling is complete; leave it inactive.'), user('active', 'Continue the upload investigation.'),
     user('defect', 'UPLOAD-62: length check passed on macOS build 5.7; restored path differs. Upload was not attempted; the mismatch is unresolved.')];
   const refs = messages.map((_message, index) => `m${index}`);
-  const candidate = JSON.stringify({ taskSubject: 'Current task', state: 'Chart closed; upload mismatch unresolved.', notes: Object.fromEntries(refs.map(ref => [ref, `Note ${ref}`])),
+  const candidate = JSON.stringify({ taskSubject: 'Current task', state: 'Chart closed; upload mismatch unresolved.', activeTask: 'm5', closedTopics: 'm4:m1,m2', notes: Object.fromEntries(refs.map(ref => [ref, `Note ${ref}`])),
     verbatim: Object.fromEntries(refs.map(ref => [ref, true])) });
   for (const { currentId } of CHAT_MODEL_FAMILIES) await t.test(currentId, () => {
     const context = buildNextTurnContext(input(messages, { modelId: currentId, usageKind: 'compaction', compactionFormat: 'semantic',
@@ -622,9 +622,9 @@ test('all four semantic models close subtopics while retaining interleaved work 
     assert.equal(wire.model, currentId); assert.equal(wire.tool_config.mode, 'none');
     assert.equal(wire.model_options.response_format.type, 'json_schema');
     const index = semanticReviewEvidenceIndex(context.request.messages[0]!.text);
-    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ activeTask: 'm5', constraints: 'm0',
+    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ activeTask: 'keep', constraints: 'm0',
       facts: 'm1,m2', decisions: '', openWork: 'm3,m5',
-      pastTopics: `${Object.keys(index).find(id => index[id]!.sourceRef === 'm4')}:m1,m2`,
+      pastTopics: 'keep',
       unresolvedDefects: Object.keys(index).filter(id => index[id]!.sourceRef === 'm6').join(',') }),
     candidate, sources, refs, context.request.messages[0]!.text));
     assert.deepEqual(compiled.facts.map((entry: { sourceRefs: string[] }) => entry.sourceRefs), [['m6']]);
@@ -658,7 +658,7 @@ test('builds an independent semantic review from the exact current archive and a
   }));
   const sources = context.compactionSources!;
   const sourceRefs = getSemanticCompactionCoverageRefSet(sources);
-  const candidate = JSON.stringify({ taskSubject: 'Current task', state: 'Current task.', notes: { m0: 'Continue package validation.', m1: 'Review the Windows build.', t0: 'The build is ready.' }, verbatim: { m0: false, m1: false, t0: false } });
+  const candidate = JSON.stringify({ taskSubject: 'Current task', state: 'Current task.', activeTask: 'm0', closedTopics: '', notes: { m0: 'Continue package validation.', m1: 'Review the Windows build.', t0: 'The build is ready.' }, verbatim: { m0: false, m1: false, t0: false } });
   const originalRequest = structuredClone(context.request);
 
   const review = buildSemanticCompactionReviewRequest(context.request, sources, sourceRefs, candidate);
