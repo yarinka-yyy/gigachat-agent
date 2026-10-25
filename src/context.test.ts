@@ -575,7 +575,7 @@ test('rolls semantic compaction forward with stable global refs and only the new
 test('both semantic wire requests preserve source distinctions for all four selected models', async (t) => {
   const messages = [
     user('scope', 'Do not publish ownerCode values; the field name may appear in the report.'),
-    assistant('permission', 'This is discussion only. Do not read or write local files before permission.'),
+    assistant('permission', 'This is discussion only. Do not read or write local files before permission. Do not publish ownerCode at all.'),
     user('observed', 'The copy was read on Linux build 4.2. Hash comparison passed; import is untested.'),
   ];
   for (const { currentId } of CHAT_MODEL_FAMILIES) await t.test(currentId, () => {
@@ -585,10 +585,11 @@ test('both semantic wire requests preserve source distinctions for all four sele
     const candidate = JSON.stringify({ taskSubject: 'Current task', state: 'Current task.', activeTask: 'm2', closedTopics: '', notes: { m0: 'Do not publish ownerCode.', m1: 'Read may be permitted.', m2: 'Copy validated.' }, verbatim: { m0: true, m1: true, m2: true } });
     const review = buildSemanticCompactionReviewRequest(context.request, sources, getSemanticCompactionCoverageRefSet(sources), candidate);
     assert.ok(review);
-    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ activeTask: 'm2', classifications: { m0: 'decision', m1: 'constraint', m2: 'fact' }, pastTopics: 'none', unresolvedDefects: '' }),
+    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ activeTask: 'm2', classifications: { m0: 'constraint', m1: 'drop', m2: 'fact' }, unresolvedDefects: '' }),
     candidate, sources, getSemanticCompactionCoverageRefSet(sources), context.request.messages[0]!.text));
-    assert.equal(compiled.decisions[0].text, messages[0]!.text);
-    assert.equal(compiled.constraints[0].text, messages[1]!.text);
+    assert.deepEqual(compiled.decisions, []);
+    assert.equal(compiled.constraints[0].text, messages[0]!.text);
+    assert.doesNotMatch(JSON.stringify(compiled), /Do not publish ownerCode at all/);
     assert.equal(compiled.facts[0].text, messages[2]!.text);
     assert.equal(compiled.activeTask.text, messages[2]!.text);
     const decode = (text: string) => JSON.parse(text.slice(text.indexOf('\n') + 1)) as Record<string, unknown>;
@@ -627,8 +628,8 @@ test('all four semantic models close subtopics while retaining interleaved work 
     assert.equal(wire.model, currentId); assert.equal(wire.tool_config.mode, 'none');
     assert.equal(wire.model_options.response_format.type, 'json_schema');
     const index = semanticReviewEvidenceIndex(context.request.messages[0]!.text);
-    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ activeTask: 'm5', classifications: { m0: 'constraint', m1: 'closed', m2: 'closed', m3: 'openWork', m4: 'drop', m5: 'openWork', m6: 'defect' },
-      pastTopics: `${Object.keys(index).find(id => index[id]!.sourceRef === 'm4')}:m1,m2`,
+    const proof = Object.keys(index).find(id => index[id]!.sourceRef === 'm4');
+    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ activeTask: 'm5', classifications: { m0: 'constraint', m1: `closed:${proof}`, m2: `closed:${proof}`, m3: 'openWork', m4: 'drop', m5: 'openWork', m6: 'defect' },
       unresolvedDefects: Object.keys(index).filter(id => index[id]!.sourceRef === 'm6').join(',') }),
     candidate, sources, refs, context.request.messages[0]!.text));
     assert.deepEqual(compiled.facts.map((entry: { sourceRefs: string[] }) => entry.sourceRefs), [['m6']]);
@@ -714,6 +715,7 @@ test('builds an independent semantic review from the exact current archive and a
   assert.equal(systemText.split(SEMANTIC_COMPACTION_TASK_INSTRUCTION).length - 1, 0);
   const header = decode(wire.messages[1]!.content[0]!.text!);
   const { notes, verbatim, ...state } = JSON.parse(candidate);
+  delete state.closedTopics;
   assert.deepEqual(header, state, 'notes occur beside their sources rather than twice in the wire');
   const records = wire.messages.slice(3, -1).map(message => decode(message.content[0]!.text!));
   const quoteIndex = semanticReviewEvidenceIndex(context.request.messages[0]!.text);
