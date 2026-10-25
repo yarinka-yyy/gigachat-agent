@@ -21,6 +21,7 @@ import {
 } from './compaction';
 
 const at = '2026-10-18T12:00:00.000Z';
+const reviewJson = (value: unknown): string => JSON.stringify(value);
 const user = (id: string, text: string, attachmentIds?: string[]): ChatMessage => ({
   id, role: 'user', text, createdAt: at, ...(attachmentIds ? { attachmentIds } : {}),
 });
@@ -565,13 +566,12 @@ test('requires exact quotes to be nonempty substrings of the referenced source v
 test('source notes cover every source before compression without becoming a snapshot', () => {
   const refs = ['m0', 'm1', 't0'];
   const notes = { m0: 'Earlier restriction stays active.', m1: 'Discussion closed.', t0: 'Read passed; import untested.' };
-  const topics = Object.fromEntries(refs.map(ref => [ref, '__global__']));
   const verbatim = Object.fromEntries(refs.map(ref => [ref, false]));
-  assert.deepEqual(JSON.parse(compileSemanticSourceNotes(JSON.stringify({ notes, verbatim, topics }), refs)), { notes, verbatim, topics });
+  assert.deepEqual(JSON.parse(compileSemanticSourceNotes(JSON.stringify({ taskSubject: 'Current task', state: 'Current task.', notes, verbatim }), refs)), { taskSubject: 'Current task', state: 'Current task.', notes, verbatim });
   assert.deepEqual(semanticSourceNotesResponseFormat(refs).schema.properties.notes.required, refs);
   for (const invalid of [{ notes: { m0: notes.m0 } }, { notes: { ...notes, unknown: 'extra' } },
-    { notes: { ...notes, m1: '' } }, { notes: { ...notes, m1: 'x'.repeat(641) } }, { notes, facts: [] }]) {
-    assert.throws(() => compileSemanticSourceNotes(JSON.stringify({ topics, verbatim, ...invalid }), refs));
+    { notes: { ...notes, m1: '' } }, { notes: { ...notes, m1: 'x'.repeat(161) } }, { notes, facts: [] }]) {
+    assert.throws(() => compileSemanticSourceNotes(JSON.stringify({ taskSubject: 'Current task', state: 'Current task.', verbatim, ...invalid }), refs));
   }
   assert.throws(() => validateSemanticCompactionMemory(JSON.stringify({ notes }), semanticSources()));
 });
@@ -589,33 +589,59 @@ test('critical anchors are materialized without model paraphrases and reject una
   assert.throws(() => compileAnchoredSemanticCompactionMemory(JSON.stringify(value), sources, ['t0'], archive));
 });
 
-test('resolution cannot rewrite notes or silently leave a source unaccounted for', () => {
-  const sources = semanticSources(), refs = getSemanticCompactionCoverageRefSet(sources);
+test('topic closure removes all its details and defect state survives compilation and recall formatting', () => {
+  const sources = createCompactionSources([
+    user('policy', 'Keep all original reports.'), user('chart', 'Compare chart widths.'),
+    user('queue', 'The upload queue is still unresolved.'), assistant('legend', 'Use a small chart legend.'),
+    user('close', 'Chart styling is complete.'), user('result', 'UPLOAD-62: length passed; restored path differs. Upload not attempted; mismatch unresolved.'),
+  ], [], []), refs = getSemanticCompactionCoverageRefSet(sources);
   const archive = serializeSemanticCompactionTranscript(sources);
-  const topics = Object.fromEntries(refs.map(ref => [ref, ref === 'm0' ? '__global__' : ref === 'm2' ? 'm2' : 'm1']));
-  const notes = JSON.stringify({ notes: Object.fromEntries(refs.map(ref => [ref, `Meaning of ${ref}.`])), verbatim: Object.fromEntries(refs.map(ref => [ref, ref === 'm2'])), topics });
-  const resolution = { reconciliation: 'Working is open.', activeTask: 'm1', topicStates: { m1: 'open', m2: 'open' }, novelty: { m1: 'new' }, dispositions: Object.fromEntries(refs.map(ref => [ref,
-    ref === 'm0' ? 'constraint' : ref === 't0' ? 'fact' : ref === 'm2' ? 'openWork' : 'omit'])) };
-  const memory = JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify(resolution), notes, sources, refs, archive));
-  assert.equal(memory.activeTask.text, 'Meaning of m1.');
-  assert.equal(memory.openWork[0].text, sources.messages[2]!.text);
+  const notes = JSON.stringify({ taskSubject: 'Upload', state: 'Chart closed; upload unresolved.', notes: Object.fromEntries(refs.map(ref => [ref, `Note ${ref}`])), verbatim: Object.fromEntries(refs.map(ref => [ref, true])) });
+  const resolution = { format: 'gigachat-semantic-memory', version: 1,
+    activeTask: { text: 'Investigate queue.', sourceRefs: ['m2'] },
+    constraints: [{ scope: 'Reports', sourceRefs: ['m0', 'm1'] }], decisions: [],
+    facts: [{ sourceRefs: ['m1'] }, { sourceRefs: ['m3'] }],
+    openWork: [{ text: 'Chart details.', sourceRefs: ['m3'] }, { text: 'Check upload.', sourceRefs: ['m2'] }],
+    pastTopics: [{ text: 'Chart styling complete.', sourceRefs: ['m1', 'm3'], closedBy: 'm4' }],
+    unresolvedDefects: [{ sourceRefs: ['m5'] }],
+  };
+  const memory = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson(resolution), notes, sources, refs, archive));
+  assert.deepEqual(memory.constraints[0].sourceRefs, ['m0']);
   assert.equal(memory.constraints[0].text, sources.messages[0]!.text);
-  const closed = JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...resolution, topicStates: { m1: 'open', m2: 'closed' } }), notes, sources, refs, archive));
-  assert.deepEqual(closed.openWork, []);
-  assert.equal(closed.constraints[0].text, memory.constraints[0].text);
-  assert.throws(() => compileResolvedSemanticCompactionMemory(JSON.stringify({ ...resolution, topicStates: { ...resolution.topicStates, __global__: 'closed' } }), notes, sources, refs, archive));
-  const scopedNotes = JSON.stringify({ ...JSON.parse(notes), topics: { ...topics, m0: 'm0' } });
-  const scoped = JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...resolution,
-    topicStates: { m0: 'closed', m1: 'open', m2: 'closed' } }), scopedNotes, sources, refs, archive));
-  assert.equal(scoped.constraints[0].text, sources.messages[0]!.text, 'closing a topic cannot silently revoke a selected constraint');
-  const repeated = JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...resolution, activeTask: 'm0',
-    novelty: { m1: 'restatement' }, dispositions: { ...resolution.dispositions, m1: 'fact' } }), notes, sources, refs, archive));
-  assert.ok(repeated.facts.every((entry: { sourceRefs: string[] }) => !entry.sourceRefs.includes('m1')));
-  for (const dispositions of [{ ...resolution.dispositions, m0: ['constraint', 'constraint'] },
-    { ...resolution.dispositions, m0: ['unknown'] }, { ...resolution.dispositions, m999: [] }, {}]) {
-    assert.throws(() => compileResolvedSemanticCompactionMemory(JSON.stringify({ ...resolution, dispositions }), notes, sources, refs, archive));
+  assert.deepEqual(memory.facts.map((entry: { sourceRefs: string[] }) => entry.sourceRefs), [['m5']]);
+  assert.deepEqual(memory.openWork.map((entry: { sourceRefs: string[] }) => entry.sourceRefs), [['m2'], ['m5']]);
+  assert.equal(memory.openWork[1].text, `Наблюдённый неустранённый дефект: ${sources.messages[5]!.text}`);
+  assert.deepEqual(memory.closedTopics, resolution.pastTopics);
+  assert.deepEqual(memory.unresolvedDefects, [memory.openWork[1]]);
+  assert.deepEqual(validateSemanticCompactionMemory(JSON.stringify(memory), sources), memory, 'typed state round trips in snapshots');
+  const formatted = formatSemanticCompactionMemory(JSON.stringify(memory), sources);
+  assert.match(formatted, /НЕУСТРАНЁННЫЙ ДЕФЕКТ/);
+  assert.match(formatted, /restored path differs/);
+  assert.doesNotMatch(formatted, /Compare chart widths|small chart legend|Дословная цитата m5:/);
+  for (const change of [{ unresolvedDefects: undefined }, { observedDefect: true, defectEvidence: '' },
+    { unresolvedDefects: [{ sourceRefs: ['m999'] }] }, { unresolvedDefects: [{ sourceRefs: ['m1'] }] },
+    { unresolvedDefects: [{ sourceRefs: [] }] },
+    { pastTopics: [{ ...resolution.pastTopics[0], closedBy: 'm3' }] },
+    { pastTopics: [{ ...resolution.pastTopics[0], closedBy: 'm0' }] }]) {
+    assert.throws(() => compileResolvedSemanticCompactionMemory(reviewJson({ ...resolution, ...change }), notes, sources, refs, archive));
   }
-  assert.throws(() => compileResolvedSemanticCompactionMemory(JSON.stringify({ ...resolution, text: 'rewrite' }), notes, sources, refs, archive));
+  assert.throws(() => validateSemanticCompactionMemory(JSON.stringify({ ...memory, openWork: [] }), sources), /Состояние дефекта/);
+  assert.throws(() => validateSemanticCompactionMemory(JSON.stringify({ ...memory, facts: [] }), sources), /Состояние дефекта/);
+  assert.throws(() => validateSemanticCompactionMemory(JSON.stringify({ ...memory, decisions: [{ text: 'Reopen legend.', sourceRefs: ['m3'] }] }), sources), /Закрытые/);
+  const rollingSources = createCompactionSources([
+    ...sources.messages.map(source => source.role === 'user' ? user(source.ref, source.text) : assistant(source.ref, source.text)),
+    user('continue', 'Continue the upload investigation; no repair has been performed.'),
+  ], [], []);
+  const rollingArchive = serializeSemanticCompactionTranscript(rollingSources, memory, 6);
+  const rollingRefs = getSemanticCompactionCoverageRefSet(rollingSources, memory, 6);
+  const rollingNotes = JSON.stringify({ taskSubject: 'Upload', state: 'Mismatch still unresolved.',
+    notes: Object.fromEntries(rollingRefs.map(ref => [ref, 'Available memory.'])), verbatim: Object.fromEntries(rollingRefs.map(ref => [ref, true])) });
+  const rolling = { ...resolution, pastTopics: [] };
+  const continued = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson(rolling), rollingNotes, rollingSources, rollingRefs, rollingArchive));
+  assert.deepEqual(continued.closedTopics, memory.closedTopics, 'later review cannot silently reopen closed details');
+  assert.deepEqual(continued.unresolvedDefects, memory.unresolvedDefects, 'state survives a second compaction without prefix accumulation');
+  assert.throws(() => compileResolvedSemanticCompactionMemory(reviewJson({ ...rolling, unresolvedDefects: [] }), rollingNotes,
+    rollingSources, rollingRefs, rollingArchive), /нельзя потерять/);
 });
 
 test('segmented semantic input reconstructs every source and rejects malformed envelopes', () => {

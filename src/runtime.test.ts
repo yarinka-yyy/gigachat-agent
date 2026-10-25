@@ -947,8 +947,9 @@ test('semantic compaction reviews once on the selected model and accounts for bo
         assert.equal(request.functionCallMode, 'none');
         assert.deepEqual(request.protocolHistory, []);
         yield { type: 'text-delta', text: requests.length === 1
-          ? JSON.stringify({ notes: Object.fromEntries(input.messages.map((message, index) => [`m${index}`, `Draft: ${message.text}`])), verbatim: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, false])), topics: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, '__global__'])) })
-          : JSON.stringify({ reconciliation: 'The task remains open.', activeTask: 'm0', topicStates: {}, novelty: Object.fromEntries(input.messages.flatMap((message, index) => message.role === 'assistant' ? [[`m${index}`, 'new']] : [])), dispositions: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, 'fact'])) }) };
+          ? JSON.stringify({ taskSubject: 'Current task', state: 'Task remains open.', notes: Object.fromEntries(input.messages.map((message, index) => [`m${index}`, `Draft: ${message.text}`])), verbatim: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, false])) })
+          : JSON.stringify({ format: 'gigachat-semantic-memory', version: 1, activeTask: { text: 'Task remains open.', sourceRefs: ['m0'] },
+            constraints: [], decisions: [], openWork: [], pastTopics: [], unresolvedDefects: [], facts: input.messages.map((_message, index) => ({ sourceRefs: [`m${index}`] })) }) };
         yield { type: 'usage', promptTokens: 10, completionTokens: 5, totalTokens: 15, precachedPromptTokens: 0 };
         yield { type: 'completed', functionsStateId: requests.length === 1 ? 'draft-state' : 'review-state' };
       }),
@@ -960,8 +961,8 @@ test('semantic compaction reviews once on the selected model and accounts for bo
       preflightProviderRequest: async (_turn, request, _signal, _owner, reservation) => {
         if (reservation) {
           assert.equal(requests.length, 0, 'reserve review before spending the first completion');
-          assert.ok(reservation.additionalInputTokenReserve > 65536 && reservation.additionalInputTokenReserve < 65536 + 1024 * input.messages.length);
-          assert.equal(request.messages.length, input.messages.length + 3);
+          assert.equal(reservation.additionalInputTokenReserve, 32768);
+          assert.equal(request.messages.length, 3);
         }
         preflights.push(request);
       },
@@ -985,10 +986,10 @@ test('semantic compaction reviews once on the selected model and accounts for bo
     assert.equal(requests.length, 2);
     assert.equal(preflights.length, 3, 'reserve review, exact draft, exact review');
     assert.equal(saved.length, 1);
-    assert.equal(JSON.parse(saved[0]!).activeTask.text, `Draft: ${input.messages[0]!.text}`);
+    assert.equal(JSON.parse(saved[0]!).activeTask.text, 'Task remains open.');
     assert.match(requests[1]!.messages[0]!.text, /Draft/);
-    const sourceRecord = JSON.parse(requests[1]!.messages[2]!.text.split('\n').slice(1).join('\n')) as { text: string };
-    assert.equal(sourceRecord.text, input.messages[0]!.text);
+    const sourceRecord = JSON.parse(requests[1]!.messages[1]!.text.split('\n').slice(1).join('\n')) as { messages: Array<{ text: string }> };
+    assert.equal(sourceRecord.messages[0]!.text, input.messages[0]!.text);
     assert.equal(requests[1]!.messages[requests[1]!.messages.length - 1]!.id, 'request-semantic-review-task');
     assert.equal(receipts.length, 2);
     assert.ok(receipts.every(receipt => receipt.status === 'completed' && receipt.requestKind === 'compaction'
@@ -1013,9 +1014,9 @@ test('semantic failures keep the previous checkpoint and never retry the draft o
         if (calls === 2 && fault === 'review-network') { yield { type: 'error', category: 'network', retryable: true }; return; }
         if (calls === 2 && fault === 'review-cancel') { runtime.cancel(runtime.list()[0]!.id); return; }
         const candidate = calls === 1
-          ? JSON.stringify({ notes: Object.fromEntries(input.messages.slice(fault === 'missing-source-note' ? 1 : 0).map(message => [`m${input.messages.indexOf(message)}`, message.text])), verbatim: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, false])), topics: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, '__global__'])) })
+          ? JSON.stringify({ taskSubject: 'Current task', state: 'Task remains open.', notes: Object.fromEntries(input.messages.slice(fault === 'missing-source-note' ? 1 : 0).map(message => [`m${input.messages.indexOf(message)}`, message.text])), verbatim: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, false])) })
           : fault === 'unquoted-review'
-            ? JSON.stringify({ ...JSON.parse(memory), facts: [{ text: 'Unquoted fact.', sourceRefs: ['m0'], exactQuotes: [] }] }) : memory;
+            ? JSON.stringify({ ...JSON.parse(memory), unresolvedDefects: [], facts: [{ text: 'Unquoted fact.', sourceRefs: ['m0'], exactQuotes: [] }] }) : memory;
         yield { type: 'text-delta', text: fault === 'invalid-draft' || calls === 2 && fault === 'invalid-review' ? '{}' : candidate };
         yield { type: 'completed' };
       }), tools: testTools,
@@ -1030,7 +1031,7 @@ test('semantic failures keep the previous checkpoint and never retry the draft o
       },
       ...(fault === 'missing-preflight' ? {} : { preflightProviderRequest: async (_turn, _request, _signal, _owner, reservation) => {
         if (reservation) {
-          assert.ok(reservation.additionalInputTokenReserve > 65536 && reservation.additionalInputTokenReserve < 65536 + 1024 * input.messages.length);
+          assert.equal(reservation.additionalInputTokenReserve, 32768);
           if (fault === 'reserve-budget') throw Object.assign(new Error('reserve over budget'), { category: 'context' });
           if (fault === 'reserve-mutation') _request.messages[0]!.text += 'tampered';
           return;

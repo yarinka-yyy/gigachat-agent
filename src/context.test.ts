@@ -13,6 +13,7 @@ import { compileExtractiveCompaction, compileSemanticCompactionMemory,
   compileResolvedSemanticCompactionMemory, createCompactionSources, getSemanticCompactionCoverageRefSet } from './compaction';
 
 const at = '2026-10-09T12:00:00.000Z';
+const reviewJson = (value: unknown): string => JSON.stringify(value);
 const user = (id: string, text = id): ChatMessage => ({ id, role: 'user', text, createdAt: at });
 const assistant = (id: string, text = id): ChatMessage => ({ id, role: 'assistant', text, createdAt: at, source: 'runtime' });
 
@@ -527,13 +528,13 @@ test('rolls semantic compaction forward with stable global refs and only the new
     ],
   });
   assert.doesNotThrow(() => compileSemanticCompactionMemory(nextCandidate, context.compactionSources!));
-  const notes = JSON.stringify({ notes: Object.fromEntries(envelope.coverageRefSet.map(ref => [ref, 'The old tool returned its result.'])), verbatim: Object.fromEntries(envelope.coverageRefSet.map(ref => [ref, false])), topics: Object.fromEntries(envelope.coverageRefSet.map(ref => [ref, '__global__'])) });
+  const notes = JSON.stringify({ taskSubject: 'Current task', state: 'Current task.', notes: Object.fromEntries(envelope.coverageRefSet.map(ref => [ref, 'The old tool returned its result.'])), verbatim: Object.fromEntries(envelope.coverageRefSet.map(ref => [ref, false])) });
   const review = buildSemanticCompactionReviewRequest(context.request, context.compactionSources!, envelope.coverageRefSet, notes);
   assert.ok(review);
   const reviewEnvelope = JSON.parse(review.messages[1]!.text.slice(review.messages[1]!.text.indexOf('\n') + 1)) as typeof envelope;
   assert.deepEqual(reviewEnvelope.previousMemory, envelope.previousMemory);
   assert.deepEqual(reviewEnvelope.tools, envelope.tools);
-  const reviewMessages = review.messages.slice(2, -1).map(message => JSON.parse(message.text.slice(message.text.indexOf('\n') + 1)) as { sourceRef: string; text: string });
+  const reviewMessages = reviewEnvelope.messages;
   assert.deepEqual({ ...reviewEnvelope, messages: reviewMessages }, envelope, 'segmented review preserves the full rolling archive without replaying old sources');
   assert.deepEqual(reviewMessages, envelope.messages, 'the review sees only the new raw suffix');
   assert.deepEqual(reviewEnvelope.tools, envelope.tools, 'the review sees only suffix tool records');
@@ -574,11 +575,12 @@ test('both semantic wire requests preserve source distinctions for all four sele
     const context = buildNextTurnContext(input(messages, { modelId: currentId, usageKind: 'compaction',
       compactionFormat: 'semantic', functionCallMode: 'none', compactionToolReceipts: [], compactionArtifacts: [] }));
     const sources = context.compactionSources!;
-    const candidate = JSON.stringify({ notes: { m0: 'Do not publish ownerCode.', m1: 'Read may be permitted.', m2: 'Copy validated.' }, verbatim: { m0: true, m1: true, m2: true }, topics: { m0: '__global__', m1: '__global__', m2: '__global__' } });
+    const candidate = JSON.stringify({ taskSubject: 'Current task', state: 'Current task.', notes: { m0: 'Do not publish ownerCode.', m1: 'Read may be permitted.', m2: 'Copy validated.' }, verbatim: { m0: true, m1: true, m2: true } });
     const review = buildSemanticCompactionReviewRequest(context.request, sources, getSemanticCompactionCoverageRefSet(sources), candidate);
     assert.ok(review);
-    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ reconciliation: 'Preserve boundaries and the limited outcome.',
-      activeTask: 'm2', topicStates: {}, novelty: { m1: 'new' }, dispositions: { m0: 'decision', m1: 'constraint', m2: 'fact' } }),
+    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ format: 'gigachat-semantic-memory', version: 1,
+      activeTask: { text: 'Copy validated.', sourceRefs: ['m2'] }, decisions: [{ text: 'Keep scope.', sourceRefs: ['m0'] }],
+      constraints: [{ scope: 'Files', sourceRefs: ['m1'] }], facts: [{ sourceRefs: ['m2'] }], openWork: [], pastTopics: [], unresolvedDefects: [] }),
     candidate, sources, getSemanticCompactionCoverageRefSet(sources), context.request.messages[0]!.text));
     assert.equal(compiled.decisions[0].text, messages[0]!.text);
     assert.equal(compiled.constraints[0].text, messages[1]!.text);
@@ -593,10 +595,46 @@ test('both semantic wire requests preserve source distinctions for all four sele
       const start = request === context.request ? 1 : 2;
       assert.equal(wire.model, currentId);
       assert.equal(wire.tool_config.mode, 'none');
-      assert.deepEqual({ ...decode(wire.messages[start]!.content[0]!.text),
-        messages: wire.messages.slice(start + 1, -1).map(message => decode(message.content[0]!.text)) }, archive);
+      assert.deepEqual(request === context.request ? { ...decode(wire.messages[start]!.content[0]!.text),
+        messages: wire.messages.slice(start + 1, -1).map(message => decode(message.content[0]!.text)) } : decode(wire.messages[start]!.content[0]!.text), archive);
       assert.ok(wire.messages.slice(1).every(message => message.role === 'user'));
     }
+  });
+});
+
+test('all four semantic models close subtopics while retaining interleaved work and observed defects', async (t) => {
+  const messages = [user('boundary', 'Keep all original reports.'), user('detail', 'Chart layout: compare thin borders.'),
+    assistant('subtopic', 'The chart legend uses a compact font.'), user('separate', 'The upload queue still needs investigation.'),
+    user('closed', 'Chart styling is complete; leave it inactive.'), user('active', 'Continue the upload investigation.'),
+    user('defect', 'UPLOAD-62: length check passed on macOS build 5.7; restored path differs. Upload was not attempted; the mismatch is unresolved.')];
+  const refs = messages.map((_message, index) => `m${index}`);
+  const candidate = JSON.stringify({ taskSubject: 'Current task', state: 'Chart closed; upload mismatch unresolved.', notes: Object.fromEntries(refs.map(ref => [ref, `Note ${ref}`])),
+    verbatim: Object.fromEntries(refs.map(ref => [ref, true])) });
+  for (const { currentId } of CHAT_MODEL_FAMILIES) await t.test(currentId, () => {
+    const context = buildNextTurnContext(input(messages, { modelId: currentId, usageKind: 'compaction', compactionFormat: 'semantic',
+      functionCallMode: 'none', compactionToolReceipts: [], compactionArtifacts: [] }));
+    const sources = context.compactionSources!;
+    const review = buildSemanticCompactionReviewRequest(context.request, sources, refs, candidate)!;
+    const wire = JSON.parse(serializeProviderTurnRequest(review).body);
+    assert.equal(wire.model, currentId); assert.equal(wire.tool_config.mode, 'none');
+    assert.equal(wire.model_options.response_format.type, 'text');
+    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ format: 'gigachat-semantic-memory', version: 1,
+      activeTask: { text: 'Continue upload.', sourceRefs: ['m5'] }, constraints: [{ scope: 'Reports', sourceRefs: ['m0'] }],
+      facts: [{ sourceRefs: ['m1'] }, { sourceRefs: ['m2'] }], decisions: [],
+      openWork: [{ text: 'Queue pending.', sourceRefs: ['m3'] }, { text: 'Investigate.', sourceRefs: ['m5'] }],
+      pastTopics: [{ text: 'Chart complete.', sourceRefs: ['m1', 'm2'], closedBy: 'm4' }], unresolvedDefects: [{ sourceRefs: ['m6'] }] }),
+    candidate, sources, refs, context.request.messages[0]!.text));
+    assert.deepEqual(compiled.facts.map((entry: { sourceRefs: string[] }) => entry.sourceRefs), [['m6']]);
+    assert.deepEqual(compiled.decisions, []);
+    assert.deepEqual(compiled.openWork.map((entry: { sourceRefs: string[] }) => entry.sourceRefs), [['m3'], ['m5'], ['m6']]);
+    assert.equal(compiled.facts[0].text, messages[6]!.text);
+    assert.equal(compiled.openWork[2].text, `Наблюдённый неустранённый дефект: ${compiled.facts[0].text}`);
+    assert.deepEqual(compiled.unresolvedDefects, [compiled.openWork[2]]);
+    const next = buildNextTurnContext(input([...messages, user('recall', 'What is the current test result?')], {
+      modelId: currentId, compactSnapshot: { ...snapshot(messages[6]!.id, messages[6]!.id, messages), text: JSON.stringify(compiled), version: 2, modelId: currentId },
+      compactionToolReceipts: [], compactionArtifacts: [],
+    }));
+    assert.match(JSON.stringify(serializeProviderTurnRequest(next.request).body), /НЕУСТРАНЁННЫЙ ДЕФЕКТ/);
   });
 });
 
@@ -616,7 +654,7 @@ test('builds an independent semantic review from the exact current archive and a
   }));
   const sources = context.compactionSources!;
   const sourceRefs = getSemanticCompactionCoverageRefSet(sources);
-  const candidate = JSON.stringify({ notes: { m0: 'Continue package validation.', m1: 'Review the Windows build.', t0: 'The build is ready.' }, verbatim: { m0: false, m1: false, t0: false }, topics: { m0: 'm0', m1: 'm0', t0: 'm0' } });
+  const candidate = JSON.stringify({ taskSubject: 'Current task', state: 'Current task.', notes: { m0: 'Continue package validation.', m1: 'Review the Windows build.', t0: 'The build is ready.' }, verbatim: { m0: false, m1: false, t0: false } });
   const originalRequest = structuredClone(context.request);
 
   const review = buildSemanticCompactionReviewRequest(context.request, sources, sourceRefs, candidate);
@@ -639,15 +677,15 @@ test('builds an independent semantic review from the exact current archive and a
   assert.equal(Object.prototype.hasOwnProperty.call(review, 'compactionRepair'), false);
   assert.equal(review.functionCallMode, 'none');
   assert.equal(review.maxOutputTokens, 4096);
-  assert.equal(review.messages.length, messages.length + 3);
+  assert.equal(review.messages.length, 3);
   assert.ok(review.messages.every(message => message.role === 'user'), 'historical roles never become current instructions');
   const decode = (text: string) => JSON.parse(text.slice(text.indexOf('\n') + 1)) as Record<string, unknown>;
-  assert.deepEqual({ ...decode(review.messages[1]!.text), messages: review.messages.slice(2, -1).map(message => decode(message.text)) },
+  assert.deepEqual(decode(review.messages[1]!.text),
     decode(context.request.messages[0]!.text), 'review reconstructs every exact source record after the candidate');
   assert.match(review.messages[0]?.text ?? '', /^ПОИСТОЧНИКОВЫЕ СМЫСЛОВЫЕ ЗАМЕТКИ JSON/);
   assert.match(review.messages[0]?.text ?? '', /Review the Windows build/);
   assert.equal(review.messages[review.messages.length - 1]?.id, 'request-semantic-review-task');
-  assert.match(review.messages[review.messages.length - 1]?.text ?? '', /При расхождении опирайся на архив/);
+  assert.match(review.messages[review.messages.length - 1]?.text ?? '', /При расхождении заметки с архивом опирайся на архив/);
   assert.doesNotMatch(review.messages.map(({ text }) => text).join('\n'), /Независимо проверь черновик semantic-памяти/);
 
   const reviewWire = serializeProviderTurnRequest(review);
@@ -655,7 +693,7 @@ test('builds an independent semantic review from the exact current archive and a
   const wire = JSON.parse(reviewWire.body) as {
     tools?: unknown[]; tool_config: { mode: string };
     messages: Array<{ role: string; content: Array<{ text?: string }> }>;
-    model_options: { response_format: { schema: { required: string[]; properties: Record<string, unknown> } } };
+    model_options: { response_format: { type: string } };
   };
   assert.deepEqual(wire.messages.map(({ role }) => role), ['system', ...review.messages.map(message => message.role)]);
   const systemText = wire.messages[0]?.content[0]?.text ?? '';
@@ -667,7 +705,8 @@ test('builds an independent semantic review from the exact current archive and a
   assert.equal(wire.messages[wire.messages.length - 1]?.content[0]?.text, review.messages[review.messages.length - 1]?.text);
   assert.equal(wire.tool_config.mode, 'none');
   assert.equal(wire.tools, undefined);
-  assert.deepEqual(wire.model_options.response_format.schema.required, ['reconciliation', 'activeTask', 'topicStates', 'novelty', 'dispositions']);
+  assert.equal(wire.model_options.response_format.type, 'text');
+  assert.match(review.messages[2]!.text, /unresolvedDefects/);
   assert.doesNotMatch(review.messages[0]!.text + review.messages[1]!.text,
     /private-review-receipt|private-review-state|functionsStateId/);
 

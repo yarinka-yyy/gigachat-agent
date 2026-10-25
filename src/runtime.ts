@@ -989,7 +989,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
             options.assertProviderStateOwner?.(providerStateOwner, controller.signal);
             const preflight = Promise.resolve().then(() =>
               options.preflightProviderRequest!(turn.input, checkedRequest, controller.signal, providerStateOwner,
-                checkedRequest === reservedReview ? { additionalInputTokenReserve: semanticReviewInputReserve(semanticSourceRefs!.length) } : undefined));
+                checkedRequest === reservedReview ? { additionalInputTokenReserve: semanticReviewInputReserve() } : undefined));
             await waitTracked(
               preflight,
               operationTimeoutMs,

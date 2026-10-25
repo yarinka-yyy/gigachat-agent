@@ -215,8 +215,7 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
           response_format: request.compactionFormat === 'semantic'
             ? semanticCompactionResponseFormat(request.messages[0]?.id === 'request-compaction-transcript' ? request.messages[0].text : undefined,
               request.messages[0]?.id === 'request-semantic-review-candidate' ? request.messages[1]?.text : undefined,
-              request.messages[0]?.id === 'request-semantic-review-candidate' ? request.messages[0].text : undefined,
-              request.messages[0]?.id === 'request-semantic-review-candidate' ? request.messages.slice(2, -1).map(message => message.text) : undefined)
+              request.messages[0]?.id === 'request-semantic-review-candidate' ? request.messages[0].text : undefined)
             : COMPACTION_RESPONSE_FORMAT,
         } : {}),
       },
