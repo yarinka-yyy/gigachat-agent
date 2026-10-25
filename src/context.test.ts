@@ -622,14 +622,16 @@ test('all four semantic models close subtopics while retaining interleaved work 
       activeTask: { text: 'Continue upload.', sourceRefs: ['m5'] }, constraints: [{ scope: 'Reports', sourceRefs: ['m0'] }],
       facts: [{ sourceRefs: ['m1'] }, { sourceRefs: ['m2'] }], decisions: [],
       openWork: [{ text: 'Queue pending.', sourceRefs: ['m3'] }, { text: 'Investigate.', sourceRefs: ['m5'] }],
-      pastTopics: [{ text: 'Chart complete.', sourceRefs: ['m1', 'm2'], closedBy: 'm4' }], unresolvedDefects: [{ sourceRefs: ['m6'] }] }),
+      pastTopics: [{ text: 'Chart complete.', sourceRefs: ['m1', 'm2'], closureEvidence: 'Chart styling is complete; leave it inactive.' }],
+      unresolvedDefects: [{ sourceRefs: ['m6'], exactQuotes: [{ sourceRef: 'm6', text: 'length check passed on macOS build 5.7; restored path differs. Upload was not attempted; the mismatch is unresolved.' }] }] }),
     candidate, sources, refs, context.request.messages[0]!.text));
     assert.deepEqual(compiled.facts.map((entry: { sourceRefs: string[] }) => entry.sourceRefs), [['m6']]);
     assert.deepEqual(compiled.decisions, []);
     assert.deepEqual(compiled.openWork.map((entry: { sourceRefs: string[] }) => entry.sourceRefs), [['m3'], ['m5'], ['m6']]);
     assert.equal(compiled.facts[0].text, messages[6]!.text);
-    assert.equal(compiled.openWork[2].text, `Наблюдённый неустранённый дефект: ${compiled.facts[0].text}`);
-    assert.deepEqual(compiled.unresolvedDefects, [compiled.openWork[2]]);
+    assert.equal(compiled.openWork[2].text, 'Наблюдённый неустранённый дефект: length check passed on macOS build 5.7; restored path differs. Upload was not attempted; the mismatch is unresolved.');
+    assert.deepEqual(compiled.unresolvedDefects[0].sourceRefs, compiled.openWork[2].sourceRefs);
+    assert.equal(compiled.closedTopics[0].closedBy, 'm4');
     const next = buildNextTurnContext(input([...messages, user('recall', 'What is the current test result?')], {
       modelId: currentId, compactSnapshot: { ...snapshot(messages[6]!.id, messages[6]!.id, messages), text: JSON.stringify(compiled), version: 2, modelId: currentId },
       compactionToolReceipts: [], compactionArtifacts: [],

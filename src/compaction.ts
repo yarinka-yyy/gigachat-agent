@@ -161,8 +161,22 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
   const review: unknown = JSON.parse(value);
   if (!isRecord(review) || !hasOnlyKeys(review, [...semanticMemorySchema.required, 'unresolvedDefects'])
     || !Array.isArray(review.unresolvedDefects)) throw new Error('Review должен явно указать закрытые темы и состояние дефектов.');
-  const previous = (JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)) as { previousMemory: SemanticCompactionMemory | null }).previousMemory;
-  const reviewedClosed = validateClosedTopics(review.pastTopics, sources);
+  splitSemanticCompactionTranscript(archiveText);
+  const archive = JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)) as {
+    previousMemory: SemanticCompactionMemory | null; messages: Array<{ sourceRef: string; role: string; text: string }>;
+  };
+  const previous = archive.previousMemory;
+  if (!Array.isArray(review.pastTopics)) throw new Error('Некорректные закрытые темы.');
+  const reviewedClosed = validateClosedTopics(review.pastTopics.map(topic => {
+    if (!isRecord(topic) || !hasOnlyKeys(topic, ['text', 'sourceRefs', 'closureEvidence'])) throw new Error('Закрытие требует дословного основания.');
+    const evidence = validateSemanticText(topic.closureEvidence, MAX_SEMANTIC_QUOTE_BYTES);
+    const matches = new Set([
+      ...archive.messages.filter(source => source.role === 'user' && source.text.includes(evidence)).map(source => source.sourceRef),
+      ...(previous?.closedTopics ?? []).filter(prior => prior.closureEvidence === evidence).map(prior => prior.closedBy),
+    ]);
+    if (matches.size !== 1) throw new Error('Основание закрытия должно однозначно находиться в доступном user-источнике.');
+    return { text: topic.text, sourceRefs: topic.sourceRefs, closedBy: [...matches][0], closureEvidence: evidence };
+  }), sources);
   const closedTopics = validateClosedTopics([
     ...(previous?.closedTopics ?? []).filter(prior => !reviewedClosed.some(topic => prior.sourceRefs.every(ref => topic.sourceRefs.includes(ref)))),
     ...reviewedClosed,
@@ -170,15 +184,21 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
   const closed = new Set(closedTopics.flatMap(topic => topic.sourceRefs.filter(ref => ref !== topic.closedBy)));
   const sourceTexts = semanticSourceTexts(sources);
   const defects = review.unresolvedDefects.map(entry => {
-    if (!isRecord(entry) || !hasOnlyKeys(entry, ['sourceRefs'])) throw new Error('Дефект должен ссылаться на наблюдённый источник.');
+    if (!isRecord(entry) || !hasOnlyKeys(entry, ['sourceRefs', 'exactQuotes'])) throw new Error('Дефект требует точных свидетельств результата.');
     const refs = validateSemanticSourceRefs(entry.sourceRefs, sourceTexts);
     if (refs.some(ref => closed.has(ref))) throw new Error('Открытый дефект не может принадлежать закрытой теме.');
-    return { sourceRefs: refs };
+    const exactQuotes = validateSemanticQuotes(entry.exactQuotes, refs, sourceTexts);
+    if (!exactQuotes.length || refs.some(ref => !exactQuotes.some(quote => quote.sourceRef === ref))) throw new Error('Каждый источник состояния дефекта требует дословного свидетельства.');
+    return { sourceRefs: refs, exactQuotes };
   });
   if (defects.length > 16) throw new Error('Слишком много открытых дефектов.');
   for (const prior of previous?.unresolvedDefects ?? []) {
     if (prior.sourceRefs.some(ref => !closed.has(ref) && !defects.some(defect => defect.sourceRefs.includes(ref)))) {
       throw new Error('Наблюдённый дефект нельзя потерять без подтверждённого закрытия.');
+    }
+    if (prior.exactQuotes?.some(quote => !closed.has(quote.sourceRef)
+      && !defects.some(defect => defect.exactQuotes.some(next => next.sourceRef === quote.sourceRef && next.text === quote.text)))) {
+      throw new Error('Точное свидетельство дефекта нельзя заменить пересказом.');
     }
   }
   const exactRefs = sourceRefs.filter(ref => verbatim[ref]);
@@ -192,7 +212,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
       return kept.length ? [{ ...entry, sourceRefs: kept }] : [];
     });
   };
-  const facts = [...new Map([...retain(review.facts), ...defects].map(entry => [canonicalJson([...entry.sourceRefs as string[]].sort()), entry])).values()];
+  const facts = [...new Map([...retain(review.facts), ...defects.map(({ sourceRefs }) => ({ sourceRefs }))].map(entry => [canonicalJson([...entry.sourceRefs as string[]].sort()), entry])).values()];
   const memory = { ...review, activeTask: review.activeTask === null ? null : retain([review.activeTask])[0] ?? null,
     constraints: retain(review.constraints), decisions: retain(review.decisions), openWork: retain(review.openWork),
     facts,
@@ -204,11 +224,13 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
   if (defects.length) {
     compiled.unresolvedDefects = defects.map(defect => {
       const fact = compiled.facts.find(entry => entry.sourceRefs.length === defect.sourceRefs.length && entry.sourceRefs.every((ref, index) => ref === defect.sourceRefs[index]))!;
-      return { text: `Наблюдённый неустранённый дефект: ${fact.text}`, sourceRefs: fact.sourceRefs };
+      if (defect.exactQuotes.some(quote => !fact.text.includes(quote.text))) throw new Error('Свидетельство дефекта отсутствует в доступной памяти.');
+      return { text: `Наблюдённый неустранённый дефект: ${defect.exactQuotes.map(quote => quote.text).join(' ')}`,
+        sourceRefs: fact.sourceRefs, exactQuotes: defect.exactQuotes };
     });
     for (const defect of compiled.unresolvedDefects) {
       compiled.openWork = compiled.openWork.filter(entry => !entry.sourceRefs.some(ref => defect.sourceRefs.includes(ref)));
-      compiled.openWork.push(defect);
+      compiled.openWork.push({ text: defect.text, sourceRefs: defect.sourceRefs });
     }
   }
   return compileGeneratedSemanticCompactionMemory(canonicalJson(compiled), sources, sourceRefs);
@@ -339,6 +361,7 @@ export interface SemanticCompactionFact extends SemanticCompactionEntry {
 
 export interface SemanticClosedTopic extends SemanticCompactionEntry {
   closedBy: string;
+  closureEvidence?: string;
 }
 
 export interface SemanticCompactionMemory {
@@ -351,7 +374,7 @@ export interface SemanticCompactionMemory {
   facts: SemanticCompactionFact[];
   pastTopics: SemanticCompactionEntry[];
   closedTopics?: SemanticClosedTopic[];
-  unresolvedDefects?: SemanticCompactionEntry[];
+  unresolvedDefects?: SemanticCompactionFact[];
 }
 
 export interface CompactionAttachmentSource {
@@ -701,32 +724,7 @@ function parseSemanticCompactionMemory(value: unknown, sources: CompactionSource
       text: validateSemanticText(item.text, MAX_SEMANTIC_ENTRY_BYTES),
       sourceRefs,
     };
-    if (item.exactQuotes !== undefined) {
-      if (!Array.isArray(item.exactQuotes) || item.exactQuotes.length > MAX_SEMANTIC_QUOTES_PER_FACT) {
-        throw new Error('Список точных цитат семантической памяти превышает допустимый размер.');
-      }
-      const seenQuotes = new Set<string>();
-      fact.exactQuotes = item.exactQuotes.map((quote): SemanticCompactionQuote => {
-        if (!isRecord(quote) || !hasOnlyKeys(quote, ['sourceRef', 'text'])
-          || typeof quote.sourceRef !== 'string' || !sourceRefs.includes(quote.sourceRef)) {
-          throw new Error('Точная цитата не связана с исходником факта.');
-        }
-        const text = quote.text;
-        if (typeof text !== 'string' || !text || Buffer.byteLength(text, 'utf8') > MAX_SEMANTIC_QUOTE_BYTES
-          // eslint-disable-next-line no-control-regex -- Exact quotes cannot contain hidden control characters.
-          || /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/.test(text)) {
-          throw new Error('Точная цитата семантической памяти имеет неверный текст.');
-        }
-        const quoteKey = `${quote.sourceRef}\u0000${text}`;
-        if (seenQuotes.has(quoteKey)) throw new Error('Семантическая память содержит повторную точную цитату.');
-        seenQuotes.add(quoteKey);
-        const sourceValues = sourceTexts.get(quote.sourceRef) ?? [];
-        if (!sourceValues.some((sourceText) => sourceText.includes(text))) {
-          throw new Error('Точная цитата не совпадает с текстом исходного сообщения или результата инструмента.');
-        }
-        return { sourceRef: quote.sourceRef, text };
-      });
-    }
+    if (item.exactQuotes !== undefined) fact.exactQuotes = validateSemanticQuotes(item.exactQuotes, sourceRefs, sourceTexts);
     return fact;
   });
   const pastTopics = validateSemanticEntries(parsed.pastTopics, sourceTexts, MAX_SEMANTIC_COUNTS.pastTopics);
@@ -745,14 +743,26 @@ function parseSemanticCompactionMemory(value: unknown, sources: CompactionSource
     pastTopics,
   };
   if (parsed.closedTopics !== undefined) memory.closedTopics = validateClosedTopics(parsed.closedTopics, sources);
-  if (parsed.unresolvedDefects !== undefined) memory.unresolvedDefects = validateSemanticEntries(parsed.unresolvedDefects, sourceTexts, 16);
+  if (parsed.unresolvedDefects !== undefined) {
+    if (!Array.isArray(parsed.unresolvedDefects) || parsed.unresolvedDefects.length > 16) throw new Error('Некорректные состояния дефектов.');
+    memory.unresolvedDefects = parsed.unresolvedDefects.map(item => {
+      if (!isRecord(item) || !hasOnlyKeys(item, ['text', 'sourceRefs'], ['exactQuotes'])) throw new Error('Некорректное состояние дефекта.');
+      const entry = validateSemanticEntry({ text: item.text, sourceRefs: item.sourceRefs }, sourceTexts);
+      return { ...entry, ...(item.exactQuotes === undefined ? {} : { exactQuotes: validateSemanticQuotes(item.exactQuotes, entry.sourceRefs, sourceTexts) }) };
+    });
+  }
   const closed = new Set((memory.closedTopics ?? []).flatMap(topic => topic.sourceRefs.filter(ref => ref !== topic.closedBy)));
   if ([activeTask, ...constraints, ...decisions, ...openWork, ...facts, ...(memory.unresolvedDefects ?? [])]
     .some(entry => entry?.sourceRefs.some(ref => closed.has(ref)))) throw new Error('Закрытые подробности не могут быть активной памятью.');
   for (const defect of memory.unresolvedDefects ?? []) {
     if (!defect.text.startsWith('Наблюдённый неустранённый дефект: ')
       || !openWork.some(entry => entry.text === defect.text && canonicalJson(entry.sourceRefs) === canonicalJson(defect.sourceRefs))
-      || !facts.some(entry => defect.text === `Наблюдённый неустранённый дефект: ${entry.text}` && canonicalJson(entry.sourceRefs) === canonicalJson(defect.sourceRefs))) {
+      || !facts.some(entry => canonicalJson(entry.sourceRefs) === canonicalJson(defect.sourceRefs)
+        && (defect.exactQuotes === undefined ? defect.text === `Наблюдённый неустранённый дефект: ${entry.text}`
+          : defect.exactQuotes.length > 0
+            && defect.sourceRefs.every(ref => defect.exactQuotes!.some(quote => quote.sourceRef === ref))
+            && defect.exactQuotes.every(quote => entry.text.includes(quote.text))
+            && defect.text === `Наблюдённый неустранённый дефект: ${defect.exactQuotes.map(quote => quote.text).join(' ')}`))) {
       throw new Error('Состояние дефекта должно сохранять результат и открытую работу вместе.');
     }
   }
@@ -762,11 +772,29 @@ function parseSemanticCompactionMemory(value: unknown, sources: CompactionSource
   return memory;
 }
 
+function validateSemanticQuotes(value: unknown, sourceRefs: readonly string[], sourceTexts: Map<string, string[]>): SemanticCompactionQuote[] {
+  if (!Array.isArray(value) || value.length > MAX_SEMANTIC_QUOTES_PER_FACT) throw new Error('Список точных цитат семантической памяти превышает допустимый размер.');
+  const seen = new Set<string>();
+  return value.map(quote => {
+    if (!isRecord(quote) || !hasOnlyKeys(quote, ['sourceRef', 'text'])
+      || typeof quote.sourceRef !== 'string' || !sourceRefs.includes(quote.sourceRef)) throw new Error('Точная цитата не связана с исходником факта.');
+    const text = quote.text;
+    if (typeof text !== 'string' || !text || Buffer.byteLength(text, 'utf8') > MAX_SEMANTIC_QUOTE_BYTES
+      // eslint-disable-next-line no-control-regex -- Exact quotes cannot contain hidden control characters.
+      || /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/.test(text)) throw new Error('Точная цитата семантической памяти имеет неверный текст.');
+    const key = `${quote.sourceRef}\u0000${text}`;
+    if (seen.has(key)) throw new Error('Семантическая память содержит повторную точную цитату.');
+    seen.add(key);
+    if (!sourceTexts.get(quote.sourceRef)?.some(source => source.includes(text))) throw new Error('Точная цитата не совпадает с текстом исходного сообщения или результата инструмента.');
+    return { sourceRef: quote.sourceRef, text };
+  });
+}
+
 function validateClosedTopics(value: unknown, sources: CompactionSources): SemanticClosedTopic[] {
   if (!Array.isArray(value) || value.length > MAX_GENERATED_PAST_TOPICS) throw new Error('Некорректные закрытые темы.');
   const sourceTexts = semanticSourceTexts(sources), members = new Set<string>();
   return value.map(topic => {
-    if (!isRecord(topic) || !hasOnlyKeys(topic, ['text', 'sourceRefs', 'closedBy'])) throw new Error('Закрытие должно иметь список подробностей и источник подтверждения.');
+    if (!isRecord(topic) || !hasOnlyKeys(topic, ['text', 'sourceRefs', 'closedBy'], ['closureEvidence'])) throw new Error('Закрытие должно иметь список подробностей и источник подтверждения.');
     const entry = validateSemanticEntry({ text: topic.text, sourceRefs: topic.sourceRefs }, sourceTexts);
     const closedBy = validateSemanticSourceRefs([topic.closedBy], sourceTexts)[0]!;
     if ([...entry.text].length > MAX_GENERATED_PAST_TOPIC_CHARS
@@ -779,7 +807,10 @@ function validateClosedTopics(value: unknown, sources: CompactionSources): Seman
       if (members.has(ref)) throw new Error('Подробность не может принадлежать двум закрытым темам.');
       members.add(ref);
     }
-    return { ...entry, closedBy };
+    if (topic.closureEvidence === undefined) return { ...entry, closedBy };
+    const closureEvidence = validateSemanticText(topic.closureEvidence, MAX_SEMANTIC_QUOTE_BYTES);
+    if (!sourceTexts.get(closedBy)?.some(text => text.includes(closureEvidence))) throw new Error('Основание закрытия не совпадает с user-источником.');
+    return { ...entry, closedBy, closureEvidence };
   });
 }
 
@@ -834,8 +865,11 @@ export function formatSemanticCompactionMemory(value: unknown, sources: Compacti
     }
   }
   if (memory.unresolvedDefects?.length) {
-    lines.push('Текущий наблюдённый результат проверки содержит НЕУСТРАНЁННЫЙ ДЕФЕКТ. Это уже обнаруженная ошибка, не только план будущей проверки; частичный успех её не отменяет:');
-    for (const defect of memory.unresolvedDefects) lines.push(renderEntry(defect));
+    lines.push('Последний наблюдённый результат: НЕУСТРАНЁННЫЙ ДЕФЕКТ. Дословные свидетельства частичного результата, конкретной ошибки и предела проверки:');
+    for (const defect of memory.unresolvedDefects) {
+      if (defect.exactQuotes?.length) for (const quote of defect.exactQuotes) lines.push(`- ${JSON.stringify(quote.text)} (источник: ${quote.sourceRef})`);
+      else lines.push(renderEntry(defect));
+    }
   }
   const formatted = lines.join('\n');
   if (Buffer.byteLength(formatted, 'utf8') > MAX_COMPACT_SUMMARY_BYTES) {

@@ -602,17 +602,17 @@ test('topic closure removes all its details and defect state survives compilatio
     constraints: [{ scope: 'Reports', sourceRefs: ['m0', 'm1'] }], decisions: [],
     facts: [{ sourceRefs: ['m1'] }, { sourceRefs: ['m3'] }],
     openWork: [{ text: 'Chart details.', sourceRefs: ['m3'] }, { text: 'Check upload.', sourceRefs: ['m2'] }],
-    pastTopics: [{ text: 'Chart styling complete.', sourceRefs: ['m1', 'm3'], closedBy: 'm4' }],
-    unresolvedDefects: [{ sourceRefs: ['m5'] }],
+    pastTopics: [{ text: 'Chart styling complete.', sourceRefs: ['m1', 'm3'], closureEvidence: 'Chart styling is complete.' }],
+    unresolvedDefects: [{ sourceRefs: ['m5'], exactQuotes: [{ sourceRef: 'm5', text: 'length passed; restored path differs. Upload not attempted; mismatch unresolved.' }] }],
   };
   const memory = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson(resolution), notes, sources, refs, archive));
   assert.deepEqual(memory.constraints[0].sourceRefs, ['m0']);
   assert.equal(memory.constraints[0].text, sources.messages[0]!.text);
   assert.deepEqual(memory.facts.map((entry: { sourceRefs: string[] }) => entry.sourceRefs), [['m5']]);
   assert.deepEqual(memory.openWork.map((entry: { sourceRefs: string[] }) => entry.sourceRefs), [['m2'], ['m5']]);
-  assert.equal(memory.openWork[1].text, `Наблюдённый неустранённый дефект: ${sources.messages[5]!.text}`);
-  assert.deepEqual(memory.closedTopics, resolution.pastTopics);
-  assert.deepEqual(memory.unresolvedDefects, [memory.openWork[1]]);
+  assert.equal(memory.openWork[1].text, `Наблюдённый неустранённый дефект: ${resolution.unresolvedDefects[0]!.exactQuotes[0]!.text}`);
+  assert.deepEqual(memory.closedTopics, [{ ...resolution.pastTopics[0], closedBy: 'm4' }]);
+  assert.deepEqual(memory.unresolvedDefects, [{ ...memory.openWork[1], exactQuotes: resolution.unresolvedDefects[0]!.exactQuotes }]);
   assert.deepEqual(validateSemanticCompactionMemory(JSON.stringify(memory), sources), memory, 'typed state round trips in snapshots');
   const formatted = formatSemanticCompactionMemory(JSON.stringify(memory), sources);
   assert.match(formatted, /НЕУСТРАНЁННЫЙ ДЕФЕКТ/);
@@ -621,8 +621,10 @@ test('topic closure removes all its details and defect state survives compilatio
   for (const change of [{ unresolvedDefects: undefined }, { observedDefect: true, defectEvidence: '' },
     { unresolvedDefects: [{ sourceRefs: ['m999'] }] }, { unresolvedDefects: [{ sourceRefs: ['m1'] }] },
     { unresolvedDefects: [{ sourceRefs: [] }] },
-    { pastTopics: [{ ...resolution.pastTopics[0], closedBy: 'm3' }] },
-    { pastTopics: [{ ...resolution.pastTopics[0], closedBy: 'm0' }] }]) {
+    { pastTopics: [{ ...resolution.pastTopics[0], closureEvidence: 'Use a small chart legend.' }] },
+    { pastTopics: [{ ...resolution.pastTopics[0], closureEvidence: 'Keep all original reports.' }] },
+    { unresolvedDefects: [{ sourceRefs: ['m5'], exactQuotes: [] }] },
+    { unresolvedDefects: [{ sourceRefs: ['m5'], exactQuotes: [{ sourceRef: 'm5', text: 'Restoration was not complete.' }] }] }]) {
     assert.throws(() => compileResolvedSemanticCompactionMemory(reviewJson({ ...resolution, ...change }), notes, sources, refs, archive));
   }
   assert.throws(() => validateSemanticCompactionMemory(JSON.stringify({ ...memory, openWork: [] }), sources), /Состояние дефекта/);
@@ -642,6 +644,8 @@ test('topic closure removes all its details and defect state survives compilatio
   assert.deepEqual(continued.unresolvedDefects, memory.unresolvedDefects, 'state survives a second compaction without prefix accumulation');
   assert.throws(() => compileResolvedSemanticCompactionMemory(reviewJson({ ...rolling, unresolvedDefects: [] }), rollingNotes,
     rollingSources, rollingRefs, rollingArchive), /нельзя потерять/);
+  assert.throws(() => compileResolvedSemanticCompactionMemory(reviewJson({ ...rolling, unresolvedDefects: [{ sourceRefs: ['m5'],
+    exactQuotes: [{ sourceRef: 'm5', text: 'Upload not attempted' }] }] }), rollingNotes, rollingSources, rollingRefs, rollingArchive), /нельзя заменить/);
 });
 
 test('segmented semantic input reconstructs every source and rejects malformed envelopes', () => {
