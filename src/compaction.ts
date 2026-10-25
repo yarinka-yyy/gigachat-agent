@@ -151,16 +151,90 @@ export function semanticReviewInputReserve(): number {
 }
 
 export function semanticSourceResolutionResponseFormat() {
-  // Review composes its JSON as text; local parsing still enforces every state and source boundary.
-  return { type: 'text' };
+  return { type: 'json_schema', strict: true, schema: { type: 'object',
+    properties: Object.fromEntries(SEMANTIC_REVIEW_FIELDS.map(field => [field, { type: 'string', maxLength: 512 }])),
+    required: [...SEMANTIC_REVIEW_FIELDS], additionalProperties: false } };
+}
+
+const SEMANTIC_REVIEW_FIELDS = ['activeTask', 'constraints', 'decisions', 'openWork', 'facts', 'pastTopics', 'unresolvedDefects'] as const;
+
+export function semanticReviewEvidenceIndex(archiveText: string): Record<string, SemanticCompactionQuote & { role: string }> {
+  splitSemanticCompactionTranscript(archiveText);
+  const archive = JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)) as {
+    previousMemory: SemanticCompactionMemory | null;
+    messages: Array<{ sourceRef: string; role: string; text: string }>;
+    tools: Array<{ sourceRef: string; content?: string; result?: string }>;
+  };
+  const index: Record<string, SemanticCompactionQuote & { role: string }> = {}, seen = new Set<string>();
+  let nextId = 0;
+  const add = (sourceRef: string, text: string, role: string, split = true) => {
+    for (const sentence of (split ? text.split(/(?<=[.!?])\s+|\r?\n/u) : [text]).filter(Boolean)) {
+      let chunk = '';
+      const append = () => {
+        const key = canonicalJson([sourceRef, chunk]);
+        if (chunk && !seen.has(key)) { index[`q${nextId++}`] = { sourceRef, text: chunk, role }; seen.add(key); }
+        chunk = '';
+      };
+      for (const char of sentence) {
+        if (Buffer.byteLength(chunk + char, 'utf8') > MAX_SEMANTIC_QUOTE_BYTES) append();
+        chunk += char;
+      }
+      append();
+    }
+  };
+  for (const topic of archive.previousMemory?.closedTopics ?? []) if (topic.closureEvidence) add(topic.closedBy, topic.closureEvidence, 'user', false);
+  const priorDefects = archive.previousMemory?.unresolvedDefects ?? [];
+  const witnessedRefs = new Set(priorDefects.flatMap(entry => (entry.exactQuotes ?? []).map(quote => quote.sourceRef)));
+  for (const entry of priorDefects) {
+    for (const quote of entry.exactQuotes ?? []) add(quote.sourceRef, quote.text, 'memory', false);
+  }
+  for (const entry of archive.previousMemory?.facts ?? []) {
+    for (const quote of entry.exactQuotes ?? []) if (!witnessedRefs.has(quote.sourceRef)) add(quote.sourceRef, quote.text, 'memory', false);
+  }
+  for (const source of archive.messages) if (source.role === 'user') add(source.sourceRef, source.text, source.role);
+  for (const source of archive.tools) for (const text of [source.content, source.result]) if (typeof text === 'string' && text) add(source.sourceRef, text, 'tool');
+  return index;
 }
 
 export function compileResolvedSemanticCompactionMemory(value: string, notesValue: string, sources: CompactionSources, sourceRefs: readonly string[], archiveText: string): string {
-  const { verbatim } = JSON.parse(compileSemanticSourceNotes(notesValue, sourceRefs)) as { verbatim: Record<string, boolean> };
-  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > MAX_COMPACTION_CANDIDATE_BYTES) throw new Error('Review превышает допустимый размер.');
-  const review: unknown = JSON.parse(value);
-  if (!isRecord(review) || !hasOnlyKeys(review, [...semanticMemorySchema.required, 'unresolvedDefects'])
-    || !Array.isArray(review.unresolvedDefects)) throw new Error('Review должен явно указать закрытые темы и состояние дефектов.');
+  const { notes, verbatim } = JSON.parse(compileSemanticSourceNotes(notesValue, sourceRefs)) as { notes: Record<string, string>; verbatim: Record<string, boolean> };
+  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > 4096) throw new Error('Review превышает ограничение 4096 байт.');
+  const selection: unknown = JSON.parse(value);
+  if (!isRecord(selection) || !hasOnlyKeys(selection, [...SEMANTIC_REVIEW_FIELDS])
+    || SEMANTIC_REVIEW_FIELDS.some(field => typeof selection[field] !== 'string' || (selection[field] as string).length > 512)) throw new Error('Review должен содержать только ограниченные списки ссылок.');
+  const evidenceIndex = semanticReviewEvidenceIndex(archiveText);
+  const list = (text: string, allowed: readonly string[], limit: number): string[] => {
+    const refs = text ? text.split(',').map(ref => ref.trim()) : [];
+    if (refs.length > limit || new Set(refs).size !== refs.length || refs.some(ref => !allowed.includes(ref))) throw new Error('Некорректные или повторные ссылки review.');
+    return refs;
+  };
+  const field = (name: typeof SEMANTIC_REVIEW_FIELDS[number], limit: number) => list(selection[name] as string, sourceRefs, limit);
+  const groups = (name: 'pastTopics' | 'unresolvedDefects', limit: number): string[] => {
+    const text = selection[name] as string, values = text ? text.split(';') : [];
+    if (values.length > limit || values.some(value => !value.trim())) throw new Error('Некорректные группы review.');
+    return values;
+  };
+  const entry = (ref: string) => ({ text: notes[ref]!, sourceRefs: [ref] });
+  const active = field('activeTask', 1);
+  const review = { format: SEMANTIC_COMPACTION_FORMAT, version: 1,
+    activeTask: active.length ? entry(active[0]!) : null,
+    constraints: field('constraints', MAX_SEMANTIC_COUNTS.constraints).map(ref => ({ scope: `Источник ${ref}`, sourceRefs: [ref] })),
+    decisions: field('decisions', MAX_SEMANTIC_COUNTS.decisions).map(entry),
+    openWork: field('openWork', MAX_SEMANTIC_COUNTS.openWork).map(entry),
+    facts: field('facts', MAX_SEMANTIC_COUNTS.facts).map(ref => ({ sourceRefs: [ref] })),
+    pastTopics: groups('pastTopics', MAX_GENERATED_PAST_TOPICS).map(group => {
+      const [id, members, extra] = group.split(':'), proof = evidenceIndex[id?.trim() ?? ''];
+      if (extra !== undefined || members === undefined || !proof || proof.role !== 'user') throw new Error('Закрытие требует индексированного user-основания.');
+      return { text: [...proof.text].length <= MAX_GENERATED_PAST_TOPIC_CHARS ? proof.text : `Закрытая ветка (${proof.sourceRef}).`,
+        sourceRefs: list(members, sourceRefs, MAX_SEMANTIC_REFS_PER_ENTRY), closureEvidence: proof.text };
+    }),
+    unresolvedDefects: groups('unresolvedDefects', 16).map(group => {
+      const exactQuotes = list(group, Object.keys(evidenceIndex), MAX_SEMANTIC_QUOTES_PER_FACT).map(id => {
+        const { sourceRef, text } = evidenceIndex[id]!; return { sourceRef, text };
+      });
+      return { sourceRefs: [...new Set(exactQuotes.map(quote => quote.sourceRef))], exactQuotes };
+    }),
+  };
   splitSemanticCompactionTranscript(archiveText);
   const archive = JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)) as {
     previousMemory: SemanticCompactionMemory | null; messages: Array<{ sourceRef: string; role: string; text: string }>;

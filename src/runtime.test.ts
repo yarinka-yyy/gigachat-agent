@@ -948,8 +948,8 @@ test('semantic compaction reviews once on the selected model and accounts for bo
         assert.deepEqual(request.protocolHistory, []);
         yield { type: 'text-delta', text: requests.length === 1
           ? JSON.stringify({ taskSubject: 'Current task', state: 'Task remains open.', notes: Object.fromEntries(input.messages.map((message, index) => [`m${index}`, `Draft: ${message.text}`])), verbatim: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, false])) })
-          : JSON.stringify({ format: 'gigachat-semantic-memory', version: 1, activeTask: { text: 'Task remains open.', sourceRefs: ['m0'] },
-            constraints: [], decisions: [], openWork: [], pastTopics: [], unresolvedDefects: [], facts: input.messages.map((_message, index) => ({ sourceRefs: [`m${index}`] })) }) };
+          : JSON.stringify({ activeTask: 'm0', constraints: '', decisions: '', openWork: '', pastTopics: '', unresolvedDefects: '',
+            facts: input.messages.map((_message, index) => `m${index}`).join(',') }) };
         yield { type: 'usage', promptTokens: 10, completionTokens: 5, totalTokens: 15, precachedPromptTokens: 0 };
         yield { type: 'completed', functionsStateId: requests.length === 1 ? 'draft-state' : 'review-state' };
       }),
@@ -986,7 +986,7 @@ test('semantic compaction reviews once on the selected model and accounts for bo
     assert.equal(requests.length, 2);
     assert.equal(preflights.length, 3, 'reserve review, exact draft, exact review');
     assert.equal(saved.length, 1);
-    assert.equal(JSON.parse(saved[0]!).activeTask.text, 'Task remains open.');
+    assert.equal(JSON.parse(saved[0]!).activeTask.text, `Draft: ${input.messages[0]!.text}`);
     assert.match(requests[1]!.messages[0]!.text, /Draft/);
     const sourceRecord = JSON.parse(requests[1]!.messages[1]!.text.split('\n').slice(1).join('\n')) as { messages: Array<{ text: string }> };
     assert.equal(sourceRecord.messages[0]!.text, input.messages[0]!.text);

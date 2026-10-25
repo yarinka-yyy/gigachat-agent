@@ -10,7 +10,7 @@ import { GigaChatProviderError, MAX_PROVIDER_REQUEST_BYTES, serializeProviderTur
 import { calculateLiteWorkingBudget, isLitePromptOverMeasuredInputGuard, liteHardInputLimit } from './context-budget';
 import { CHAT_MODEL_FAMILIES } from './model-catalog';
 import { compileExtractiveCompaction, compileSemanticCompactionMemory,
-  compileResolvedSemanticCompactionMemory, createCompactionSources, getSemanticCompactionCoverageRefSet } from './compaction';
+  compileResolvedSemanticCompactionMemory, createCompactionSources, getSemanticCompactionCoverageRefSet, semanticReviewEvidenceIndex } from './compaction';
 
 const at = '2026-10-09T12:00:00.000Z';
 const reviewJson = (value: unknown): string => JSON.stringify(value);
@@ -531,7 +531,9 @@ test('rolls semantic compaction forward with stable global refs and only the new
   const notes = JSON.stringify({ taskSubject: 'Current task', state: 'Current task.', notes: Object.fromEntries(envelope.coverageRefSet.map(ref => [ref, 'The old tool returned its result.'])), verbatim: Object.fromEntries(envelope.coverageRefSet.map(ref => [ref, false])) });
   const review = buildSemanticCompactionReviewRequest(context.request, context.compactionSources!, envelope.coverageRefSet, notes);
   assert.ok(review);
-  const reviewEnvelope = JSON.parse(review.messages[1]!.text.slice(review.messages[1]!.text.indexOf('\n') + 1)) as typeof envelope;
+  const { evidenceIndex, ...reviewEnvelope } = JSON.parse(review.messages[1]!.text.slice(review.messages[1]!.text.indexOf('\n') + 1)) as typeof envelope & { evidenceIndex: unknown };
+  assert.deepEqual(evidenceIndex, semanticReviewEvidenceIndex(context.request.messages[0]!.text));
+  assert.doesNotMatch(JSON.stringify(evidenceIndex), /Old raw request\.|Old raw answer\./);
   assert.deepEqual(reviewEnvelope.previousMemory, envelope.previousMemory);
   assert.deepEqual(reviewEnvelope.tools, envelope.tools);
   const reviewMessages = reviewEnvelope.messages;
@@ -578,9 +580,8 @@ test('both semantic wire requests preserve source distinctions for all four sele
     const candidate = JSON.stringify({ taskSubject: 'Current task', state: 'Current task.', notes: { m0: 'Do not publish ownerCode.', m1: 'Read may be permitted.', m2: 'Copy validated.' }, verbatim: { m0: true, m1: true, m2: true } });
     const review = buildSemanticCompactionReviewRequest(context.request, sources, getSemanticCompactionCoverageRefSet(sources), candidate);
     assert.ok(review);
-    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ format: 'gigachat-semantic-memory', version: 1,
-      activeTask: { text: 'Copy validated.', sourceRefs: ['m2'] }, decisions: [{ text: 'Keep scope.', sourceRefs: ['m0'] }],
-      constraints: [{ scope: 'Files', sourceRefs: ['m1'] }], facts: [{ sourceRefs: ['m2'] }], openWork: [], pastTopics: [], unresolvedDefects: [] }),
+    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ activeTask: 'm2', decisions: 'm0',
+      constraints: 'm1', facts: 'm2', openWork: '', pastTopics: '', unresolvedDefects: '' }),
     candidate, sources, getSemanticCompactionCoverageRefSet(sources), context.request.messages[0]!.text));
     assert.equal(compiled.decisions[0].text, messages[0]!.text);
     assert.equal(compiled.constraints[0].text, messages[1]!.text);
@@ -595,8 +596,10 @@ test('both semantic wire requests preserve source distinctions for all four sele
       const start = request === context.request ? 1 : 2;
       assert.equal(wire.model, currentId);
       assert.equal(wire.tool_config.mode, 'none');
-      assert.deepEqual(request === context.request ? { ...decode(wire.messages[start]!.content[0]!.text),
-        messages: wire.messages.slice(start + 1, -1).map(message => decode(message.content[0]!.text)) } : decode(wire.messages[start]!.content[0]!.text), archive);
+      const reviewed = decode(wire.messages[start]!.content[0]!.text);
+      delete reviewed.evidenceIndex;
+      assert.deepEqual(request === context.request ? { ...reviewed,
+        messages: wire.messages.slice(start + 1, -1).map(message => decode(message.content[0]!.text)) } : reviewed, archive);
       assert.ok(wire.messages.slice(1).every(message => message.role === 'user'));
     }
   });
@@ -617,19 +620,18 @@ test('all four semantic models close subtopics while retaining interleaved work 
     const review = buildSemanticCompactionReviewRequest(context.request, sources, refs, candidate)!;
     const wire = JSON.parse(serializeProviderTurnRequest(review).body);
     assert.equal(wire.model, currentId); assert.equal(wire.tool_config.mode, 'none');
-    assert.equal(wire.model_options.response_format.type, 'text');
-    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ format: 'gigachat-semantic-memory', version: 1,
-      activeTask: { text: 'Continue upload.', sourceRefs: ['m5'] }, constraints: [{ scope: 'Reports', sourceRefs: ['m0'] }],
-      facts: [{ sourceRefs: ['m1'] }, { sourceRefs: ['m2'] }], decisions: [],
-      openWork: [{ text: 'Queue pending.', sourceRefs: ['m3'] }, { text: 'Investigate.', sourceRefs: ['m5'] }],
-      pastTopics: [{ text: 'Chart complete.', sourceRefs: ['m1', 'm2'], closureEvidence: 'Chart styling is complete; leave it inactive.' }],
-      unresolvedDefects: [{ sourceRefs: ['m6'], exactQuotes: [{ sourceRef: 'm6', text: 'length check passed on macOS build 5.7; restored path differs. Upload was not attempted; the mismatch is unresolved.' }] }] }),
+    assert.equal(wire.model_options.response_format.type, 'json_schema');
+    const index = semanticReviewEvidenceIndex(context.request.messages[0]!.text);
+    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ activeTask: 'm5', constraints: 'm0',
+      facts: 'm1,m2', decisions: '', openWork: 'm3,m5',
+      pastTopics: `${Object.keys(index).find(id => index[id]!.sourceRef === 'm4')}:m1,m2`,
+      unresolvedDefects: Object.keys(index).filter(id => index[id]!.sourceRef === 'm6').join(',') }),
     candidate, sources, refs, context.request.messages[0]!.text));
     assert.deepEqual(compiled.facts.map((entry: { sourceRefs: string[] }) => entry.sourceRefs), [['m6']]);
     assert.deepEqual(compiled.decisions, []);
     assert.deepEqual(compiled.openWork.map((entry: { sourceRefs: string[] }) => entry.sourceRefs), [['m3'], ['m5'], ['m6']]);
     assert.equal(compiled.facts[0].text, messages[6]!.text);
-    assert.equal(compiled.openWork[2].text, 'Наблюдённый неустранённый дефект: length check passed on macOS build 5.7; restored path differs. Upload was not attempted; the mismatch is unresolved.');
+    assert.equal(compiled.openWork[2].text, `Наблюдённый неустранённый дефект: ${messages[6]!.text}`);
     assert.deepEqual(compiled.unresolvedDefects[0].sourceRefs, compiled.openWork[2].sourceRefs);
     assert.equal(compiled.closedTopics[0].closedBy, 'm4');
     const next = buildNextTurnContext(input([...messages, user('recall', 'What is the current test result?')], {
@@ -668,7 +670,7 @@ test('builds an independent semantic review from the exact current archive and a
   assert.equal(review.system.length, originalRequest.system.length);
   assert.equal(reviewTaskLayer.source, 'runtime');
   assert.equal(reviewTaskLayer.label, 'Задача текущего запроса');
-  assert.match(reviewTaskLayer.text, /^Определи актуальность каждой/);
+  assert.match(reviewTaskLayer.text, /^Сверь заметки со всей историей/);
   assert.notEqual(reviewTaskLayer.text, SEMANTIC_COMPACTION_TASK_INSTRUCTION);
   assert.equal(review.system.filter((layer) => layer.label === 'Задача текущего запроса').length, 1);
   assert.equal(review.system.filter((layer) => layer.text === SEMANTIC_COMPACTION_TASK_INSTRUCTION).length, 0);
@@ -682,7 +684,10 @@ test('builds an independent semantic review from the exact current archive and a
   assert.equal(review.messages.length, 3);
   assert.ok(review.messages.every(message => message.role === 'user'), 'historical roles never become current instructions');
   const decode = (text: string) => JSON.parse(text.slice(text.indexOf('\n') + 1)) as Record<string, unknown>;
-  assert.deepEqual(decode(review.messages[1]!.text),
+  const indexedArchive = decode(review.messages[1]!.text);
+  assert.deepEqual(indexedArchive.evidenceIndex, semanticReviewEvidenceIndex(context.request.messages[0]!.text));
+  delete indexedArchive.evidenceIndex;
+  assert.deepEqual(indexedArchive,
     decode(context.request.messages[0]!.text), 'review reconstructs every exact source record after the candidate');
   assert.match(review.messages[0]?.text ?? '', /^ПОИСТОЧНИКОВЫЕ СМЫСЛОВЫЕ ЗАМЕТКИ JSON/);
   assert.match(review.messages[0]?.text ?? '', /Review the Windows build/);
@@ -707,7 +712,7 @@ test('builds an independent semantic review from the exact current archive and a
   assert.equal(wire.messages[wire.messages.length - 1]?.content[0]?.text, review.messages[review.messages.length - 1]?.text);
   assert.equal(wire.tool_config.mode, 'none');
   assert.equal(wire.tools, undefined);
-  assert.equal(wire.model_options.response_format.type, 'text');
+  assert.equal(wire.model_options.response_format.type, 'json_schema');
   assert.match(review.messages[2]!.text, /unresolvedDefects/);
   assert.doesNotMatch(review.messages[0]!.text + review.messages[1]!.text,
     /private-review-receipt|private-review-state|functionsStateId/);
