@@ -300,16 +300,16 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
   const metadata = JSON.parse(records[0]!.slice(records[0]!.indexOf('\n') + 1));
   const groups = draftTopicSources(topics, metadata.coverageRefSet, metadata.tools);
   const topicByRef = topicSources(groups);
+  const format = semanticCompactionResponseFormat(undefined, archiveText, candidateText);
+  if (!('sourceUpdates' in format.schema.properties)) throw new Error('Review требует контракт выбора источников.');
+  const choices = format.schema.properties;
   const index = metadata.evidenceIndex as Record<string, SemanticCompactionQuote & { role: string }>;
   const evidenceIds = Object.keys(index).sort((left, right) => Number(left.slice(1)) - Number(right.slice(1)));
-  const archiveMessages = (JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)).messages as Array<{ sourceRef: string; role: string; text: string }>);
-  const assistantRefs = new Set(archiveMessages.filter(source => source.role === 'assistant').map(source => source.sourceRef));
-  metadata.topicSources = Object.fromEntries(groups.map(topic => [topic.subject, { sourceRefs: topic.sourceRefs }]));
-  const requestRefs = new Set(historicalSemanticRequestRefs(metadata.previousMemory, archiveMessages));
-  const review = (ref: string) => ({ categories: requestRefs.has(ref) ? ['request'] : assistantRefs.has(ref) ? ['decision', ...archiveMessages.filter(source => source.role === 'user' && Number(source.sourceRef.slice(1)) < Number(ref.slice(1))).map(source => `paraphrase:${source.sourceRef}`), ...(verbatim[ref] ? [] : ['drop'])] : [...SOURCE_CATEGORIES, 'defect', ...(archiveMessages.some(source => source.sourceRef === ref && source.role === 'user') ? ['request'] : ['drop'])],
+  metadata.topicSources = Object.fromEntries(groups.map(topic => [topic.subject, { sourceRefs: topic.sourceRefs, witnesses: choices.topicUpdates.properties[topic.subject]!.properties.evidence.enum }]));
+  const review = (ref: string) => ({ categories: choices.classifications.properties[ref]!.enum,
+    updates: choices.sourceUpdates.properties[ref]!.enum,
     topic: topicByRef[ref] ?? null, note: notes[ref] ?? null, verbatim: verbatim[ref] ?? null,
-    evidence: Object.fromEntries(evidenceIds.filter(id => index[id]!.sourceRef === ref).map(id => [`${ref}/${id}`,
-      archiveMessages.some(source => source.sourceRef === ref && source.role === 'user') && !requestRefs.has(ref) ? {} : { text: index[id]!.text }])) });
+    evidence: Object.fromEntries(evidenceIds.filter(id => index[id]!.sourceRef === ref).map(id => [`${ref}/${id}`, { text: index[id]!.text }])) });
   const messageRefs = new Set<string>();
   const aligned = records.slice(1).map(record => {
     const value = JSON.parse(record.slice(record.indexOf('\n') + 1));
@@ -334,8 +334,16 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
     previousMemory: SemanticCompactionMemory | null; messages: Array<{ sourceRef: string; role: string; text: string }>; tools: Array<{ sourceRef: string; anchorRef: string }>;
   };
   const topicByRef = topicSources(draftTopicSources(draft.topics, sourceRefs, archive.tools));
-  if (isRecord(selection) && (Object.prototype.hasOwnProperty.call(selection, 'evidence') || Object.prototype.hasOwnProperty.call(selection, 'state'))) selection = expandSemanticReviewDecision(selection, topicByRef, semanticReviewEvidenceIndex(archiveText), archive.messages,
-    protectedSemanticMemoryRefs(archive.previousMemory));
+  if (isRecord(selection) && (Object.prototype.hasOwnProperty.call(selection, 'evidence') || Object.prototype.hasOwnProperty.call(selection, 'state'))) {
+    const format = semanticCompactionResponseFormat(undefined, archiveText, `ЗАМЕТКИ\n${notesValue}`);
+    if (!('sourceUpdates' in format.schema.properties)) throw new Error('Review требует контракт выбора источников.');
+    const selected = selection.sourceUpdates, allowed = format.schema.properties.sourceUpdates.properties;
+    if (!isRecord(selected) || !hasOnlyKeys(selected, [...sourceRefs])
+      || sourceRefs.some(ref => typeof selected[ref] !== 'string' || !allowed[ref]!.enum.includes(selected[ref] as string))) throw new Error('Review содержит недопустимое изменение источника.');
+    if (typeof selection.activeTask !== 'string' || !format.schema.properties.activeTask.enum.includes(selection.activeTask)) throw new Error('Активная задача требует допустимого первичного источника.');
+    selection = expandSemanticReviewDecision(selection, topicByRef, semanticReviewEvidenceIndex(archiveText), archive.messages,
+      protectedSemanticMemoryRefs(archive.previousMemory));
+  }
   if (!isRecord(selection) || !hasOnlyKeys(selection, [...SEMANTIC_REVIEW_FIELDS])
     || ['activeTask', 'unresolvedDefects'].some(field => typeof selection[field] !== 'string' || (selection[field] as string).length > 512)
     || !isRecord(selection.classifications) || !hasOnlyKeys(selection.classifications, [...sourceRefs])
@@ -580,6 +588,17 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   const assistantOrigins = Object.fromEntries(archive.messages.filter(source => source.role === 'assistant').map(source => [source.sourceRef, userRefs.filter(ref => Number(ref.slice(1)) < Number(source.sourceRef.slice(1)))]));
   return semanticReviewDecisionResponseFormat(refs, taskRefs, archive.previousMemory ? semanticMemorySourceRefs(archive.previousMemory).filter(ref => !reportRefs.has(ref)) : [], protectedRefs, withSources(updateEvidence), withSources(independentEvidence), withSources(topicEvidence), assistantOrigins,
     refs.filter(ref => draft ? draft.verbatim[ref] : false), requestRefs, closedRefs, evidenceIds.map(id => topicWitnessAddress(id, evidenceIndex[id]!)));
+}
+
+export function semanticCompactionWireResponseFormat(archiveText?: string, reviewMetadata?: string, reviewNotes?: string) {
+  const format = semanticCompactionResponseFormat(archiveText, reviewMetadata, reviewNotes);
+  if (!('sourceUpdates' in format.schema.properties)) return format;
+  const properties = format.schema.properties;
+  return { ...format, schema: { ...format.schema, properties: { ...properties,
+    sourceUpdates: { ...properties.sourceUpdates, properties: Object.fromEntries(Object.keys(properties.sourceUpdates.properties).map(ref => [ref, { type: 'string', maxLength: 512 }])) },
+    classifications: { ...properties.classifications, properties: Object.fromEntries(Object.keys(properties.classifications.properties).map(ref => [ref, { type: 'string', maxLength: 96 }])) },
+    evidence: { ...properties.evidence, items: { type: 'string', minLength: 1, maxLength: MAX_SEMANTIC_QUOTE_BYTES + 64 } },
+  } } };
 }
 
 export function compileSemanticSourceNotes(value: unknown, sourceRefs: readonly string[]): string {
