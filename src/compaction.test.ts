@@ -703,6 +703,33 @@ test('topic closure removes all its details and defect state survives compilatio
   assert.throws(() => compileResolvedSemanticCompactionMemory(' '.repeat(4097), notes, sources, refs, archive), /4096 байт/);
 });
 
+test('rolling reclassification retains accepted facts and quotes only available prior literals', () => {
+  const literal = 'The copy check passed on build 2.8.';
+  const fact = 'The checksum is unchanged; the upload was not attempted.';
+  const sources = createCompactionSources([user('decision', `${literal} HIDDEN-OLD-DETAIL-63`), user('fact', fact), assistant('ack', 'Noted.'), user('suffix', 'Continue the investigation.')], [], []);
+  const prior = { format: 'gigachat-semantic-memory' as const, version: 1 as const, activeTask: null, constraints: [],
+    decisions: [{ text: literal, sourceRefs: ['m0'] }], openWork: [], pastTopics: [],
+    facts: [{ text: fact, sourceRefs: ['m1'], exactQuotes: [{ sourceRef: 'm1', text: fact }] }] };
+  const archive = serializeSemanticCompactionTranscript(sources, prior, 3);
+  const refs = getSemanticCompactionCoverageRefSet(sources, prior, 3);
+  const notes = JSON.stringify({ taskSubject: 'Upload investigation', state: 'The copy check passed; upload remains unverified.', activeTask: 'none', topics: [],
+    notes: Object.fromEntries(refs.map(ref => [ref, 'Available state.'])), verbatim: Object.fromEntries(refs.map(ref => [ref, false])) });
+  const selection = { sourceUpdates: Object.fromEntries(refs.map(ref => [ref, 'none'])), topicUpdates: {}, assistantOrigins: {}, activeTask: 'none', unresolvedDefects: '',
+    classifications: { m0: 'fact', m1: 'decision', m3: 'openWork' } };
+  const compile = (text = archive, value = selection) => JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify(value), notes, sources, refs, text));
+  const memory = compile();
+  assert.deepEqual(memory.facts.find((entry: { sourceRefs: string[] }) => entry.sourceRefs.includes('m0')).exactQuotes, [{ sourceRef: 'm0', text: literal }]);
+  assert.deepEqual(memory.facts.find((entry: { sourceRefs: string[] }) => entry.sourceRefs.includes('m1')), prior.facts[0], 'a category change cannot silently remove an accepted observation or its proof');
+  assert.ok(!memory.decisions.some((entry: { sourceRefs: string[] }) => entry.sourceRefs.includes('m1')), 'reclassifying an unchanged fact must not create a second decision copy');
+  assert.doesNotMatch(JSON.stringify(memory), /HIDDEN-OLD-DETAIL-63/);
+  assert.throws(() => compile(archive, { ...selection, classifications: { ...selection.classifications, m1: 'drop' } }), /Критичный/);
+  const schema = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${notes}`).schema;
+  assert.ok('classifications' in schema.properties);
+  assert.ok(!schema.properties.classifications.properties.m1!.enum.includes('drop'));
+  const paraphraseArchive = serializeSemanticCompactionTranscript(sources, { ...prior, decisions: [{ text: 'All checks have passed.', sourceRefs: ['m0'] }] }, 3);
+  assert.throws(() => compile(paraphraseArchive), /дословное основание/, 'a prior paraphrase cannot be relabelled as literal evidence');
+});
+
 test('source state transitions override stale categories without dropping durable exceptions or independent work', () => {
   const messages = [
     user('policy', 'Do not write files. Exclude public scores; an internal retry counter is allowed. The ownerCode field name may appear, but never its values.'),

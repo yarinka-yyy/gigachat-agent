@@ -447,7 +447,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
   if (active.some(ref => closed.has(ref) || superseded.has(ref))) throw new Error('Активная задача не может ссылаться на закрытый или заменённый источник.');
   if (draft.activeTask !== 'none' && !active.length && !closed.has(draft.activeTask) && !superseded.has(draft.activeTask)) throw new Error('Review не может стереть активную задачу без подтверждённого закрытия.');
   const protectedRefs = new Set([...userRefs, ...(previous?.activeTask?.sourceRefs ?? []),
-    ...(previous?.constraints ?? []).flatMap(entry => entry.sourceRefs), ...(previous?.openWork ?? []).flatMap(entry => entry.sourceRefs), ...(previous?.assistantReports ?? []).flatMap(entry => entry.sourceRefs)]);
+    ...(previous?.constraints ?? []).flatMap(entry => entry.sourceRefs), ...(previous?.facts ?? []).flatMap(entry => entry.sourceRefs), ...(previous?.openWork ?? []).flatMap(entry => entry.sourceRefs), ...(previous?.assistantReports ?? []).flatMap(entry => entry.sourceRefs)]);
   if (sourceRefs.some(ref => protectedRefs.has(ref) && classes[ref] === 'drop' && !active.includes(ref)
     && !closed.has(ref) && !superseded.has(ref) && !closureOnly.has(ref))) throw new Error('Критичный первичный источник нельзя отбросить без подтверждённого закрытия или замены.');
   if (assistantRefs.some(ref => verbatim[ref] && (selection.assistantOrigins as Record<string, unknown>)[ref] === 'self' && classes[ref] === 'drop'
@@ -484,8 +484,12 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
       return kept.length ? [{ ...entry, sourceRefs: kept }] : [];
     });
   };
-  const facts = [...new Map([...retain(review.facts), ...defects.map(({ sourceRefs }) => ({ sourceRefs }))].map(entry => [canonicalJson([...entry.sourceRefs as string[]].sort()), entry])).values()];
-  const decisions = retain(review.decisions), assistantReports = decisions.filter(entry => (entry.sourceRefs as string[]).some(ref => reportRefs.has(ref)));
+  const facts = [...new Map([...retain(review.facts), ...retain((previous?.facts ?? []).map(({ sourceRefs }) => ({ sourceRefs }))),
+    ...defects.map(({ sourceRefs }) => ({ sourceRefs }))].map(entry => [canonicalJson([...entry.sourceRefs as string[]].sort()), entry])).values()];
+  const priorFactRefs = new Set((previous?.facts ?? []).flatMap(entry => entry.sourceRefs));
+  const priorDecisionRefs = new Set((previous?.decisions ?? []).flatMap(entry => entry.sourceRefs));
+  const decisions = retain(review.decisions).filter(entry => !(entry.sourceRefs as string[]).every(ref => priorFactRefs.has(ref) && !priorDecisionRefs.has(ref)));
+  const assistantReports = decisions.filter(entry => (entry.sourceRefs as string[]).some(ref => reportRefs.has(ref)));
   const memory = { ...review, activeTask: review.activeTask === null ? null : retain([review.activeTask])[0] ?? null,
     constraints: retain(review.constraints), decisions: decisions.filter(entry => !(entry.sourceRefs as string[]).some(ref => reportRefs.has(ref))), openWork: retain(review.openWork),
     ...(assistantReports.length ? { assistantReports } : {}),
@@ -536,7 +540,7 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
     ? evidenceIds.filter(id => evidenceIndex[id]!.sourceRef === ref) : []]));
   const reportRefs = new Set((archive.previousMemory?.assistantReports ?? []).flatMap(entry => entry.sourceRefs));
   const protectedRefs = [...new Set([...userRefs, ...(archive.previousMemory?.activeTask?.sourceRefs ?? []),
-    ...(archive.previousMemory?.constraints ?? []).flatMap(entry => entry.sourceRefs), ...(archive.previousMemory?.openWork ?? []).flatMap(entry => entry.sourceRefs), ...reportRefs])];
+    ...(archive.previousMemory?.constraints ?? []).flatMap(entry => entry.sourceRefs), ...(archive.previousMemory?.facts ?? []).flatMap(entry => entry.sourceRefs), ...(archive.previousMemory?.openWork ?? []).flatMap(entry => entry.sourceRefs), ...reportRefs])];
   const withSources = (choices: Record<string, string[]>) => Object.fromEntries(Object.entries(choices).map(([key, ids]) => [key, ids.map(id => `${evidenceIndex[id]!.sourceRef}/${id}`)]));
   const assistantOrigins = Object.fromEntries(archive.messages.filter(source => source.role === 'assistant').map(source => [source.sourceRef, userRefs.filter(ref => Number(ref.slice(1)) < Number(source.sourceRef.slice(1)))]));
   const topicWitnesses = Object.fromEntries(Object.entries(topicEvidence).map(([scope, ids]) => [scope, ids.map(id => topicWitnessAddress(id, evidenceIndex[id]!))]));
@@ -594,6 +598,7 @@ export function compileAnchoredSemanticCompactionMemory(value: unknown, sources:
     previousMemory: SemanticCompactionMemory | null;
   };
   const texts = new Map<string, string[]>(), quotes = new Map<string, SemanticCompactionQuote[]>();
+  const boundTexts = semanticSourceTexts(sources);
   const add = (ref: string, text: string, evidence: SemanticCompactionQuote[]) => {
     texts.set(ref, [...(texts.get(ref) ?? []), text]);
     quotes.set(ref, [...(quotes.get(ref) ?? []), ...evidence]);
@@ -616,8 +621,11 @@ export function compileAnchoredSemanticCompactionMemory(value: unknown, sources:
     for (const entry of [prior.activeTask, ...prior.constraints, ...prior.decisions, ...prior.openWork, ...prior.facts, ...prior.pastTopics, ...(prior.assistantReports ?? [])]) {
       if (entry && prior.unresolvedDefects?.some(defect => defect.text === entry.text
         && canonicalJson(defect.sourceRefs) === canonicalJson(entry.sourceRefs))) continue;
-      if (entry) for (const ref of entry.sourceRefs) add(ref, entry.text, 'exactQuotes' in entry
-        ? (entry as SemanticCompactionFact).exactQuotes?.filter(quote => quote.sourceRef === ref) ?? [] : []);
+      if (entry) for (const ref of entry.sourceRefs) {
+        const evidence = 'exactQuotes' in entry ? (entry as SemanticCompactionFact).exactQuotes?.filter(quote => quote.sourceRef === ref) ?? [] : [];
+        // Recover only a literal already present in memory, never text from the hidden prefix.
+        add(ref, entry.text, evidence.length ? evidence : boundTexts.get(ref)?.some(text => text.includes(entry.text)) ? literalQuotes(ref, entry.text) : []);
+      }
     }
   }
   for (const record of archive.messages) add(record.sourceRef, record.text, literalQuotes(record.sourceRef, record.text));
