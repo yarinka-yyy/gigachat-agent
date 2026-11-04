@@ -1193,7 +1193,7 @@ export function formatSemanticCompactionMemory(value: unknown, sources: Compacti
       else lines.push(renderEntry(defect));
     }
   }
-  lines.push('При ответе о результатах опирайся на дословные свидетельства: отдельно передавай выполненное, оставшийся дефект и непроверенное. Не заменяй точное наблюдение более общим выводом.');
+  lines.push('Если запрошен итог проверки, передавай единым блоком связанные подтверждённые результаты, открытые дефекты и непроверенное. Для точного статуса цитируй дословные свидетельства вместо их обобщения.');
   const formatted = lines.join('\n');
   if (Buffer.byteLength(formatted, 'utf8') > MAX_COMPACT_SUMMARY_BYTES) {
     throw new Error('Форматированная семантическая память превышает ограничение 32 КиБ.');
