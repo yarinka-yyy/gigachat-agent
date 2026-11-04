@@ -870,11 +870,15 @@ test('source state transitions override stale categories without dropping durabl
     sourceUpdates: { ...decision.sourceUpdates, m2: `closes:m5/${witness}`, m3: `closes:m5/${witness}` } };
   assert.deepEqual(groupedCompile(shared), memory, 'topic and source transitions reuse one indexed literal witness');
   const paired = { state: 'Chart discussion is complete; queue investigation remains open.', sources: Object.fromEntries(Object.entries(shared.sourceUpdates).map(([ref, update]) => [ref, `${shared.classifications[ref as keyof typeof shared.classifications]}|${update}`])),
-    activeTask: shared.activeTask, topicUpdates: shared.topicUpdates, unresolvedDefects: shared.unresolvedDefects };
+    activeTask: shared.activeTask, topicUpdates: { Chart: { closed: true, evidence: evidence[witness]!.text } }, unresolvedDefects: shared.unresolvedDefects };
   assert.deepEqual(groupedCompile(paired), memory, 'one source row keeps category and transition together without changing provenance');
   const pairedSchema = semanticCompactionWireResponseFormat(undefined, archive, `ЗАМЕТКИ\n${grouped}`).schema;
   assert.ok('sources' in pairedSchema.properties);
   assert.equal(Object.keys(pairedSchema.properties)[0], 'state', 'independent state is established before source choices');
+  assert.equal(Object.keys(pairedSchema.properties)[1], 'topicUpdates', 'closure selects its literal before the per-source rows');
+  for (const proof of [`m5/${witness}`, 'A fabricated closure.', messages[3]!.text, messages[0]!.text]) {
+    assert.throws(() => groupedCompile({ ...paired, topicUpdates: { Chart: { closed: true, evidence: proof } } }), /свидетельства/);
+  }
   for (const [ref, row] of Object.entries(paired.sources)) assert.match(row, new RegExp(pairedSchema.properties.sources.properties[ref]!.pattern));
   for (const ref of refs) {
     const pattern = new RegExp(pairedSchema.properties.sources.properties[ref]!.pattern);

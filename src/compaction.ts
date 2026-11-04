@@ -311,7 +311,8 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
   const { notes, verbatim } = draft;
   if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > 4096) throw new Error('Review превышает ограничение 4096 байт.');
   let selection: unknown = JSON.parse(value);
-  if (isRecord(selection) && Object.prototype.hasOwnProperty.call(selection, 'sources')) {
+  const pairedReview = isRecord(selection) && Object.prototype.hasOwnProperty.call(selection, 'sources');
+  if (isRecord(selection) && pairedReview) {
     if (!hasOnlyKeys(selection, ['state', 'sources', 'activeTask', 'topicUpdates', 'unresolvedDefects']) || typeof selection.state !== 'string'
       || !selection.state.trim() || [...selection.state].length > 160 || !isRecord(selection.sources)
       || !hasOnlyKeys(selection.sources, [...sourceRefs])) throw new Error('Review требует одной записи на каждый источник.');
@@ -335,6 +336,17 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
     if (!isRecord(selected) || !hasOnlyKeys(selected, [...sourceRefs])
       || sourceRefs.some(ref => typeof selected[ref] !== 'string' || !allowed[ref]!.enum.includes(selected[ref] as string))) throw new Error('Review содержит недопустимое изменение источника.');
     if (typeof selection.activeTask !== 'string' || !format.schema.properties.activeTask.enum.includes(selection.activeTask)) throw new Error('Активная задача требует допустимого первичного источника.');
+    if (pairedReview && isRecord(selection.topicUpdates)) {
+      const index = semanticReviewEvidenceIndex(archiveText);
+      const topics = format.schema.properties.topicUpdates.properties;
+      selection.topicUpdates = Object.fromEntries(Object.entries(selection.topicUpdates).map(([subject, update]) => {
+        if (!isRecord(update) || update.closed !== true) return [subject, update];
+        const matches = (topics[subject]?.properties.evidence.enum ?? [])
+          .filter(address => address !== 'none' && index[address.split('/')[1]!]!.text === update.evidence);
+        if (matches.length !== 1) throw new Error('Закрытие темы требует однозначного дословного USER-свидетельства.');
+        return [subject, { ...update, evidence: matches[0] }];
+      }));
+    }
     selection = expandSemanticReviewDecision(selection, topicByRef, semanticReviewEvidenceIndex(archiveText), archive.messages,
       protectedSemanticMemoryRefs(archive.previousMemory));
   }
@@ -591,6 +603,10 @@ export function semanticCompactionWireResponseFormat(archiveText?: string, revie
   const alternatives = (values: string[]) => values.map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
   return { ...format, schema: { type: 'object', properties: {
     state: { type: 'string', minLength: 1, maxLength: 160, description: 'First establish what is completed, what remains open and which restrictions remain active across the whole archive. This is your independent review, not a draft quotation.' },
+    topicUpdates: { ...topicUpdates, properties: Object.fromEntries(Object.entries(topicUpdates.properties).map(([subject, topic]) => [subject,
+      { ...topic, properties: { ...topic.properties, evidence: { type: 'string', minLength: 1, maxLength: MAX_SEMANTIC_QUOTE_BYTES,
+        description: 'Exact USER quotation explicitly completing this topic, copied from review.evidence. Use none for an open topic. Do not return an address.' } } },
+    ])) },
     sources: { type: 'object', properties: Object.fromEntries(sourceUpdates.required.map(ref => {
       const updates = sourceUpdates.properties[ref]!.enum;
       const independent = updates.filter(value => value.startsWith('independent:')).map(value => value.slice('independent:'.length));
@@ -601,8 +617,8 @@ export function semanticCompactionWireResponseFormat(archiveText?: string, revie
       return [ref, { type: 'string', minLength: 3, maxLength: 609,
       pattern: `^(?:${alternatives(classifications.properties[ref]!.enum)})\\|(?:${updatePattern})$`,
       description: 'category|update for this source, using its review.categories and review.updates. Example: constraint|none.',
-    }]; })), required: sourceUpdates.required, additionalProperties: false }, activeTask, topicUpdates, unresolvedDefects,
-  }, required: ['state', 'sources', 'activeTask', 'topicUpdates', 'unresolvedDefects'], additionalProperties: false } };
+    }]; })), required: sourceUpdates.required, additionalProperties: false }, activeTask, unresolvedDefects,
+  }, required: ['state', 'topicUpdates', 'sources', 'activeTask', 'unresolvedDefects'], additionalProperties: false } };
 }
 
 export function compileSemanticSourceNotes(value: unknown, sourceRefs: readonly string[]): string {
