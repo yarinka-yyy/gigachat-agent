@@ -134,8 +134,14 @@ const semanticAnchoredResponseFormat = {
 };
 
 const QUOTE_LIST_PATTERN = 'q[0-9]+(?:,q[0-9]+)*';
-type DraftTopic = { subject: string; sourceRefs: string[]; evidence: string };
-const topicSources = (topics: DraftTopic[]): Record<string, string> => Object.fromEntries(topics.flatMap(topic => topic.sourceRefs.map(ref => [ref, topic.subject])));
+type DraftTopic = { subject: string; firstSource: string; lastSource: string; evidence: string };
+function draftTopicSources(topics: DraftTopic[], refs: readonly string[], tools: Array<{ sourceRef: string; anchorRef: string }>) {
+  return topics.map(topic => ({ ...topic, sourceRefs: refs.filter(ref => {
+    const anchor = ref.startsWith('m') ? ref : tools.find(tool => tool.sourceRef === ref)?.anchorRef;
+    return anchor !== undefined && Number(anchor.slice(1)) >= Number(topic.firstSource.slice(1)) && Number(anchor.slice(1)) <= Number(topic.lastSource.slice(1));
+  }) }));
+}
+const topicSources = (topics: Array<{ subject: string; sourceRefs: string[] }>): Record<string, string[]> => Object.fromEntries([...new Set(topics.flatMap(topic => topic.sourceRefs))].map(ref => [ref, topics.filter(topic => topic.sourceRefs.includes(ref)).map(topic => topic.subject)]));
 
 export function semanticSourceNotesResponseFormat(sourceRefs: readonly string[], primarySourceRefs: readonly string[] = sourceRefs, closureEvidence?: string[]) {
   return {
@@ -145,8 +151,9 @@ export function semanticSourceNotesResponseFormat(sourceRefs: readonly string[],
       topics: { type: 'array', maxItems: MAX_GENERATED_PAST_TOPICS, items: { type: 'object', properties: {
         subject: { type: 'string', minLength: 1, maxLength: MAX_SEMANTIC_SUBJECT_CHARS },
         evidence: closureEvidence ? { type: 'string', enum: closureEvidence } : { type: 'string', minLength: 1, maxLength: MAX_SEMANTIC_QUOTE_BYTES },
-        sourceRefs: { type: 'array', minItems: 1, maxItems: sourceRefs.length, uniqueItems: true, items: { type: 'string', enum: [...sourceRefs] } },
-      }, required: ['subject', 'evidence', 'sourceRefs'], additionalProperties: false } }, notes: {
+        firstSource: { type: 'string', enum: sourceRefs.filter(ref => ref.startsWith('m')) },
+        lastSource: { type: 'string', enum: sourceRefs.filter(ref => ref.startsWith('m')) },
+      }, required: ['subject', 'evidence', 'firstSource', 'lastSource'], additionalProperties: false } }, notes: {
       type: 'object', properties: Object.fromEntries(sourceRefs.map(ref => [ref, { type: 'string', minLength: 1, maxLength: MAX_SOURCE_NOTE_CHARS }])),
       required: [...sourceRefs], additionalProperties: false,
     }, verbatim: { type: 'object', properties: Object.fromEntries(sourceRefs.map(ref => [ref, {
@@ -185,10 +192,10 @@ function semanticReviewDecisionResponseFormat(refs: string[], primary: string[],
   }, required: [...SEMANTIC_GLOBAL_REVIEW_FIELDS], additionalProperties: false } };
 }
 
-function expandSemanticReviewDecision(value: Record<string, unknown>, scopes: Record<string, string>, index: Record<string, SemanticCompactionQuote & { role: string }>, messages: Array<{ sourceRef: string; role: string }>): Record<string, unknown> {
+function expandSemanticReviewDecision(value: Record<string, unknown>, scopes: Record<string, string[]>, index: Record<string, SemanticCompactionQuote & { role: string }>, messages: Array<{ sourceRef: string; role: string }>): Record<string, unknown> {
   if (!hasOnlyKeys(value, [...SEMANTIC_GLOBAL_REVIEW_FIELDS]) || typeof value.state !== 'string' || !value.state.trim() || [...value.state].length > 160
     || !isRecord(value.topicUpdates) || !isRecord(value.classifications)) throw new Error('Некорректное решение review.');
-  const groups = [...new Set(Object.values(scopes))];
+  const groups = [...new Set(Object.values(scopes).flat())];
   const assistantRefs = messages.filter(source => source.role === 'assistant').map(source => source.sourceRef);
   if (Object.entries(value.classifications).some(([ref, category]) => category === 'paraphrase' && !assistantRefs.includes(ref))) throw new Error('Пересказ допустим только для нового assistant-источника.');
   if (!hasOnlyKeys(value.topicUpdates, groups)) throw new Error('Review требует решения для каждой побочной ветки.');
@@ -246,13 +253,14 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
   const offset = candidateText.indexOf('\n') + 1;
   const candidate = candidateText.slice(offset);
   const { notes = {}, verbatim = {}, topics = [] } = candidate ? JSON.parse(candidate) : {};
-  const topicByRef = topicSources(topics);
   const records = splitSemanticCompactionTranscript(archiveText);
   const metadata = JSON.parse(records[0]!.slice(records[0]!.indexOf('\n') + 1));
+  const groups = draftTopicSources(topics, metadata.coverageRefSet, metadata.tools);
+  const topicByRef = topicSources(groups);
   const index = metadata.evidenceIndex as Record<string, SemanticCompactionQuote & { role: string }>;
   const evidenceIds = Object.keys(index).sort((left, right) => Number(left.slice(1)) - Number(right.slice(1)));
   const assistantRefs = new Set((JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)).messages as Array<{ sourceRef: string; role: string }>).filter(source => source.role === 'assistant').map(source => source.sourceRef));
-  metadata.topicSources = Object.fromEntries(topics.map((topic: DraftTopic) => [topic.subject, { sourceRefs: topic.sourceRefs, evidence: topic.evidence }]));
+  metadata.topicSources = Object.fromEntries(groups.map(topic => [topic.subject, { sourceRefs: topic.sourceRefs, evidence: topic.evidence }]));
   const review = (ref: string) => ({ categories: assistantRefs.has(ref) ? ['paraphrase', 'decision', 'drop'] : [...SOURCE_CATEGORIES, 'defect', 'drop'],
     topic: topicByRef[ref] ?? null, note: notes[ref] ?? null, verbatim: verbatim[ref] ?? null,
     evidence: Object.fromEntries(evidenceIds.filter(id => index[id]!.sourceRef === ref).map(id => [id, { choice: evidenceChoice(id, index[id]!.text), text: index[id]!.text }])) });
@@ -271,13 +279,13 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
 
 export function compileResolvedSemanticCompactionMemory(value: string, notesValue: string, sources: CompactionSources, sourceRefs: readonly string[], archiveText: string): string {
   const draft = JSON.parse(compileSemanticSourceNotes(notesValue, sourceRefs)) as { notes: Record<string, string>; verbatim: Record<string, boolean>; activeTask: string; topics: DraftTopic[] };
-  const topicByRef = topicSources(draft.topics);
   const { notes, verbatim } = draft;
   if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > 4096) throw new Error('Review превышает ограничение 4096 байт.');
   let selection: unknown = JSON.parse(value);
   const archive = JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)) as {
-    previousMemory: SemanticCompactionMemory | null; messages: Array<{ sourceRef: string; role: string; text: string }>;
+    previousMemory: SemanticCompactionMemory | null; messages: Array<{ sourceRef: string; role: string; text: string }>; tools: Array<{ sourceRef: string; anchorRef: string }>;
   };
+  const topicByRef = topicSources(draftTopicSources(draft.topics, sourceRefs, archive.tools));
   if (isRecord(selection) && Object.prototype.hasOwnProperty.call(selection, 'state')) selection = expandSemanticReviewDecision(selection, topicByRef, semanticReviewEvidenceIndex(archiveText), archive.messages);
   if (!isRecord(selection) || !hasOnlyKeys(selection, [...SEMANTIC_REVIEW_FIELDS])
     || ['activeTask', 'unresolvedDefects'].some(field => typeof selection[field] !== 'string' || (selection[field] as string).length > 512)
@@ -325,7 +333,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
   if (!isRecord(selection.sourceUpdates) || !hasOnlyKeys(selection.sourceUpdates, [...sourceRefs])) throw new Error('Review требует одного решения об изменении состояния каждого источника.');
   const superseded = new Map<string, string>(), closureOnly = new Set<string>();
   const sourcePosition = (ref: string) => Number((ref.startsWith('t') ? sources.tools.find(tool => tool.ref === ref)!.anchorRef : ref).slice(1));
-  const topics = [...new Set(Object.values(topicByRef))];
+  const topics = [...new Set(Object.values(topicByRef).flat())];
   if (!isRecord(selection.topicUpdates) || !hasOnlyKeys(selection.topicUpdates, topics)) throw new Error('Review требует решения для каждой темы draft.');
   const topicClosures = new Map<string, string>();
   for (const topic of topics) {
@@ -334,7 +342,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
     if (typeof update !== 'string') throw new Error('Некорректное состояние темы.');
     const [kind, id, extra] = update.split(':'), proof = evidenceIndex[id!];
     if (kind !== 'closes' || extra !== undefined || !proof || proof.role !== 'user' || !userRefs.includes(proof.sourceRef)
-      || !sourceRefs.some(ref => topicByRef[ref] === topic && sourcePosition(ref) < sourcePosition(proof.sourceRef))) throw new Error('Закрытие темы требует более позднего нового user-свидетельства.');
+      || !sourceRefs.some(ref => topicByRef[ref]?.includes(topic) && sourcePosition(ref) < sourcePosition(proof.sourceRef))) throw new Error('Закрытие темы требует более позднего нового user-свидетельства.');
     topicClosures.set(topic, id!);
   }
   for (const ref of sourceRefs) {
@@ -345,8 +353,14 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
       if (classes[ref] === 'drop' && !active.includes(ref)) throw new Error('Сохранение независимого источника требует активной категории.');
       continue;
     }
-    const closure = topicClosures.get(topicByRef[ref]!);
-    if (update === 'none' && closure && sourcePosition(ref) < sourcePosition(evidenceIndex[closure]!.sourceRef)) update = `closes:${closure}`;
+    if (update === 'none') {
+      const closures = [...new Set((topicByRef[ref] ?? []).flatMap(topic => {
+        const id = topicClosures.get(topic);
+        return id && sourcePosition(ref) < sourcePosition(evidenceIndex[id]!.sourceRef) ? [id] : [];
+      }))];
+      if (closures.length > 1) throw new Error('Пересекающиеся предложения review противоречат друг другу.');
+      if (closures.length) update = `closes:${closures[0]}`;
+    }
     if (update === 'none') continue;
     const [kind, id, extra] = update.split(':');
     const proof = evidenceIndex[id!];
@@ -481,7 +495,7 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   const draft = candidate ? JSON.parse(compileSemanticSourceNotes(candidate, refs)) as { topics: DraftTopic[] } : null;
   const position = (ref: string) => ref.startsWith('t') ? Number(archive.tools.find(tool => tool.sourceRef === ref)?.anchorRef.slice(1) ?? -1) : Number(ref.slice(1));
   const updateEvidence = Object.fromEntries(refs.map(ref => [ref, evidenceIds.filter(id => position(evidenceIndex[id]!.sourceRef) > position(ref))]));
-  const scopes = draft ? draft.topics : Array.from({ length: MAX_GENERATED_PAST_TOPICS }, (_, i) => ({ subject: `${i}`.padEnd(MAX_SEMANTIC_SUBJECT_CHARS, 'X'), sourceRefs: refs }));
+  const scopes = draft ? draftTopicSources(draft.topics, refs, archive.tools) : Array.from({ length: MAX_GENERATED_PAST_TOPICS }, (_, i) => ({ subject: `${i}`.padEnd(MAX_SEMANTIC_SUBJECT_CHARS, 'X'), sourceRefs: refs }));
   const topicEvidence = Object.fromEntries(scopes.map(topic => [topic.subject, evidenceIds.filter(id => topic.sourceRefs.some(ref => position(ref) < position(evidenceIndex[id]!.sourceRef)))]));
   return semanticReviewDecisionResponseFormat(refs, primary, archive.previousMemory ? semanticMemorySourceRefs(archive.previousMemory) : [], updateEvidence, topicEvidence, evidenceIndex);
 }
@@ -503,15 +517,15 @@ export function compileSemanticSourceNotes(value: unknown, sourceRefs: readonly 
   if ([...state].length > MAX_SEMANTIC_STATE_CHARS) throw new Error('Общий итог слишком длинный.');
   if (typeof parsed.activeTask !== 'string' || parsed.activeTask !== 'none' && !sourceRefs.includes(parsed.activeTask)) throw new Error('Draft требует явного источника активной задачи или none.');
   const topics = parsed.topics;
-  const groupedRefs = new Set<string>(), subjects = new Set<string>();
+  const subjects = new Set<string>();
   if (!Array.isArray(topics) || topics.length > MAX_GENERATED_PAST_TOPICS) throw new Error('Некорректные побочные ветки draft.');
   for (const topic of topics) {
-    if (!isRecord(topic) || !hasOnlyKeys(topic, ['subject', 'sourceRefs', 'evidence']) || typeof topic.subject !== 'string'
+    if (!isRecord(topic) || !hasOnlyKeys(topic, ['subject', 'firstSource', 'lastSource', 'evidence']) || typeof topic.subject !== 'string'
       || !topic.subject.trim() || [...topic.subject].length > MAX_SEMANTIC_SUBJECT_CHARS || subjects.has(topic.subject)
       || typeof topic.evidence !== 'string' || !topic.evidence.trim() || Buffer.byteLength(topic.evidence) > MAX_SEMANTIC_QUOTE_BYTES
-      || !Array.isArray(topic.sourceRefs) || !topic.sourceRefs.length || topic.sourceRefs.some(ref => typeof ref !== 'string' || !sourceRefs.includes(ref) || groupedRefs.has(ref))) throw new Error('Ветки требуют разных названий и неповторяющихся доступных источников.');
+      || [topic.firstSource, topic.lastSource].some(ref => typeof ref !== 'string' || !ref.startsWith('m') || !sourceRefs.includes(ref))
+      || Number((topic.firstSource as string).slice(1)) > Number((topic.lastSource as string).slice(1))) throw new Error('Ветки требуют разных названий и упорядоченных доступных границ.');
     subjects.add(topic.subject);
-    for (const ref of topic.sourceRefs) { if (groupedRefs.has(ref)) throw new Error('Повторный источник ветки.'); groupedRefs.add(ref); }
   }
   for (const ref of sourceRefs) {
     const note = parsed.notes[ref];
