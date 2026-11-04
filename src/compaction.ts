@@ -314,14 +314,12 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
   const aligned = records.slice(1).map(record => {
     const value = JSON.parse(record.slice(record.indexOf('\n') + 1));
     messageRefs.add(value.sourceRef);
-    return { primary: value.role === 'user', record: record.slice(0, record.indexOf('\n') + 1) + JSON.stringify({ ...value, review: review(value.sourceRef) }) };
+    return record.slice(0, record.indexOf('\n') + 1) + JSON.stringify({ ...value, review: review(value.sourceRef) });
   });
-  // Put primary evidence after bulky assistant data; source refs retain the original chronology.
-  aligned.sort((a, b) => Number(a.primary) - Number(b.primary));
   metadata.sourceReviews = Object.fromEntries((metadata.coverageRefSet as string[]).filter(ref => !messageRefs.has(ref)).map(ref => [ref, review(ref)]));
   delete metadata.evidenceIndex;
   return { candidate: candidateText.slice(0, offset) + (candidate ? '{}' : ''), records: [
-    records[0]!.slice(0, records[0]!.indexOf('\n') + 1) + JSON.stringify(metadata), ...aligned.map(value => value.record),
+    records[0]!.slice(0, records[0]!.indexOf('\n') + 1) + JSON.stringify(metadata), ...aligned,
   ] };
 }
 

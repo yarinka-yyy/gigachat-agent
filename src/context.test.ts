@@ -615,7 +615,7 @@ test('both semantic wire requests preserve source distinctions for all four sele
       delete reviewed.sourceReviews;
       delete reviewed.topicSources;
       const records = wire.messages.slice(start + 1, -1).map(message => { const record = decode(message.content[0]!.text); delete record.review; return record; });
-      if (request === review) assert.deepEqual(records.map(record => record.sourceRef), ['m1', 'm0', 'm2'], 'primary user evidence follows assistant payloads without changing source chronology');
+      assert.deepEqual(records.map(record => record.sourceRef), ['m0', 'm1', 'm2'], 'review keeps each historical role beside its original chronological neighbors');
       records.sort((a, b) => Number((a.sourceRef as string).slice(1)) - Number((b.sourceRef as string).slice(1)));
       assert.deepEqual({ ...reviewed, messages: records }, archive);
       assert.ok(wire.messages.slice(1).every(message => message.role === 'user'));
