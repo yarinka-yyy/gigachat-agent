@@ -181,9 +181,10 @@ function semanticReviewDecisionResponseFormat(refs: string[], primary: string[],
     : ['decision', ...(assistantOrigins[ref] ?? []).map(origin => `paraphrase:${origin}`), ...(exactRefs.includes(ref) ? [] : ['drop'])]).filter(value => value !== 'drop' || !protectedRefs.includes(ref));
   return { type: 'json_schema', strict: true, schema: { type: 'object', properties: {
     state: { type: 'string', minLength: 1, maxLength: 160 },
-    topicUpdates: { type: 'object', properties: Object.fromEntries(Object.entries(topicEvidence).map(([scope, ids]) => [scope, {
-      type: 'object', properties: { closed: { type: 'boolean' }, evidence: { type: 'string', enum: ['none', ...ids] } }, required: ['closed', 'evidence'], additionalProperties: false,
-    }])), required: Object.keys(topicEvidence), additionalProperties: false },
+    topicUpdates: { type: 'object', properties: Object.fromEntries(Object.entries(topicEvidence).map(([scope, ids]) => [scope, { anyOf: [
+      { type: 'object', properties: { closed: { type: 'boolean', enum: [false] }, evidence: { type: 'string', enum: ['none'] } }, required: ['closed', 'evidence'], additionalProperties: false },
+      ...(ids.length ? [{ type: 'object', properties: { closed: { type: 'boolean', enum: [true] }, evidence: { type: 'string', enum: ids } }, required: ['closed', 'evidence'], additionalProperties: false }] : []),
+    ] }])), required: Object.keys(topicEvidence), additionalProperties: false },
     sourceUpdates: { type: 'object', properties: Object.fromEntries(refs.map(ref => [ref, { type: 'string', maxLength: 512,
       pattern: `^(?:${['none', ...(retained.includes(ref) && protectedRefs.includes(ref) ? ['keep'] : []),
         ...(independentEvidence[ref]!.length ? [`independent:(?:${independentEvidence[ref]!.join('|')})`] : []),
