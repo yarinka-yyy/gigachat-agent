@@ -743,7 +743,7 @@ test('source state transitions override stale categories without dropping durabl
   assert.ok('sourceUpdates' in schema.properties);
   assert.deepEqual(schema.properties.sourceUpdates.required, Object.keys(sourceUpdates));
 
-  const grouped = JSON.stringify({ ...JSON.parse(notes), topics: [{ subject: 'Chart', evidence: evidence[idsFor('m5')[0]!]!.text, firstSource: 'm1', lastSource: 'm7' }] });
+  const grouped = JSON.stringify({ ...JSON.parse(notes), topics: [{ subject: 'Chart', evidence: evidence[idsFor('m5')[0]!]!.text, firstSource: 'm1', lastSource: 'm3' }] });
   const topicReview = { ...resolution, topicUpdates: { Chart: `closes:${idsFor('m5')[0]}` },
     sourceUpdates: { ...sourceUpdates, m1: 'keep', m2: 'none', m3: 'none' },
     assistantOrigins: { m3: 'self', m9: 'm0' }, classifications: { ...resolution.classifications, m9: 'decision' } };
@@ -754,7 +754,10 @@ test('source state transitions override stale categories without dropping durabl
     { subject: 'Current queue', firstSource: 'm0', lastSource: 'm9', evidence: 'An incorrect completion proposal.' }] });
   assert.deepEqual(JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...topicReview, topicUpdates: { ...topicReview.topicUpdates, 'Current queue': 'none' } }), overlapping, sources, refs, archive)), memory,
     'an independent rejection of an overlapping draft proposal cannot undo the accepted closure');
-  assert.throws(() => compileResolvedSemanticCompactionMemory(JSON.stringify({ ...topicReview, topicUpdates: { ...topicReview.topicUpdates, 'Current queue': `closes:${idsFor('m6')[0]}` } }), overlapping, sources, refs, archive), /Пересекающиеся/);
+  assert.throws(() => compileResolvedSemanticCompactionMemory(JSON.stringify({ ...topicReview, topicUpdates: { ...topicReview.topicUpdates, 'Current queue': `closes:${idsFor('m6')[0]}` } }), overlapping, sources, refs, archive), /после всего диапазона/);
+  const conflicting = JSON.stringify({ ...JSON.parse(grouped), topics: [...JSON.parse(grouped).topics,
+    { subject: 'Other proposal', firstSource: 'm2', lastSource: 'm3', evidence: 'An overlapping proposal.' }] });
+  assert.throws(() => compileResolvedSemanticCompactionMemory(JSON.stringify({ ...topicReview, topicUpdates: { ...topicReview.topicUpdates, 'Other proposal': `closes:${idsFor('m6')[0]}` } }), conflicting, sources, refs, archive), /Пересекающиеся/);
   for (const change of [
     { topicUpdates: {} }, { topicUpdates: { Chart: `closes:${idsFor('m0')[0]}` } },
     { topicUpdates: { Chart: `supersedes:${idsFor('m5')[0]}` } },
@@ -769,14 +772,14 @@ test('source state transitions override stale categories without dropping durabl
   assert.ok(groupedSchema.properties.topicUpdates.properties.Chart!.properties.evidence.enum.includes(witness));
   assert.ok(!groupedSchema.properties.classifications.properties.m0!.enum.includes('drop'), 'a protected primary cannot be silently omitted even when the draft suggested a closed range');
   for (const proof of ['A fabricated closure.', evidence[idsFor('m0')[0]!]!.text, messages[3]!.text]) {
-    const invalid = JSON.stringify({ ...JSON.parse(grouped), topics: [{ subject: 'Chart', evidence: proof, firstSource: 'm1', lastSource: 'm7' }] });
+    const invalid = JSON.stringify({ ...JSON.parse(grouped), topics: [{ subject: 'Chart', evidence: proof, firstSource: 'm1', lastSource: 'm3' }] });
     const schema = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${invalid}`).schema;
     assert.ok('topicUpdates' in schema.properties);
     assert.ok(schema.properties.topicUpdates.properties.Chart!.properties.evidence.enum.includes(witness), 'untrusted draft evidence must remain correctable by independent review');
     assert.deepEqual(JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...topicReview, topicUpdates: { Chart: `closes:${idsFor('m5')[0]}` } }), invalid, sources, refs, archive)), memory);
   }
   const decision = { state: 'Chart closed; independent queue and the observed mismatch remain open.',
-    topicUpdates: { Chart: { closed: true, evidence: witness } }, sourceUpdates: topicReview.sourceUpdates,
+    topicUpdates: { Chart: { closed: true, evidence: witness } }, sourceUpdates: { ...topicReview.sourceUpdates, m1: `independent:${idsFor('m1')[0]}` },
     activeTask: 'm5', unresolvedDefects: '', classifications: { ...topicReview.classifications, m9: 'paraphrase' } };
   assert.deepEqual(groupedCompile(decision), memory, 'explicit semantic decisions share the exact provenance and chronological guards');
   for (const change of [
@@ -785,6 +788,8 @@ test('source state transitions override stale categories without dropping durabl
     { topicUpdates: { Chart: { closed: false, evidence: witness } } },
     { topicUpdates: { Chart: { closed: true, evidence: 'none' } } },
     { sourceUpdates: {} }, { classifications: { ...decision.classifications, m0: 'paraphrase' } },
+    { sourceUpdates: { ...decision.sourceUpdates, m1: `independent:${idsFor('m0')[0]}` } },
+    { sourceUpdates: { ...decision.sourceUpdates, m1: 'keep' } },
     { activeTask: 'm3' },
     { state: '' }, { extra: 'forbidden' },
   ]) assert.throws(() => groupedCompile({ ...decision, ...change }));
@@ -798,7 +803,10 @@ test('review decision schema requires every source once and only later new user 
   const reserved = semanticCompactionResponseFormat(undefined, archive).schema;
   const actual = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${notes}`).schema;
   assert.ok('sourceUpdates' in actual.properties && 'sourceUpdates' in reserved.properties);
-  assert.deepEqual(actual.properties.sourceUpdates, reserved.properties.sourceUpdates);
+  for (const ref of refs) {
+    assert.ok(!new RegExp(actual.properties.sourceUpdates.properties[ref]!.pattern).test('keep'));
+    assert.ok(new RegExp(reserved.properties.sourceUpdates.properties[ref]!.pattern).test('none'));
+  }
   assert.deepEqual(actual.properties.sourceUpdates.required, refs);
   assert.deepEqual(actual.properties.classifications.properties.m1!.enum, ['paraphrase', 'decision', 'drop']);
   assert.ok(actual.properties.classifications.properties.m0!.enum.includes('constraint'));

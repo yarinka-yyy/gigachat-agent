@@ -175,7 +175,7 @@ const SOURCE_CLASSES = ['drop', 'defect', ...Array.from({ length: 15 }, (_, mask
 const SEMANTIC_REVIEW_FIELDS = ['sourceUpdates', 'topicUpdates', 'assistantOrigins', 'activeTask', 'classifications', 'unresolvedDefects'] as const;
 const SEMANTIC_GLOBAL_REVIEW_FIELDS = ['state', 'topicUpdates', 'sourceUpdates', 'classifications', 'activeTask', 'unresolvedDefects'] as const;
 
-function semanticReviewDecisionResponseFormat(refs: string[], primary: string[], retained: string[], protectedRefs: string[], updateEvidence: Record<string, string[]>, topicEvidence: Record<string, string[]>) {
+function semanticReviewDecisionResponseFormat(refs: string[], primary: string[], retained: string[], protectedRefs: string[], updateEvidence: Record<string, string[]>, independentEvidence: Record<string, string[]>, topicEvidence: Record<string, string[]>) {
   const category = (ref: string) => (primary.includes(ref) || retained.includes(ref) || ref.startsWith('t') ? SOURCE_CLASSES : ['paraphrase', 'decision', 'drop']).filter(value => value !== 'drop' || !protectedRefs.includes(ref));
   return { type: 'json_schema', strict: true, schema: { type: 'object', properties: {
     state: { type: 'string', minLength: 1, maxLength: 160 },
@@ -183,7 +183,9 @@ function semanticReviewDecisionResponseFormat(refs: string[], primary: string[],
       type: 'object', properties: { closed: { type: 'boolean' }, evidence: { type: 'string', enum: ['none', ...ids] } }, required: ['closed', 'evidence'], additionalProperties: false,
     }])), required: Object.keys(topicEvidence), additionalProperties: false },
     sourceUpdates: { type: 'object', properties: Object.fromEntries(refs.map(ref => [ref, { type: 'string', maxLength: 512,
-      pattern: updateEvidence[ref]!.length ? `^(?:none|keep|(?:closes|supersedes):(?:${updateEvidence[ref]!.join('|')}))$` : '^(?:none|keep)$',
+      pattern: `^(?:${['none', ...(retained.includes(ref) && protectedRefs.includes(ref) ? ['keep'] : []),
+        ...(independentEvidence[ref]!.length ? [`independent:(?:${independentEvidence[ref]!.join('|')})`] : []),
+        ...(updateEvidence[ref]!.length ? [`(?:closes|supersedes):(?:${updateEvidence[ref]!.join('|')})`] : [])].join('|')})$`,
     }])), required: refs, additionalProperties: false },
     classifications: { type: 'object', properties: Object.fromEntries(refs.map(ref => [ref, { type: 'string', enum: category(ref) }])), required: refs, additionalProperties: false },
     activeTask: { type: 'string', enum: [...primary, 'none'] },
@@ -191,9 +193,9 @@ function semanticReviewDecisionResponseFormat(refs: string[], primary: string[],
   }, required: [...SEMANTIC_GLOBAL_REVIEW_FIELDS], additionalProperties: false } };
 }
 
-function expandSemanticReviewDecision(value: Record<string, unknown>, scopes: Record<string, string[]>, index: Record<string, SemanticCompactionQuote & { role: string }>, messages: Array<{ sourceRef: string; role: string }>): Record<string, unknown> {
+function expandSemanticReviewDecision(value: Record<string, unknown>, scopes: Record<string, string[]>, index: Record<string, SemanticCompactionQuote & { role: string }>, messages: Array<{ sourceRef: string; role: string }>, priorProtected: string[]): Record<string, unknown> {
   if (!hasOnlyKeys(value, [...SEMANTIC_GLOBAL_REVIEW_FIELDS]) || typeof value.state !== 'string' || !value.state.trim() || [...value.state].length > 160
-    || !isRecord(value.topicUpdates) || !isRecord(value.classifications)) throw new Error('Некорректное решение review.');
+    || !isRecord(value.topicUpdates) || !isRecord(value.classifications) || !isRecord(value.sourceUpdates)) throw new Error('Некорректное решение review.');
   const groups = [...new Set(Object.values(scopes).flat())];
   const assistantRefs = messages.filter(source => source.role === 'assistant').map(source => source.sourceRef);
   if (Object.entries(value.classifications).some(([ref, category]) => category === 'paraphrase' && !assistantRefs.includes(ref))) throw new Error('Пересказ допустим только для нового assistant-источника.');
@@ -205,7 +207,14 @@ function expandSemanticReviewDecision(value: Record<string, unknown>, scopes: Re
     if (!index[choice.evidence]) throw new Error('Закрытие ветки требует доступного user-свидетельства.');
     return [scope, `closes:${choice.evidence}`];
   }));
-  return { sourceUpdates: value.sourceUpdates, topicUpdates, activeTask: value.activeTask, unresolvedDefects: value.unresolvedDefects,
+  const sourceUpdates = Object.fromEntries(Object.entries(value.sourceUpdates).map(([ref, update]) => {
+    if (update === 'keep' && !priorProtected.includes(ref)) throw new Error('Новый независимый источник требует собственного USER-свидетельства.');
+    if (typeof update !== 'string' || !update.startsWith('independent:')) return [ref, update];
+    const id = update.slice('independent:'.length), proof = index[id];
+    if (!proof || proof.role !== 'user' || proof.sourceRef !== ref || !messages.some(source => source.sourceRef === ref && source.role === 'user')) throw new Error('Независимое обязательство требует собственного первичного USER-свидетельства.');
+    return [ref, 'keep'];
+  }));
+  return { sourceUpdates, topicUpdates, activeTask: value.activeTask, unresolvedDefects: value.unresolvedDefects,
     classifications: Object.fromEntries(Object.entries(value.classifications).map(([ref, category]) => [ref, category === 'paraphrase' ? 'drop' : category])),
     assistantOrigins: Object.fromEntries(assistantRefs.map(ref => [ref, 'self'])) };
 }
@@ -285,7 +294,8 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
     previousMemory: SemanticCompactionMemory | null; messages: Array<{ sourceRef: string; role: string; text: string }>; tools: Array<{ sourceRef: string; anchorRef: string }>;
   };
   const topicByRef = topicSources(draftTopicSources(draft.topics, sourceRefs, archive.tools));
-  if (isRecord(selection) && Object.prototype.hasOwnProperty.call(selection, 'state')) selection = expandSemanticReviewDecision(selection, topicByRef, semanticReviewEvidenceIndex(archiveText), archive.messages);
+  if (isRecord(selection) && Object.prototype.hasOwnProperty.call(selection, 'state')) selection = expandSemanticReviewDecision(selection, topicByRef, semanticReviewEvidenceIndex(archiveText), archive.messages,
+    [...(archive.previousMemory?.activeTask?.sourceRefs ?? []), ...(archive.previousMemory?.constraints ?? []).flatMap(entry => entry.sourceRefs), ...(archive.previousMemory?.openWork ?? []).flatMap(entry => entry.sourceRefs)]);
   if (!isRecord(selection) || !hasOnlyKeys(selection, [...SEMANTIC_REVIEW_FIELDS])
     || ['activeTask', 'unresolvedDefects'].some(field => typeof selection[field] !== 'string' || (selection[field] as string).length > 512)
     || !isRecord(selection.classifications) || !hasOnlyKeys(selection.classifications, [...sourceRefs])
@@ -341,7 +351,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
     if (typeof update !== 'string') throw new Error('Некорректное состояние темы.');
     const [kind, id, extra] = update.split(':'), proof = evidenceIndex[id!];
     if (kind !== 'closes' || extra !== undefined || !proof || proof.role !== 'user' || !userRefs.includes(proof.sourceRef)
-      || !sourceRefs.some(ref => topicByRef[ref]?.includes(topic) && sourcePosition(ref) < sourcePosition(proof.sourceRef))) throw new Error('Закрытие темы требует более позднего нового user-свидетельства.');
+      || !sourceRefs.filter(ref => topicByRef[ref]?.includes(topic)).every(ref => sourcePosition(ref) < sourcePosition(proof.sourceRef))) throw new Error('Закрытие темы требует user-свидетельства после всего диапазона.');
     topicClosures.set(topic, id!);
   }
   for (const ref of sourceRefs) {
@@ -494,11 +504,14 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   const draft = candidate ? JSON.parse(compileSemanticSourceNotes(candidate, refs)) as { topics: DraftTopic[]; verbatim: Record<string, boolean> } : null;
   const position = (ref: string) => ref.startsWith('t') ? Number(archive.tools.find(tool => tool.sourceRef === ref)?.anchorRef.slice(1) ?? -1) : Number(ref.slice(1));
   const updateEvidence = Object.fromEntries(refs.map(ref => [ref, evidenceIds.filter(id => position(evidenceIndex[id]!.sourceRef) > position(ref))]));
-  const scopes = draft ? draftTopicSources(draft.topics, refs, archive.tools) : Array.from({ length: MAX_GENERATED_PAST_TOPICS }, (_, i) => ({ subject: `${i}`.padEnd(MAX_SEMANTIC_SUBJECT_CHARS, 'X'), sourceRefs: refs }));
-  const topicEvidence = Object.fromEntries(scopes.map(topic => [topic.subject, evidenceIds.filter(id => topic.sourceRefs.some(ref => position(ref) < position(evidenceIndex[id]!.sourceRef)))]));
+  const firstAvailable = refs.filter(ref => ref.startsWith('m')).sort((a, b) => Number(a.slice(1)) - Number(b.slice(1)))[0]!;
+  const scopes = draft ? draftTopicSources(draft.topics, refs, archive.tools) : Array.from({ length: MAX_GENERATED_PAST_TOPICS }, (_, i) => ({ subject: `${i}`.padEnd(MAX_SEMANTIC_SUBJECT_CHARS, 'X'), sourceRefs: [firstAvailable] }));
+  const topicEvidence = Object.fromEntries(scopes.map(topic => [topic.subject, evidenceIds.filter(id => topic.sourceRefs.every(ref => position(ref) < position(evidenceIndex[id]!.sourceRef)))]));
+  const independentEvidence = Object.fromEntries(refs.map(ref => [ref, (!draft || scopes.some(scope => scope.sourceRefs.includes(ref)))
+    ? evidenceIds.filter(id => evidenceIndex[id]!.sourceRef === ref) : []]));
   const protectedRefs = [...new Set([...userRefs.filter(ref => draft?.verbatim[ref]), ...(archive.previousMemory?.activeTask?.sourceRefs ?? []),
     ...(archive.previousMemory?.constraints ?? []).flatMap(entry => entry.sourceRefs), ...(archive.previousMemory?.openWork ?? []).flatMap(entry => entry.sourceRefs)])];
-  return semanticReviewDecisionResponseFormat(refs, primary, archive.previousMemory ? semanticMemorySourceRefs(archive.previousMemory) : [], protectedRefs, updateEvidence, topicEvidence);
+  return semanticReviewDecisionResponseFormat(refs, primary, archive.previousMemory ? semanticMemorySourceRefs(archive.previousMemory) : [], protectedRefs, updateEvidence, independentEvidence, topicEvidence);
 }
 
 export function compileSemanticSourceNotes(value: unknown, sourceRefs: readonly string[]): string {
