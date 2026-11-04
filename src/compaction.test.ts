@@ -683,8 +683,13 @@ test('topic closure removes all its details and defect state survives compilatio
   assert.deepEqual(continued.unresolvedDefects, memory.unresolvedDefects, 'state survives a second compaction without prefix accumulation');
   assert.throws(() => compileResolvedSemanticCompactionMemory(reviewJson({ ...rollingResolution, unresolvedDefects: '' }), rollingNotes,
     rollingSources, rollingRefs, rollingArchive), /нельзя потерять/);
-  assert.throws(() => compileResolvedSemanticCompactionMemory(reviewJson({ ...rollingResolution, unresolvedDefects: rolling.unresolvedDefects.split(',').slice(-1)[0] }), rollingNotes,
-    rollingSources, rollingRefs, rollingArchive), /нельзя заменить/);
+  const splitWitness = { ...memory, unresolvedDefects: memory.unresolvedDefects.map((entry: { exactQuotes: Array<{ sourceRef: string; text: string }> }) => ({ ...entry,
+    exactQuotes: entry.exactQuotes.flatMap(quote => quote.text.split(/(?<=[.!?])\s+/u).map(text => ({ sourceRef: quote.sourceRef, text }))) })) };
+  const splitArchive = serializeSemanticCompactionTranscript(rollingSources, splitWitness, 6);
+  const splitIndex = semanticReviewEvidenceIndex(splitArchive);
+  const partialWitness = Object.keys(splitIndex).filter(id => splitIndex[id]!.sourceRef === 'm5').slice(-1)[0];
+  assert.throws(() => compileResolvedSemanticCompactionMemory(reviewJson({ ...rollingResolution, unresolvedDefects: partialWitness }), rollingNotes,
+    rollingSources, rollingRefs, splitArchive), /нельзя заменить/);
   const legacyWitness = { ...memory, unresolvedDefects: [{ ...memory.openWork[1], exactQuotes: [{ sourceRef: 'm5', text: sources.messages[5]!.text }] }] };
   const legacyArchive = serializeSemanticCompactionTranscript(rollingSources, legacyWitness, 6);
   const legacyIndex = semanticReviewEvidenceIndex(legacyArchive);
@@ -793,6 +798,17 @@ test('source state transitions override stale categories without dropping durabl
     { activeTask: 'm3' },
     { state: '' }, { extra: 'forbidden' },
   ]) assert.throws(() => groupedCompile({ ...decision, ...change }));
+});
+
+test('review witnesses retain short user instructions with their qualifications and bound long fragments', () => {
+  const text = 'Finish the chart discussion. The import is still pending; do not edit its backups.';
+  const long = 'Long observations. '.repeat(100);
+  const sources = createCompactionSources([user('short', text), user('long', long)], [], []);
+  const index = semanticReviewEvidenceIndex(serializeSemanticCompactionTranscript(sources));
+  assert.deepEqual(Object.values(index).filter(quote => quote.sourceRef === 'm0'), [{ sourceRef: 'm0', text, role: 'user' }]);
+  const fragments = Object.values(index).filter(quote => quote.sourceRef === 'm1');
+  assert.ok(fragments.length > 0);
+  assert.ok(fragments.every(quote => Buffer.byteLength(quote.text, 'utf8') <= 1024 && long.includes(quote.text)));
 });
 
 test('review decision schema requires every source once and only later new user witnesses', () => {

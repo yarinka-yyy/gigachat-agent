@@ -252,7 +252,8 @@ export function semanticReviewEvidenceIndex(archiveText: string): Record<string,
   for (const entry of archive.previousMemory?.facts ?? []) {
     for (const quote of entry.exactQuotes ?? []) if (!witnessedRefs.has(quote.sourceRef)) add(quote.sourceRef, quote.text, 'memory', false);
   }
-  for (const source of archive.messages) if (source.role === 'user') add(source.sourceRef, source.text, source.role);
+  // Keep a short instruction and its qualifications together instead of offering detached sentences as proof.
+  for (const source of archive.messages) if (source.role === 'user') add(source.sourceRef, source.text, source.role, Buffer.byteLength(source.text, 'utf8') > MAX_SEMANTIC_QUOTE_BYTES);
   for (const source of archive.tools) for (const text of [source.content, source.result]) if (typeof text === 'string' && text) add(source.sourceRef, text, 'tool');
   return index;
 }
