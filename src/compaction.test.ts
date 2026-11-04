@@ -611,7 +611,7 @@ test('topic closure removes all its details and defect state survives compilatio
   assert.ok('retained' in format.schema.properties);
   assert.ok(!format.schema.properties.activeTask.enum.includes('m3'));
   assert.ok(!format.schema.properties.activeTask.enum.includes('keep'));
-  assert.deepEqual(format.schema.properties.retained.items.properties.sourceRef.enum, refs);
+  assert.deepEqual(format.schema.properties.retained.properties.decision.items.enum.map(value => value.split(': ')[0]), refs);
   const emptyDraft = JSON.stringify({ ...JSON.parse(notes), activeTask: 'none', verbatim: Object.fromEntries(refs.map(ref => [ref, false])) });
   const emptyState = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ ...resolution, sourceUpdates: { ...resolution.sourceUpdates, m1: 'none', m3: 'none' }, activeTask: 'none', classifications: { ...resolution.classifications, m1: 'drop', m3: 'drop' } }), emptyDraft, sources, refs, archive));
   assert.equal(emptyState.activeTask, null, 'an explicitly absent task must stay absent');
@@ -726,7 +726,7 @@ test('source state transitions override stale categories without dropping durabl
     'explicit none everywhere cannot authorize dropping a live exception');
   const schema = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${notes}`).schema;
   assert.ok('retained' in schema.properties);
-  assert.deepEqual(schema.properties.retained.items.properties.sourceRef.enum, Object.keys(sourceUpdates));
+  assert.deepEqual(schema.properties.retained.properties.decision.items.enum.map(value => value.split(': ')[0]), Object.keys(sourceUpdates));
 
   const grouped = JSON.stringify({ ...JSON.parse(notes), topics: Object.fromEntries(refs.map(ref => [ref, ['m1', 'm2', 'm3', 'm7'].includes(ref) ? 'Chart' : 'shared'])) });
   const topicReview = { ...resolution, topicUpdates: { m1: `closes:${idsFor('m5')[0]}` },
@@ -745,19 +745,25 @@ test('source state transitions override stale categories without dropping durabl
   ]) assert.throws(() => groupedCompile({ ...topicReview, ...change }));
   const groupedSchema = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${grouped}`).schema;
   assert.ok('retained' in groupedSchema.properties);
-  assert.deepEqual(groupedSchema.properties.closedTopics.items.properties.topicRefs!.items.enum, ['m1']);
+  assert.ok(groupedSchema.properties.closedTopics.items.properties.targets.items.enum.includes('topic:m1: Chart'));
   const decision = { state: 'Chart closed; independent queue and the observed mismatch remain open.',
-    closedTopics: [{ evidence: idsFor('m5')[0], topicRefs: ['m1'], sourceRefs: [] }],
-    supersededSources: [{ evidence: idsFor('m6')[0], sourceRefs: ['m4'] }], activeTask: 'm5', unresolvedDefects: '',
-    retained: Object.entries(topicReview.classifications).filter(([, category]) => category !== 'drop').map(([sourceRef, category]) =>
-      ({ sourceRef, category, origin: sourceRef === 'm9' ? 'm0' : 'self', independent: sourceRef === 'm1' })) };
+    closedTopics: [{ evidence: idsFor('m5')[0], targets: ['topic:m1'] }],
+    supersededSources: [{ evidence: idsFor('m6')[0], targets: ['m4'] }], activeTask: 'm5', unresolvedDefects: '',
+    retained: { constraint: ['m0'], decision: ['m3', 'm9'], openWork: ['m1', 'm5'], fact: ['m2', 'm4', 'm6', 'm7'], defect: ['m8'], independent: ['m1'], assistantOrigins: [{ sourceRef: 'm3', origin: 'self' }, { sourceRef: 'm9', origin: 'm0' }] } };
   assert.deepEqual(groupedCompile(decision), memory, 'explicit semantic decisions share the exact provenance and chronological guards');
+  const labels = Object.fromEntries([...groupedSchema.properties.retained.properties.decision.items.enum,
+    ...groupedSchema.properties.closedTopics.items.properties.targets.items.enum,
+    ...groupedSchema.properties.closedTopics.items.properties.evidence.enum].map(value => [value.split(': ')[0]!, value]));
+  const labelled = JSON.parse(JSON.stringify(decision), (_key, value: unknown) => typeof value === 'string' ? labels[value] ?? value : value);
+  assert.deepEqual(groupedCompile(labelled), memory, 'readable choice labels resolve only to their exact original references');
+  assert.throws(() => groupedCompile({ ...labelled, activeTask: `${labels.m5} forged` }), /подпись/);
   for (const change of [
-    { retained: [...decision.retained, decision.retained[0]] },
-    { retained: decision.retained.map(item => item.sourceRef === 'm9' ? { ...item, origin: 'm9' } : item) },
+    { retained: { ...decision.retained, constraint: ['m0', 'm0'] } },
+    { retained: { ...decision.retained, assistantOrigins: [{ sourceRef: 'm3', origin: 'self' }, { sourceRef: 'm9', origin: 'm9' }] } },
     { closedTopics: [{ ...decision.closedTopics[0], evidence: idsFor('m0')[0] }] },
-    { closedTopics: [{ ...decision.closedTopics[0], topicRefs: ['unknown'] }] },
-    { closedTopics: [{ evidence: idsFor('m5')[0], topicRefs: [], sourceRefs: ['m2', 'm2'] }] },
+    { closedTopics: [{ ...decision.closedTopics[0], targets: ['unknown'] }] },
+    { closedTopics: [{ ...decision.closedTopics[0], targets: [] }] },
+    { closedTopics: [{ evidence: idsFor('m5')[0], targets: ['m2', 'm2'] }] },
     { supersededSources: [...decision.supersededSources, decision.supersededSources[0]] },
     { state: '' }, { extra: 'forbidden' },
   ]) assert.throws(() => groupedCompile({ ...decision, ...change }));
@@ -772,10 +778,12 @@ test('review decision schema exposes all sources and only new user witnesses wit
   const actual = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${notes}`).schema;
   assert.ok('retained' in actual.properties && 'retained' in reserved.properties);
   assert.deepEqual(actual.properties.retained, reserved.properties.retained);
-  assert.deepEqual(actual.properties.retained.items.properties.sourceRef.enum, refs);
-  assert.deepEqual(actual.properties.closedTopics.items.properties.evidence.enum, Object.keys(evidence).filter(id => evidence[id]!.role === 'user'));
-  assert.equal(actual.properties.closedTopics.items.properties.topicRefs!.maxItems, 0);
-  assert.deepEqual(reserved.properties.closedTopics.items.properties.topicRefs!.items.enum, refs);
+  assert.deepEqual(actual.properties.retained.properties.decision.items.enum.map(value => value.split(': ')[0]), refs);
+  assert.ok(actual.properties.retained.properties.constraint.items.enum.every(value => !value.startsWith('m1: ')), 'new assistant cannot be selected as authority');
+  assert.deepEqual(actual.properties.closedTopics.items.properties.evidence.enum.map(value => value.split(': ')[0]), Object.keys(evidence).filter(id => evidence[id]!.role === 'user'));
+  assert.equal(actual.properties.closedTopics.items.properties.targets.minItems, 1);
+  assert.ok(!actual.properties.closedTopics.items.properties.targets.items.enum.some(value => value.startsWith('topic:')));
+  assert.equal(reserved.properties.closedTopics.items.properties.targets.items.enum.filter(value => value.startsWith('topic:')).length, refs.length);
   assert.equal(Object.keys(actual.properties)[0], 'state');
   assert.equal('sourceUpdates' in actual.properties, false);
 });
@@ -785,11 +793,11 @@ test('rolling review decisions retain previous tools without replaying their raw
   const archive = serializeSemanticCompactionTranscript(sources, previous, 64), evidence = semanticReviewEvidenceIndex(archive);
   const schema = semanticCompactionResponseFormat(undefined, archive).schema;
   assert.ok('retained' in schema.properties);
-  assert.deepEqual(schema.properties.retained.items.properties.sourceRef.enum, getSemanticCompactionCoverageRefSet(sources, previous, 64));
+  assert.deepEqual(schema.properties.retained.properties.decision.items.enum.map(value => value.split(': ')[0]), getSemanticCompactionCoverageRefSet(sources, previous, 64));
   const proofs = schema.properties.closedTopics.items.properties.evidence.enum;
-  assert.deepEqual(proofs, Object.keys(evidence).filter(id => evidence[id]!.role === 'user' && Number(evidence[id]!.sourceRef.slice(1)) >= 64));
-  assert.ok(schema.properties.retained.items.properties.sourceRef.enum.includes('t0'));
-  assert.ok(!schema.properties.retained.items.properties.sourceRef.enum.includes('m2'));
+  assert.deepEqual(proofs.map(value => value.split(': ')[0]), Object.keys(evidence).filter(id => evidence[id]!.role === 'user' && Number(evidence[id]!.sourceRef.slice(1)) >= 64));
+  assert.ok(schema.properties.retained.properties.decision.items.enum.some(value => value.startsWith('t0: ')));
+  assert.ok(!schema.properties.retained.properties.decision.items.enum.some(value => value.startsWith('m2: ')));
 });
 
 test('explicit absence of a task retains a primary constraint and rolling review cannot silently erase it', () => {
