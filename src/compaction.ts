@@ -314,7 +314,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
   };
   const topicByRef = topicSources(draftTopicSources(draft.topics, sourceRefs, archive.tools));
   if (isRecord(selection) && Object.prototype.hasOwnProperty.call(selection, 'state')) selection = expandSemanticReviewDecision(selection, topicByRef, semanticReviewEvidenceIndex(archiveText), archive.messages,
-    [...(archive.previousMemory?.activeTask?.sourceRefs ?? []), ...(archive.previousMemory?.constraints ?? []).flatMap(entry => entry.sourceRefs), ...(archive.previousMemory?.openWork ?? []).flatMap(entry => entry.sourceRefs)]);
+    protectedSemanticMemoryRefs(archive.previousMemory));
   if (!isRecord(selection) || !hasOnlyKeys(selection, [...SEMANTIC_REVIEW_FIELDS])
     || ['activeTask', 'unresolvedDefects'].some(field => typeof selection[field] !== 'string' || (selection[field] as string).length > 512)
     || !isRecord(selection.classifications) || !hasOnlyKeys(selection.classifications, [...sourceRefs])
@@ -322,6 +322,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
       || value.length > 96 || !SOURCE_CLASSES.includes(value); })) throw new Error('Review требует классификации каждого источника ровно один раз.');
   const evidenceIndex = semanticReviewEvidenceIndex(archiveText);
   const previous = archive.previousMemory;
+  const priorProtectedRefs = new Set(protectedSemanticMemoryRefs(previous));
   const reportRefs = new Set([...archive.messages.filter(source => source.role === 'assistant').map(source => source.sourceRef),
     ...(previous?.assistantReports ?? []).flatMap(entry => entry.sourceRefs)]);
   const primaryRefs = new Set([...archive.messages.filter(source => source.role === 'user').map(source => source.sourceRef),
@@ -383,7 +384,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
       if (classes[ref] === 'drop' && !active.includes(ref)) throw new Error('Сохранение независимого источника требует активной категории.');
       continue;
     }
-    if (update === 'none') {
+    if (update === 'none' && !priorProtectedRefs.has(ref)) {
       const closures = [...new Set((topicByRef[ref] ?? []).flatMap(topic => {
         const id = topicClosures.get(topic);
         return id && sourcePosition(ref) < sourcePosition(evidenceIndex[id]!.sourceRef) ? [id] : [];
@@ -446,8 +447,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
   const closed = new Set(closedTopics.flatMap(topic => topic.sourceRefs.filter(ref => ref !== topic.closedBy)));
   if (active.some(ref => closed.has(ref) || superseded.has(ref))) throw new Error('Активная задача не может ссылаться на закрытый или заменённый источник.');
   if (draft.activeTask !== 'none' && !active.length && !closed.has(draft.activeTask) && !superseded.has(draft.activeTask)) throw new Error('Review не может стереть активную задачу без подтверждённого закрытия.');
-  const protectedRefs = new Set([...userRefs, ...(previous?.activeTask?.sourceRefs ?? []),
-    ...(previous?.constraints ?? []).flatMap(entry => entry.sourceRefs), ...(previous?.decisions ?? []).flatMap(entry => entry.sourceRefs), ...(previous?.facts ?? []).flatMap(entry => entry.sourceRefs), ...(previous?.openWork ?? []).flatMap(entry => entry.sourceRefs), ...(previous?.assistantReports ?? []).flatMap(entry => entry.sourceRefs)]);
+  const protectedRefs = new Set([...userRefs, ...priorProtectedRefs]);
   if (sourceRefs.some(ref => protectedRefs.has(ref) && classes[ref] === 'drop' && !active.includes(ref)
     && !closed.has(ref) && !superseded.has(ref) && !closureOnly.has(ref))) throw new Error('Критичный первичный источник нельзя отбросить без подтверждённого закрытия или замены.');
   if (assistantRefs.some(ref => verbatim[ref] && (selection.assistantOrigins as Record<string, unknown>)[ref] === 'self' && classes[ref] === 'drop'
@@ -539,8 +539,7 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   const independentEvidence = Object.fromEntries(refs.map(ref => [ref, (!draft || scopes.some(scope => scope.sourceRefs.includes(ref)))
     ? evidenceIds.filter(id => evidenceIndex[id]!.sourceRef === ref) : []]));
   const reportRefs = new Set((archive.previousMemory?.assistantReports ?? []).flatMap(entry => entry.sourceRefs));
-  const protectedRefs = [...new Set([...userRefs, ...(archive.previousMemory?.activeTask?.sourceRefs ?? []),
-    ...(archive.previousMemory?.constraints ?? []).flatMap(entry => entry.sourceRefs), ...(archive.previousMemory?.decisions ?? []).flatMap(entry => entry.sourceRefs), ...(archive.previousMemory?.facts ?? []).flatMap(entry => entry.sourceRefs), ...(archive.previousMemory?.openWork ?? []).flatMap(entry => entry.sourceRefs), ...reportRefs])];
+  const protectedRefs = [...new Set([...userRefs, ...protectedSemanticMemoryRefs(archive.previousMemory)])];
   const withSources = (choices: Record<string, string[]>) => Object.fromEntries(Object.entries(choices).map(([key, ids]) => [key, ids.map(id => `${evidenceIndex[id]!.sourceRef}/${id}`)]));
   const assistantOrigins = Object.fromEntries(archive.messages.filter(source => source.role === 'assistant').map(source => [source.sourceRef, userRefs.filter(ref => Number(ref.slice(1)) < Number(source.sourceRef.slice(1)))]));
   const topicWitnesses = Object.fromEntries(Object.entries(topicEvidence).map(([scope, ids]) => [scope, ids.map(id => topicWitnessAddress(id, evidenceIndex[id]!))]));
@@ -916,6 +915,12 @@ function validateSemanticCoverageRefSet(value: unknown, sourceTexts: ReadonlyMap
     seen.add(ref);
     return ref;
   });
+}
+
+function protectedSemanticMemoryRefs(memory: SemanticCompactionMemory | null): string[] {
+  if (!memory) return [];
+  return [...new Set([memory.activeTask, ...memory.constraints, ...memory.decisions, ...memory.facts, ...memory.openWork, ...(memory.assistantReports ?? [])]
+    .flatMap(entry => entry?.sourceRefs ?? []))];
 }
 
 function semanticMemorySourceRefs(memory: SemanticCompactionMemory): string[] {

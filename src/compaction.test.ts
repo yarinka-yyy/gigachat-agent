@@ -706,7 +706,7 @@ test('topic closure removes all its details and defect state survives compilatio
 test('rolling reclassification retains accepted facts and quotes only available prior literals', () => {
   const literal = 'The copy check passed on build 2.8. The report may name ownerCode, never expose its values.';
   const fact = 'The checksum is unchanged; the upload was not attempted.';
-  const sources = createCompactionSources([user('decision', `${literal} HIDDEN-OLD-DETAIL-63`), user('fact', fact), assistant('ack', 'Noted.'), user('suffix', 'Continue the investigation.')], [], []);
+  const sources = createCompactionSources([user('decision', `${literal} HIDDEN-OLD-DETAIL-63`), user('fact', fact), assistant('ack', 'Noted.'), user('suffix', 'The copy discussion is closed. Continue the upload investigation; the checksum observation remains current.')], [], []);
   const prior = { format: 'gigachat-semantic-memory' as const, version: 1 as const, activeTask: null, constraints: [],
     decisions: [{ text: literal, sourceRefs: ['m0'] }], openWork: [], pastTopics: [],
     facts: [{ text: fact, sourceRefs: ['m1'], exactQuotes: [{ sourceRef: 'm1', text: fact }] }] };
@@ -729,6 +729,18 @@ test('rolling reclassification retains accepted facts and quotes only available 
   assert.ok('classifications' in schema.properties);
   assert.ok(!schema.properties.classifications.properties.m1!.enum.includes('drop'));
   assert.ok(!schema.properties.classifications.properties.m0!.enum.includes('drop'));
+  const wireKeep = { state: 'Observed copy result remains valid.', topicUpdates: {},
+    sourceUpdates: { ...selection.sourceUpdates, m0: 'keep', m1: 'keep' }, classifications: selection.classifications,
+    activeTask: selection.activeTask, unresolvedDefects: selection.unresolvedDefects };
+  assert.deepEqual(JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify(wireKeep), notes, sources, refs, archive)), memory, 'schema and wire normalizer agree on every protected prior category');
+  const evidence = semanticReviewEvidenceIndex(archive), closure = Object.keys(evidence).find(id => evidence[id]!.sourceRef === 'm3')!;
+  const groupedNotes = JSON.stringify({ ...JSON.parse(notes), topics: [{ subject: 'Copy discussion', firstSource: 'm0', lastSource: 'm1', evidence: 'The copy discussion is closed.' }] });
+  const groupedReview = { ...selection, topicUpdates: { 'Copy discussion': `closes:${closure}` } };
+  const grouped = JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify(groupedReview), groupedNotes, sources, refs, archive));
+  assert.deepEqual(grouped.facts, memory.facts, 'a proposed topic closure cannot implicitly erase accepted observations or primary decisions');
+  const explicitlyClosed = JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...groupedReview, sourceUpdates: { ...selection.sourceUpdates, m0: `closes:${closure}` } }), groupedNotes, sources, refs, archive));
+  assert.deepEqual(explicitlyClosed.closedTopics[0].sourceRefs, ['m0']);
+  assert.deepEqual(explicitlyClosed.facts.find((entry: { sourceRefs: string[] }) => entry.sourceRefs.includes('m1')), prior.facts[0]);
   const paraphraseArchive = serializeSemanticCompactionTranscript(sources, { ...prior, decisions: [{ text: 'All checks have passed.', sourceRefs: ['m0'] }] }, 3);
   assert.throws(() => compile(paraphraseArchive), /дословное основание/, 'a prior paraphrase cannot be relabelled as literal evidence');
 });
