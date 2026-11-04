@@ -311,6 +311,18 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
   const { notes, verbatim } = draft;
   if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > 4096) throw new Error('Review превышает ограничение 4096 байт.');
   let selection: unknown = JSON.parse(value);
+  if (isRecord(selection) && Object.prototype.hasOwnProperty.call(selection, 'sources')) {
+    if (!hasOnlyKeys(selection, ['sources', 'activeTask', 'topicUpdates', 'unresolvedDefects']) || !isRecord(selection.sources)
+      || !hasOnlyKeys(selection.sources, [...sourceRefs])) throw new Error('Review требует одной записи на каждый источник.');
+    const rows = Object.entries(selection.sources).map(([ref, row]) => {
+      if (typeof row !== 'string') throw new Error('Решение источника требует строки категория|переход.');
+      const parts = row.split('|').map(part => part.trim());
+      if (parts.length !== 2 || parts.some(part => !part)) throw new Error('Решение источника требует категории и перехода.');
+      return { ref, category: parts[0]!, update: parts[1]! };
+    });
+    selection = { activeTask: selection.activeTask, topicUpdates: selection.topicUpdates, unresolvedDefects: selection.unresolvedDefects,
+      classifications: Object.fromEntries(rows.map(row => [row.ref, row.category])), sourceUpdates: Object.fromEntries(rows.map(row => [row.ref, row.update])) };
+  }
   const archive = JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)) as {
     previousMemory: SemanticCompactionMemory | null; messages: Array<{ sourceRef: string; role: string; text: string }>; tools: Array<{ sourceRef: string; anchorRef: string }>;
   };
@@ -569,6 +581,17 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   const assistantOrigins = Object.fromEntries(archive.messages.filter(source => source.role === 'assistant').map(source => [source.sourceRef, userRefs.filter(ref => Number(ref.slice(1)) < Number(source.sourceRef.slice(1)))]));
   return semanticReviewDecisionResponseFormat(refs, taskRefs, archive.previousMemory ? semanticMemorySourceRefs(archive.previousMemory).filter(ref => !reportRefs.has(ref)) : [], protectedRefs, withSources(updateEvidence), withSources(independentEvidence), withSources(topicEvidence), assistantOrigins,
     refs.filter(ref => draft ? draft.verbatim[ref] : false), requestRefs, closedRefs);
+}
+
+export function semanticCompactionWireResponseFormat(archiveText?: string, reviewMetadata?: string, reviewNotes?: string) {
+  const format = semanticCompactionResponseFormat(archiveText, reviewMetadata, reviewNotes);
+  if (!('sourceUpdates' in format.schema.properties)) return format;
+  const { sourceUpdates, activeTask, topicUpdates, unresolvedDefects } = format.schema.properties;
+  return { ...format, schema: { type: 'object', properties: {
+    sources: { type: 'object', properties: Object.fromEntries(sourceUpdates.required.map(ref => [ref, { type: 'string', minLength: 3, maxLength: 609,
+      description: 'category|update for this source, using its review.categories and review.updates. Example: constraint|none.',
+    }])), required: sourceUpdates.required, additionalProperties: false }, activeTask, topicUpdates, unresolvedDefects,
+  }, required: ['sources', 'activeTask', 'topicUpdates', 'unresolvedDefects'], additionalProperties: false } };
 }
 
 export function compileSemanticSourceNotes(value: unknown, sourceRefs: readonly string[]): string {

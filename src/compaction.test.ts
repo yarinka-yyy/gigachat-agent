@@ -869,6 +869,11 @@ test('source state transitions override stale categories without dropping durabl
   const shared = { ...decision,
     sourceUpdates: { ...decision.sourceUpdates, m2: `closes:m5/${witness}`, m3: `closes:m5/${witness}` } };
   assert.deepEqual(groupedCompile(shared), memory, 'topic and source transitions reuse one indexed literal witness');
+  const paired = { sources: Object.fromEntries(Object.entries(shared.sourceUpdates).map(([ref, update]) => [ref, `${shared.classifications[ref as keyof typeof shared.classifications]}|${update}`])),
+    activeTask: shared.activeTask, topicUpdates: shared.topicUpdates, unresolvedDefects: shared.unresolvedDefects };
+  assert.deepEqual(groupedCompile(paired), memory, 'one source row keeps category and transition together without changing provenance');
+  for (const sources of [{ ...paired.sources, m0: 'constraint' }, { ...paired.sources, m0: 'constraint|none|none' },
+    { ...paired.sources, m0: 'constraint|closes:m0/q0' }, { ...paired.sources, m0: 'paraphrase:m1|none' }]) assert.throws(() => groupedCompile({ ...paired, sources }));
   assert.equal(JSON.stringify(shared).includes(evidence[witness]!.text), false, 'the compiler materializes exact archive text instead of asking the model to copy it');
   assert.equal(groupedCompile(shared).closedTopics[0].closureEvidence, evidence[witness]!.text);
   assert.ok(Buffer.byteLength(JSON.stringify(shared)) <= 4096);

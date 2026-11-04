@@ -948,7 +948,7 @@ test('semantic compaction reviews once on the selected model and accounts for bo
         assert.deepEqual(request.protocolHistory, []);
         yield { type: 'text-delta', text: requests.length === 1
           ? JSON.stringify({ taskSubject: 'Current task', state: 'Task remains open.', activeTask: 'm0', topics: [], notes: Object.fromEntries(input.messages.map((message, index) => [`m${index}`, `Draft: ${message.text}`])), verbatim: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, false])) })
-          : JSON.stringify({ topicUpdates: {}, sourceUpdates: Object.fromEntries(input.messages.map((_, index) => [`m${index}`, 'none'])), activeTask: 'm0', classifications: Object.fromEntries(input.messages.map((message, index) => [`m${index}`, message.role === 'assistant' ? 'decision' : 'fact'])), unresolvedDefects: '' }) };
+          : JSON.stringify({ topicUpdates: {}, sources: Object.fromEntries(input.messages.map((message, index) => [`m${index}`, `${message.role === 'assistant' ? 'decision' : 'fact'}|none`])), activeTask: 'm0', unresolvedDefects: '' }) };
         yield { type: 'usage', promptTokens: 10, completionTokens: 5, totalTokens: 15, precachedPromptTokens: 0 };
         yield { type: 'completed', functionsStateId: requests.length === 1 ? 'draft-state' : 'review-state' };
       }),
@@ -1114,8 +1114,8 @@ test('persists three semantic runtime cycles with only previous memory and the n
           const proof = Object.keys(evidence).find(id => evidence[id]!.sourceRef === 'm6')!;
           sourceUpdates.m4 = sourceUpdates.m5 = `closes:m6/${proof}`;
         }
-        answer = JSON.stringify({ topicUpdates: {}, sourceUpdates, activeTask: 'm2', unresolvedDefects: '',
-          classifications: Object.fromEntries(archive.coverageRefSet.map(ref => [ref, ['m0', 'm10'].includes(ref) ? 'constraint' : ref === 'm2' ? 'openWork' : ref === 'm8' ? 'defect' : ref === 'm12' ? 'fact' : 'drop'])) });
+        answer = JSON.stringify({ topicUpdates: {}, sources: Object.fromEntries(archive.coverageRefSet.map(ref => [ref,
+          `${['m0', 'm10'].includes(ref) ? 'constraint' : ref === 'm2' ? 'openWork' : ref === 'm8' ? 'defect' : ref === 'm12' ? 'fact' : 'drop'}|${sourceUpdates[ref]}`])), activeTask: 'm2', unresolvedDefects: '' });
         assert.ok(Buffer.byteLength(answer) <= 4096);
       }
       yield { type: 'text-delta', text: answer }; yield { type: 'completed' };
