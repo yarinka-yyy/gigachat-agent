@@ -232,8 +232,11 @@ function runtimeErrorCategory(error: unknown, turnTimedOut = false): ProviderErr
 }
 
 function compileCompactionCandidate(value: string, sources: CompactionSources, semanticSourceRefs: readonly string[] | null, archiveText?: string, notes?: string): string {
-  try { return semanticSourceRefs === null ? compileExtractiveCompaction(value, sources)
-    : compileResolvedSemanticCompactionMemory(value, notes!, sources, semanticSourceRefs, archiveText!); }
+  try {
+    if (semanticSourceRefs === null) return compileExtractiveCompaction(value, sources);
+    if (typeof JSON.parse(value)?.state !== 'string') throw new Error('Review requires the public wire contract.');
+    return compileResolvedSemanticCompactionMemory(value, notes!, sources, semanticSourceRefs, archiveText!);
+  }
   catch {
     throw Object.assign(new Error('COMPACTION_CANDIDATE_REJECTED'), { category: 'context' as const });
   }

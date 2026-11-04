@@ -186,10 +186,10 @@ function semanticReviewDecisionResponseFormat(refs: string[], primary: string[],
       { type: 'object', properties: { closed: { type: 'boolean', enum: [false] }, evidence: { type: 'string', enum: ['none'] } }, required: ['closed', 'evidence'], additionalProperties: false },
       ...(ids.length ? [{ type: 'object', properties: { closed: { type: 'boolean', enum: [true] }, evidence: { type: 'string', enum: ids } }, required: ['closed', 'evidence'], additionalProperties: false }] : []),
     ] }])), required: Object.keys(topicEvidence), additionalProperties: false },
-    sourceUpdates: { type: 'object', properties: Object.fromEntries(refs.map(ref => [ref, { type: 'string', maxLength: 512,
+    sourceUpdates: { type: 'object', properties: Object.fromEntries(refs.map(ref => [ref, { type: 'string', maxLength: MAX_SEMANTIC_QUOTE_BYTES + 64,
       pattern: `^(?:${['none', ...(retained.includes(ref) && protectedRefs.includes(ref) ? ['keep'] : []),
-        ...(independentEvidence[ref]!.length ? [`independent:(?:${independentEvidence[ref]!.join('|')})`] : []),
-        ...(updateEvidence[ref]!.length ? [`(?:closes|supersedes):(?:${updateEvidence[ref]!.join('|')})`] : [])].join('|')})$`,
+        ...(independentEvidence[ref]!.length ? [`independent:(?:${independentEvidence[ref]!.join('|')}): [\\s\\S]+`] : []),
+        ...(updateEvidence[ref]!.length ? [`(?:closes|supersedes):(?:${updateEvidence[ref]!.join('|')}): [\\s\\S]+`] : [])].join('|')})$`,
     }])), required: refs, additionalProperties: false },
     classifications: { type: 'object', properties: Object.fromEntries(refs.map(ref => [ref, { type: 'string', enum: category(ref) }])), required: refs, additionalProperties: false },
     activeTask: { type: 'string', enum: [...primary, 'none'] },
@@ -225,7 +225,10 @@ function expandSemanticReviewDecision(value: Record<string, unknown>, scopes: Re
   const sourceUpdates = Object.fromEntries(Object.entries(value.sourceUpdates).map(([ref, update]) => {
     if (update === 'keep' && !priorProtected.includes(ref)) throw new Error('Новый независимый источник требует собственного USER-свидетельства.');
     if (typeof update !== 'string' || !update.includes(':')) return [ref, update];
-    const separator = update.indexOf(':'), kind = update.slice(0, separator), id = resolveEvidence(update.slice(separator + 1)), proof = index[id];
+    const separator = update.indexOf(':'), kind = update.slice(0, separator);
+    const matches = Object.keys(index).filter(id => topicWitnessAddress(id, index[id]!) === update.slice(separator + 1));
+    if (matches.length !== 1) throw new Error('Изменение источника требует полного адреса и дословного текста свидетельства.');
+    const id = matches[0]!, proof = index[id];
     if (kind !== 'independent') return [ref, `${kind}:${id}`];
     if (!proof || proof.role !== 'user' || proof.sourceRef !== ref || !messages.some(source => source.sourceRef === ref && source.role === 'user')) throw new Error('Независимое обязательство требует собственного первичного USER-свидетельства.');
     return [ref, 'keep'];

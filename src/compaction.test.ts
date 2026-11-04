@@ -861,7 +861,7 @@ test('source state transitions override stale categories without dropping durabl
     assert.deepEqual(JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...topicReview, topicUpdates: { Chart: `closes:${idsFor('m5')[0]}` } }), invalid, sources, refs, archive)), memory);
   }
   const decision = { state: 'Chart closed; independent queue and the observed mismatch remain open.',
-    topicUpdates: { Chart: { closed: true, evidence: wireWitness } }, sourceUpdates: { ...Object.fromEntries(Object.entries(topicReview.sourceUpdates).map(([ref, update]) => [ref, update.replace(/q[0-9]+/gu, id => `${evidence[id]!.sourceRef}/${id}`)])), m1: `independent:m1/${idsFor('m1')[0]}` },
+    topicUpdates: { Chart: { closed: true, evidence: wireWitness } }, sourceUpdates: { ...Object.fromEntries(Object.entries(topicReview.sourceUpdates).map(([ref, update]) => [ref, update.replace(/q[0-9]+/gu, id => `${evidence[id]!.sourceRef}/${id}: ${evidence[id]!.text}`)])), m1: `independent:m1/${idsFor('m1')[0]}: ${evidence[idsFor('m1')[0]!]!.text}` },
     activeTask: 'm5', unresolvedDefects: '', classifications: { ...topicReview.classifications, m9: 'paraphrase:m0' } };
   assert.deepEqual(groupedCompile(decision), memory, 'explicit semantic decisions share the exact provenance and chronological guards');
   for (const change of [
@@ -873,6 +873,9 @@ test('source state transitions override stale categories without dropping durabl
     { topicUpdates: { Chart: { closed: true, evidence: 'none' } } },
     { sourceUpdates: {} }, { classifications: { ...decision.classifications, m0: 'paraphrase' } },
     { sourceUpdates: { ...decision.sourceUpdates, m1: `independent:${idsFor('m0')[0]}` } },
+    { sourceUpdates: { ...decision.sourceUpdates, m2: `closes:m5/${witness}` } },
+    { sourceUpdates: { ...decision.sourceUpdates, m2: `closes:m5/${witness}: Fabricated text.` } },
+    { sourceUpdates: { ...decision.sourceUpdates, m2: `closes:m0/${witness}: ${evidence[witness]!.text}` } },
     { sourceUpdates: { ...decision.sourceUpdates, m1: 'keep' } },
     { activeTask: 'm3' },
     { state: '' }, { extra: 'forbidden' },
@@ -997,7 +1000,8 @@ test('review decision schema requires every source once and only later new user 
   assert.equal(reserved.properties.topicUpdates.required.length, 2);
   assert.ok(reserved.properties.topicUpdates.required.every(subject => subject.length === 80));
   for (const [id, proof] of Object.entries(evidence)) {
-    assert.equal(new RegExp(actual.properties.sourceUpdates.properties.m0!.pattern).test(`closes:${proof.sourceRef}/${id}`), proof.role === 'user' && Number(proof.sourceRef.slice(1)) > 0);
+    assert.equal(new RegExp(actual.properties.sourceUpdates.properties.m0!.pattern).test(`closes:${proof.sourceRef}/${id}: ${proof.text}`), proof.role === 'user' && Number(proof.sourceRef.slice(1)) > 0);
+    assert.ok(!new RegExp(actual.properties.sourceUpdates.properties.m0!.pattern).test(`closes:${proof.sourceRef}/${id}`));
   }
   assert.equal(Object.keys(actual.properties)[0], 'state');
 });

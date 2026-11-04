@@ -1002,7 +1002,7 @@ test('semantic compaction reviews once on the selected model and accounts for bo
 
 test('semantic failures keep the previous checkpoint and never retry the draft or review', async (t) => {
   for (const fault of ['missing-preflight', 'reserve-budget', 'reserve-mutation', 'missing-reserve-budget', 'zero-reserve-budget', 'invalid-reserve-budget', 'excessive-reserve-budget', 'model-switch', 'changed-archive', 'changed-service-task', 'invalid-draft', 'invalid-review',
-    'missing-source-note', 'unquoted-review', 'review-budget', 'missing-review-count', 'invalid-review-count', 'review-reserve-exceeded', 'review-network', 'review-cancel', 'unexpected-function'] as const) await t.test(fault, async () => {
+    'missing-source-note', 'unquoted-review', 'private-review-shape', 'review-budget', 'missing-review-count', 'invalid-review-count', 'review-reserve-exceeded', 'review-network', 'review-cancel', 'unexpected-function'] as const) await t.test(fault, async () => {
     const input = { ...compactionTurnFor(`semantic-fault-${fault}`), modelId: 'GigaChat-3-Lightning' };
     const memory = JSON.stringify({ format: 'gigachat-semantic-memory', version: 1,
       activeTask: { text: 'Keep the current task.', sourceRefs: ['m0'] }, constraints: [], decisions: [], openWork: [], facts: [], pastTopics: [] });
@@ -1015,6 +1015,10 @@ test('semantic failures keep the previous checkpoint and never retry the draft o
         if (calls === 2 && fault === 'review-cancel') { runtime.cancel(runtime.list()[0]!.id); return; }
         const candidate = calls === 1
           ? JSON.stringify({ taskSubject: 'Current task', state: 'Task remains open.', activeTask: 'm0', topics: [], notes: Object.fromEntries(input.messages.slice(fault === 'missing-source-note' ? 1 : 0).map(message => [`m${input.messages.indexOf(message)}`, message.text])), verbatim: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, false])) })
+          : fault === 'private-review-shape'
+            ? JSON.stringify({ topicUpdates: {}, assistantOrigins: Object.fromEntries(input.messages.flatMap((message, index) => message.role === 'assistant' ? [[`m${index}`, 'self']] : [])),
+              sourceUpdates: Object.fromEntries(input.messages.map((_, index) => [`m${index}`, 'none'])), activeTask: 'm0',
+              classifications: Object.fromEntries(input.messages.map((message, index) => [`m${index}`, message.role === 'assistant' ? 'decision' : 'fact'])), unresolvedDefects: '' })
           : fault === 'unquoted-review'
             ? JSON.stringify({ ...JSON.parse(memory), unresolvedDefects: [], facts: [{ text: 'Unquoted fact.', sourceRefs: ['m0'], exactQuotes: [] }] }) : memory;
         yield { type: 'text-delta', text: fault === 'invalid-draft' || calls === 2 && fault === 'invalid-review' ? '{}' : candidate };
@@ -1107,7 +1111,7 @@ test('persists three semantic runtime cycles with only previous memory and the n
         if (!covered) {
           const evidence = semanticReviewEvidenceIndex(archiveText);
           const proof = Object.keys(evidence).find(id => evidence[id]!.sourceRef === 'm6')!;
-          sourceUpdates.m4 = sourceUpdates.m5 = `closes:m6/${proof}`;
+          sourceUpdates.m4 = sourceUpdates.m5 = `closes:m6/${proof}: ${evidence[proof]!.text}`;
         }
         answer = JSON.stringify({ state: 'Импорт открыт, наблюдённый дефект не устранён.', topicUpdates: {}, sourceUpdates, activeTask: 'm2', unresolvedDefects: '',
           classifications: Object.fromEntries(archive.coverageRefSet.map(ref => [ref, ['m0', 'm10'].includes(ref) ? 'constraint' : ref === 'm2' ? 'openWork' : ref === 'm8' ? 'defect' : ref === 'm12' ? 'fact' : 'drop'])) });
