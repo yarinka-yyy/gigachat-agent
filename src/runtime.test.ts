@@ -986,7 +986,7 @@ test('semantic compaction reviews once on the selected model and accounts for bo
     assert.equal(requests.length, 2);
     assert.equal(preflights.length, 3, 'reserve review, exact draft, exact review');
     assert.equal(saved.length, 1);
-    assert.equal(JSON.parse(saved[0]!).activeTask.text, `Draft: ${input.messages[0]!.text}`);
+    assert.equal(JSON.parse(saved[0]!).activeTask.text, input.messages[0]!.text, 'a false draft flag cannot replace the primary task with its paraphrase');
     assert.match(requests[1]!.messages[0]!.text, /Draft/);
     const sourceRecord = JSON.parse(requests[1]!.messages[1]!.text.split('\n').slice(1).join('\n')) as { messages: Array<{ text: string }> };
     assert.equal(sourceRecord.messages[0]!.text, input.messages[0]!.text);

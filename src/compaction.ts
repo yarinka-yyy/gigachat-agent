@@ -432,7 +432,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
   const closed = new Set(closedTopics.flatMap(topic => topic.sourceRefs.filter(ref => ref !== topic.closedBy)));
   if (active.some(ref => closed.has(ref) || superseded.has(ref))) throw new Error('Активная задача не может ссылаться на закрытый или заменённый источник.');
   if (draft.activeTask !== 'none' && !active.length && !closed.has(draft.activeTask) && !superseded.has(draft.activeTask)) throw new Error('Review не может стереть активную задачу без подтверждённого закрытия.');
-  const protectedRefs = new Set([...userRefs.filter(ref => verbatim[ref]), ...(previous?.activeTask?.sourceRefs ?? []),
+  const protectedRefs = new Set([...userRefs, ...(previous?.activeTask?.sourceRefs ?? []),
     ...(previous?.constraints ?? []).flatMap(entry => entry.sourceRefs), ...(previous?.openWork ?? []).flatMap(entry => entry.sourceRefs)]);
   if (sourceRefs.some(ref => protectedRefs.has(ref) && classes[ref] === 'drop' && !active.includes(ref)
     && !closed.has(ref) && !superseded.has(ref) && !closureOnly.has(ref))) throw new Error('Критичный первичный источник нельзя отбросить без подтверждённого закрытия или замены.');
@@ -516,7 +516,7 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   const topicEvidence = Object.fromEntries(scopes.map(topic => [topic.subject, evidenceIds.filter(id => topic.sourceRefs.every(ref => position(ref) < position(evidenceIndex[id]!.sourceRef)))]));
   const independentEvidence = Object.fromEntries(refs.map(ref => [ref, (!draft || scopes.some(scope => scope.sourceRefs.includes(ref)))
     ? evidenceIds.filter(id => evidenceIndex[id]!.sourceRef === ref) : []]));
-  const protectedRefs = [...new Set([...userRefs.filter(ref => draft?.verbatim[ref]), ...(archive.previousMemory?.activeTask?.sourceRefs ?? []),
+  const protectedRefs = [...new Set([...userRefs, ...(archive.previousMemory?.activeTask?.sourceRefs ?? []),
     ...(archive.previousMemory?.constraints ?? []).flatMap(entry => entry.sourceRefs), ...(archive.previousMemory?.openWork ?? []).flatMap(entry => entry.sourceRefs)])];
   const withSources = (choices: Record<string, string[]>) => Object.fromEntries(Object.entries(choices).map(([key, ids]) => [key, ids.map(id => `${evidenceIndex[id]!.sourceRef}/${id}`)]));
   return semanticReviewDecisionResponseFormat(refs, primary, archive.previousMemory ? semanticMemorySourceRefs(archive.previousMemory) : [], protectedRefs, withSources(updateEvidence), withSources(independentEvidence), withSources(topicEvidence));

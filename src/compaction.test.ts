@@ -628,7 +628,11 @@ test('topic closure removes all its details and defect state survives compilatio
   assert.ok(!format.schema.properties.activeTask.enum.includes('keep'));
   assert.deepEqual(format.schema.properties.sourceUpdates.required, refs);
   const emptyDraft = JSON.stringify({ ...JSON.parse(notes), activeTask: 'none', verbatim: Object.fromEntries(refs.map(ref => [ref, false])) });
-  const emptyState = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ ...resolution, sourceUpdates: { ...resolution.sourceUpdates, m1: 'none', m3: 'none' }, activeTask: 'none', classifications: { ...resolution.classifications, m1: 'drop', m3: 'drop' } }), emptyDraft, sources, refs, archive));
+  const emptySelection = { ...resolution, sourceUpdates: { ...resolution.sourceUpdates, m1: 'none', m3: 'none' }, activeTask: 'none', classifications: { ...resolution.classifications, m1: 'fact', m3: 'drop', m4: 'fact' } };
+  const emptyState = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson(emptySelection), emptyDraft, sources, refs, archive));
+  assert.throws(() => compileResolvedSemanticCompactionMemory(reviewJson({ ...emptySelection, classifications: { ...emptySelection.classifications, m0: 'drop' } }), emptyDraft, sources, refs, archive), /Критичный первичный/,
+    'verbatim=false is not evidence that a new primary instruction has no durable constraint');
+  assert.ok(!format.schema.properties.classifications.properties.m0!.enum.includes('drop'));
   assert.equal(emptyState.activeTask, null, 'an explicitly absent task must stay absent');
   assert.deepEqual(emptyState.closedTopics ?? [], [], 'an explicitly empty closure selection is valid');
   const corrected = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ ...resolution, activeTask: 'm5' }), notes, sources, refs, archive));
