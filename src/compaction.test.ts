@@ -860,11 +860,11 @@ test('source state transitions override stale categories without dropping durabl
     assert.ok(schema.properties.topicUpdates.properties.Chart!.anyOf[1]!.properties.evidence.enum.includes(wireWitness), 'untrusted draft evidence must remain correctable by independent review');
     assert.deepEqual(JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...topicReview, topicUpdates: { Chart: `closes:${idsFor('m5')[0]}` } }), invalid, sources, refs, archive)), memory);
   }
-  const decision = { evidence: [wireWitness, ...['m1', 'm6'].map(ref => `${ref}/${idsFor(ref)[0]}: ${evidence[idsFor(ref)[0]!]!.text}`)],
+  const decision = { evidence: ['m1', 'm6'].map(ref => `${ref}/${idsFor(ref)[0]}: ${evidence[idsFor(ref)[0]!]!.text}`),
     topicUpdates: { Chart: { closed: true, evidence: wireWitness } }, sourceUpdates: { ...Object.fromEntries(Object.entries(topicReview.sourceUpdates).map(([ref, update]) => [ref, update.replace(/q[0-9]+/gu, id => `${evidence[id]!.sourceRef}/${id}`)])), m1: `independent:m1/${idsFor('m1')[0]}` },
     activeTask: 'm5', unresolvedDefects: '', classifications: { ...topicReview.classifications, m9: 'paraphrase:m0' } };
   assert.deepEqual(groupedCompile(decision), memory, 'explicit semantic decisions share the exact provenance and chronological guards');
-  const shared = { ...decision, topicUpdates: { Chart: { closed: false, evidence: 'none' } },
+  const shared = { ...decision, evidence: [...decision.evidence, wireWitness], topicUpdates: { Chart: { closed: false, evidence: 'none' } },
     sourceUpdates: { ...decision.sourceUpdates, m2: `closes:m5/${witness}`, m3: `closes:m5/${witness}` } };
   assert.deepEqual(groupedCompile(shared), memory, 'multiple source transitions reuse one literal witness');
   assert.equal(JSON.stringify(shared).split(evidence[witness]!.text).length - 1, 1);
@@ -879,6 +879,7 @@ test('source state transitions override stale categories without dropping durabl
     { sourceUpdates: {} }, { classifications: { ...decision.classifications, m0: 'paraphrase' } },
     { sourceUpdates: { ...decision.sourceUpdates, m1: `independent:${idsFor('m0')[0]}` } },
     { evidence: [] }, { evidence: [wireWitness, wireWitness] }, { evidence: ['Fabricated text.'] },
+    { evidence: [...decision.evidence, wireWitness] },
     { evidence: [`m0/${witness}: ${evidence[witness]!.text}`] },
     { sourceUpdates: { ...decision.sourceUpdates, m2: `closes:m5/${witness}: Fabricated text.` } },
     { sourceUpdates: { ...decision.sourceUpdates, m2: `closes:m0/${witness}: ${evidence[witness]!.text}` } },

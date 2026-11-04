@@ -181,7 +181,7 @@ function semanticReviewDecisionResponseFormat(refs: string[], primary: string[],
     : ['decision', ...(assistantOrigins[ref] ?? []).map(origin => `paraphrase:${origin}`), ...(exactRefs.includes(ref) ? [] : ['drop'])])
     .filter(value => (value !== 'request' || requestRefs.includes(ref) || primary.includes(ref) && !retained.includes(ref)) && (value !== 'drop' || !protectedRefs.includes(ref)));
   return { type: 'json_schema', strict: true, schema: { type: 'object', properties: {
-    evidence: { type: 'array', maxItems: Math.min(refs.length, witnesses.length), uniqueItems: true, items: { type: 'string', ...(witnesses.length ? { enum: witnesses } : {}) } },
+    evidence: { type: 'array', description: 'Only literal witnesses used by closes/supersedes/independent sourceUpdates. none, keep and classifications need no witness. Use [] when no source transitions are selected.', maxItems: Math.min(refs.length, witnesses.length), uniqueItems: true, items: { type: 'string', ...(witnesses.length ? { enum: witnesses } : {}) } },
     topicUpdates: { type: 'object', properties: Object.fromEntries(Object.entries(topicEvidence).map(([scope, ids]) => [scope, { anyOf: [
       { type: 'object', properties: { closed: { type: 'boolean', enum: [false] }, evidence: { type: 'string', enum: ['none'] } }, required: ['closed', 'evidence'], additionalProperties: false },
       ...(ids.length ? [{ type: 'object', properties: { closed: { type: 'boolean', enum: [true] }, evidence: { type: 'string', enum: ids } }, required: ['closed', 'evidence'], additionalProperties: false }] : []),
@@ -229,15 +229,18 @@ function expandSemanticReviewDecision(value: Record<string, unknown>, scopes: Re
     if (witnesses.length !== 1) throw new Error('Закрытие требует полного адреса и дословного текста свидетельства.');
     return [scope, `closes:${witnesses[0]}`];
   }));
+  const usedEvidence = new Set<string>();
   const sourceUpdates = Object.fromEntries(Object.entries(value.sourceUpdates).map(([ref, update]) => {
     if (update === 'keep' && !priorProtected.includes(ref)) throw new Error('Новый независимый источник требует собственного USER-свидетельства.');
     if (typeof update !== 'string' || !update.includes(':')) return [ref, update];
     const separator = update.indexOf(':'), kind = update.slice(0, separator), id = resolveEvidence(update.slice(separator + 1)), proof = index[id];
     if (!selectedEvidence.has(id)) throw new Error('Изменение источника требует выбранного дословного USER-свидетельства.');
+    usedEvidence.add(id);
     if (kind !== 'independent') return [ref, `${kind}:${id}`];
     if (!proof || proof.role !== 'user' || proof.sourceRef !== ref || !messages.some(source => source.sourceRef === ref && source.role === 'user')) throw new Error('Независимое обязательство требует собственного первичного USER-свидетельства.');
     return [ref, 'keep'];
   }));
+  if ([...selectedEvidence].some(id => !usedEvidence.has(id))) throw new Error('Таблица свидетельств не должна содержать неиспользуемые цитаты.');
   if (typeof value.unresolvedDefects !== 'string') throw new Error('Некорректные свидетельства дефекта.');
   const unresolvedDefects = value.unresolvedDefects ? value.unresolvedDefects.split(';').map(group => group.split(',').map(resolveEvidence).join(',')).join(';') : '';
   return { sourceUpdates, topicUpdates, activeTask: value.activeTask, unresolvedDefects,
@@ -305,12 +308,14 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
   const aligned = records.slice(1).map(record => {
     const value = JSON.parse(record.slice(record.indexOf('\n') + 1));
     messageRefs.add(value.sourceRef);
-    return record.slice(0, record.indexOf('\n') + 1) + JSON.stringify({ ...value, review: review(value.sourceRef) });
+    return { primary: value.role === 'user', record: record.slice(0, record.indexOf('\n') + 1) + JSON.stringify({ ...value, review: review(value.sourceRef) }) };
   });
+  // Put primary evidence after bulky assistant data; source refs retain the original chronology.
+  aligned.sort((a, b) => Number(a.primary) - Number(b.primary));
   metadata.sourceReviews = Object.fromEntries((metadata.coverageRefSet as string[]).filter(ref => !messageRefs.has(ref)).map(ref => [ref, review(ref)]));
   delete metadata.evidenceIndex;
   return { candidate: candidateText.slice(0, offset) + (candidate ? '{}' : ''), records: [
-    records[0]!.slice(0, records[0]!.indexOf('\n') + 1) + JSON.stringify(metadata), ...aligned,
+    records[0]!.slice(0, records[0]!.indexOf('\n') + 1) + JSON.stringify(metadata), ...aligned.map(value => value.record),
   ] };
 }
 

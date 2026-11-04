@@ -1101,6 +1101,7 @@ test('persists three semantic runtime cycles with only previous memory and the n
       const wire = JSON.parse(serializeProviderTurnRequest(request).body) as { messages: Array<{ content: Array<{ text: string }> }> };
       const wireSources = wire.messages.flatMap(item => item.content.map(part => part.text).filter(text => text.startsWith('ИСТОЧНИК ИСТОРИИ JSON.'))
         .map(text => JSON.parse(text.slice(text.indexOf('\n') + 1)) as { sourceRef: string; text: string }));
+      wireSources.sort((a, b) => Number(a.sourceRef.slice(1)) - Number(b.sourceRef.slice(1)));
       assert.deepEqual(wireSources.map(({ sourceRef, text }) => [sourceRef, text]), archive.messages.map(({ sourceRef, text }) => [sourceRef, text]));
       let answer: string;
       if (draftStage) answer = JSON.stringify({ taskSubject: 'Проверка импорта', state: 'Версия формата не подтверждена; дефект открыт.', activeTask: 'm2', topics: [],
