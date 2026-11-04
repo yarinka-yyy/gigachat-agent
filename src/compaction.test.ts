@@ -8,6 +8,7 @@ import {
   compileSemanticSourceNotes,
   semanticSourceNotesResponseFormat,
   semanticSourceResolutionResponseFormat,
+  semanticCompactionResponseFormat,
   semanticReviewEvidenceIndex,
   compileAnchoredSemanticCompactionMemory,
   compileResolvedSemanticCompactionMemory,
@@ -722,11 +723,51 @@ test('source state transitions override stale categories without dropping durabl
   const withoutTransitions = { ...resolution, sourceUpdates: Object.fromEntries(Object.keys(sourceUpdates).map(ref => [ref, 'none'])) };
   assert.throws(() => compile({ ...withoutTransitions, classifications: { ...resolution.classifications, m0: 'drop' } }), /Критичный/,
     'explicit none everywhere cannot authorize dropping a live exception');
-  const schema = semanticSourceResolutionResponseFormat(refs, Object.keys(sourceUpdates), [], Object.fromEntries(Object.keys(sourceUpdates).map(ref => [ref, idsFor(ref)]))).schema;
+  const schema = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${notes}`).schema;
+  assert.ok('sourceUpdates' in schema.properties);
   assert.deepEqual(schema.properties.sourceUpdates.required, Object.keys(sourceUpdates));
   const pattern = new RegExp(schema.properties.sourceUpdates.properties.m5!.pattern);
   assert.ok(pattern.test(sourceUpdates.m5));
   assert.ok(!pattern.test(`closes:${idsFor('m0')[0]}:m2`), 'schema also binds a transition to its own source evidence');
+});
+
+test('review schema permits only known earlier messages and tool anchors for each user witness', () => {
+  const { sources } = largeSemanticSources(), refs = getSemanticCompactionCoverageRefSet(sources);
+  const archive = serializeSemanticCompactionTranscript(sources), evidence = semanticReviewEvidenceIndex(archive);
+  const notes = JSON.stringify({ taskSubject: 'Report', state: 'Pending.', activeTask: 'm0', closedTopics: '',
+    notes: Object.fromEntries(refs.map(ref => [ref, 'Source note.'])), verbatim: Object.fromEntries(refs.map(ref => [ref, false])) });
+  const reserved = semanticCompactionResponseFormat(undefined, archive).schema;
+  const actual = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${notes}`).schema;
+  assert.deepEqual(reserved, actual, 'reservation and dispatch use the same chronology contract');
+  assert.ok('sourceUpdates' in actual.properties);
+  const updates = actual.properties.sourceUpdates;
+  assert.deepEqual(updates.required, sources.messages.filter(source => source.role === 'user').map(source => source.ref));
+  for (const ref of updates.required) {
+    const id = Object.keys(evidence).find(id => evidence[id]!.sourceRef === ref)!;
+    const pattern = new RegExp(updates.properties[ref]!.pattern);
+    assert.ok(pattern.test('none'));
+    for (const target of [...refs, 'm999', 't999']) {
+      const position = target.startsWith('m') ? Number(target.slice(1))
+        : Number(sources.tools.find(tool => tool.ref === target)?.anchorRef.slice(1));
+      const allowed = refs.includes(target) && position < Number(ref.slice(1));
+      for (const kind of ['closes', 'supersedes']) assert.equal(pattern.test(`${kind}:${id}:${target}`), allowed, `${ref} ${kind} ${target}`);
+    }
+    assert.ok(!pattern.test(`closes:${id}:m00`));
+    assert.ok(!pattern.test(`closes:${id}:m0,${ref}`), 'an earlier first member cannot hide a self reference');
+  }
+  assert.equal(updates.properties.m0!.pattern, '^none$');
+});
+
+test('rolling review schema retains earlier tools without replaying their raw prefix', () => {
+  const { sources } = largeSemanticSources(), previous = validateSemanticCompactionMemory(semanticCandidate(), sources);
+  const archive = serializeSemanticCompactionTranscript(sources, previous, 64), evidence = semanticReviewEvidenceIndex(archive);
+  const schema = semanticCompactionResponseFormat(undefined, archive).schema;
+  assert.ok('sourceUpdates' in schema.properties);
+  assert.deepEqual(schema.properties.sourceUpdates.required, ['m64']);
+  const pattern = new RegExp(schema.properties.sourceUpdates.properties.m64!.pattern);
+  const id = Object.keys(evidence).find(id => evidence[id]!.sourceRef === 'm64')!;
+  assert.ok(pattern.test(`closes:${id}:m0,m1,t0`), 'prior memory refs remain eligible, including a tool absent from the suffix');
+  for (const target of ['t1', 'm64', 'm65', 'm2', 't99']) assert.ok(!pattern.test(`supersedes:${id}:${target}`), target);
 });
 
 test('explicit absence of a task retains a primary constraint and rolling review cannot silently erase it', () => {

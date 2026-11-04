@@ -172,12 +172,13 @@ const SOURCE_CATEGORIES = ['constraint', 'decision', 'openWork', 'fact'];
 const SOURCE_CLASSES = ['drop', 'defect', ...Array.from({ length: 15 }, (_, mask) =>
   SOURCE_CATEGORIES.filter((_category, bit) => (mask + 1) & (1 << bit)).join('+'))];
 
-export function semanticSourceResolutionResponseFormat(sourceRefs: readonly string[] = [], primarySourceRefs: readonly string[] = sourceRefs, retainedSourceRefs: readonly string[] = [], updateEvidence: Record<string, string[]> = {}) {
+export function semanticSourceResolutionResponseFormat(sourceRefs: readonly string[] = [], primarySourceRefs: readonly string[] = sourceRefs, retainedSourceRefs: readonly string[] = [], updateSources: Record<string, { evidence: string[]; targets: string[] }> = {}) {
   return { type: 'json_schema', strict: true, schema: { type: 'object',
-    properties: { sourceUpdates: { type: 'object', properties: Object.fromEntries(Object.entries(updateEvidence).map(([ref, ids]) => {
-      const update = `(?:closes|supersedes):(?:${ids.join('|')}):${SOURCE_LIST_PATTERN}`;
-      return [ref, { type: 'string', maxLength: 512, pattern: ids.length ? `^(?:none|${update}(?:;${update})*)$` : '^none$' }];
-    })), required: Object.keys(updateEvidence), additionalProperties: false },
+    properties: { sourceUpdates: { type: 'object', properties: Object.fromEntries(Object.entries(updateSources).map(([ref, { evidence, targets }]) => {
+      const target = `(?:${targets.join('|')})`;
+      const update = `(?:closes|supersedes):(?:${evidence.join('|')}):${target}(?:,${target})*`;
+      return [ref, { type: 'string', maxLength: 512, pattern: evidence.length && targets.length ? `^(?:none|${update}(?:;${update})*)$` : '^none$' }];
+    })), required: Object.keys(updateSources), additionalProperties: false },
       unresolvedDefects: { type: 'string', maxLength: 512, pattern: `^(?:${QUOTE_LIST_PATTERN}(?:;${QUOTE_LIST_PATTERN})*)?$` },
       activeTask: { type: 'string', enum: [...primarySourceRefs, 'none'] },
       classifications: { type: 'object', properties: Object.fromEntries(sourceRefs.map(ref => [ref, { type: 'string', maxLength: 96,
@@ -424,16 +425,22 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   if (!Array.isArray(refs) || !refs.length || new Set(refs).size !== refs.length
     || refs.some(ref => typeof ref !== 'string' || !/^(m|t)(0|[1-9][0-9]*)$/.test(ref))) throw new Error('Некорректные источники заметок.');
   const fullArchive = archiveText ?? reviewMetadata!;
-  const archive = JSON.parse(fullArchive.slice(fullArchive.indexOf('\n') + 1)) as { messages: Array<{ sourceRef: string; role: string }>; previousMemory: SemanticCompactionMemory | null };
+  const archive = JSON.parse(fullArchive.slice(fullArchive.indexOf('\n') + 1)) as { messages: Array<{ sourceRef: string; role: string }>; tools: Array<{ sourceRef: string; anchorRef: string }>; previousMemory: SemanticCompactionMemory | null };
   const primary = [...new Set([...archive.messages.filter(source => source.role === 'user').map(source => source.sourceRef),
     ...(archive.previousMemory?.activeTask?.sourceRefs ?? []), ...(archive.previousMemory?.openWork ?? []).flatMap(entry => entry.sourceRefs)])];
   if (archiveText !== undefined) return semanticSourceNotesResponseFormat(refs, primary, [...new Set([...primary, ...(archive.previousMemory?.closedTopics ?? []).map(topic => topic.closedBy)])]);
   const candidate = reviewNotes?.slice(reviewNotes.indexOf('\n') + 1);
   if (candidate) compileSemanticSourceNotes(candidate, refs);
   const evidenceIndex = semanticReviewEvidenceIndex(fullArchive);
-  const updateEvidence = Object.fromEntries(archive.messages.filter(source => source.role === 'user').map(source => [source.sourceRef,
-    Object.keys(evidenceIndex).filter(id => evidenceIndex[id]!.sourceRef === source.sourceRef && evidenceIndex[id]!.role === 'user')]));
-  return semanticSourceResolutionResponseFormat(refs, primary, archive.previousMemory ? semanticMemorySourceRefs(archive.previousMemory) : [], updateEvidence);
+  const retained = archive.previousMemory ? semanticMemorySourceRefs(archive.previousMemory) : [];
+  const toolPositions = new Map(archive.tools.map(tool => [tool.sourceRef, Number(tool.anchorRef.slice(1))]));
+  const sourcePosition = (ref: string) => ref.startsWith('m') ? Number(ref.slice(1))
+    : toolPositions.get(ref) ?? (retained.includes(ref) ? -1 : Infinity);
+  const updateSources = Object.fromEntries(archive.messages.filter(source => source.role === 'user').map(source => [source.sourceRef, {
+    evidence: Object.keys(evidenceIndex).filter(id => evidenceIndex[id]!.sourceRef === source.sourceRef && evidenceIndex[id]!.role === 'user'),
+    targets: refs.filter(ref => sourcePosition(ref) < sourcePosition(source.sourceRef)),
+  }]));
+  return semanticSourceResolutionResponseFormat(refs, primary, retained, updateSources);
 }
 
 export function compileSemanticSourceNotes(value: unknown, sourceRefs: readonly string[]): string {
