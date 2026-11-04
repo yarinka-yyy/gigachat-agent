@@ -754,7 +754,7 @@ test('rolling reclassification retains accepted facts and quotes only available 
   assert.ok('classifications' in schema.properties);
   assert.ok(!schema.properties.classifications.properties.m1!.enum.includes('drop'));
   assert.ok(!schema.properties.classifications.properties.m0!.enum.includes('drop'));
-  const wireKeep = { state: 'Observed copy result remains valid.', topicUpdates: {},
+  const wireKeep = { evidence: [], topicUpdates: {},
     sourceUpdates: { ...selection.sourceUpdates, m0: 'keep', m1: 'keep' }, classifications: selection.classifications,
     activeTask: selection.activeTask, unresolvedDefects: selection.unresolvedDefects };
   assert.deepEqual(JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify(wireKeep), notes, sources, refs, archive)), memory, 'schema and wire normalizer agree on every protected prior category');
@@ -860,10 +860,15 @@ test('source state transitions override stale categories without dropping durabl
     assert.ok(schema.properties.topicUpdates.properties.Chart!.anyOf[1]!.properties.evidence.enum.includes(wireWitness), 'untrusted draft evidence must remain correctable by independent review');
     assert.deepEqual(JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...topicReview, topicUpdates: { Chart: `closes:${idsFor('m5')[0]}` } }), invalid, sources, refs, archive)), memory);
   }
-  const decision = { state: 'Chart closed; independent queue and the observed mismatch remain open.',
-    topicUpdates: { Chart: { closed: true, evidence: wireWitness } }, sourceUpdates: { ...Object.fromEntries(Object.entries(topicReview.sourceUpdates).map(([ref, update]) => [ref, update.replace(/q[0-9]+/gu, id => `${evidence[id]!.sourceRef}/${id}: ${evidence[id]!.text}`)])), m1: `independent:m1/${idsFor('m1')[0]}: ${evidence[idsFor('m1')[0]!]!.text}` },
+  const decision = { evidence: [wireWitness, ...['m1', 'm6'].map(ref => `${ref}/${idsFor(ref)[0]}: ${evidence[idsFor(ref)[0]!]!.text}`)],
+    topicUpdates: { Chart: { closed: true, evidence: wireWitness } }, sourceUpdates: { ...Object.fromEntries(Object.entries(topicReview.sourceUpdates).map(([ref, update]) => [ref, update.replace(/q[0-9]+/gu, id => `${evidence[id]!.sourceRef}/${id}`)])), m1: `independent:m1/${idsFor('m1')[0]}` },
     activeTask: 'm5', unresolvedDefects: '', classifications: { ...topicReview.classifications, m9: 'paraphrase:m0' } };
   assert.deepEqual(groupedCompile(decision), memory, 'explicit semantic decisions share the exact provenance and chronological guards');
+  const shared = { ...decision, topicUpdates: { Chart: { closed: false, evidence: 'none' } },
+    sourceUpdates: { ...decision.sourceUpdates, m2: `closes:m5/${witness}`, m3: `closes:m5/${witness}` } };
+  assert.deepEqual(groupedCompile(shared), memory, 'multiple source transitions reuse one literal witness');
+  assert.equal(JSON.stringify(shared).split(evidence[witness]!.text).length - 1, 1);
+  assert.ok(Buffer.byteLength(JSON.stringify(shared)) <= 4096);
   for (const change of [
     { topicUpdates: { Chart: { closed: true, evidence: 'q999' } } }, { topicUpdates: {} },
     { topicUpdates: { Chart: { closed: true, evidence: witness } } },
@@ -873,12 +878,13 @@ test('source state transitions override stale categories without dropping durabl
     { topicUpdates: { Chart: { closed: true, evidence: 'none' } } },
     { sourceUpdates: {} }, { classifications: { ...decision.classifications, m0: 'paraphrase' } },
     { sourceUpdates: { ...decision.sourceUpdates, m1: `independent:${idsFor('m0')[0]}` } },
-    { sourceUpdates: { ...decision.sourceUpdates, m2: `closes:m5/${witness}` } },
+    { evidence: [] }, { evidence: [wireWitness, wireWitness] }, { evidence: ['Fabricated text.'] },
+    { evidence: [`m0/${witness}: ${evidence[witness]!.text}`] },
     { sourceUpdates: { ...decision.sourceUpdates, m2: `closes:m5/${witness}: Fabricated text.` } },
     { sourceUpdates: { ...decision.sourceUpdates, m2: `closes:m0/${witness}: ${evidence[witness]!.text}` } },
     { sourceUpdates: { ...decision.sourceUpdates, m1: 'keep' } },
     { activeTask: 'm3' },
-    { state: '' }, { extra: 'forbidden' },
+    { evidence: '' }, { state: 'Old wire format.' }, { extra: 'forbidden' },
   ]) assert.throws(() => groupedCompile({ ...decision, ...change }));
 });
 
@@ -887,7 +893,7 @@ test('critical assistant data requires retention or a cited earlier user origin'
   const archive = serializeSemanticCompactionTranscript(sources), refs = getSemanticCompactionCoverageRefSet(sources);
   const notes = JSON.stringify({ taskSubject: 'Test plan', state: 'Data and constraints remain relevant.', activeTask: 'm3', topics: [],
     notes: Object.fromEntries(refs.map(ref => [ref, 'A short note.'])), verbatim: Object.fromEntries(refs.map(ref => [ref, true])) });
-  const decision = { state: 'Prepare a test plan.', topicUpdates: {}, sourceUpdates: Object.fromEntries(refs.map(ref => [ref, 'none'])),
+  const decision = { evidence: [], topicUpdates: {}, sourceUpdates: Object.fromEntries(refs.map(ref => [ref, 'none'])),
     classifications: { m0: 'constraint', m1: 'paraphrase:m0', m2: 'decision', m3: 'openWork' }, activeTask: 'm3', unresolvedDefects: '' };
   const compile = (classifications: Record<string, string>) => JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...decision, classifications }), notes, sources, refs, archive));
   const memory = compile(decision.classifications);
@@ -942,7 +948,7 @@ test('historical user requests retain text without becoming observed facts or pe
   assert.throws(() => compileResolvedSemanticCompactionMemory(JSON.stringify({ ...selection, topicUpdates: { Investigation: `closes:${proof}` } }), grouped, sources, refs, archive), /user-свидетельства/);
   const continuedSources = createCompactionSources([...messages, user('continue', 'Continue investigating without actions.')], [], []);
   const continuedArchive = serializeSemanticCompactionTranscript(continuedSources, memory, 6), continuedRefs = getSemanticCompactionCoverageRefSet(continuedSources, memory, 6);
-  const continued = { state: 'Investigation remains open.', topicUpdates: {}, sourceUpdates: Object.fromEntries(continuedRefs.map(ref => [ref, ref === 'm4' ? 'keep' : 'none'])),
+  const continued = { evidence: [], topicUpdates: {}, sourceUpdates: Object.fromEntries(continuedRefs.map(ref => [ref, ref === 'm4' ? 'keep' : 'none'])),
     classifications: { m0: 'constraint', m2: 'openWork', m4: 'request', m6: 'openWork' }, activeTask: 'm2', unresolvedDefects: '' };
   const compile = (classes = continued.classifications) => JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...continued, classifications: classes }), draft(continuedRefs), continuedSources, continuedRefs, continuedArchive));
   assert.deepEqual(compile().historicalRequests, memory.historicalRequests);
@@ -1000,10 +1006,9 @@ test('review decision schema requires every source once and only later new user 
   assert.equal(reserved.properties.topicUpdates.required.length, 2);
   assert.ok(reserved.properties.topicUpdates.required.every(subject => subject.length === 80));
   for (const [id, proof] of Object.entries(evidence)) {
-    assert.equal(new RegExp(actual.properties.sourceUpdates.properties.m0!.pattern).test(`closes:${proof.sourceRef}/${id}: ${proof.text}`), proof.role === 'user' && Number(proof.sourceRef.slice(1)) > 0);
-    assert.ok(!new RegExp(actual.properties.sourceUpdates.properties.m0!.pattern).test(`closes:${proof.sourceRef}/${id}`));
+    assert.equal(new RegExp(actual.properties.sourceUpdates.properties.m0!.pattern).test(`closes:${proof.sourceRef}/${id}`), proof.role === 'user' && Number(proof.sourceRef.slice(1)) > 0);
   }
-  assert.equal(Object.keys(actual.properties)[0], 'state');
+  assert.equal(Object.keys(actual.properties)[0], 'evidence');
 });
 
 test('rolling review decisions retain previous tools without replaying their raw prefix', () => {
