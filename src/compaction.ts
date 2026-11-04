@@ -1175,7 +1175,7 @@ export function formatSemanticCompactionMemory(value: unknown, sources: Compacti
     for (const entry of memory.constraints) lines.push(`- [${JSON.stringify(entry.scope)}] ${JSON.stringify(entry.text)} (источники: ${entry.sourceRefs.join(', ')})`);
   }
   for (const [title, entries] of [
-    ['Решения:', memory.decisions], ['Открытая работа:', memory.openWork], ['Подтверждённые факты:', memory.facts], ['Неактивные темы:', memory.pastTopics],
+    ['Решения:', memory.decisions], ['Открытая работа:', memory.openWork], ['Первичные сведения (могут содержать планы и требования; сами по себе не подтверждают выполнение):', memory.facts], ['Неактивные темы:', memory.pastTopics],
   ] as const) {
     if (!entries.length) continue;
     lines.push(title);
@@ -1187,12 +1187,13 @@ export function formatSemanticCompactionMemory(value: unknown, sources: Compacti
     }
   }
   if (memory.unresolvedDefects?.length) {
-    lines.push('Последний наблюдённый результат: НЕУСТРАНЁННЫЙ ДЕФЕКТ. Дословные свидетельства частичного результата, конкретной ошибки и предела проверки:');
+    lines.push('НЕУСТРАНЁННЫЙ ДЕФЕКТ. Дословные свидетельства дополняют сохранённые результаты, не заменяя их:');
     for (const defect of memory.unresolvedDefects) {
       if (defect.exactQuotes?.length) for (const quote of defect.exactQuotes) lines.push(`- ${JSON.stringify(quote.text)} (источник: ${quote.sourceRef})`);
       else lines.push(renderEntry(defect));
     }
   }
+  lines.push('При ответе о результатах опирайся на дословные свидетельства: отдельно передавай выполненное, оставшийся дефект и непроверенное. Не заменяй точное наблюдение более общим выводом.');
   const formatted = lines.join('\n');
   if (Buffer.byteLength(formatted, 'utf8') > MAX_COMPACT_SUMMARY_BYTES) {
     throw new Error('Форматированная семантическая память превышает ограничение 32 КиБ.');
