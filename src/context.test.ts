@@ -715,18 +715,21 @@ test('builds an independent semantic review from the exact current archive and a
   assert.equal(systemText.split(reviewTaskLayer.text).length - 1, 1);
   assert.equal(systemText.split(SEMANTIC_COMPACTION_TASK_INSTRUCTION).length - 1, 0);
   const header = decode(wire.messages[1]!.content[0]!.text!);
-  const { notes, verbatim, topics, ...state } = JSON.parse(candidate);
-  assert.deepEqual(header, state, 'notes occur beside their sources rather than twice in the wire');
+  const { notes, verbatim, topics } = JSON.parse(candidate);
+  assert.deepEqual(header, {}, 'review must derive its own task and state rather than inherit the draft verdict');
   const records = wire.messages.slice(3, -1).map(message => decode(message.content[0]!.text!));
   const quoteIndex = semanticReviewEvidenceIndex(context.request.messages[0]!.text);
   assert.equal(records.length, sources.messages.length);
   for (const record of records) {
     const ref = record.sourceRef as string;
-    assert.deepEqual(record.review, { topic: topics[ref], note: notes[ref], verbatim: verbatim[ref],
-      evidence: Object.fromEntries(Object.entries(quoteIndex).filter(([, quote]) => quote.sourceRef === ref).map(([id, quote]) => [id, quote.text])) });
+    assert.deepEqual(record.review, {
+      categories: record.role === 'assistant' ? ['paraphrase', 'decision', 'drop'] : ['constraint', 'decision', 'openWork', 'fact', 'defect', 'drop'], topic: topics[ref], note: notes[ref], verbatim: verbatim[ref],
+      evidence: Object.fromEntries(Object.entries(quoteIndex).filter(([, quote]) => quote.sourceRef === ref).map(([id, quote]) => [id, { choice: `${quote.text} [${id}]`, text: quote.text }])) });
   }
   const metadata = decode(wire.messages[2]!.content[0]!.text!);
-  assert.deepEqual(metadata.sourceReviews, { t0: { topic: 'shared', note: notes.t0, verbatim: verbatim.t0, evidence: Object.fromEntries(Object.entries(quoteIndex).filter(([, quote]) => quote.sourceRef === 't0').map(([id, quote]) => [id, quote.text])) } });
+  const toolReviews = metadata.sourceReviews as Record<string, unknown>;
+  assert.deepEqual(toolReviews.t0, { categories: ['constraint', 'decision', 'openWork', 'fact', 'defect', 'drop'], topic: 'shared', note: notes.t0, verbatim: verbatim.t0,
+    evidence: Object.fromEntries(Object.entries(quoteIndex).filter(([, quote]) => quote.sourceRef === 't0').map(([id, quote]) => [id, { choice: `${quote.text} [${id}]`, text: quote.text }])) });
   assert.equal(metadata.evidenceIndex, undefined, 'literal evidence is local to its source, not duplicated in a distant index');
   assert.equal(wire.messages[wire.messages.length - 1]?.content[0]?.text, review.messages[review.messages.length - 1]?.text);
   assert.equal(wire.tool_config.mode, 'none');
