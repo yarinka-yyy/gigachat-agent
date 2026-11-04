@@ -500,7 +500,7 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   const evidenceIndex = semanticReviewEvidenceIndex(fullArchive);
   const userRefs = archive.messages.filter(source => source.role === 'user').map(source => source.sourceRef);
   const evidenceIds = Object.keys(evidenceIndex).filter(id => evidenceIndex[id]!.role === 'user' && userRefs.includes(evidenceIndex[id]!.sourceRef));
-  if (archiveText !== undefined) return semanticSourceNotesResponseFormat(refs, primary, [...new Set(evidenceIds.map(id => evidenceIndex[id]!.text))]);
+  if (archiveText !== undefined) return semanticSourceNotesResponseFormat(refs, primary, [...new Set(evidenceIds.flatMap(id => evidenceIndex[id]!.text.split(/(?<=[.!?])\s+|\r?\n/u)).filter(Boolean))]);
   const candidate = reviewNotes?.slice(reviewNotes.indexOf('\n') + 1);
   const draft = candidate ? JSON.parse(compileSemanticSourceNotes(candidate, refs)) as { topics: DraftTopic[]; verbatim: Record<string, boolean> } : null;
   const position = (ref: string) => ref.startsWith('t') ? Number(archive.tools.find(tool => tool.sourceRef === ref)?.anchorRef.slice(1) ?? -1) : Number(ref.slice(1));

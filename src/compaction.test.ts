@@ -806,6 +806,9 @@ test('review witnesses retain short user instructions with their qualifications 
   const sources = createCompactionSources([user('short', text), user('long', long)], [], []);
   const index = semanticReviewEvidenceIndex(serializeSemanticCompactionTranscript(sources));
   assert.deepEqual(Object.values(index).filter(quote => quote.sourceRef === 'm0'), [{ sourceRef: 'm0', text, role: 'user' }]);
+  const draft = semanticCompactionResponseFormat(serializeSemanticCompactionTranscript(sources));
+  assert.ok('topics' in draft.schema.properties);
+  assert.ok(draft.schema.properties.topics.items.properties.evidence.enum?.includes('Finish the chart discussion.'));
   const fragments = Object.values(index).filter(quote => quote.sourceRef === 'm1');
   assert.ok(fragments.length > 0);
   assert.ok(fragments.every(quote => Buffer.byteLength(quote.text, 'utf8') <= 1024 && long.includes(quote.text)));
