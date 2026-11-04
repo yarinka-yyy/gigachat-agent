@@ -1161,7 +1161,7 @@ test('persists three semantic runtime cycles with only previous memory and the n
     const question = { id: `rolling-continuation-${cycle}`, role: 'user' as const, text: 'Продолжи текущую проверку.', createdAt: new Date().toISOString() };
     const next = buildNextTurnContext({ globalText: '', messages: [...detail.messages, question], compactSnapshot: detail.compactSnapshot,
       modelId: detail.modelId, permissionProfile: 'ask', functionCallMode: 'none', compactionToolReceipts: [], compactionArtifacts: [] });
-    assert.deepEqual(next.request.messages.map(message => message.id), [question.id]);
+    assert.deepEqual(next.request.messages.map(message => message.id), ['request-semantic-memory', question.id]);
     assert.doesNotMatch(serializeProviderTurnRequest(next.request).body, /RAW-OLD-DETAIL-47/);
     previousSnapshot = detail.compactSnapshot!; covered = detail.messages.length;
   }

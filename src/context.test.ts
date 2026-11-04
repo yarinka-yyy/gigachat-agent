@@ -312,14 +312,23 @@ test('uses a v2 semantic archive only after covered-prefix hash and source valid
     compactionToolReceipts: [receipt],
     compactionArtifacts: [artifact],
   }));
-  const summary = context.request.system.find((layer) => layer.source === 'summary')?.text ?? '';
+  const summary = context.request.messages[0]?.text ?? '';
 
-  assert.deepEqual(context.request.messages.map((message) => message.id), [currentUser.id]);
+  assert.deepEqual(context.request.messages.map((message) => message.id), ['request-semantic-memory', currentUser.id]);
+  assert.equal(context.request.messages[0]?.role, 'user');
+  assert.equal(context.request.system.some(layer => layer.source === 'summary'), false, 'archived source claims must not become system instructions');
   assert.deepEqual(context.request.protocolHistory, [], 'covered tool calls are archived, not replayed');
   assert.match(summary, /Архивная семантическая память v1/);
   assert.match(summary, /Continue the current task\./);
   assert.match(summary, /exact detail/);
   assert.doesNotMatch(JSON.stringify(context.request), /Covered user message stays out|Covered answer stays out|covered-private-state/);
+  for (const { currentId } of CHAT_MODEL_FAMILIES) {
+    const wire = JSON.parse(serializeProviderTurnRequest({ ...context.request, modelId: currentId }).body);
+    assert.deepEqual(wire.messages.slice(-2).map((message: { role: string }) => message.role), ['user', 'user']);
+    assert.equal(wire.messages.at(-2).content[0].text, summary);
+    assert.equal(wire.messages.at(-1).content[0].text, currentUser.text);
+    assert.ok(!wire.messages[0].content[0].text.includes(summary), 'the memory is present once, outside the instruction layer');
+  }
 
   const emptySuffix = buildNextTurnContext(input(covered, {
     compactSnapshot: snapshot,
@@ -327,8 +336,8 @@ test('uses a v2 semantic archive only after covered-prefix hash and source valid
     compactionToolReceipts: [receipt],
     compactionArtifacts: [artifact],
   }));
-  assert.deepEqual(emptySuffix.request.messages, [], 'an assistant-covered tail may leave no raw suffix');
-  assert.match(emptySuffix.request.system.find((layer) => layer.source === 'summary')?.text ?? '', /Continue the current task\./);
+  assert.deepEqual(emptySuffix.request.messages.map(message => message.id), ['request-semantic-memory'], 'an assistant-covered tail may leave only the stored archive');
+  assert.match(emptySuffix.request.messages[0]?.text ?? '', /Continue the current task\./);
 
   const fullSources = createCompactionSources([...covered, currentUser], [receipt], [artifact]);
   const futureReference = { ...snapshot, id: 'semantic-future-ref', text: compileSemanticCompactionMemory(JSON.stringify(memory('m2')), fullSources) };

@@ -240,9 +240,12 @@ export function buildNextTurnContext(
     ...input,
     ...(input.compactionFormat === 'semantic' ? { taskInstruction: SEMANTIC_COMPACTION_TASK_INSTRUCTION } : {}),
     ...(shouldAddFilesOnlyTask ? { taskInstruction: FILES_ONLY_TASK_INSTRUCTION } : {}),
-    compactSnapshot: isCompaction || nativeCheckpointSelected || !input.compactSnapshot
-      ? null : { text: semanticSummaryText ?? formatArchivedCompactionNotes(input.compactSnapshot.text) },
-    messages: selectedMessages,
+    compactSnapshot: isCompaction || nativeCheckpointSelected || semanticSummaryText !== null || !input.compactSnapshot
+      ? null : { text: formatArchivedCompactionNotes(input.compactSnapshot.text) },
+    messages: semanticSummaryText === null ? selectedMessages : [{
+      id: 'request-semantic-memory', role: 'user', text: semanticSummaryText,
+      createdAt: input.compactSnapshot!.createdAt,
+    }, ...selectedMessages],
     protocolHistory,
   });
   if (isCompaction && input.compactionFormat === 'semantic') {
