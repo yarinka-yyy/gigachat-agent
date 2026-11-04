@@ -948,7 +948,7 @@ test('semantic compaction reviews once on the selected model and accounts for bo
         assert.deepEqual(request.protocolHistory, []);
         yield { type: 'text-delta', text: requests.length === 1
           ? JSON.stringify({ taskSubject: 'Current task', state: 'Task remains open.', activeTask: 'm0', topics: Object.fromEntries(input.messages.map((_, index) => [`m${index}`, 'shared'])), notes: Object.fromEntries(input.messages.map((message, index) => [`m${index}`, `Draft: ${message.text}`])), verbatim: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, false])) })
-          : JSON.stringify({ topicUpdates: {}, assistantOrigins: Object.fromEntries(input.messages.flatMap((message, index) => message.role === 'assistant' ? [[`m${index}`, 'self']] : [])), sourceUpdates: Object.fromEntries(input.messages.map((_, index) => [`m${index}`, 'none'])), activeTask: 'm0', classifications: Object.fromEntries(input.messages.map((message, index) => [`m${index}`, message.role === 'user' ? 'fact' : 'decision'])), unresolvedDefects: '' }) };
+          : JSON.stringify({ state: 'Task remains open.', closedTopics: [], supersededSources: [], activeTask: 'm0', retained: input.messages.map((message, index) => ({ sourceRef: `m${index}`, category: message.role === 'user' ? 'fact' : 'decision', origin: 'self', independent: false })), unresolvedDefects: '' }) };
         yield { type: 'usage', promptTokens: 10, completionTokens: 5, totalTokens: 15, precachedPromptTokens: 0 };
         yield { type: 'completed', functionsStateId: requests.length === 1 ? 'draft-state' : 'review-state' };
       }),
@@ -1103,14 +1103,15 @@ test('persists three semantic runtime cycles with only previous memory and the n
         notes: Object.fromEntries(archive.coverageRefSet.map(ref => [ref, `Сохранить источник ${ref}.`])),
         verbatim: Object.fromEntries(archive.coverageRefSet.map(ref => [ref, !covered && ['m0', 'm2', 'm8'].includes(ref)])) });
       else {
-        const sourceUpdates = Object.fromEntries(archive.coverageRefSet.map(ref => [ref, 'none']));
+        const closedTopics: Array<{ evidence: string; topicRefs: string[]; sourceRefs: string[] }> = [];
         if (!covered) {
           const evidence = semanticReviewEvidenceIndex(archiveText);
           const proof = Object.keys(evidence).find(id => evidence[id]!.sourceRef === 'm6')!;
-          sourceUpdates.m4 = sourceUpdates.m5 = `closes:${proof}`;
+          closedTopics.push({ evidence: proof, topicRefs: [], sourceRefs: ['m4', 'm5'] });
         }
-        answer = JSON.stringify({ topicUpdates: {}, assistantOrigins: Object.fromEntries(archive.messages.filter(message => message.role === 'assistant').map(message => [message.sourceRef, 'self'])), sourceUpdates, activeTask: 'm2', unresolvedDefects: '', classifications: Object.fromEntries(archive.coverageRefSet.map(ref =>
-          [ref, ref === 'm0' || ref === 'm10' ? 'constraint' : ref === 'm2' ? 'openWork' : ref === 'm8' ? 'defect' : ref === 'm12' ? 'fact' : 'drop'])) });
+        answer = JSON.stringify({ state: 'Импорт открыт, наблюдённый дефект не устранён.', closedTopics, supersededSources: [], activeTask: 'm2', unresolvedDefects: '',
+          retained: archive.coverageRefSet.flatMap(ref => { const category = ref === 'm0' || ref === 'm10' ? 'constraint' : ref === 'm2' ? 'openWork' : ref === 'm8' ? 'defect' : ref === 'm12' ? 'fact' : null;
+            return category ? [{ sourceRef: ref, category, origin: 'self', independent: ref === 'm0' || ref === 'm2' }] : []; }) });
         assert.ok(Buffer.byteLength(answer) <= 4096);
       }
       yield { type: 'text-delta', text: answer }; yield { type: 'completed' };

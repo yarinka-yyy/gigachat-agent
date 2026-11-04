@@ -676,7 +676,7 @@ test('builds an independent semantic review from the exact current archive and a
   assert.equal(review.system.length, originalRequest.system.length);
   assert.equal(reviewTaskLayer.source, 'runtime');
   assert.equal(reviewTaskLayer.label, 'Задача текущего запроса');
-  assert.match(reviewTaskLayer.text, /^Сверь заметки со всей историей/);
+  assert.match(reviewTaskLayer.text, /^Проверь состояние ВСЕЙ истории/);
   assert.notEqual(reviewTaskLayer.text, SEMANTIC_COMPACTION_TASK_INSTRUCTION);
   assert.equal(review.system.filter((layer) => layer.label === 'Задача текущего запроса').length, 1);
   assert.equal(review.system.filter((layer) => layer.text === SEMANTIC_COMPACTION_TASK_INSTRUCTION).length, 0);
