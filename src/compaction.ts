@@ -178,7 +178,8 @@ const topicWitnessAddress = (id: string, proof: SemanticCompactionQuote): string
 
 function semanticReviewDecisionResponseFormat(refs: string[], primary: string[], retained: string[], protectedRefs: string[], updateEvidence: Record<string, string[]>, independentEvidence: Record<string, string[]>, topicEvidence: Record<string, string[]>, assistantOrigins: Record<string, string[]>, exactRefs: string[], requestRefs: string[], closedRefs: string[], witnesses: string[]) {
   const quoteSchema = { type: 'string', minLength: 1, maxLength: MAX_SEMANTIC_QUOTE_BYTES + 64,
-    description: 'Copy the literal text from the matching sourceRef/qN evidence. The compiler verifies the complete address and exact text.',
+    enum: witnesses.length ? witnesses : ['none'],
+    description: 'Select the exact literal witness used by a source or topic transition. Do not paraphrase.',
   };
   const category = (ref: string) => (closedRefs.includes(ref) ? ['drop'] : requestRefs.includes(ref) ? ['request'] : primary.includes(ref) || retained.includes(ref) || ref.startsWith('t') ? SOURCE_CLASSES
     : ['decision', ...(assistantOrigins[ref] ?? []).map(origin => `paraphrase:${origin}`), ...(exactRefs.includes(ref) ? [] : ['drop'])])
@@ -193,10 +194,10 @@ function semanticReviewDecisionResponseFormat(refs: string[], primary: string[],
     activeTask: { type: 'string', enum: [...primary, 'none'] },
     topicUpdates: { type: 'object', properties: Object.fromEntries(Object.entries(topicEvidence).map(([scope, ids]) => [scope, {
       type: 'object', properties: { closed: { type: 'boolean', enum: ids.length ? [false, true] : [false] },
-        evidence: ids.length ? quoteSchema : { type: 'string', enum: ['none'] } }, required: ['closed', 'evidence'], additionalProperties: false,
+        evidence: { type: 'string', enum: ['none', ...ids] } }, required: ['closed', 'evidence'], additionalProperties: false,
     }])), required: Object.keys(topicEvidence), additionalProperties: false },
     unresolvedDefects: { type: 'string', maxLength: 512 },
-    evidence: { type: 'array', description: 'After choosing sourceUpdates, copy only their used literal witnesses. This is not a list of retained sources. none, keep and classifications need no witness. Use [] when no source transitions are selected.', maxItems: Math.min(refs.length, witnesses.length), uniqueItems: true, items: quoteSchema },
+    evidence: { type: 'array', description: 'After choosing sourceUpdates and topicUpdates, select only their used literal witnesses. This is not a list of retained sources. none, keep and classifications need no witness. Use [] when no transitions are selected.', maxItems: Math.min(refs.length, witnesses.length), uniqueItems: true, items: quoteSchema },
   }, required: [...SEMANTIC_GLOBAL_REVIEW_FIELDS], additionalProperties: false } };
 }
 
@@ -223,16 +224,17 @@ function expandSemanticReviewDecision(value: Record<string, unknown>, scopes: Re
     if (!assistantRefs.includes(ref) || !messages.some(source => source.sourceRef === origin && source.role === 'user') || Number(origin.slice(1)) >= Number(ref.slice(1))) throw new Error('Пересказ требует более раннего USER-первоисточника.');
     origins[ref] = origin;
   }
+  const usedEvidence = new Set<string>();
   if (!hasOnlyKeys(value.topicUpdates, groups)) throw new Error('Review требует решения для каждой побочной ветки.');
   const topicUpdates = Object.fromEntries(groups.map(scope => {
     const choice = (value.topicUpdates as Record<string, unknown>)[scope];
     if (!isRecord(choice) || !hasOnlyKeys(choice, ['closed', 'evidence']) || typeof choice.closed !== 'boolean' || typeof choice.evidence !== 'string') throw new Error('Ветка требует явного closed и evidence.');
     if (!choice.closed) { if (choice.evidence !== 'none') throw new Error('Открытая ветка не может иметь основание закрытия.'); return [scope, 'none']; }
-    const witnesses = Object.keys(index).filter(id => topicWitnessAddress(id, index[id]!) === choice.evidence);
-    if (witnesses.length !== 1) throw new Error('Закрытие требует полного адреса и дословного текста свидетельства.');
-    return [scope, `closes:${witnesses[0]}`];
+    const id = resolveEvidence(choice.evidence);
+    if (!selectedEvidence.has(id)) throw new Error('Закрытие требует выбранного дословного USER-свидетельства.');
+    usedEvidence.add(id);
+    return [scope, `closes:${id}`];
   }));
-  const usedEvidence = new Set<string>();
   const sourceUpdates = Object.fromEntries(Object.entries(value.sourceUpdates).map(([ref, update]) => {
     if (update === 'keep' && !priorProtected.includes(ref)) throw new Error('Новый независимый источник требует собственного USER-свидетельства.');
     if (typeof update !== 'string' || !update.includes(':')) return [ref, update];
@@ -306,7 +308,8 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
   const requestRefs = new Set(historicalSemanticRequestRefs(metadata.previousMemory, archiveMessages));
   const review = (ref: string) => ({ categories: requestRefs.has(ref) ? ['request'] : assistantRefs.has(ref) ? ['decision', ...archiveMessages.filter(source => source.role === 'user' && Number(source.sourceRef.slice(1)) < Number(ref.slice(1))).map(source => `paraphrase:${source.sourceRef}`), ...(verbatim[ref] ? [] : ['drop'])] : [...SOURCE_CATEGORIES, 'defect', ...(archiveMessages.some(source => source.sourceRef === ref && source.role === 'user') ? ['request'] : ['drop'])],
     topic: topicByRef[ref] ?? null, note: notes[ref] ?? null, verbatim: verbatim[ref] ?? null,
-    evidence: Object.fromEntries(evidenceIds.filter(id => index[id]!.sourceRef === ref).map(id => [`${ref}/${id}`, { text: index[id]!.text }])) });
+    evidence: Object.fromEntries(evidenceIds.filter(id => index[id]!.sourceRef === ref).map(id => [`${ref}/${id}`,
+      archiveMessages.some(source => source.sourceRef === ref && source.role === 'user') && !requestRefs.has(ref) ? {} : { text: index[id]!.text }])) });
   const messageRefs = new Set<string>();
   const aligned = records.slice(1).map(record => {
     const value = JSON.parse(record.slice(record.indexOf('\n') + 1));
@@ -575,8 +578,7 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   const protectedRefs = [...new Set([...userRefs, ...protectedSemanticMemoryRefs(archive.previousMemory)])];
   const withSources = (choices: Record<string, string[]>) => Object.fromEntries(Object.entries(choices).map(([key, ids]) => [key, ids.map(id => `${evidenceIndex[id]!.sourceRef}/${id}`)]));
   const assistantOrigins = Object.fromEntries(archive.messages.filter(source => source.role === 'assistant').map(source => [source.sourceRef, userRefs.filter(ref => Number(ref.slice(1)) < Number(source.sourceRef.slice(1)))]));
-  const topicWitnesses = Object.fromEntries(Object.entries(topicEvidence).map(([scope, ids]) => [scope, ids.map(id => topicWitnessAddress(id, evidenceIndex[id]!))]));
-  return semanticReviewDecisionResponseFormat(refs, taskRefs, archive.previousMemory ? semanticMemorySourceRefs(archive.previousMemory).filter(ref => !reportRefs.has(ref)) : [], protectedRefs, withSources(updateEvidence), withSources(independentEvidence), topicWitnesses, assistantOrigins,
+  return semanticReviewDecisionResponseFormat(refs, taskRefs, archive.previousMemory ? semanticMemorySourceRefs(archive.previousMemory).filter(ref => !reportRefs.has(ref)) : [], protectedRefs, withSources(updateEvidence), withSources(independentEvidence), withSources(topicEvidence), assistantOrigins,
     refs.filter(ref => draft ? draft.verbatim[ref] : false), requestRefs, closedRefs, evidenceIds.map(id => topicWitnessAddress(id, evidenceIndex[id]!)));
 }
 
