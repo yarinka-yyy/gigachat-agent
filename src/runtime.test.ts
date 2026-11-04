@@ -13,8 +13,8 @@ import { createHookApprovalGate, createHookDispatcher, createHookRegistry, HookD
 import { createTurnRuntime, queueAcceptedTurnOrMarkNotSent, type PreparedCompactionContext, type PreparedTurn, type ToolReceiptInput, type ToolReceiptStart, type TurnRuntimeOptions } from './runtime';
 import { buildNextTurnContext, COMPACTION_TASK_INSTRUCTION, estimateProviderPromptTokens } from './context';
 import { CHAT_MODEL_FAMILIES } from './model-catalog';
-import { isLitePromptOverMeasuredInputGuard, liteHardInputLimit, withLiteNormalOutputCap } from './context-budget';
-import { createCompactionSources, serializeCompactionTranscript, type CompactionSources } from './compaction';
+import { isLitePromptOverMeasuredInputGuard, liteHardInputLimit, reserveSemanticReviewInput, withLiteNormalOutputCap } from './context-budget';
+import { createCompactionSources, semanticReviewEvidenceIndex, serializeCompactionTranscript, type CompactionSources, type SemanticCompactionMemory } from './compaction';
 import { mergeUsageReceipt } from './usage';
 import { createBalanceScopeGuard } from './usage-view';
 import {
@@ -1055,6 +1055,117 @@ test('semantic failures keep the previous checkpoint and never retry the draft o
     assert.equal(calls, ['missing-preflight', 'reserve-budget', 'reserve-mutation', 'missing-reserve-budget', 'zero-reserve-budget', 'invalid-reserve-budget', 'excessive-reserve-budget', 'model-switch', 'changed-archive', 'changed-service-task'].includes(fault) ? 0
       : ['invalid-draft', 'missing-source-note', 'review-budget', 'missing-review-count', 'invalid-review-count', 'review-reserve-exceeded', 'unexpected-function'].includes(fault) ? 1 : 2);
   });
+});
+
+test('persists three semantic runtime cycles with only previous memory and the new suffix after reopen', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-semantic-runtime-rolling-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  let store = await openStore(directory);
+  const chat = await store.createChat();
+  await store.updateChat(chat.id, { modelId: 'GigaChat-3-Lightning' });
+  let pairs = 0;
+  const appendPair = async (text: string) => {
+    const { turn } = await store.acceptLocalMessage(chat.id, text, `rolling-pair-${pairs++}`);
+    await store.consumeTurnReservation(turn);
+    await store.appendAssistantMessageFromRuntime(turn, 'Учтено.', {
+      id: turn.turnId, chatId: turn.chatId, anchorMessageId: turn.messageId, assistantMessageId: turn.assistantMessageId,
+      modelId: turn.modelId, status: 'completed', createdAt: turn.messages[turn.messages.length - 1]!.createdAt, endedAt: new Date().toISOString(), activity: [],
+    });
+  };
+  const policy = 'Значение accountId передавать нельзя; имя поля accountId допустимо в схеме. Рейтинги исключены, кроме локального счётчика QA.';
+  const task = 'Продолжить локальную проверку импорта. Поддержка версии формата остаётся открытым вопросом.';
+  const defect = 'Прочитано 781 строк, ожидалось 782. Импорт не проверен.';
+  await appendPair(policy);
+  await appendPair(task);
+  await appendPair('Отдельная старая тема: RAW-OLD-DETAIL-47, вариант раскладки для другого проекта.');
+  await appendPair('Отдельную старую тему закрываем.');
+  await appendPair(defect);
+  let covered = 0, commits = 0;
+  let previousSnapshot: CompactSnapshot | null = null;
+  const requests: ProviderTurnRequest[] = [];
+  type Archive = { previousMemory: SemanticCompactionMemory | null; coverageRefSet: string[];
+    messages: Array<{ sourceRef: string; role: string; text: string }> };
+  const runtime = createTurnRuntime({
+    provider: makeProvider(async function* (request) {
+      requests.push(request);
+      const draftStage = requests.length % 2 === 1;
+      const archiveText = request.messages[draftStage ? 0 : 1]!.text;
+      const archive = JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)) as Archive;
+      assert.deepEqual(archive.previousMemory, previousSnapshot ? JSON.parse(previousSnapshot.text) : null);
+      assert.deepEqual(archive.messages.map(item => item.sourceRef), Array.from({ length: covered ? 2 : 10 }, (_, i) => `m${covered + i}`));
+      if (covered) assert.doesNotMatch(JSON.stringify(archive), /RAW-OLD-DETAIL-47/);
+      const wire = JSON.parse(serializeProviderTurnRequest(request).body) as { messages: Array<{ content: Array<{ text: string }> }> };
+      const wireSources = wire.messages.flatMap(item => item.content.map(part => part.text).filter(text => text.startsWith('ИСТОЧНИК ИСТОРИИ JSON.'))
+        .map(text => JSON.parse(text.slice(text.indexOf('\n') + 1)) as { sourceRef: string; text: string }));
+      assert.deepEqual(wireSources.map(({ sourceRef, text }) => [sourceRef, text]), archive.messages.map(({ sourceRef, text }) => [sourceRef, text]));
+      let answer: string;
+      if (draftStage) answer = JSON.stringify({ taskSubject: 'Проверка импорта', state: 'Версия формата не подтверждена; дефект открыт.', activeTask: 'm2', closedTopics: '',
+        notes: Object.fromEntries(archive.coverageRefSet.map(ref => [ref, `Сохранить источник ${ref}.`])),
+        verbatim: Object.fromEntries(archive.coverageRefSet.map(ref => [ref, !covered && ['m0', 'm2', 'm8'].includes(ref)])) });
+      else {
+        const sourceUpdates = Object.fromEntries(archive.messages.filter(item => item.role === 'user').map(item => [item.sourceRef, 'none']));
+        if (!covered) {
+          const evidence = semanticReviewEvidenceIndex(archiveText);
+          const proof = Object.keys(evidence).find(id => evidence[id]!.sourceRef === 'm6')!;
+          sourceUpdates.m6 = `closes:${proof}:m4,m5`;
+        }
+        answer = JSON.stringify({ sourceUpdates, activeTask: 'm2', unresolvedDefects: '', classifications: Object.fromEntries(archive.coverageRefSet.map(ref =>
+          [ref, ref === 'm0' || ref === 'm10' ? 'constraint' : ref === 'm2' ? 'openWork' : ref === 'm8' ? 'defect' : ref === 'm12' ? 'fact' : 'drop'])) });
+        assert.ok(Buffer.byteLength(answer) <= 4096);
+      }
+      yield { type: 'text-delta', text: answer }; yield { type: 'completed' };
+    }), tools: testTools, compactionEnabled: true,
+    prepareTurn: async turn => {
+      const detail = await store.getChat(chat.id), prefix = await store.getCompactionPrefix(chat.id, turn.compactBoundaryMessageId);
+      const context = buildNextTurnContext({ globalText: '', messages: prefix.messages, compactSnapshot: detail.compactSnapshot,
+        modelId: turn.modelId, permissionProfile: turn.permissionProfile, usageKind: 'compaction', compactionFormat: 'semantic',
+        functionCallMode: 'none', compactionToolReceipts: [], compactionArtifacts: [] });
+      return { request: context.request, compaction: { boundaryMessageId: turn.compactBoundaryMessageId!, coveredThroughMessageId: prefix.coveredThroughMessageId,
+        coveredPrefixHash: prefix.coveredPrefixHash, expectedSnapshotId: turn.compactExpectedSnapshotId ?? null, provenance: 'fixture', sources: context.compactionSources! } };
+    },
+    preflightProviderRequest: async (_turn, request, signal, _owner, reservation) => {
+      const estimate = await estimateProviderPromptTokens(request, async (_model, texts) => texts.map(text => Buffer.byteLength(text)), signal);
+      assert.equal(estimate.status, 'complete'); assert.ok(liteHardInputLimit(request, estimate) !== null);
+      if (reservation) { const budget = reserveSemanticReviewInput(request, estimate, reservation.additionalInputTokenReserve); assert.ok(budget); return budget; }
+      assert.equal(isLitePromptOverMeasuredInputGuard(request, estimate), false);
+      return { inputTokens: estimate.tokens! };
+    },
+    consumeTurn: (turn, signal) => store.consumeTurnReservation(turn, signal), releaseTurn: turn => store.releaseTurnReservation(turn.turnId),
+    persistTurnRecord: turn => store.updateRuntimeTurn(turn), recordUsageReceipt: receipt => store.recordUsageReceipt(receipt),
+    appendAssistant: async () => assert.fail('A compact result must not become an assistant message.'),
+    appendCompaction: async (_turn, text, signal, prefix, terminal) => {
+      assert.equal(prefix.expectedSnapshotId, previousSnapshot?.id ?? null);
+      await store.commitCompactSnapshot(chat.id, { id: `rolling-fixture-${++commits}`, version: 2, boundaryMessageId: prefix.boundaryMessageId,
+        coveredThroughMessageId: prefix.coveredThroughMessageId, coveredPrefixHash: prefix.coveredPrefixHash, text,
+        modelId: 'GigaChat-3-Lightning', provenance: 'fixture', createdAt: new Date().toISOString() }, prefix.expectedSnapshotId, signal, terminal);
+    },
+  });
+  for (let cycle = 1; cycle <= 3; cycle++) {
+    if (cycle > 1) await appendPair(cycle === 2 ? 'До отдельного согласования разрешено только чтение; запись запрещена.' : 'Версия формата пока не подтверждена; согласование ожидается.');
+    const before = await store.getChat(chat.id), anchor = before.messages[before.messages.length - 2]!.id;
+    const { turn } = await store.acceptCompactionTurn(chat.id, `rolling-compact-${cycle}`, anchor);
+    assert.ok(runtime.enqueueCompaction(turn)); await runtime.whenIdle();
+    assert.equal(runtime.list(chat.id)[cycle - 1]?.status, 'completed');
+    store = await openStore(directory);
+    const detail = await store.getChat(chat.id);
+    assert.deepEqual(detail.messages, before.messages);
+    assert.equal(detail.compactSnapshot?.id, `rolling-fixture-${cycle}`);
+    const memory = JSON.parse(detail.compactSnapshot!.text) as SemanticCompactionMemory;
+    assert.equal(memory.activeTask?.text, task);
+    assert.equal(memory.constraints.find(entry => entry.sourceRefs.includes('m0'))?.text, policy);
+    assert.equal(memory.unresolvedDefects?.[0]?.exactQuotes?.map(quote => quote.text).join(' '), defect);
+    assert.deepEqual(memory.closedTopics?.[0]?.sourceRefs, ['m4', 'm5']);
+    const active = [memory.activeTask!, ...memory.constraints, ...memory.decisions, ...memory.openWork, ...memory.facts];
+    assert.ok(active.every(entry => entry.sourceRefs.every(ref => !['m4', 'm5'].includes(ref))));
+    assert.ok(Buffer.byteLength(detail.compactSnapshot!.text) <= 32768);
+    const question = { id: `rolling-continuation-${cycle}`, role: 'user' as const, text: 'Продолжи текущую проверку.', createdAt: new Date().toISOString() };
+    const next = buildNextTurnContext({ globalText: '', messages: [...detail.messages, question], compactSnapshot: detail.compactSnapshot,
+      modelId: detail.modelId, permissionProfile: 'ask', functionCallMode: 'none', compactionToolReceipts: [], compactionArtifacts: [] });
+    assert.deepEqual(next.request.messages.map(message => message.id), [question.id]);
+    assert.doesNotMatch(serializeProviderTurnRequest(next.request).body, /RAW-OLD-DETAIL-47/);
+    previousSnapshot = detail.compactSnapshot!; covered = detail.messages.length;
+  }
+  assert.equal(commits, 3); assert.equal(requests.length, 6);
 });
 
 test('keeps production compaction disabled and refuses unexpected summarizer function calls', async () => {
