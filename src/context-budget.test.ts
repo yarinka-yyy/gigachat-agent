@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ContextBudgetInput, ContextBudgetMeasure } from './context-budget';
 import { calculateContextBudget, calculateLiteWorkingBudget, isLitePromptOverMeasuredInputGuard, liteHardInputLimit,
-  LITE_OPERATIONAL_PROFILE, withLiteNormalOutputCap } from './context-budget';
+  LITE_OPERATIONAL_PROFILE, reserveSemanticReviewInput, withLiteNormalOutputCap } from './context-budget';
+import type { ContextPromptEstimate } from './contracts';
 
 function measure(tokens: number | null, confidence: ContextBudgetMeasure['confidence'] = 'documented'): ContextBudgetMeasure {
   return { tokens, confidence };
@@ -19,6 +20,25 @@ function input(overrides: Partial<ContextBudgetInput> = {}): ContextBudgetInput 
     ...overrides,
   };
 }
+
+test('reserves review headroom within the measured input guard without assuming draft size', () => {
+  const request = { modelId: 'GigaChat-3-Lightning', usageKind: 'compaction' as const, compactionFormat: 'semantic' as const, maxOutputTokens: 4096 };
+  const estimate: ContextPromptEstimate = { status: 'complete', tokens: 90_000, knownTokens: 90_000,
+    provenance: 'estimated', wireMessageCount: 38, functionCallCount: 0, unknownReasons: [] };
+  const limit = liteHardInputLimit(request, estimate)!;
+  assert.ok(estimate.tokens! + 32768 > limit);
+  assert.deepEqual(reserveSemanticReviewInput(request, estimate, 32768), { inputTokens: 90_000, maxInputTokens: limit });
+  assert.deepEqual(reserveSemanticReviewInput(request, { ...estimate, tokens: 20_000 }, 32768), { inputTokens: 20_000, maxInputTokens: 52_768 });
+  assert.deepEqual(reserveSemanticReviewInput(request, { ...estimate, tokens: limit - 1 }, 32768), { inputTokens: limit - 1, maxInputTokens: limit });
+  for (const tokens of [limit, limit + 1, -1, NaN, null]) assert.equal(reserveSemanticReviewInput(request, { ...estimate, tokens }, 32768), null);
+  for (const maximum of [0, -1, NaN, Number.MAX_SAFE_INTEGER]) assert.equal(reserveSemanticReviewInput(request, estimate, maximum), null);
+  for (const changed of [{ ...estimate, status: 'partial' as const }, { ...estimate, provenance: 'unknown' as const },
+    { ...estimate, unknownReasons: ['tokenizer-unavailable' as const] }, { ...estimate, wireMessageCount: 2051 }]) {
+    assert.equal(reserveSemanticReviewInput(request, changed, 32768), null);
+  }
+  for (const modelId of ['GigaChat-3-Pro', 'GigaChat-2-Max', 'GigaChat-3-Ultra']) assert.equal(reserveSemanticReviewInput({ ...request, modelId }, estimate, 32768), null);
+  assert.equal(reserveSemanticReviewInput({ ...request, usageKind: 'chat' }, estimate, 32768), null);
+});
 
 test('uses the smaller of chat and compaction capacity, then deducts the reserve', () => {
   assert.deepEqual(calculateContextBudget(input()), {

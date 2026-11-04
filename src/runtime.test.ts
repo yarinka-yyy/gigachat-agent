@@ -964,6 +964,7 @@ test('semantic compaction reviews once on the selected model and accounts for bo
           assert.equal(request.messages.length, 3);
         }
         preflights.push(request);
+        return reservation ? { inputTokens: 90000, maxInputTokens: 100000 } : { inputTokens: requests.length === 1 ? 100000 : 10 };
       },
       consumeTurn: async () => undefined, releaseTurn: () => undefined,
       appendAssistant: async () => { assert.fail('a compact candidate must not become a visible assistant reply'); },
@@ -1000,8 +1001,8 @@ test('semantic compaction reviews once on the selected model and accounts for bo
 });
 
 test('semantic failures keep the previous checkpoint and never retry the draft or review', async (t) => {
-  for (const fault of ['missing-preflight', 'reserve-budget', 'reserve-mutation', 'model-switch', 'changed-archive', 'changed-service-task', 'invalid-draft', 'invalid-review',
-    'missing-source-note', 'unquoted-review', 'review-budget', 'review-network', 'review-cancel', 'unexpected-function'] as const) await t.test(fault, async () => {
+  for (const fault of ['missing-preflight', 'reserve-budget', 'reserve-mutation', 'missing-reserve-budget', 'zero-reserve-budget', 'invalid-reserve-budget', 'excessive-reserve-budget', 'model-switch', 'changed-archive', 'changed-service-task', 'invalid-draft', 'invalid-review',
+    'missing-source-note', 'unquoted-review', 'review-budget', 'missing-review-count', 'invalid-review-count', 'review-reserve-exceeded', 'review-network', 'review-cancel', 'unexpected-function'] as const) await t.test(fault, async () => {
     const input = { ...compactionTurnFor(`semantic-fault-${fault}`), modelId: 'GigaChat-3-Lightning' };
     const memory = JSON.stringify({ format: 'gigachat-semantic-memory', version: 1,
       activeTask: { text: 'Keep the current task.', sourceRefs: ['m0'] }, constraints: [], decisions: [], openWork: [], facts: [], pastTopics: [] });
@@ -1033,9 +1034,14 @@ test('semantic failures keep the previous checkpoint and never retry the draft o
           assert.equal(reservation.additionalInputTokenReserve, 32768);
           if (fault === 'reserve-budget') throw Object.assign(new Error('reserve over budget'), { category: 'context' });
           if (fault === 'reserve-mutation') _request.messages[0]!.text += 'tampered';
-          return;
+          if (fault === 'missing-reserve-budget') return;
+          return { inputTokens: 10, maxInputTokens: fault === 'zero-reserve-budget' ? 10 : fault === 'invalid-reserve-budget' ? NaN
+            : fault === 'excessive-reserve-budget' ? 32779 : 32778 };
         }
         if (++preflights === 2 && fault === 'review-budget') throw Object.assign(new Error('over budget'), { category: 'context' });
+        if (preflights === 2 && fault === 'missing-review-count') return;
+        return { inputTokens: preflights === 2 && fault === 'review-reserve-exceeded' ? 32779
+          : preflights === 2 && fault === 'invalid-review-count' ? NaN : 10 };
       } }),
       consumeTurn: async () => undefined, releaseTurn: () => undefined,
       appendAssistant: async () => { assert.fail('no assistant append'); },
@@ -1046,8 +1052,8 @@ test('semantic failures keep the previous checkpoint and never retry the draft o
     await runtime.whenIdle();
     assert.equal(saves, 0);
     assert.equal(runtime.list()[0]?.status, fault === 'review-cancel' ? 'cancelled' : 'failed');
-    assert.equal(calls, ['missing-preflight', 'reserve-budget', 'reserve-mutation', 'model-switch', 'changed-archive', 'changed-service-task'].includes(fault) ? 0
-      : ['invalid-draft', 'missing-source-note', 'review-budget', 'unexpected-function'].includes(fault) ? 1 : 2);
+    assert.equal(calls, ['missing-preflight', 'reserve-budget', 'reserve-mutation', 'missing-reserve-budget', 'zero-reserve-budget', 'invalid-reserve-budget', 'excessive-reserve-budget', 'model-switch', 'changed-archive', 'changed-service-task'].includes(fault) ? 0
+      : ['invalid-draft', 'missing-source-note', 'review-budget', 'missing-review-count', 'invalid-review-count', 'review-reserve-exceeded', 'unexpected-function'].includes(fault) ? 1 : 2);
   });
 });
 

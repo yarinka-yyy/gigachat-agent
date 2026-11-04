@@ -7,7 +7,7 @@ import { openStore, type LocalStore } from './store';
 import { assertCompactionWireReduction, COMPACTION_QUALITY_VERIFIED, COMPACTION_UNAVAILABLE_REASON, COMPACTION_TASK_INSTRUCTION,
   buildNextTurnContext, countEstimatedContextTextTokens, createContextTextTokenCache, estimateProviderPromptTokens,
   validateCompactSummary } from './context';
-import { isLitePromptOverMeasuredInputGuard, liteHardInputLimit, LITE_OPERATIONAL_PROFILE } from './context-budget';
+import { isLitePromptOverMeasuredInputGuard, liteHardInputLimit, LITE_OPERATIONAL_PROFILE, reserveSemanticReviewInput } from './context-budget';
 import { createContextPreview } from './context-preview';
 import { createLocalTextTokenCounter } from './local-tokenizer';
 import { createLocalTools, createPowerShellHelper, resolvePowerShellHelperPath } from './local-tools';
@@ -961,12 +961,16 @@ async function createMainRuntime(
         || liteHardInputLimit(request, estimate) === null)) {
         throw Object.assign(new Error('Бюджет semantic-запроса не подтверждён для выбранной модели; сжатие не отправлено.'), { category: 'context' as const });
       }
-      const reservedEstimate = reservation && estimate.tokens !== null
-        ? { ...estimate, tokens: estimate.tokens + reservation.additionalInputTokenReserve } : estimate;
-      if (request.modelId === LITE_OPERATIONAL_PROFILE.modelId && isLitePromptOverMeasuredInputGuard(request, reservedEstimate)) {
+      if (reservation) {
+        const budget = reserveSemanticReviewInput(request, estimate, reservation.additionalInputTokenReserve);
+        if (!budget) throw Object.assign(new Error('COMPACTION_REVIEW_BUDGET_UNAVAILABLE'), { category: 'context' as const });
+        return budget;
+      }
+      if (request.modelId === LITE_OPERATIONAL_PROFILE.modelId && isLitePromptOverMeasuredInputGuard(request, estimate)) {
         throw Object.assign(new Error('Контекст запроса превышает проверенный безопасный предел GigaChat Lite. Уменьшите запрос или историю и повторите ход.'),
           { category: 'context' as const });
       }
+      if (estimate.tokens !== null) return { inputTokens: estimate.tokens };
     },
     consumeTurn: (turn: AcceptedTurnInput, signal) => store.consumeTurnReservation(turn, signal),
     releaseTurn: (turn) => store.releaseTurnReservation(turn.turnId),

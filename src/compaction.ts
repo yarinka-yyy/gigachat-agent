@@ -164,7 +164,7 @@ export function semanticSourceNotesResponseFormat(sourceRefs: readonly string[],
 }
 
 export function semanticReviewInputReserve(): number {
-  // Review contains the bounded draft once; its archive and schema are already known.
+  // Maximum allowance; preflight may allocate less headroom and must check the exact review against it.
   return MAX_COMPACT_SUMMARY_BYTES;
 }
 

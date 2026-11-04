@@ -203,6 +203,22 @@ export function isLitePromptOverMeasuredInputGuard(
     && estimate.tokens! > inputLimit;
 }
 
+export function reserveSemanticReviewInput(
+  request: Pick<ProviderTurnRequest, 'modelId' | 'usageKind' | 'compactionFormat' | 'maxOutputTokens'>,
+  estimate: ContextPromptEstimate,
+  maximumDraftReserve: number,
+): { inputTokens: number; maxInputTokens: number } | null {
+  if (request.usageKind !== 'compaction' || request.compactionFormat !== 'semantic'
+    || estimate.status !== 'complete' || estimate.provenance !== 'estimated' || estimate.unknownReasons.length
+    || !Number.isSafeInteger(estimate.tokens) || estimate.tokens! < 0
+    || !Number.isSafeInteger(maximumDraftReserve) || maximumDraftReserve <= 0
+    || !Number.isSafeInteger(estimate.tokens! + maximumDraftReserve)) return null;
+  const limit = liteHardInputLimit(request, estimate);
+  if (limit === null || estimate.tokens! >= limit) return null;
+  // The exact review must later fit this ceiling; an oversized draft is rejected, never truncated.
+  return { inputTokens: estimate.tokens!, maxInputTokens: Math.min(limit, estimate.tokens! + maximumDraftReserve) };
+}
+
 type ParsedMeasure =
   | { status: 'known'; tokens: number; confidence: KnownConfidence }
   | { status: 'unknown' }

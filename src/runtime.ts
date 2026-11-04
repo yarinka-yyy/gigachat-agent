@@ -77,8 +77,8 @@ export interface TurnRuntimeOptions {
   prepareProviderRequest?(turn: AcceptedTurnInput, request: ProviderTurnRequest, signal: AbortSignal,
     providerStateOwner?: ProviderStateOwner): Promise<ProviderTurnRequest>;
   preflightProviderRequest?(turn: AcceptedTurnInput, request: ProviderTurnRequest, signal: AbortSignal,
-    // Reservation is a conservative byte-level token bound for the canonical candidate, in addition to the review envelope.
-    providerStateOwner?: ProviderStateOwner, reservation?: { additionalInputTokenReserve: number }): Promise<void>;
+    // Reservation returns an enforced input ceiling; exact semantic review returns its measured input count.
+    providerStateOwner?: ProviderStateOwner, reservation?: { additionalInputTokenReserve: number }): Promise<void | { inputTokens: number; maxInputTokens?: number }>;
   assertProviderStateOwner?(providerStateOwner: ProviderStateOwner | undefined, signal: AbortSignal): void;
   consumeTurn(turn: AcceptedTurnInput, signal: AbortSignal): Promise<void>;
   releaseTurn(turn: AcceptedTurnInput): void;
@@ -918,6 +918,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       let semanticArchiveText: string | undefined;
       let semanticNotes: string | undefined;
       let semanticReviewStarted = false;
+      let semanticReviewInputLimit: number | null = null;
       let providerStateOwner: ProviderStateOwner | undefined;
       let imageGeneration: AsyncIterable<ProviderEvent> | null = null;
       if (typeof prepared === 'object' && prepared !== null && 'request' in prepared) {
@@ -990,7 +991,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
             const preflight = Promise.resolve().then(() =>
               options.preflightProviderRequest!(turn.input, checkedRequest, controller.signal, providerStateOwner,
                 checkedRequest === reservedReview ? { additionalInputTokenReserve: semanticReviewInputReserve() } : undefined));
-            await waitTracked(
+            const budget = await waitTracked(
               preflight,
               operationTimeoutMs,
               'PROMPT_PREFLIGHT_TIMEOUT',
@@ -1003,6 +1004,17 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
             catch { /* Unserializable mutation is rejected below. */ }
             if (request !== requestBeforePreflight || !unchanged) {
               throw Object.assign(new Error('Контекст запроса изменился во время проверки; ход не отправлен.'), { category: 'context' as const });
+            }
+            if (checkedRequest === reservedReview) {
+              if (!budget || !Number.isSafeInteger(budget.inputTokens) || budget.inputTokens < 0
+                || !Number.isSafeInteger(budget.maxInputTokens) || budget.maxInputTokens! <= budget.inputTokens
+                || budget.maxInputTokens! - budget.inputTokens > semanticReviewInputReserve()) {
+                throw Object.assign(new Error('COMPACTION_REVIEW_BUDGET_UNAVAILABLE'), { category: 'context' as const });
+              }
+              semanticReviewInputLimit = budget.maxInputTokens!;
+            } else if (semanticReviewStarted && (!budget || !Number.isSafeInteger(budget.inputTokens) || budget.inputTokens < 0
+              || semanticReviewInputLimit === null || budget.inputTokens > semanticReviewInputLimit)) {
+              throw Object.assign(new Error('COMPACTION_REVIEW_RESERVE_EXCEEDED'), { category: 'context' as const });
             }
           }
         }
