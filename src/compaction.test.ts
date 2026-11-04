@@ -704,7 +704,7 @@ test('topic closure removes all its details and defect state survives compilatio
 });
 
 test('rolling reclassification retains accepted facts and quotes only available prior literals', () => {
-  const literal = 'The copy check passed on build 2.8.';
+  const literal = 'The copy check passed on build 2.8. The report may name ownerCode, never expose its values.';
   const fact = 'The checksum is unchanged; the upload was not attempted.';
   const sources = createCompactionSources([user('decision', `${literal} HIDDEN-OLD-DETAIL-63`), user('fact', fact), assistant('ack', 'Noted.'), user('suffix', 'Continue the investigation.')], [], []);
   const prior = { format: 'gigachat-semantic-memory' as const, version: 1 as const, activeTask: null, constraints: [],
@@ -721,11 +721,14 @@ test('rolling reclassification retains accepted facts and quotes only available 
   assert.deepEqual(memory.facts.find((entry: { sourceRefs: string[] }) => entry.sourceRefs.includes('m0')).exactQuotes, [{ sourceRef: 'm0', text: literal }]);
   assert.deepEqual(memory.facts.find((entry: { sourceRefs: string[] }) => entry.sourceRefs.includes('m1')), prior.facts[0], 'a category change cannot silently remove an accepted observation or its proof');
   assert.ok(!memory.decisions.some((entry: { sourceRefs: string[] }) => entry.sourceRefs.includes('m1')), 'reclassifying an unchanged fact must not create a second decision copy');
+  const retainedDecision = compile(archive, { ...selection, classifications: { ...selection.classifications, m0: 'decision' } });
+  assert.equal(retainedDecision.decisions.find((entry: { sourceRefs: string[] }) => entry.sourceRefs.includes('m0')).text, literal, 'false draft exactness cannot rewrite a prior primary decision or its exceptions');
   assert.doesNotMatch(JSON.stringify(memory), /HIDDEN-OLD-DETAIL-63/);
   assert.throws(() => compile(archive, { ...selection, classifications: { ...selection.classifications, m1: 'drop' } }), /Критичный/);
   const schema = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${notes}`).schema;
   assert.ok('classifications' in schema.properties);
   assert.ok(!schema.properties.classifications.properties.m1!.enum.includes('drop'));
+  assert.ok(!schema.properties.classifications.properties.m0!.enum.includes('drop'));
   const paraphraseArchive = serializeSemanticCompactionTranscript(sources, { ...prior, decisions: [{ text: 'All checks have passed.', sourceRefs: ['m0'] }] }, 3);
   assert.throws(() => compile(paraphraseArchive), /дословное основание/, 'a prior paraphrase cannot be relabelled as literal evidence');
 });

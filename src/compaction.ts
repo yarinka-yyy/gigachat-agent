@@ -447,7 +447,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
   if (active.some(ref => closed.has(ref) || superseded.has(ref))) throw new Error('Активная задача не может ссылаться на закрытый или заменённый источник.');
   if (draft.activeTask !== 'none' && !active.length && !closed.has(draft.activeTask) && !superseded.has(draft.activeTask)) throw new Error('Review не может стереть активную задачу без подтверждённого закрытия.');
   const protectedRefs = new Set([...userRefs, ...(previous?.activeTask?.sourceRefs ?? []),
-    ...(previous?.constraints ?? []).flatMap(entry => entry.sourceRefs), ...(previous?.facts ?? []).flatMap(entry => entry.sourceRefs), ...(previous?.openWork ?? []).flatMap(entry => entry.sourceRefs), ...(previous?.assistantReports ?? []).flatMap(entry => entry.sourceRefs)]);
+    ...(previous?.constraints ?? []).flatMap(entry => entry.sourceRefs), ...(previous?.decisions ?? []).flatMap(entry => entry.sourceRefs), ...(previous?.facts ?? []).flatMap(entry => entry.sourceRefs), ...(previous?.openWork ?? []).flatMap(entry => entry.sourceRefs), ...(previous?.assistantReports ?? []).flatMap(entry => entry.sourceRefs)]);
   if (sourceRefs.some(ref => protectedRefs.has(ref) && classes[ref] === 'drop' && !active.includes(ref)
     && !closed.has(ref) && !superseded.has(ref) && !closureOnly.has(ref))) throw new Error('Критичный первичный источник нельзя отбросить без подтверждённого закрытия или замены.');
   if (assistantRefs.some(ref => verbatim[ref] && (selection.assistantOrigins as Record<string, unknown>)[ref] === 'self' && classes[ref] === 'drop'
@@ -540,7 +540,7 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
     ? evidenceIds.filter(id => evidenceIndex[id]!.sourceRef === ref) : []]));
   const reportRefs = new Set((archive.previousMemory?.assistantReports ?? []).flatMap(entry => entry.sourceRefs));
   const protectedRefs = [...new Set([...userRefs, ...(archive.previousMemory?.activeTask?.sourceRefs ?? []),
-    ...(archive.previousMemory?.constraints ?? []).flatMap(entry => entry.sourceRefs), ...(archive.previousMemory?.facts ?? []).flatMap(entry => entry.sourceRefs), ...(archive.previousMemory?.openWork ?? []).flatMap(entry => entry.sourceRefs), ...reportRefs])];
+    ...(archive.previousMemory?.constraints ?? []).flatMap(entry => entry.sourceRefs), ...(archive.previousMemory?.decisions ?? []).flatMap(entry => entry.sourceRefs), ...(archive.previousMemory?.facts ?? []).flatMap(entry => entry.sourceRefs), ...(archive.previousMemory?.openWork ?? []).flatMap(entry => entry.sourceRefs), ...reportRefs])];
   const withSources = (choices: Record<string, string[]>) => Object.fromEntries(Object.entries(choices).map(([key, ids]) => [key, ids.map(id => `${evidenceIndex[id]!.sourceRef}/${id}`)]));
   const assistantOrigins = Object.fromEntries(archive.messages.filter(source => source.role === 'assistant').map(source => [source.sourceRef, userRefs.filter(ref => Number(ref.slice(1)) < Number(source.sourceRef.slice(1)))]));
   const topicWitnesses = Object.fromEntries(Object.entries(topicEvidence).map(([scope, ids]) => [scope, ids.map(id => topicWitnessAddress(id, evidenceIndex[id]!))]));
