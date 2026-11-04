@@ -585,7 +585,7 @@ test('both semantic wire requests preserve source distinctions for all four sele
     const candidate = JSON.stringify({ taskSubject: 'Current task', state: 'Current task.', activeTask: 'm2', closedTopics: '', notes: { m0: 'Do not publish ownerCode.', m1: 'Read may be permitted.', m2: 'Copy validated.' }, verbatim: { m0: true, m1: true, m2: true } });
     const review = buildSemanticCompactionReviewRequest(context.request, sources, getSemanticCompactionCoverageRefSet(sources), candidate);
     assert.ok(review);
-    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ activeTask: 'm2', classifications: { m0: 'constraint', m1: 'drop', m2: 'fact' }, unresolvedDefects: '' }),
+    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ sourceUpdates: { m0: 'none', m2: 'none' }, activeTask: 'm2', classifications: { m0: 'constraint', m1: 'drop', m2: 'fact' }, unresolvedDefects: '' }),
     candidate, sources, getSemanticCompactionCoverageRefSet(sources), context.request.messages[0]!.text));
     assert.deepEqual(compiled.decisions, []);
     assert.equal(compiled.constraints[0].text, messages[0]!.text);
@@ -629,7 +629,7 @@ test('all four semantic models close subtopics while retaining interleaved work 
     assert.equal(wire.model_options.response_format.type, 'json_schema');
     const index = semanticReviewEvidenceIndex(context.request.messages[0]!.text);
     const proof = Object.keys(index).find(id => index[id]!.sourceRef === 'm4');
-    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ activeTask: 'm5', classifications: { m0: 'constraint', m1: `closed:${proof}`, m2: `closed:${proof}`, m3: 'openWork', m4: 'drop', m5: 'openWork', m6: 'defect' },
+    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ sourceUpdates: { m0: 'none', m1: 'none', m3: 'none', m4: `closes:${proof}:m1,m2`, m5: 'none', m6: 'none' }, activeTask: 'm5', classifications: { m0: 'constraint', m1: 'fact', m2: 'decision', m3: 'openWork', m4: 'drop', m5: 'openWork', m6: 'defect' },
       unresolvedDefects: Object.keys(index).filter(id => index[id]!.sourceRef === 'm6').join(',') }),
     candidate, sources, refs, context.request.messages[0]!.text));
     assert.deepEqual(compiled.facts.map((entry: { sourceRefs: string[] }) => entry.sourceRefs), [['m6']]);
@@ -723,10 +723,11 @@ test('builds an independent semantic review from the exact current archive and a
   for (const record of records) {
     const ref = record.sourceRef as string;
     assert.deepEqual(record.review, { note: notes[ref], verbatim: verbatim[ref],
-      evidenceRefs: Object.keys(quoteIndex).filter(id => quoteIndex[id]!.sourceRef === ref) });
+      evidence: Object.fromEntries(Object.entries(quoteIndex).filter(([, quote]) => quote.sourceRef === ref).map(([id, quote]) => [id, quote.text])) });
   }
   const metadata = decode(wire.messages[2]!.content[0]!.text!);
-  assert.deepEqual(metadata.sourceReviews, { t0: { note: notes.t0, verbatim: verbatim.t0, evidenceRefs: Object.keys(quoteIndex).filter(id => quoteIndex[id]!.sourceRef === 't0') } });
+  assert.deepEqual(metadata.sourceReviews, { t0: { note: notes.t0, verbatim: verbatim.t0, evidence: Object.fromEntries(Object.entries(quoteIndex).filter(([, quote]) => quote.sourceRef === 't0').map(([id, quote]) => [id, quote.text])) } });
+  assert.equal(metadata.evidenceIndex, undefined, 'literal evidence is local to its source, not duplicated in a distant index');
   assert.equal(wire.messages[wire.messages.length - 1]?.content[0]?.text, review.messages[review.messages.length - 1]?.text);
   assert.equal(wire.tool_config.mode, 'none');
   assert.equal(wire.tools, undefined);
