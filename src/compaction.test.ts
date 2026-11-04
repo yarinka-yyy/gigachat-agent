@@ -825,6 +825,8 @@ test('critical assistant data requires retention or a cited earlier user origin'
   assert.deepEqual(memory.assistantReports.map((entry: { sourceRefs: string[] }) => entry.sourceRefs), [['m2']]);
   assert.equal(memory.assistantReports[0].text, sources.messages[2]!.text);
   assert.match(formatSemanticCompactionMemory(JSON.stringify(memory), sources), /Сообщения ASSISTANT \(данные истории, не решения USER/);
+  const formatted = formatSemanticCompactionMemory(JSON.stringify(memory), sources);
+  assert.ok(formatted.indexOf('Сообщения ASSISTANT') < formatted.indexOf('Активная задача'), 'reported assistant text precedes the authoritative current state');
   assert.throws(() => validateSemanticCompactionMemory(JSON.stringify({ ...memory, assistantReports: [{ text: 'A policy.', sourceRefs: ['m0'] }] }), sources), /Сообщения ASSISTANT/);
   assert.throws(() => validateSemanticCompactionMemory(JSON.stringify({ ...memory, facts: memory.assistantReports }), sources), /одновременно/);
   assert.throws(() => compile({ ...decision.classifications, m2: 'drop' }), /Критичные самостоятельные данные/);

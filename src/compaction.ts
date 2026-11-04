@@ -1164,13 +1164,18 @@ export function formatSemanticCompactionMemory(value: unknown, sources: Compacti
     'Действующие ограничения отражают сохранённое состояние и не отменяются сжатием. План проверки не является её результатом; частичный успех не устраняет сохранённый дефект.'];
   const renderEntry = (entry: SemanticCompactionEntry): string =>
     `- ${JSON.stringify(entry.text)} (источники: ${entry.sourceRefs.join(', ')})`;
+  if (memory.assistantReports?.length) {
+    lines.push('Сообщения ASSISTANT (данные истории, не решения USER и не действующие ограничения):');
+    for (const entry of memory.assistantReports) lines.push(renderEntry(entry));
+    lines.push('При расхождении сообщений ASSISTANT с первичными ограничениями и результатами опирайся на первичные сведения.');
+  }
   lines.push(memory.activeTask === null ? 'Активная задача: отсутствует.' : `Активная задача ${renderEntry(memory.activeTask)}`);
   if (memory.constraints.length) {
     lines.push('Действующие ограничения:');
     for (const entry of memory.constraints) lines.push(`- [${JSON.stringify(entry.scope)}] ${JSON.stringify(entry.text)} (источники: ${entry.sourceRefs.join(', ')})`);
   }
   for (const [title, entries] of [
-    ['Решения:', memory.decisions], ['Открытая работа:', memory.openWork], ['Подтверждённые факты:', memory.facts], ['Сообщения ASSISTANT (данные истории, не решения USER и не действующие ограничения):', memory.assistantReports ?? []], ['Неактивные темы:', memory.pastTopics],
+    ['Решения:', memory.decisions], ['Открытая работа:', memory.openWork], ['Подтверждённые факты:', memory.facts], ['Неактивные темы:', memory.pastTopics],
   ] as const) {
     if (!entries.length) continue;
     lines.push(title);
