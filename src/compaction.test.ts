@@ -781,7 +781,7 @@ test('source state transitions override stale categories without dropping durabl
   const groupedSchema = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${grouped}`).schema;
   assert.ok('topicUpdates' in groupedSchema.properties);
   const witness = idsFor('m5')[0]!;
-  const wireWitness = `m5/${witness}`;
+  const wireWitness = `m5/${witness}: ${evidence[witness]!.text}`;
   assert.ok(groupedSchema.properties.topicUpdates.properties.Chart!.properties.evidence.enum.includes(wireWitness));
   assert.ok(!groupedSchema.properties.classifications.properties.m0!.enum.includes('drop'), 'a protected primary cannot be silently omitted even when the draft suggested a closed range');
   for (const proof of ['A fabricated closure.', evidence[idsFor('m0')[0]!]!.text, messages[3]!.text]) {
@@ -819,8 +819,12 @@ test('critical assistant data requires retention or a cited earlier user origin'
     classifications: { m0: 'constraint', m1: 'paraphrase:m0', m2: 'decision', m3: 'openWork' }, activeTask: 'm3', unresolvedDefects: '' };
   const compile = (classifications: Record<string, string>) => JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...decision, classifications }), notes, sources, refs, archive));
   const memory = compile(decision.classifications);
-  assert.deepEqual(memory.decisions.map((entry: { sourceRefs: string[] }) => entry.sourceRefs), [['m2']]);
-  assert.equal(memory.decisions[0].text, sources.messages[2]!.text);
+  assert.deepEqual(memory.decisions, []);
+  assert.deepEqual(memory.assistantReports.map((entry: { sourceRefs: string[] }) => entry.sourceRefs), [['m2']]);
+  assert.equal(memory.assistantReports[0].text, sources.messages[2]!.text);
+  assert.match(formatSemanticCompactionMemory(JSON.stringify(memory), sources), /Сообщения ASSISTANT \(данные истории, не решения USER/);
+  assert.throws(() => validateSemanticCompactionMemory(JSON.stringify({ ...memory, assistantReports: [{ text: 'A policy.', sourceRefs: ['m0'] }] }), sources), /Сообщения ASSISTANT/);
+  assert.throws(() => validateSemanticCompactionMemory(JSON.stringify({ ...memory, facts: memory.assistantReports }), sources), /одновременно/);
   assert.throws(() => compile({ ...decision.classifications, m2: 'drop' }), /Критичные самостоятельные данные/);
   for (const value of ['paraphrase', 'paraphrase:m1', 'paraphrase:m3', 'paraphrase:m999']) assert.throws(() => compile({ ...decision.classifications, m1: value }));
   const schema = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${notes}`).schema;
@@ -828,6 +832,15 @@ test('critical assistant data requires retention or a cited earlier user origin'
   assert.deepEqual(schema.properties.classifications.properties.m2!.enum, ['decision', 'paraphrase:m0']);
   const reserved = semanticCompactionResponseFormat(undefined, archive).schema;
   assert.ok('classifications' in reserved.properties && reserved.properties.classifications.properties.m2!.enum.includes('drop'), 'the unknown-mask reservation must include the larger classification enum');
+  const continuedSources = createCompactionSources([...sources.messages.map(source => ({ id: source.ref, role: source.role, text: source.text, createdAt: '2026-10-01T00:00:00.000Z' })), user('continue', 'Continue planning without operations.')], [], []);
+  const rollingArchive = serializeSemanticCompactionTranscript(continuedSources, memory, 4), rollingRefs = getSemanticCompactionCoverageRefSet(continuedSources, memory, 4);
+  const rollingNotes = JSON.stringify({ taskSubject: 'Test plan', state: 'Still open.', activeTask: 'm4', topics: [], notes: Object.fromEntries(rollingRefs.map(ref => [ref, 'An incomplete note.'])), verbatim: Object.fromEntries(rollingRefs.map(ref => [ref, false])) });
+  const rolling = { ...decision, activeTask: 'm4', sourceUpdates: Object.fromEntries(rollingRefs.map(ref => [ref, 'none'])), classifications: { m0: 'constraint', m2: 'decision', m3: 'openWork', m4: 'openWork' } };
+  const compileRolling = (classifications: Record<string, string>) => JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...rolling, classifications }), rollingNotes, continuedSources, rollingRefs, rollingArchive));
+  assert.deepEqual(compileRolling(rolling.classifications).assistantReports, memory.assistantReports, 'the report survives using previous memory, without replaying the source prefix');
+  assert.deepEqual(JSON.parse(rollingArchive.slice(rollingArchive.indexOf('\n') + 1)).messages.map((message: { sourceRef: string }) => message.sourceRef), ['m4']);
+  assert.throws(() => compileRolling({ ...rolling.classifications, m2: 'fact' }), /первичного источника/);
+  assert.throws(() => compileRolling({ ...rolling.classifications, m2: 'drop' }), /Критичный первичный/);
 });
 
 test('review witnesses retain short user instructions with their qualifications and bound long fragments', () => {
@@ -874,7 +887,7 @@ test('rolling review decisions retain previous tools without replaying their raw
   const schema = semanticCompactionResponseFormat(undefined, archive).schema;
   assert.ok('sourceUpdates' in schema.properties);
   assert.deepEqual(schema.properties.sourceUpdates.required, getSemanticCompactionCoverageRefSet(sources, previous, 64));
-  for (const [id, proof] of Object.entries(evidence)) assert.equal(Object.values(schema.properties.topicUpdates.properties)[0]!.properties.evidence.enum.includes(`${proof.sourceRef}/${id}`), proof.role === 'user' && Number(proof.sourceRef.slice(1)) >= 64);
+  for (const [id, proof] of Object.entries(evidence)) assert.equal(Object.values(schema.properties.topicUpdates.properties)[0]!.properties.evidence.enum.includes(`${proof.sourceRef}/${id}: ${proof.text}`), proof.role === 'user' && Number(proof.sourceRef.slice(1)) >= 64);
   assert.ok(schema.properties.sourceUpdates.properties.t0);
   assert.equal(schema.properties.sourceUpdates.properties.m2, undefined);
 });
