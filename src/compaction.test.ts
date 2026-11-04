@@ -701,7 +701,7 @@ test('topic closure removes all its details and defect state survives compilatio
   assert.ok('classifications' in closedSchema.properties && 'sourceUpdates' in closedSchema.properties);
   for (const ref of ['m1', 'm3']) {
     assert.deepEqual(closedSchema.properties.classifications.properties[ref]!.enum, ['drop']);
-    assert.equal(closedSchema.properties.sourceUpdates.properties[ref]!.pattern, '^(?:none)$');
+    assert.deepEqual(closedSchema.properties.sourceUpdates.properties[ref]!.enum, ['none']);
     assert.throws(() => compileResolvedSemanticCompactionMemory(reviewJson({ ...rollingResolution,
       sourceUpdates: { ...rollingResolution.sourceUpdates, [ref]: `closes:${Object.keys(rollingIndex).find(id => rollingIndex[id]!.sourceRef === 'm6')}` },
     }), rollingNotes, rollingSources, rollingRefs, rollingArchive), /Закрытый источник/);
@@ -849,20 +849,17 @@ test('source state transitions override stale categories without dropping durabl
   assert.ok('topicUpdates' in groupedSchema.properties);
   const witness = idsFor('m5')[0]!;
   const wireWitness = `m5/${witness}: ${evidence[witness]!.text}`;
-  const openProof = groupedSchema.properties.topicUpdates.properties.Chart!.anyOf[0]!.properties.evidence;
-  const closedProof = groupedSchema.properties.topicUpdates.properties.Chart!.anyOf[1]!.properties.evidence;
-  assert.ok('enum' in openProof && 'pattern' in closedProof);
-  assert.deepEqual(openProof.enum, ['none']);
-  assert.deepEqual(groupedSchema.properties.topicUpdates.properties.Chart!.anyOf[0]!.properties.closed.enum, [false]);
-  assert.ok(new RegExp(closedProof.pattern).test(wireWitness));
+  const closedProof = groupedSchema.properties.topicUpdates.properties.Chart!.properties.evidence;
+  assert.ok('maxLength' in closedProof);
+  assert.ok(wireWitness.length <= closedProof.maxLength);
+  assert.deepEqual(groupedSchema.properties.topicUpdates.properties.Chart!.properties.closed.enum, [false, true]);
+  assert.doesNotMatch(JSON.stringify(groupedSchema), /"(?:anyOf|pattern)":/);
   assert.ok(!groupedSchema.properties.classifications.properties.m0!.enum.includes('drop'), 'a protected primary cannot be silently omitted even when the draft suggested a closed range');
   for (const proof of ['A fabricated closure.', evidence[idsFor('m0')[0]!]!.text, messages[3]!.text]) {
     const invalid = JSON.stringify({ ...JSON.parse(grouped), topics: [{ subject: 'Chart', evidence: proof, firstSource: 'm1', lastSource: 'm3' }] });
     const schema = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${invalid}`).schema;
     assert.ok('topicUpdates' in schema.properties);
-    const proofSchema = schema.properties.topicUpdates.properties.Chart!.anyOf[1]!.properties.evidence;
-    assert.ok('pattern' in proofSchema);
-    assert.ok(new RegExp(proofSchema.pattern).test(wireWitness), 'untrusted draft evidence must remain correctable by independent review');
+    assert.deepEqual(schema.properties.topicUpdates.properties.Chart!.properties.closed.enum, [false, true], 'untrusted draft evidence must remain correctable by independent review');
     assert.deepEqual(JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...topicReview, topicUpdates: { Chart: `closes:${idsFor('m5')[0]}` } }), invalid, sources, refs, archive)), memory);
   }
   const decision = { evidence: ['m1', 'm6'].map(ref => `${ref}/${idsFor(ref)[0]}: ${evidence[idsFor(ref)[0]!]!.text}`),
@@ -921,7 +918,7 @@ test('critical assistant data requires retention or a cited earlier user origin'
   const endNotes = JSON.stringify({ ...JSON.parse(notes), topics: [{ subject: 'Unfinished last source', firstSource: 'm3', lastSource: 'm3', evidence: sources.messages[3]!.text }] });
   const endSchema = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${endNotes}`).schema;
   assert.ok('topicUpdates' in endSchema.properties);
-  assert.equal(endSchema.properties.topicUpdates.properties['Unfinished last source']!.anyOf.length, 1, 'without a later user witness the schema permits only the open branch');
+  assert.deepEqual(endSchema.properties.topicUpdates.properties['Unfinished last source']!.properties.closed.enum, [false], 'without a later user witness the schema permits only the open branch');
   const continuedSources = createCompactionSources([...sources.messages.map(source => ({ id: source.ref, role: source.role, text: source.text, createdAt: '2026-10-01T00:00:00.000Z' })), user('continue', 'Continue planning without operations.')], [], []);
   const rollingArchive = serializeSemanticCompactionTranscript(continuedSources, memory, 4), rollingRefs = getSemanticCompactionCoverageRefSet(continuedSources, memory, 4);
   const rollingNotes = JSON.stringify({ taskSubject: 'Test plan', state: 'Still open.', activeTask: 'm4', topics: [], notes: Object.fromEntries(rollingRefs.map(ref => [ref, 'An incomplete note.'])), verbatim: Object.fromEntries(rollingRefs.map(ref => [ref, false])) });
@@ -972,7 +969,7 @@ test('historical user requests retain text without becoming observed facts or pe
   assert.ok('classifications' in repeatedSchema.properties && 'sourceUpdates' in repeatedSchema.properties);
   assert.deepEqual(repeatedSchema.properties.classifications.properties.m6!.enum, ['request'], 'an identical known request does not become primary state on repetition');
   assert.ok(repeatedSchema.properties.classifications.properties.m7!.enum.includes('fact'), 'new asserted text must still receive independent review');
-  assert.doesNotMatch(repeatedSchema.properties.sourceUpdates.properties.m0!.pattern, /m6\//, 'a repeated request is not offered as closure or replacement evidence');
+  assert.ok(repeatedSchema.properties.sourceUpdates.properties.m0!.enum.every(value => !value.includes('m6/')), 'a repeated request is not offered as closure or replacement evidence');
   const repeated = { ...continued, sourceUpdates: Object.fromEntries(repeatedRefs.map(ref => [ref, 'none'])), classifications: { ...continued.classifications, m6: 'request', m7: 'fact' } };
   const compileRepeated = (category: string) => JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...repeated, classifications: { ...repeated.classifications, m6: category } }), draft(repeatedRefs), repeatedSources, repeatedRefs, repeatedArchive));
   assert.deepEqual(compileRepeated('request').historicalRequests.map((entry: { text: string }) => entry.text), [question, question]);
@@ -1002,8 +999,8 @@ test('review decision schema requires every source once and only later new user 
   const actual = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${notes}`).schema;
   assert.ok('sourceUpdates' in actual.properties && 'sourceUpdates' in reserved.properties);
   for (const ref of refs) {
-    assert.ok(!new RegExp(actual.properties.sourceUpdates.properties[ref]!.pattern).test('keep'));
-    assert.ok(new RegExp(reserved.properties.sourceUpdates.properties[ref]!.pattern).test('none'));
+    assert.ok(!actual.properties.sourceUpdates.properties[ref]!.enum.includes('keep'));
+    assert.ok(reserved.properties.sourceUpdates.properties[ref]!.enum.includes('none'));
   }
   assert.deepEqual(actual.properties.sourceUpdates.required, refs);
   assert.deepEqual(actual.properties.classifications.properties.m1!.enum, ['decision', 'paraphrase:m0', 'drop']);
@@ -1012,7 +1009,7 @@ test('review decision schema requires every source once and only later new user 
   assert.equal(reserved.properties.topicUpdates.required.length, 2);
   assert.ok(reserved.properties.topicUpdates.required.every(subject => subject.length === 80));
   for (const [id, proof] of Object.entries(evidence)) {
-    assert.equal(new RegExp(actual.properties.sourceUpdates.properties.m0!.pattern).test(`closes:${proof.sourceRef}/${id}`), proof.role === 'user' && Number(proof.sourceRef.slice(1)) > 0);
+    assert.equal(actual.properties.sourceUpdates.properties.m0!.enum.includes(`closes:${proof.sourceRef}/${id}`), proof.role === 'user' && Number(proof.sourceRef.slice(1)) > 0);
   }
   assert.equal(Object.keys(actual.properties)[0], 'evidence');
 });
@@ -1023,9 +1020,8 @@ test('rolling review decisions retain previous tools without replaying their raw
   const schema = semanticCompactionResponseFormat(undefined, archive).schema;
   assert.ok('sourceUpdates' in schema.properties);
   assert.deepEqual(schema.properties.sourceUpdates.required, getSemanticCompactionCoverageRefSet(sources, previous, 64));
-  const proofSchema = Object.values(schema.properties.topicUpdates.properties)[0]!.anyOf[1]!.properties.evidence;
-  assert.ok('pattern' in proofSchema);
-  for (const [id, proof] of Object.entries(evidence)) assert.equal(new RegExp(proofSchema.pattern).test(`${proof.sourceRef}/${id}: ${proof.text}`), proof.role === 'user' && Number(proof.sourceRef.slice(1)) >= 64);
+  assert.deepEqual(Object.values(schema.properties.topicUpdates.properties)[0]!.properties.closed.enum, [false, true]);
+  for (const [id, proof] of Object.entries(evidence)) assert.equal(schema.properties.sourceUpdates.properties.m0!.enum.includes(`closes:${proof.sourceRef}/${id}`), proof.role === 'user' && Number(proof.sourceRef.slice(1)) >= 64);
   assert.ok(schema.properties.sourceUpdates.properties.t0);
   assert.equal(schema.properties.sourceUpdates.properties.m2, undefined);
 });

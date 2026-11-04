@@ -177,27 +177,26 @@ const SEMANTIC_GLOBAL_REVIEW_FIELDS = ['evidence', 'topicUpdates', 'sourceUpdate
 const topicWitnessAddress = (id: string, proof: SemanticCompactionQuote): string => `${proof.sourceRef}/${id}: ${proof.text}`;
 
 function semanticReviewDecisionResponseFormat(refs: string[], primary: string[], retained: string[], protectedRefs: string[], updateEvidence: Record<string, string[]>, independentEvidence: Record<string, string[]>, topicEvidence: Record<string, string[]>, assistantOrigins: Record<string, string[]>, exactRefs: string[], requestRefs: string[], closedRefs: string[], witnesses: string[]) {
-  const quoteSchema = (choices: string[]) => ({ type: 'string', maxLength: MAX_SEMANTIC_QUOTE_BYTES + 64,
-    pattern: `^(?:${choices.map(choice => choice.slice(0, choice.indexOf(': '))).join('|')}): [\\s\\S]+$`,
+  const quoteSchema = { type: 'string', minLength: 1, maxLength: MAX_SEMANTIC_QUOTE_BYTES + 64,
     description: 'Copy the literal text from the matching sourceRef/qN evidence. The compiler verifies the complete address and exact text.',
-  });
+  };
   const category = (ref: string) => (closedRefs.includes(ref) ? ['drop'] : requestRefs.includes(ref) ? ['request'] : primary.includes(ref) || retained.includes(ref) || ref.startsWith('t') ? SOURCE_CLASSES
     : ['decision', ...(assistantOrigins[ref] ?? []).map(origin => `paraphrase:${origin}`), ...(exactRefs.includes(ref) ? [] : ['drop'])])
     .filter(value => (value !== 'request' || requestRefs.includes(ref) || primary.includes(ref) && !retained.includes(ref)) && (value !== 'drop' || !protectedRefs.includes(ref)));
   return { type: 'json_schema', strict: true, schema: { type: 'object', properties: {
-    evidence: { type: 'array', description: 'Only literal witnesses used by closes/supersedes/independent sourceUpdates. none, keep and classifications need no witness. Use [] when no source transitions are selected.', maxItems: Math.min(refs.length, witnesses.length), uniqueItems: true, items: quoteSchema(witnesses) },
-    topicUpdates: { type: 'object', properties: Object.fromEntries(Object.entries(topicEvidence).map(([scope, ids]) => [scope, { anyOf: [
-      { type: 'object', properties: { closed: { type: 'boolean', enum: [false] }, evidence: { type: 'string', enum: ['none'] } }, required: ['closed', 'evidence'], additionalProperties: false },
-      ...(ids.length ? [{ type: 'object', properties: { closed: { type: 'boolean', enum: [true] }, evidence: quoteSchema(ids) }, required: ['closed', 'evidence'], additionalProperties: false }] : []),
-    ] }])), required: Object.keys(topicEvidence), additionalProperties: false },
+    evidence: { type: 'array', description: 'Only literal witnesses used by closes/supersedes/independent sourceUpdates. none, keep and classifications need no witness. Use [] when no source transitions are selected.', maxItems: Math.min(refs.length, witnesses.length), uniqueItems: true, items: quoteSchema },
+    topicUpdates: { type: 'object', properties: Object.fromEntries(Object.entries(topicEvidence).map(([scope, ids]) => [scope, {
+      type: 'object', properties: { closed: { type: 'boolean', enum: ids.length ? [false, true] : [false] },
+        evidence: ids.length ? quoteSchema : { type: 'string', enum: ['none'] } }, required: ['closed', 'evidence'], additionalProperties: false,
+    }])), required: Object.keys(topicEvidence), additionalProperties: false },
     sourceUpdates: { type: 'object', properties: Object.fromEntries(refs.map(ref => [ref, { type: 'string', maxLength: 512,
-      pattern: `^(?:${['none', ...(retained.includes(ref) && protectedRefs.includes(ref) ? ['keep'] : []),
-        ...(independentEvidence[ref]!.length ? [`independent:(?:${independentEvidence[ref]!.join('|')})`] : []),
-        ...(updateEvidence[ref]!.length ? [`(?:closes|supersedes):(?:${updateEvidence[ref]!.join('|')})`] : [])].join('|')})$`,
+      enum: ['none', ...(retained.includes(ref) && protectedRefs.includes(ref) ? ['keep'] : []),
+        ...independentEvidence[ref]!.map(id => `independent:${id}`),
+        ...updateEvidence[ref]!.flatMap(id => [`closes:${id}`, `supersedes:${id}`])],
     }])), required: refs, additionalProperties: false },
     classifications: { type: 'object', properties: Object.fromEntries(refs.map(ref => [ref, { type: 'string', enum: category(ref) }])), required: refs, additionalProperties: false },
     activeTask: { type: 'string', enum: [...primary, 'none'] },
-    unresolvedDefects: { type: 'string', maxLength: 512, pattern: '^(?:(?:m|t)[0-9]+/q[0-9]+(?:,(?:m|t)[0-9]+/q[0-9]+)*(?:;(?:m|t)[0-9]+/q[0-9]+(?:,(?:m|t)[0-9]+/q[0-9]+)*)*)?$' },
+    unresolvedDefects: { type: 'string', maxLength: 512 },
   }, required: [...SEMANTIC_GLOBAL_REVIEW_FIELDS], additionalProperties: false } };
 }
 
