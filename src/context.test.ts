@@ -585,7 +585,7 @@ test('both semantic wire requests preserve source distinctions for all four sele
     const candidate = JSON.stringify({ taskSubject: 'Current task', state: 'Current task.', activeTask: 'm2', topics: [], notes: { m0: 'Do not publish ownerCode.', m1: 'Read may be permitted.', m2: 'Copy validated.' }, verbatim: { m0: true, m1: true, m2: true } });
     const review = buildSemanticCompactionReviewRequest(context.request, sources, getSemanticCompactionCoverageRefSet(sources), candidate);
     assert.ok(review);
-    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ topicUpdates: {}, assistantOrigins: { m1: 'self' }, sourceUpdates: { m0: 'none', m1: 'none', m2: 'none' }, activeTask: 'm2', classifications: { m0: 'constraint', m1: 'drop', m2: 'fact' }, unresolvedDefects: '' }),
+    const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ topicUpdates: {}, assistantOrigins: { m1: 'm0' }, sourceUpdates: { m0: 'none', m1: 'none', m2: 'none' }, activeTask: 'm2', classifications: { m0: 'constraint', m1: 'drop', m2: 'fact' }, unresolvedDefects: '' }),
     candidate, sources, getSemanticCompactionCoverageRefSet(sources), context.request.messages[0]!.text));
     assert.deepEqual(compiled.decisions, []);
     assert.equal(compiled.constraints[0].text, messages[0]!.text);
@@ -723,7 +723,7 @@ test('builds an independent semantic review from the exact current archive and a
   for (const record of records) {
     const ref = record.sourceRef as string;
     assert.deepEqual(record.review, {
-      categories: record.role === 'assistant' ? ['paraphrase', 'decision', 'drop'] : ['constraint', 'decision', 'openWork', 'fact', 'defect', 'drop'], topic: null, note: notes[ref], verbatim: verbatim[ref],
+      categories: record.role === 'assistant' ? ['decision', ...sources.messages.filter(source => source.role === 'user' && Number(source.ref.slice(1)) < Number(ref.slice(1))).map(source => `paraphrase:${source.ref}`), ...(verbatim[ref] ? [] : ['drop'])] : ['constraint', 'decision', 'openWork', 'fact', 'defect'], topic: null, note: notes[ref], verbatim: verbatim[ref],
       evidence: Object.fromEntries(Object.entries(quoteIndex).filter(([, quote]) => quote.sourceRef === ref).map(([id, quote]) => [`${ref}/${id}`, { text: quote.text }])) });
   }
   const metadata = decode(wire.messages[2]!.content[0]!.text!);

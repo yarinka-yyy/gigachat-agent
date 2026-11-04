@@ -721,7 +721,7 @@ test('source state transitions override stale categories without dropping durabl
   const notes = JSON.stringify({ taskSubject: 'Upload queue', state: 'Chart closed, upload unresolved.', activeTask: 'm5', topics: [],
     notes: Object.fromEntries(refs.map(ref => [ref, 'An incomplete extraction.'])), verbatim: Object.fromEntries(refs.map(ref => [ref, true])) });
   const sourceUpdates = { m0: 'none', m1: 'none', m2: `closes:${idsFor('m5')[0]}`, m3: `closes:${idsFor('m5')[0]}`, m4: `supersedes:${idsFor('m6')[0]}`, m5: 'none', m6: 'none', m7: 'none', m8: 'none', m9: 'none' };
-  const resolution = { topicUpdates: {}, assistantOrigins: { m3: 'self', m9: 'self' }, sourceUpdates, activeTask: 'm5', unresolvedDefects: '',
+  const resolution = { topicUpdates: {}, assistantOrigins: { m3: 'self', m9: 'm0' }, sourceUpdates, activeTask: 'm5', unresolvedDefects: '',
     classifications: { m0: 'constraint', m1: 'openWork', m2: 'fact', m3: 'decision', m4: 'fact', m5: 'openWork', m6: 'fact', m7: 'fact', m8: 'defect', m9: 'drop' } };
   const compile = (value: unknown) => JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify(value), notes, sources, refs, archive));
   const memory = compile(resolution);
@@ -793,7 +793,7 @@ test('source state transitions override stale categories without dropping durabl
   }
   const decision = { state: 'Chart closed; independent queue and the observed mismatch remain open.',
     topicUpdates: { Chart: { closed: true, evidence: wireWitness } }, sourceUpdates: { ...Object.fromEntries(Object.entries(topicReview.sourceUpdates).map(([ref, update]) => [ref, update.replace(/q[0-9]+/gu, id => `${evidence[id]!.sourceRef}/${id}`)])), m1: `independent:m1/${idsFor('m1')[0]}` },
-    activeTask: 'm5', unresolvedDefects: '', classifications: { ...topicReview.classifications, m9: 'paraphrase' } };
+    activeTask: 'm5', unresolvedDefects: '', classifications: { ...topicReview.classifications, m9: 'paraphrase:m0' } };
   assert.deepEqual(groupedCompile(decision), memory, 'explicit semantic decisions share the exact provenance and chronological guards');
   for (const change of [
     { topicUpdates: { Chart: { closed: true, evidence: 'q999' } } }, { topicUpdates: {} },
@@ -808,6 +808,26 @@ test('source state transitions override stale categories without dropping durabl
     { activeTask: 'm3' },
     { state: '' }, { extra: 'forbidden' },
   ]) assert.throws(() => groupedCompile({ ...decision, ...change }));
+});
+
+test('critical assistant data requires retention or a cited earlier user origin', () => {
+  const sources = createCompactionSources([user('policy', 'Do not edit files.'), assistant('ack', 'Files will remain untouched.'), assistant('data', 'Batch Z-41 has 3 rejected rows and job K-72 remains unresolved.'), user('task', 'Prepare the next test plan.')], [], []);
+  const archive = serializeSemanticCompactionTranscript(sources), refs = getSemanticCompactionCoverageRefSet(sources);
+  const notes = JSON.stringify({ taskSubject: 'Test plan', state: 'Data and constraints remain relevant.', activeTask: 'm3', topics: [],
+    notes: Object.fromEntries(refs.map(ref => [ref, 'A short note.'])), verbatim: Object.fromEntries(refs.map(ref => [ref, true])) });
+  const decision = { state: 'Prepare a test plan.', topicUpdates: {}, sourceUpdates: Object.fromEntries(refs.map(ref => [ref, 'none'])),
+    classifications: { m0: 'constraint', m1: 'paraphrase:m0', m2: 'decision', m3: 'openWork' }, activeTask: 'm3', unresolvedDefects: '' };
+  const compile = (classifications: Record<string, string>) => JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...decision, classifications }), notes, sources, refs, archive));
+  const memory = compile(decision.classifications);
+  assert.deepEqual(memory.decisions.map((entry: { sourceRefs: string[] }) => entry.sourceRefs), [['m2']]);
+  assert.equal(memory.decisions[0].text, sources.messages[2]!.text);
+  assert.throws(() => compile({ ...decision.classifications, m2: 'drop' }), /Критичные самостоятельные данные/);
+  for (const value of ['paraphrase', 'paraphrase:m1', 'paraphrase:m3', 'paraphrase:m999']) assert.throws(() => compile({ ...decision.classifications, m1: value }));
+  const schema = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${notes}`).schema;
+  assert.ok('classifications' in schema.properties);
+  assert.deepEqual(schema.properties.classifications.properties.m2!.enum, ['decision', 'paraphrase:m0']);
+  const reserved = semanticCompactionResponseFormat(undefined, archive).schema;
+  assert.ok('classifications' in reserved.properties && reserved.properties.classifications.properties.m2!.enum.includes('drop'), 'the unknown-mask reservation must include the larger classification enum');
 });
 
 test('review witnesses retain short user instructions with their qualifications and bound long fragments', () => {
@@ -837,7 +857,7 @@ test('review decision schema requires every source once and only later new user 
     assert.ok(new RegExp(reserved.properties.sourceUpdates.properties[ref]!.pattern).test('none'));
   }
   assert.deepEqual(actual.properties.sourceUpdates.required, refs);
-  assert.deepEqual(actual.properties.classifications.properties.m1!.enum, ['paraphrase', 'decision', 'drop']);
+  assert.deepEqual(actual.properties.classifications.properties.m1!.enum, ['decision', 'paraphrase:m0', 'drop']);
   assert.ok(actual.properties.classifications.properties.m0!.enum.includes('constraint'));
   assert.deepEqual(actual.properties.topicUpdates.required, []);
   assert.equal(reserved.properties.topicUpdates.required.length, 2);
