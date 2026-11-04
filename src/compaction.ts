@@ -174,14 +174,13 @@ const SOURCE_CLASSES = ['drop', 'defect', ...Array.from({ length: 15 }, (_, mask
 
 const SEMANTIC_REVIEW_FIELDS = ['sourceUpdates', 'topicUpdates', 'assistantOrigins', 'activeTask', 'classifications', 'unresolvedDefects'] as const;
 const SEMANTIC_GLOBAL_REVIEW_FIELDS = ['state', 'topicUpdates', 'sourceUpdates', 'classifications', 'activeTask', 'unresolvedDefects'] as const;
-const evidenceChoice = (id: string, text: string) => `${text} [${id}]`;
 
-function semanticReviewDecisionResponseFormat(refs: string[], primary: string[], retained: string[], updateEvidence: Record<string, string[]>, topicEvidence: Record<string, string[]>, index: Record<string, SemanticCompactionQuote & { role: string }>) {
-  const category = (ref: string) => primary.includes(ref) || retained.includes(ref) || ref.startsWith('t') ? SOURCE_CLASSES : ['paraphrase', 'decision', 'drop'];
+function semanticReviewDecisionResponseFormat(refs: string[], primary: string[], retained: string[], protectedRefs: string[], updateEvidence: Record<string, string[]>, topicEvidence: Record<string, string[]>) {
+  const category = (ref: string) => (primary.includes(ref) || retained.includes(ref) || ref.startsWith('t') ? SOURCE_CLASSES : ['paraphrase', 'decision', 'drop']).filter(value => value !== 'drop' || !protectedRefs.includes(ref));
   return { type: 'json_schema', strict: true, schema: { type: 'object', properties: {
     state: { type: 'string', minLength: 1, maxLength: 160 },
     topicUpdates: { type: 'object', properties: Object.fromEntries(Object.entries(topicEvidence).map(([scope, ids]) => [scope, {
-      type: 'string', enum: ['active', ...ids.map(id => evidenceChoice(id, index[id]!.text))],
+      type: 'object', properties: { closed: { type: 'boolean' }, evidence: { type: 'string', enum: ['none', ...ids] } }, required: ['closed', 'evidence'], additionalProperties: false,
     }])), required: Object.keys(topicEvidence), additionalProperties: false },
     sourceUpdates: { type: 'object', properties: Object.fromEntries(refs.map(ref => [ref, { type: 'string', maxLength: 512,
       pattern: updateEvidence[ref]!.length ? `^(?:none|keep|(?:closes|supersedes):(?:${updateEvidence[ref]!.join('|')}))$` : '^(?:none|keep)$',
@@ -201,10 +200,10 @@ function expandSemanticReviewDecision(value: Record<string, unknown>, scopes: Re
   if (!hasOnlyKeys(value.topicUpdates, groups)) throw new Error('Review требует решения для каждой побочной ветки.');
   const topicUpdates = Object.fromEntries(groups.map(scope => {
     const choice = (value.topicUpdates as Record<string, unknown>)[scope];
-    if (choice === 'active') return [scope, 'none'];
-    const proof = Object.keys(index).find(id => evidenceChoice(id, index[id]!.text) === choice);
-    if (!proof) throw new Error('Закрытие ветки требует точной подписи user-свидетельства.');
-    return [scope, `closes:${proof}`];
+    if (!isRecord(choice) || !hasOnlyKeys(choice, ['closed', 'evidence']) || typeof choice.closed !== 'boolean' || typeof choice.evidence !== 'string') throw new Error('Ветка требует явного closed и evidence.');
+    if (!choice.closed) { if (choice.evidence !== 'none') throw new Error('Открытая ветка не может иметь основание закрытия.'); return [scope, 'none']; }
+    if (!index[choice.evidence]) throw new Error('Закрытие ветки требует доступного user-свидетельства.');
+    return [scope, `closes:${choice.evidence}`];
   }));
   return { sourceUpdates: value.sourceUpdates, topicUpdates, activeTask: value.activeTask, unresolvedDefects: value.unresolvedDefects,
     classifications: Object.fromEntries(Object.entries(value.classifications).map(([ref, category]) => [ref, category === 'paraphrase' ? 'drop' : category])),
@@ -263,7 +262,7 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
   metadata.topicSources = Object.fromEntries(groups.map(topic => [topic.subject, { sourceRefs: topic.sourceRefs, evidence: topic.evidence }]));
   const review = (ref: string) => ({ categories: assistantRefs.has(ref) ? ['paraphrase', 'decision', 'drop'] : [...SOURCE_CATEGORIES, 'defect', 'drop'],
     topic: topicByRef[ref] ?? null, note: notes[ref] ?? null, verbatim: verbatim[ref] ?? null,
-    evidence: Object.fromEntries(evidenceIds.filter(id => index[id]!.sourceRef === ref).map(id => [id, { choice: evidenceChoice(id, index[id]!.text), text: index[id]!.text }])) });
+    evidence: Object.fromEntries(evidenceIds.filter(id => index[id]!.sourceRef === ref).map(id => [id, { text: index[id]!.text }])) });
   const messageRefs = new Set<string>();
   const aligned = records.slice(1).map(record => {
     const value = JSON.parse(record.slice(record.indexOf('\n') + 1));
@@ -492,12 +491,14 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   const evidenceIds = Object.keys(evidenceIndex).filter(id => evidenceIndex[id]!.role === 'user' && userRefs.includes(evidenceIndex[id]!.sourceRef));
   if (archiveText !== undefined) return semanticSourceNotesResponseFormat(refs, primary, [...new Set(evidenceIds.map(id => evidenceIndex[id]!.text))]);
   const candidate = reviewNotes?.slice(reviewNotes.indexOf('\n') + 1);
-  const draft = candidate ? JSON.parse(compileSemanticSourceNotes(candidate, refs)) as { topics: DraftTopic[] } : null;
+  const draft = candidate ? JSON.parse(compileSemanticSourceNotes(candidate, refs)) as { topics: DraftTopic[]; verbatim: Record<string, boolean> } : null;
   const position = (ref: string) => ref.startsWith('t') ? Number(archive.tools.find(tool => tool.sourceRef === ref)?.anchorRef.slice(1) ?? -1) : Number(ref.slice(1));
   const updateEvidence = Object.fromEntries(refs.map(ref => [ref, evidenceIds.filter(id => position(evidenceIndex[id]!.sourceRef) > position(ref))]));
   const scopes = draft ? draftTopicSources(draft.topics, refs, archive.tools) : Array.from({ length: MAX_GENERATED_PAST_TOPICS }, (_, i) => ({ subject: `${i}`.padEnd(MAX_SEMANTIC_SUBJECT_CHARS, 'X'), sourceRefs: refs }));
   const topicEvidence = Object.fromEntries(scopes.map(topic => [topic.subject, evidenceIds.filter(id => topic.sourceRefs.some(ref => position(ref) < position(evidenceIndex[id]!.sourceRef)))]));
-  return semanticReviewDecisionResponseFormat(refs, primary, archive.previousMemory ? semanticMemorySourceRefs(archive.previousMemory) : [], updateEvidence, topicEvidence, evidenceIndex);
+  const protectedRefs = [...new Set([...userRefs.filter(ref => draft?.verbatim[ref]), ...(archive.previousMemory?.activeTask?.sourceRefs ?? []),
+    ...(archive.previousMemory?.constraints ?? []).flatMap(entry => entry.sourceRefs), ...(archive.previousMemory?.openWork ?? []).flatMap(entry => entry.sourceRefs)])];
+  return semanticReviewDecisionResponseFormat(refs, primary, archive.previousMemory ? semanticMemorySourceRefs(archive.previousMemory) : [], protectedRefs, updateEvidence, topicEvidence);
 }
 
 export function compileSemanticSourceNotes(value: unknown, sourceRefs: readonly string[]): string {

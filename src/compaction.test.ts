@@ -765,22 +765,25 @@ test('source state transitions override stale categories without dropping durabl
   ]) assert.throws(() => groupedCompile({ ...topicReview, ...change }));
   const groupedSchema = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${grouped}`).schema;
   assert.ok('topicUpdates' in groupedSchema.properties);
-  const witness = `${evidence[idsFor('m5')[0]!]!.text} [${idsFor('m5')[0]}]`;
-  assert.ok(groupedSchema.properties.topicUpdates.properties.Chart!.enum.includes(witness));
+  const witness = idsFor('m5')[0]!;
+  assert.ok(groupedSchema.properties.topicUpdates.properties.Chart!.properties.evidence.enum.includes(witness));
+  assert.ok(!groupedSchema.properties.classifications.properties.m0!.enum.includes('drop'), 'a protected primary cannot be silently omitted even when the draft suggested a closed range');
   for (const proof of ['A fabricated closure.', evidence[idsFor('m0')[0]!]!.text, messages[3]!.text]) {
     const invalid = JSON.stringify({ ...JSON.parse(grouped), topics: [{ subject: 'Chart', evidence: proof, firstSource: 'm1', lastSource: 'm7' }] });
     const schema = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${invalid}`).schema;
     assert.ok('topicUpdates' in schema.properties);
-    assert.ok(schema.properties.topicUpdates.properties.Chart!.enum.includes(witness), 'untrusted draft evidence must remain correctable by independent review');
+    assert.ok(schema.properties.topicUpdates.properties.Chart!.properties.evidence.enum.includes(witness), 'untrusted draft evidence must remain correctable by independent review');
     assert.deepEqual(JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...topicReview, topicUpdates: { Chart: `closes:${idsFor('m5')[0]}` } }), invalid, sources, refs, archive)), memory);
   }
   const decision = { state: 'Chart closed; independent queue and the observed mismatch remain open.',
-    topicUpdates: { Chart: witness }, sourceUpdates: topicReview.sourceUpdates,
+    topicUpdates: { Chart: { closed: true, evidence: witness } }, sourceUpdates: topicReview.sourceUpdates,
     activeTask: 'm5', unresolvedDefects: '', classifications: { ...topicReview.classifications, m9: 'paraphrase' } };
   assert.deepEqual(groupedCompile(decision), memory, 'explicit semantic decisions share the exact provenance and chronological guards');
   for (const change of [
-    { topicUpdates: { Chart: `${witness} forged` } }, { topicUpdates: {} },
-    { topicUpdates: { Chart: `${evidence[idsFor('m0')[0]!]!.text} [${idsFor('m0')[0]}]` } },
+    { topicUpdates: { Chart: { closed: true, evidence: 'q999' } } }, { topicUpdates: {} },
+    { topicUpdates: { Chart: { closed: true, evidence: idsFor('m0')[0] } } },
+    { topicUpdates: { Chart: { closed: false, evidence: witness } } },
+    { topicUpdates: { Chart: { closed: true, evidence: 'none' } } },
     { sourceUpdates: {} }, { classifications: { ...decision.classifications, m0: 'paraphrase' } },
     { activeTask: 'm3' },
     { state: '' }, { extra: 'forbidden' },
@@ -814,7 +817,7 @@ test('rolling review decisions retain previous tools without replaying their raw
   const schema = semanticCompactionResponseFormat(undefined, archive).schema;
   assert.ok('sourceUpdates' in schema.properties);
   assert.deepEqual(schema.properties.sourceUpdates.required, getSemanticCompactionCoverageRefSet(sources, previous, 64));
-  for (const [id, proof] of Object.entries(evidence)) assert.equal(Object.values(schema.properties.topicUpdates.properties)[0]!.enum.includes(`${proof.text} [${id}]`), proof.role === 'user' && Number(proof.sourceRef.slice(1)) >= 64);
+  for (const [id, proof] of Object.entries(evidence)) assert.equal(Object.values(schema.properties.topicUpdates.properties)[0]!.properties.evidence.enum.includes(id), proof.role === 'user' && Number(proof.sourceRef.slice(1)) >= 64);
   assert.ok(schema.properties.sourceUpdates.properties.t0);
   assert.equal(schema.properties.sourceUpdates.properties.m2, undefined);
 });
