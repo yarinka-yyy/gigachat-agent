@@ -638,7 +638,7 @@ test('all four semantic models close subtopics while retaining interleaved work 
     const review = buildSemanticCompactionReviewRequest(context.request, sources, refs, candidate)!;
     const wire = JSON.parse(serializeProviderTurnRequest(review).body);
     assert.equal(wire.model, currentId); assert.equal(wire.tool_config.mode, 'none');
-    assert.equal(wire.model_options.response_format.type, 'json_schema');
+    assert.deepEqual(wire.model_options.response_format, { type: 'text' });
     const index = semanticReviewEvidenceIndex(context.request.messages[0]!.text);
     const proof = Object.keys(index).find(id => index[id]!.sourceRef === 'm4');
     const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ topicUpdates: {}, assistantOrigins: { m2: 'self' }, sourceUpdates: { m0: 'none', m1: `closes:${proof}`, m2: `closes:${proof}`, m3: 'none', m4: 'none', m5: 'none', m6: 'none' }, activeTask: 'm5', classifications: { m0: 'constraint', m1: 'fact', m2: 'decision', m3: 'openWork', m4: 'drop', m5: 'openWork', m6: 'defect' },
@@ -732,10 +732,7 @@ test('builds an independent semantic review from the exact current archive and a
   const quoteIndex = semanticReviewEvidenceIndex(context.request.messages[0]!.text);
   const contract = semanticCompactionResponseFormat(undefined, review.messages[1]!.text, review.messages[0]!.text).schema;
   assert.ok('sourceUpdates' in contract.properties);
-  const shape = JSON.parse(reviewWire.body).model_options.response_format.schema;
-  assert.equal(shape.properties.sourceUpdates.properties.m0.enum, undefined, 'choice catalogs belong in model-visible source data, not only in the decoder');
-  assert.equal(shape.properties.classifications.properties.m0.enum, undefined);
-  assert.equal(shape.properties.evidence.items.enum, undefined, 'literal choices are available beside their complete source rather than duplicated in a hidden output grammar');
+  assert.deepEqual(JSON.parse(reviewWire.body).model_options.response_format, { type: 'text' }, 'review chooses from the visible contract; its complete JSON is validated locally');
   assert.equal(records.length, sources.messages.length);
   for (const record of records) {
     const ref = record.sourceRef as string;
@@ -753,7 +750,7 @@ test('builds an independent semantic review from the exact current archive and a
   assert.equal(wire.messages[wire.messages.length - 1]?.content[0]?.text, review.messages[review.messages.length - 1]?.text);
   assert.equal(wire.tool_config.mode, 'none');
   assert.equal(wire.tools, undefined);
-  assert.equal(wire.model_options.response_format.type, 'json_schema');
+  assert.equal(wire.model_options.response_format.type, 'text');
   assert.match(review.messages[2]!.text, /unresolvedDefects/);
   assert.doesNotMatch(review.messages[0]!.text + review.messages[1]!.text,
     /private-review-receipt|private-review-state|functionsStateId/);

@@ -592,13 +592,8 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
 
 export function semanticCompactionWireResponseFormat(archiveText?: string, reviewMetadata?: string, reviewNotes?: string) {
   const format = semanticCompactionResponseFormat(archiveText, reviewMetadata, reviewNotes);
-  if (!('sourceUpdates' in format.schema.properties)) return format;
-  const properties = format.schema.properties;
-  return { ...format, schema: { ...format.schema, properties: { ...properties,
-    sourceUpdates: { ...properties.sourceUpdates, properties: Object.fromEntries(Object.keys(properties.sourceUpdates.properties).map(ref => [ref, { type: 'string', maxLength: 512 }])) },
-    classifications: { ...properties.classifications, properties: Object.fromEntries(Object.keys(properties.classifications.properties).map(ref => [ref, { type: 'string', maxLength: 96 }])) },
-    evidence: { ...properties.evidence, items: { type: 'string', minLength: 1, maxLength: MAX_SEMANTIC_QUOTE_BYTES + 64 } },
-  } } };
+  // Wide structured decoding produced invalid semantic choices; the compiler enforces the full review contract.
+  return 'sourceUpdates' in format.schema.properties ? { type: 'text' as const } : format;
 }
 
 export function compileSemanticSourceNotes(value: unknown, sourceRefs: readonly string[]): string {
