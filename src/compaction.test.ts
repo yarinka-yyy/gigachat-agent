@@ -849,15 +849,20 @@ test('source state transitions override stale categories without dropping durabl
   assert.ok('topicUpdates' in groupedSchema.properties);
   const witness = idsFor('m5')[0]!;
   const wireWitness = `m5/${witness}: ${evidence[witness]!.text}`;
-  assert.deepEqual(groupedSchema.properties.topicUpdates.properties.Chart!.anyOf[0]!.properties.evidence.enum, ['none']);
+  const openProof = groupedSchema.properties.topicUpdates.properties.Chart!.anyOf[0]!.properties.evidence;
+  const closedProof = groupedSchema.properties.topicUpdates.properties.Chart!.anyOf[1]!.properties.evidence;
+  assert.ok('enum' in openProof && 'pattern' in closedProof);
+  assert.deepEqual(openProof.enum, ['none']);
   assert.deepEqual(groupedSchema.properties.topicUpdates.properties.Chart!.anyOf[0]!.properties.closed.enum, [false]);
-  assert.ok(groupedSchema.properties.topicUpdates.properties.Chart!.anyOf[1]!.properties.evidence.enum.includes(wireWitness));
+  assert.ok(new RegExp(closedProof.pattern).test(wireWitness));
   assert.ok(!groupedSchema.properties.classifications.properties.m0!.enum.includes('drop'), 'a protected primary cannot be silently omitted even when the draft suggested a closed range');
   for (const proof of ['A fabricated closure.', evidence[idsFor('m0')[0]!]!.text, messages[3]!.text]) {
     const invalid = JSON.stringify({ ...JSON.parse(grouped), topics: [{ subject: 'Chart', evidence: proof, firstSource: 'm1', lastSource: 'm3' }] });
     const schema = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${invalid}`).schema;
     assert.ok('topicUpdates' in schema.properties);
-    assert.ok(schema.properties.topicUpdates.properties.Chart!.anyOf[1]!.properties.evidence.enum.includes(wireWitness), 'untrusted draft evidence must remain correctable by independent review');
+    const proofSchema = schema.properties.topicUpdates.properties.Chart!.anyOf[1]!.properties.evidence;
+    assert.ok('pattern' in proofSchema);
+    assert.ok(new RegExp(proofSchema.pattern).test(wireWitness), 'untrusted draft evidence must remain correctable by independent review');
     assert.deepEqual(JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...topicReview, topicUpdates: { Chart: `closes:${idsFor('m5')[0]}` } }), invalid, sources, refs, archive)), memory);
   }
   const decision = { evidence: ['m1', 'm6'].map(ref => `${ref}/${idsFor(ref)[0]}: ${evidence[idsFor(ref)[0]!]!.text}`),
@@ -1018,7 +1023,9 @@ test('rolling review decisions retain previous tools without replaying their raw
   const schema = semanticCompactionResponseFormat(undefined, archive).schema;
   assert.ok('sourceUpdates' in schema.properties);
   assert.deepEqual(schema.properties.sourceUpdates.required, getSemanticCompactionCoverageRefSet(sources, previous, 64));
-  for (const [id, proof] of Object.entries(evidence)) assert.equal(Object.values(schema.properties.topicUpdates.properties)[0]!.anyOf[1]!.properties.evidence.enum.includes(`${proof.sourceRef}/${id}: ${proof.text}`), proof.role === 'user' && Number(proof.sourceRef.slice(1)) >= 64);
+  const proofSchema = Object.values(schema.properties.topicUpdates.properties)[0]!.anyOf[1]!.properties.evidence;
+  assert.ok('pattern' in proofSchema);
+  for (const [id, proof] of Object.entries(evidence)) assert.equal(new RegExp(proofSchema.pattern).test(`${proof.sourceRef}/${id}: ${proof.text}`), proof.role === 'user' && Number(proof.sourceRef.slice(1)) >= 64);
   assert.ok(schema.properties.sourceUpdates.properties.t0);
   assert.equal(schema.properties.sourceUpdates.properties.m2, undefined);
 });
