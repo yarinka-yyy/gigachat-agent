@@ -1107,7 +1107,7 @@ test('persists three semantic runtime cycles with only previous memory and the n
         if (!covered) {
           const evidence = semanticReviewEvidenceIndex(archiveText);
           const proof = Object.keys(evidence).find(id => evidence[id]!.sourceRef === 'm6')!;
-          sourceUpdates.m4 = sourceUpdates.m5 = `closes:${proof}`;
+          sourceUpdates.m4 = sourceUpdates.m5 = `closes:m6/${proof}`;
         }
         answer = JSON.stringify({ state: 'Импорт открыт, наблюдённый дефект не устранён.', topicUpdates: {}, sourceUpdates, activeTask: 'm2', unresolvedDefects: '',
           classifications: Object.fromEntries(archive.coverageRefSet.map(ref => [ref, ['m0', 'm10'].includes(ref) ? 'constraint' : ref === 'm2' ? 'openWork' : ref === 'm8' ? 'defect' : ref === 'm12' ? 'fact' : 'drop'])) });
