@@ -948,7 +948,7 @@ test('semantic compaction reviews once on the selected model and accounts for bo
         assert.deepEqual(request.protocolHistory, []);
         yield { type: 'text-delta', text: requests.length === 1
           ? JSON.stringify({ taskSubject: 'Current task', state: 'Task remains open.', activeTask: 'm0', closedTopics: '', notes: Object.fromEntries(input.messages.map((message, index) => [`m${index}`, `Draft: ${message.text}`])), verbatim: Object.fromEntries(input.messages.map((_message, index) => [`m${index}`, false])) })
-          : JSON.stringify({ sourceUpdates: Object.fromEntries(input.messages.flatMap((message, index) => message.role === 'user' ? [[`m${index}`, 'none']] : [])), activeTask: 'm0', classifications: Object.fromEntries(input.messages.map((message, index) => [`m${index}`, message.role === 'user' ? 'fact' : 'decision'])), unresolvedDefects: '' }) };
+          : JSON.stringify({ sourceUpdates: Object.fromEntries(input.messages.map((_, index) => [`m${index}`, 'none'])), activeTask: 'm0', classifications: Object.fromEntries(input.messages.map((message, index) => [`m${index}`, message.role === 'user' ? 'fact' : 'decision'])), unresolvedDefects: '' }) };
         yield { type: 'usage', promptTokens: 10, completionTokens: 5, totalTokens: 15, precachedPromptTokens: 0 };
         yield { type: 'completed', functionsStateId: requests.length === 1 ? 'draft-state' : 'review-state' };
       }),
@@ -1103,11 +1103,11 @@ test('persists three semantic runtime cycles with only previous memory and the n
         notes: Object.fromEntries(archive.coverageRefSet.map(ref => [ref, `Сохранить источник ${ref}.`])),
         verbatim: Object.fromEntries(archive.coverageRefSet.map(ref => [ref, !covered && ['m0', 'm2', 'm8'].includes(ref)])) });
       else {
-        const sourceUpdates = Object.fromEntries(archive.messages.filter(item => item.role === 'user').map(item => [item.sourceRef, 'none']));
+        const sourceUpdates = Object.fromEntries(archive.coverageRefSet.map(ref => [ref, 'none']));
         if (!covered) {
           const evidence = semanticReviewEvidenceIndex(archiveText);
           const proof = Object.keys(evidence).find(id => evidence[id]!.sourceRef === 'm6')!;
-          sourceUpdates.m6 = `closes:${proof}:m4,m5`;
+          sourceUpdates.m4 = sourceUpdates.m5 = `closes:${proof}`;
         }
         answer = JSON.stringify({ sourceUpdates, activeTask: 'm2', unresolvedDefects: '', classifications: Object.fromEntries(archive.coverageRefSet.map(ref =>
           [ref, ref === 'm0' || ref === 'm10' ? 'constraint' : ref === 'm2' ? 'openWork' : ref === 'm8' ? 'defect' : ref === 'm12' ? 'fact' : 'drop'])) });

@@ -602,7 +602,7 @@ test('topic closure removes all its details and defect state survives compilatio
   const notes = JSON.stringify({ taskSubject: 'Upload', state: 'Chart closed; upload unresolved.', activeTask: 'm2', closedTopics: 'm4:m1,m3', notes: Object.fromEntries(refs.map(ref => [ref, `Note ${ref}`])), verbatim: Object.fromEntries(refs.map(ref => [ref, true])) });
   const index = semanticReviewEvidenceIndex(archive);
   const idsFor = (ref: string) => Object.keys(index).filter(id => index[id]!.sourceRef === ref);
-  const resolution = { sourceUpdates: { m0: 'none', m1: 'none', m2: 'none', m4: `closes:${idsFor('m4')[0]}:m1,m3`, m5: 'none' },
+  const resolution = { sourceUpdates: { m0: 'none', m1: `closes:${idsFor('m4')[0]}`, m2: 'none', m3: `closes:${idsFor('m4')[0]}`, m4: 'none', m5: 'none' },
     activeTask: 'm2', classifications: { m0: 'constraint', m1: 'fact', m2: 'openWork', m3: 'decision', m4: 'drop', m5: 'fact' },
     unresolvedDefects: idsFor('m5').join(',') };
   const format = semanticSourceResolutionResponseFormat(refs, ['m0', 'm1', 'm2', 'm4', 'm5']);
@@ -613,7 +613,7 @@ test('topic closure removes all its details and defect state survives compilatio
   for (const value of ['constraint', 'fact', 'openWork', 'defect', 'closed', 'constraint+fact']) assert.ok(!assistantPattern.test(value));
   assert.ok(!assistantPattern.test(`closed:${idsFor('m4')[0]}`), 'closure is resolved separately from categories');
   const emptyDraft = JSON.stringify({ ...JSON.parse(notes), activeTask: 'none', closedTopics: '', verbatim: Object.fromEntries(refs.map(ref => [ref, false])) });
-  const emptyState = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ ...resolution, sourceUpdates: { ...resolution.sourceUpdates, m4: 'none' }, activeTask: 'none', classifications: { ...resolution.classifications, m1: 'drop', m3: 'drop' } }), emptyDraft, sources, refs, archive));
+  const emptyState = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ ...resolution, sourceUpdates: { ...resolution.sourceUpdates, m1: 'none', m3: 'none' }, activeTask: 'none', classifications: { ...resolution.classifications, m1: 'drop', m3: 'drop' } }), emptyDraft, sources, refs, archive));
   assert.equal(emptyState.activeTask, null, 'an explicitly absent task must stay absent');
   assert.deepEqual(emptyState.closedTopics ?? [], [], 'an explicitly empty closure selection is valid');
   const corrected = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ ...resolution, activeTask: 'm5' }), notes, sources, refs, archive));
@@ -662,7 +662,7 @@ test('topic closure removes all its details and defect state survives compilatio
     notes: Object.fromEntries(rollingRefs.map(ref => [ref, 'Available memory.'])), verbatim: Object.fromEntries(rollingRefs.map(ref => [ref, true])) });
   const rollingIndex = semanticReviewEvidenceIndex(rollingArchive);
   const rolling = { ...resolution, classifications: { ...resolution.classifications, m1: 'drop', m3: 'drop', m6: 'openWork' }, unresolvedDefects: Object.keys(rollingIndex).filter(id => rollingIndex[id]!.sourceRef === 'm5').join(',') };
-  const rollingResolution = { ...rolling, sourceUpdates: { m6: 'none' } };
+  const rollingResolution = { ...rolling, sourceUpdates: Object.fromEntries(rollingRefs.map(ref => [ref, 'none'])) };
   const continued = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson(rollingResolution), rollingNotes, rollingSources, rollingRefs, rollingArchive));
   assert.deepEqual(continued.closedTopics, memory.closedTopics, 'later review cannot silently reopen closed details');
   assert.deepEqual(continued.unresolvedDefects, memory.unresolvedDefects, 'state survives a second compaction without prefix accumulation');
@@ -696,7 +696,7 @@ test('source state transitions override stale categories without dropping durabl
   const idsFor = (ref: string) => Object.keys(evidence).filter(id => evidence[id]!.sourceRef === ref);
   const notes = JSON.stringify({ taskSubject: 'Upload queue', state: 'Chart closed, upload unresolved.', activeTask: 'm5', closedTopics: '',
     notes: Object.fromEntries(refs.map(ref => [ref, 'An incomplete extraction.'])), verbatim: Object.fromEntries(refs.map(ref => [ref, true])) });
-  const sourceUpdates = { m0: 'none', m1: 'none', m2: 'none', m4: 'none', m5: `closes:${idsFor('m5')[0]}:m2,m3`, m6: `supersedes:${idsFor('m6')[0]}:m4`, m7: 'none', m8: 'none' };
+  const sourceUpdates = { m0: 'none', m1: 'none', m2: `closes:${idsFor('m5')[0]}`, m3: `closes:${idsFor('m5')[0]}`, m4: `supersedes:${idsFor('m6')[0]}`, m5: 'none', m6: 'none', m7: 'none', m8: 'none', m9: 'none' };
   const resolution = { sourceUpdates, activeTask: 'm5', unresolvedDefects: '',
     classifications: { m0: 'constraint', m1: 'openWork', m2: 'fact', m3: 'decision', m4: 'fact', m5: 'openWork', m6: 'fact', m7: 'fact', m8: 'defect', m9: 'drop' } };
   const compile = (value: unknown) => JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify(value), notes, sources, refs, archive));
@@ -710,13 +710,14 @@ test('source state transitions override stale categories without dropping durabl
   assert.equal(memory.unresolvedDefects[0].text, `Наблюдённый неустранённый дефект: ${idsFor('m8').map(id => evidence[id]!.text).join(' ')}`);
   assert.ok(Buffer.byteLength(JSON.stringify(memory)) <= 32768);
   for (const updates of [
-    { ...sourceUpdates, m0: undefined }, { ...sourceUpdates, m9: 'none' },
-    { ...sourceUpdates, m5: '' }, { ...sourceUpdates, m5: 'closes:q999:m2' },
-    { ...sourceUpdates, m5: `closes:${idsFor('m0')[0]}:m2` },
-    { ...sourceUpdates, m5: `closes:${idsFor('m5')[0]}:m7` },
-    { ...sourceUpdates, m5: `closes:${idsFor('m5')[0]}:m2,m2` },
-    { ...sourceUpdates, m6: `supersedes:${idsFor('m6')[0]}:m2` },
-    { ...sourceUpdates, m6: `supersedes:${idsFor('m6')[0]}:m5` },
+    { ...sourceUpdates, m0: undefined }, { ...sourceUpdates, m99: 'none' },
+    { ...sourceUpdates, m2: '' }, { ...sourceUpdates, m2: 'closes:q999' },
+    { ...sourceUpdates, m2: `closes:${idsFor('m0')[0]}` },
+    { ...sourceUpdates, m2: `closes:${idsFor('m2')[0]}` },
+    { ...sourceUpdates, m2: `closes:${idsFor('m3')[0]}` },
+    { ...sourceUpdates, m2: `closes:${idsFor('m5')[0]}:m2,m2` },
+    { ...sourceUpdates, m2: `closes:${idsFor('m5')[0]};supersedes:${idsFor('m6')[0]}` },
+    { ...sourceUpdates, m5: `supersedes:${idsFor('m6')[0]}` },
   ]) assert.throws(() => compile({ ...resolution, sourceUpdates: updates }));
   for (const ref of ['m0', 'm1', 'm6', 'm7']) assert.throws(() => compile({ ...resolution,
     classifications: { ...resolution.classifications, [ref]: 'drop' } }), /Критичный|Замена/);
@@ -726,9 +727,9 @@ test('source state transitions override stale categories without dropping durabl
   const schema = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${notes}`).schema;
   assert.ok('sourceUpdates' in schema.properties);
   assert.deepEqual(schema.properties.sourceUpdates.required, Object.keys(sourceUpdates));
-  const pattern = new RegExp(schema.properties.sourceUpdates.properties.m5!.pattern);
-  assert.ok(pattern.test(sourceUpdates.m5));
-  assert.ok(!pattern.test(`closes:${idsFor('m0')[0]}:m2`), 'schema also binds a transition to its own source evidence');
+  const pattern = new RegExp(schema.properties.sourceUpdates.properties.m2!.pattern);
+  assert.ok(pattern.test(sourceUpdates.m2));
+  assert.ok(!pattern.test(`closes:${idsFor('m0')[0]}`), 'schema requires later user evidence');
 });
 
 test('review schema permits only known earlier messages and tool anchors for each user witness', () => {
@@ -741,21 +742,18 @@ test('review schema permits only known earlier messages and tool anchors for eac
   assert.deepEqual(reserved, actual, 'reservation and dispatch use the same chronology contract');
   assert.ok('sourceUpdates' in actual.properties);
   const updates = actual.properties.sourceUpdates;
-  assert.deepEqual(updates.required, sources.messages.filter(source => source.role === 'user').map(source => source.ref));
+  assert.deepEqual(updates.required, refs);
   for (const ref of updates.required) {
-    const id = Object.keys(evidence).find(id => evidence[id]!.sourceRef === ref)!;
     const pattern = new RegExp(updates.properties[ref]!.pattern);
     assert.ok(pattern.test('none'));
-    for (const target of [...refs, 'm999', 't999']) {
-      const position = target.startsWith('m') ? Number(target.slice(1))
-        : Number(sources.tools.find(tool => tool.ref === target)?.anchorRef.slice(1));
-      const allowed = refs.includes(target) && position < Number(ref.slice(1));
-      for (const kind of ['closes', 'supersedes']) assert.equal(pattern.test(`${kind}:${id}:${target}`), allowed, `${ref} ${kind} ${target}`);
+    const position = Number((ref.startsWith('m') ? ref : sources.tools.find(tool => tool.ref === ref)!.anchorRef).slice(1));
+    for (const [id, proof] of Object.entries(evidence)) {
+      const allowed = proof.role === 'user' && position < Number(proof.sourceRef.slice(1));
+      for (const kind of ['closes', 'supersedes']) assert.equal(pattern.test(`${kind}:${id}`), allowed, `${ref} ${kind} ${id}`);
     }
-    assert.ok(!pattern.test(`closes:${id}:m00`));
-    assert.ok(!pattern.test(`closes:${id}:m0,${ref}`), 'an earlier first member cannot hide a self reference');
+    for (const invalid of ['closes:q999', 'closes:q0:m1,m1', 'closes:q0;supersedes:q1', 'closes:q0,q1']) assert.ok(!pattern.test(invalid));
   }
-  assert.equal(updates.properties.m0!.pattern, '^none$');
+  assert.equal(updates.properties.m65!.pattern, '^none$');
 });
 
 test('rolling review schema retains earlier tools without replaying their raw prefix', () => {
@@ -763,11 +761,12 @@ test('rolling review schema retains earlier tools without replaying their raw pr
   const archive = serializeSemanticCompactionTranscript(sources, previous, 64), evidence = semanticReviewEvidenceIndex(archive);
   const schema = semanticCompactionResponseFormat(undefined, archive).schema;
   assert.ok('sourceUpdates' in schema.properties);
-  assert.deepEqual(schema.properties.sourceUpdates.required, ['m64']);
-  const pattern = new RegExp(schema.properties.sourceUpdates.properties.m64!.pattern);
+  assert.deepEqual(schema.properties.sourceUpdates.required, getSemanticCompactionCoverageRefSet(sources, previous, 64));
   const id = Object.keys(evidence).find(id => evidence[id]!.sourceRef === 'm64')!;
-  assert.ok(pattern.test(`closes:${id}:m0,m1,t0`), 'prior memory refs remain eligible, including a tool absent from the suffix');
-  for (const target of ['t1', 'm64', 'm65', 'm2', 't99']) assert.ok(!pattern.test(`supersedes:${id}:${target}`), target);
+  for (const ref of ['m0', 'm1', 't0']) assert.ok(new RegExp(schema.properties.sourceUpdates.properties[ref]!.pattern).test(`closes:${id}`));
+  for (const ref of ['t1', 'm64', 'm65']) assert.ok(!new RegExp(schema.properties.sourceUpdates.properties[ref]!.pattern).test(`supersedes:${id}`));
+  assert.equal(schema.properties.sourceUpdates.properties.m2, undefined);
+  assert.equal(schema.properties.sourceUpdates.properties.t99, undefined);
 });
 
 test('explicit absence of a task retains a primary constraint and rolling review cannot silently erase it', () => {
@@ -777,8 +776,8 @@ test('explicit absence of a task retains a primary constraint and rolling review
   assert.equal(memory.activeTask, null);
   const rolling = createCompactionSources([user('policy', sources.messages[0]!.text), user('new', 'There is still no task; the restriction remains.')], [], []);
   const rollingNotes = JSON.stringify({ ...JSON.parse(notes), notes: { m0: 'Old policy.', m1: 'No task.' }, verbatim: { m0: false, m1: false } });
-  assert.throws(() => compileResolvedSemanticCompactionMemory(JSON.stringify({ sourceUpdates: { m1: 'none' }, activeTask: 'none', unresolvedDefects: '', classifications: { m0: 'drop', m1: 'fact' } }), rollingNotes, rolling, ['m0', 'm1'], serializeSemanticCompactionTranscript(rolling, memory, 1)), /Критичный/);
-  const continued = JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ sourceUpdates: { m1: 'none' }, activeTask: 'none', unresolvedDefects: '', classifications: { m0: 'decision', m1: 'fact' } }), rollingNotes, rolling, ['m0', 'm1'], serializeSemanticCompactionTranscript(rolling, memory, 1)));
+  assert.throws(() => compileResolvedSemanticCompactionMemory(JSON.stringify({ sourceUpdates: { m0: 'none', m1: 'none' }, activeTask: 'none', unresolvedDefects: '', classifications: { m0: 'drop', m1: 'fact' } }), rollingNotes, rolling, ['m0', 'm1'], serializeSemanticCompactionTranscript(rolling, memory, 1)), /Критичный/);
+  const continued = JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ sourceUpdates: { m0: 'none', m1: 'none' }, activeTask: 'none', unresolvedDefects: '', classifications: { m0: 'decision', m1: 'fact' } }), rollingNotes, rolling, ['m0', 'm1'], serializeSemanticCompactionTranscript(rolling, memory, 1)));
   assert.equal(continued.decisions[0].text, sources.messages[0]!.text, 'rolling critical text survives reclassification even when the new draft clears verbatim');
 });
 
