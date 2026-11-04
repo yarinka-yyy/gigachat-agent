@@ -234,7 +234,8 @@ function runtimeErrorCategory(error: unknown, turnTimedOut = false): ProviderErr
 function compileCompactionCandidate(value: string, sources: CompactionSources, semanticSourceRefs: readonly string[] | null, archiveText?: string, notes?: string): string {
   try {
     if (semanticSourceRefs === null) return compileExtractiveCompaction(value, sources);
-    if (!Array.isArray(JSON.parse(value)?.evidence)) throw new Error('Review requires the public wire contract.');
+    const decision = JSON.parse(value);
+    if (!decision || typeof decision !== 'object' || !Object.prototype.hasOwnProperty.call(decision, 'sourceUpdates') || Object.prototype.hasOwnProperty.call(decision, 'assistantOrigins')) throw new Error('Review requires the public wire contract.');
     return compileResolvedSemanticCompactionMemory(value, notes!, sources, semanticSourceRefs, archiveText!);
   }
   catch {

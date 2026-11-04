@@ -638,7 +638,7 @@ test('all four semantic models close subtopics while retaining interleaved work 
     const review = buildSemanticCompactionReviewRequest(context.request, sources, refs, candidate)!;
     const wire = JSON.parse(serializeProviderTurnRequest(review).body);
     assert.equal(wire.model, currentId); assert.equal(wire.tool_config.mode, 'none');
-    assert.deepEqual(wire.model_options.response_format, { type: 'text' });
+    assert.equal(wire.model_options.response_format.type, 'json_schema');
     const index = semanticReviewEvidenceIndex(context.request.messages[0]!.text);
     const proof = Object.keys(index).find(id => index[id]!.sourceRef === 'm4');
     const compiled = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ topicUpdates: {}, assistantOrigins: { m2: 'self' }, sourceUpdates: { m0: 'none', m1: `closes:${proof}`, m2: `closes:${proof}`, m3: 'none', m4: 'none', m5: 'none', m6: 'none' }, activeTask: 'm5', classifications: { m0: 'constraint', m1: 'fact', m2: 'decision', m3: 'openWork', m4: 'drop', m5: 'openWork', m6: 'defect' },
@@ -709,7 +709,7 @@ test('builds an independent semantic review from the exact current archive and a
   assert.match(review.messages[0]?.text ?? '', /^ПОИСТОЧНИКОВЫЕ СМЫСЛОВЫЕ ЗАМЕТКИ JSON/);
   assert.match(review.messages[0]?.text ?? '', /Review the Windows build/);
   assert.equal(review.messages[review.messages.length - 1]?.id, 'request-semantic-review-task');
-  assert.match(review.messages[review.messages.length - 1]?.text ?? '', /При расхождении заметки с архивом опирайся на архив/);
+  assert.match(review.messages[review.messages.length - 1]?.text ?? '', /Сверь всю историю независимо от заметок/);
   assert.doesNotMatch(review.messages.map(({ text }) => text).join('\n'), /Независимо проверь черновик semantic-памяти/);
 
   const reviewWire = serializeProviderTurnRequest(review);
@@ -732,25 +732,25 @@ test('builds an independent semantic review from the exact current archive and a
   const quoteIndex = semanticReviewEvidenceIndex(context.request.messages[0]!.text);
   const contract = semanticCompactionResponseFormat(undefined, review.messages[1]!.text, review.messages[0]!.text).schema;
   assert.ok('sourceUpdates' in contract.properties);
-  assert.deepEqual(JSON.parse(reviewWire.body).model_options.response_format, { type: 'text' }, 'review chooses from the visible contract; its complete JSON is validated locally');
+  assert.equal(JSON.parse(reviewWire.body).model_options.response_format.schema.properties.evidence, undefined, 'review selects exact addresses without copying a second table of source text');
   assert.equal(records.length, sources.messages.length);
   for (const record of records) {
     const ref = record.sourceRef as string;
     assert.deepEqual(record.review, {
-      categories: contract.properties.classifications.properties[ref]!.enum,
-      updates: contract.properties.sourceUpdates.properties[ref]!.enum, topic: null, note: notes[ref], verbatim: verbatim[ref],
+      categories: [...new Set(contract.properties.classifications.properties[ref]!.enum.flatMap(value => value.split('+')))],
+      updates: { stable: ['none'], independent: [], changes: Object.entries(quoteIndex).filter(([, quote]) => quote.role === 'user' && Number(quote.sourceRef.slice(1)) > Number(ref.slice(1))).map(([id, quote]) => `${quote.sourceRef}/${id}`) }, topic: null, note: notes[ref], verbatim: verbatim[ref],
       evidence: Object.fromEntries(Object.entries(quoteIndex).filter(([, quote]) => quote.sourceRef === ref).map(([id, quote]) => [`${ref}/${id}`, { text: quote.text }])) });
   }
   const metadata = decode(wire.messages[2]!.content[0]!.text!);
   const toolReviews = metadata.sourceReviews as Record<string, unknown>;
-  assert.deepEqual(toolReviews.t0, { categories: contract.properties.classifications.properties.t0!.enum,
-    updates: contract.properties.sourceUpdates.properties.t0!.enum, topic: null, note: notes.t0, verbatim: verbatim.t0,
+  assert.deepEqual(toolReviews.t0, { categories: [...new Set(contract.properties.classifications.properties.t0!.enum.flatMap(value => value.split('+')))],
+    updates: { stable: ['none'], independent: [], changes: Object.entries(quoteIndex).filter(([, quote]) => quote.role === 'user' && Number(quote.sourceRef.slice(1)) > 2).map(([id, quote]) => `${quote.sourceRef}/${id}`) }, topic: null, note: notes.t0, verbatim: verbatim.t0,
     evidence: Object.fromEntries(Object.entries(quoteIndex).filter(([, quote]) => quote.sourceRef === 't0').map(([id, quote]) => [`t0/${id}`, { text: quote.text }])) });
   assert.equal(metadata.evidenceIndex, undefined, 'literal evidence is local to its source, not duplicated in a distant index');
   assert.equal(wire.messages[wire.messages.length - 1]?.content[0]?.text, review.messages[review.messages.length - 1]?.text);
   assert.equal(wire.tool_config.mode, 'none');
   assert.equal(wire.tools, undefined);
-  assert.equal(wire.model_options.response_format.type, 'text');
+  assert.equal(wire.model_options.response_format.type, 'json_schema');
   assert.match(review.messages[2]!.text, /unresolvedDefects/);
   assert.doesNotMatch(review.messages[0]!.text + review.messages[1]!.text,
     /private-review-receipt|private-review-state|functionsStateId/);
