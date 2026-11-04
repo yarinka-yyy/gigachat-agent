@@ -312,7 +312,8 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
   if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > 4096) throw new Error('Review превышает ограничение 4096 байт.');
   let selection: unknown = JSON.parse(value);
   if (isRecord(selection) && Object.prototype.hasOwnProperty.call(selection, 'sources')) {
-    if (!hasOnlyKeys(selection, ['sources', 'activeTask', 'topicUpdates', 'unresolvedDefects']) || !isRecord(selection.sources)
+    if (!hasOnlyKeys(selection, ['state', 'sources', 'activeTask', 'topicUpdates', 'unresolvedDefects']) || typeof selection.state !== 'string'
+      || !selection.state.trim() || [...selection.state].length > 160 || !isRecord(selection.sources)
       || !hasOnlyKeys(selection.sources, [...sourceRefs])) throw new Error('Review требует одной записи на каждый источник.');
     const rows = Object.entries(selection.sources).map(([ref, row]) => {
       if (typeof row !== 'string') throw new Error('Решение источника требует строки категория|переход.');
@@ -586,12 +587,22 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
 export function semanticCompactionWireResponseFormat(archiveText?: string, reviewMetadata?: string, reviewNotes?: string) {
   const format = semanticCompactionResponseFormat(archiveText, reviewMetadata, reviewNotes);
   if (!('sourceUpdates' in format.schema.properties)) return format;
-  const { sourceUpdates, activeTask, topicUpdates, unresolvedDefects } = format.schema.properties;
+  const { sourceUpdates, classifications, activeTask, topicUpdates, unresolvedDefects } = format.schema.properties;
+  const alternatives = (values: string[]) => values.map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
   return { ...format, schema: { type: 'object', properties: {
-    sources: { type: 'object', properties: Object.fromEntries(sourceUpdates.required.map(ref => [ref, { type: 'string', minLength: 3, maxLength: 609,
+    state: { type: 'string', minLength: 1, maxLength: 160, description: 'First establish what is completed, what remains open and which restrictions remain active across the whole archive. This is your independent review, not a draft quotation.' },
+    sources: { type: 'object', properties: Object.fromEntries(sourceUpdates.required.map(ref => {
+      const updates = sourceUpdates.properties[ref]!.enum;
+      const independent = updates.filter(value => value.startsWith('independent:')).map(value => value.slice('independent:'.length));
+      const changes = updates.filter(value => value.startsWith('closes:')).map(value => value.slice('closes:'.length));
+      const updatePattern = [alternatives(updates.filter(value => !value.includes(':'))),
+        ...(independent.length ? [`independent:(?:${alternatives(independent)})`] : []),
+        ...(changes.length ? [`(?:closes|supersedes):(?:${alternatives(changes)})`] : [])].join('|');
+      return [ref, { type: 'string', minLength: 3, maxLength: 609,
+      pattern: `^(?:${alternatives(classifications.properties[ref]!.enum)})\\|(?:${updatePattern})$`,
       description: 'category|update for this source, using its review.categories and review.updates. Example: constraint|none.',
-    }])), required: sourceUpdates.required, additionalProperties: false }, activeTask, topicUpdates, unresolvedDefects,
-  }, required: ['sources', 'activeTask', 'topicUpdates', 'unresolvedDefects'], additionalProperties: false } };
+    }]; })), required: sourceUpdates.required, additionalProperties: false }, activeTask, topicUpdates, unresolvedDefects,
+  }, required: ['state', 'sources', 'activeTask', 'topicUpdates', 'unresolvedDefects'], additionalProperties: false } };
 }
 
 export function compileSemanticSourceNotes(value: unknown, sourceRefs: readonly string[]): string {
