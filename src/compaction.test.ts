@@ -951,6 +951,17 @@ test('historical user requests retain text without becoming observed facts or pe
   assert.ok('classifications' in schema.properties);
   assert.deepEqual(schema.properties.classifications.properties.m4!.enum, ['request']);
   assert.ok(!schema.properties.classifications.properties.m0!.enum.includes('request'));
+  const repeatedSources = createCompactionSources([...messages, user('repeat', question), user('new-data', `${question} The checksum check failed.`)], [], []);
+  const repeatedArchive = serializeSemanticCompactionTranscript(repeatedSources, memory, 6), repeatedRefs = getSemanticCompactionCoverageRefSet(repeatedSources, memory, 6);
+  const repeatedSchema = semanticCompactionResponseFormat(undefined, repeatedArchive, `ЗАМЕТКИ\n${draft(repeatedRefs)}`).schema;
+  assert.ok('classifications' in repeatedSchema.properties && 'sourceUpdates' in repeatedSchema.properties);
+  assert.deepEqual(repeatedSchema.properties.classifications.properties.m6!.enum, ['request'], 'an identical known request does not become primary state on repetition');
+  assert.ok(repeatedSchema.properties.classifications.properties.m7!.enum.includes('fact'), 'new asserted text must still receive independent review');
+  assert.doesNotMatch(repeatedSchema.properties.sourceUpdates.properties.m0!.pattern, /m6\//, 'a repeated request is not offered as closure or replacement evidence');
+  const repeated = { ...continued, sourceUpdates: Object.fromEntries(repeatedRefs.map(ref => [ref, 'none'])), classifications: { ...continued.classifications, m6: 'request', m7: 'fact' } };
+  const compileRepeated = (category: string) => JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...repeated, classifications: { ...repeated.classifications, m6: category } }), draft(repeatedRefs), repeatedSources, repeatedRefs, repeatedArchive));
+  assert.deepEqual(compileRepeated('request').historicalRequests.map((entry: { text: string }) => entry.text), [question, question]);
+  for (const category of ['constraint', 'fact', 'drop']) assert.throws(() => compileRepeated(category), /Архивный запрос/);
 });
 
 test('review witnesses retain short user instructions with their qualifications and bound long fragments', () => {

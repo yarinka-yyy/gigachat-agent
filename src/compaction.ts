@@ -286,10 +286,10 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
   const topicByRef = topicSources(groups);
   const index = metadata.evidenceIndex as Record<string, SemanticCompactionQuote & { role: string }>;
   const evidenceIds = Object.keys(index).sort((left, right) => Number(left.slice(1)) - Number(right.slice(1)));
-  const archiveMessages = (JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)).messages as Array<{ sourceRef: string; role: string }>);
+  const archiveMessages = (JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)).messages as Array<{ sourceRef: string; role: string; text: string }>);
   const assistantRefs = new Set(archiveMessages.filter(source => source.role === 'assistant').map(source => source.sourceRef));
   metadata.topicSources = Object.fromEntries(groups.map(topic => [topic.subject, { sourceRefs: topic.sourceRefs, evidence: topic.evidence }]));
-  const requestRefs = new Set((metadata.previousMemory?.historicalRequests ?? []).flatMap((entry: SemanticCompactionEntry) => entry.sourceRefs));
+  const requestRefs = new Set(historicalSemanticRequestRefs(metadata.previousMemory, archiveMessages));
   const review = (ref: string) => ({ categories: requestRefs.has(ref) ? ['request'] : assistantRefs.has(ref) ? ['decision', ...archiveMessages.filter(source => source.role === 'user' && Number(source.sourceRef.slice(1)) < Number(ref.slice(1))).map(source => `paraphrase:${source.sourceRef}`), ...(verbatim[ref] ? [] : ['drop'])] : [...SOURCE_CATEGORIES, 'defect', ...(archiveMessages.some(source => source.sourceRef === ref && source.role === 'user') ? ['request'] : ['drop'])],
     topic: topicByRef[ref] ?? null, note: notes[ref] ?? null, verbatim: verbatim[ref] ?? null,
     evidence: Object.fromEntries(evidenceIds.filter(id => index[id]!.sourceRef === ref).map(id => [`${ref}/${id}`, { text: index[id]!.text }])) });
@@ -332,7 +332,8 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
     ...(previous?.activeTask?.sourceRefs ?? []), ...(previous?.openWork ?? []).flatMap(entry => entry.sourceRefs)]);
   if (selection.activeTask !== 'none' && !primaryRefs.has(selection.activeTask as string)) throw new Error('Активная задача требует первичного user-источника, а не assistant-пересказа.');
   const classes = { ...selection.classifications } as Record<string, string>;
-  if ((previous?.historicalRequests ?? []).some(entry => entry.sourceRefs.some(ref => classes[ref] !== 'request'))) throw new Error('Архивный запрос нельзя повышать до утверждения или действующего ограничения.');
+  const requestRefs = historicalSemanticRequestRefs(previous, archive.messages);
+  if (requestRefs.some(ref => classes[ref] !== 'request')) throw new Error('Архивный запрос нельзя повышать до утверждения или действующего ограничения.');
   if (sourceRefs.some(ref => classes[ref] === 'request' && !archive.messages.some(source => source.sourceRef === ref && source.role === 'user')
     && !(previous?.historicalRequests ?? []).some(entry => entry.sourceRefs.includes(ref)))) throw new Error('Нельзя понизить прежнее первичное состояние до архивного запроса.');
   const primaryReviewRefs = new Set([...primaryRefs, ...(previous ? semanticMemorySourceRefs(previous).filter(ref => !reportRefs.has(ref)) : [])]);
@@ -535,13 +536,15 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   if (!Array.isArray(refs) || !refs.length || new Set(refs).size !== refs.length
     || refs.some(ref => typeof ref !== 'string' || !/^(m|t)(0|[1-9][0-9]*)$/.test(ref))) throw new Error('Некорректные источники заметок.');
   const fullArchive = archiveText ?? reviewMetadata!;
-  const archive = JSON.parse(fullArchive.slice(fullArchive.indexOf('\n') + 1)) as { messages: Array<{ sourceRef: string; role: string }>; tools: Array<{ sourceRef: string; anchorRef: string }>; previousMemory: SemanticCompactionMemory | null };
+  const archive = JSON.parse(fullArchive.slice(fullArchive.indexOf('\n') + 1)) as { messages: Array<{ sourceRef: string; role: string; text: string }>; tools: Array<{ sourceRef: string; anchorRef: string }>; previousMemory: SemanticCompactionMemory | null };
   const primary = [...new Set([...archive.messages.filter(source => source.role === 'user').map(source => source.sourceRef),
     ...(archive.previousMemory?.activeTask?.sourceRefs ?? []), ...(archive.previousMemory?.openWork ?? []).flatMap(entry => entry.sourceRefs)])];
   const evidenceIndex = semanticReviewEvidenceIndex(fullArchive);
   const userRefs = archive.messages.filter(source => source.role === 'user').map(source => source.sourceRef);
-  const evidenceIds = Object.keys(evidenceIndex).filter(id => evidenceIndex[id]!.role === 'user' && userRefs.includes(evidenceIndex[id]!.sourceRef));
-  if (archiveText !== undefined) return semanticSourceNotesResponseFormat(refs, primary, [...new Set(evidenceIds.flatMap(id => evidenceIndex[id]!.text.split(/(?<=[.!?])\s+|\r?\n/u)).filter(Boolean))]);
+  const requestRefs = historicalSemanticRequestRefs(archive.previousMemory, archive.messages);
+  const taskRefs = primary.filter(ref => !requestRefs.includes(ref));
+  const evidenceIds = Object.keys(evidenceIndex).filter(id => evidenceIndex[id]!.role === 'user' && userRefs.includes(evidenceIndex[id]!.sourceRef) && !requestRefs.includes(evidenceIndex[id]!.sourceRef));
+  if (archiveText !== undefined) return semanticSourceNotesResponseFormat(refs, taskRefs, [...new Set(evidenceIds.flatMap(id => evidenceIndex[id]!.text.split(/(?<=[.!?])\s+|\r?\n/u)).filter(Boolean))]);
   const candidate = reviewNotes?.slice(reviewNotes.indexOf('\n') + 1);
   const draft = candidate ? JSON.parse(compileSemanticSourceNotes(candidate, refs)) as { topics: DraftTopic[]; verbatim: Record<string, boolean> } : null;
   const position = (ref: string) => ref.startsWith('t') ? Number(archive.tools.find(tool => tool.sourceRef === ref)?.anchorRef.slice(1) ?? -1) : Number(ref.slice(1));
@@ -557,8 +560,8 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   const withSources = (choices: Record<string, string[]>) => Object.fromEntries(Object.entries(choices).map(([key, ids]) => [key, ids.map(id => `${evidenceIndex[id]!.sourceRef}/${id}`)]));
   const assistantOrigins = Object.fromEntries(archive.messages.filter(source => source.role === 'assistant').map(source => [source.sourceRef, userRefs.filter(ref => Number(ref.slice(1)) < Number(source.sourceRef.slice(1)))]));
   const topicWitnesses = Object.fromEntries(Object.entries(topicEvidence).map(([scope, ids]) => [scope, ids.map(id => topicWitnessAddress(id, evidenceIndex[id]!))]));
-  return semanticReviewDecisionResponseFormat(refs, primary, archive.previousMemory ? semanticMemorySourceRefs(archive.previousMemory).filter(ref => !reportRefs.has(ref)) : [], protectedRefs, withSources(updateEvidence), withSources(independentEvidence), topicWitnesses, assistantOrigins,
-    refs.filter(ref => draft ? draft.verbatim[ref] : false), (archive.previousMemory?.historicalRequests ?? []).flatMap(entry => entry.sourceRefs), closedRefs);
+  return semanticReviewDecisionResponseFormat(refs, taskRefs, archive.previousMemory ? semanticMemorySourceRefs(archive.previousMemory).filter(ref => !reportRefs.has(ref)) : [], protectedRefs, withSources(updateEvidence), withSources(independentEvidence), topicWitnesses, assistantOrigins,
+    refs.filter(ref => draft ? draft.verbatim[ref] : false), requestRefs, closedRefs);
 }
 
 export function compileSemanticSourceNotes(value: unknown, sourceRefs: readonly string[]): string {
@@ -943,6 +946,12 @@ function closedSemanticMemoryRefs(memory: SemanticCompactionMemory | null): stri
   return [...new Set((memory?.closedTopics ?? []).flatMap(topic => topic.sourceRefs.filter(ref => ref !== topic.closedBy)))];
 }
 
+function historicalSemanticRequestRefs(memory: SemanticCompactionMemory | null, messages: Array<{ sourceRef: string; role: string; text: string }>): string[] {
+  const requests = memory?.historicalRequests ?? [];
+  return [...new Set([...requests.flatMap(entry => entry.sourceRefs), ...messages.filter(source => source.role === 'user'
+    && requests.some(entry => entry.text === source.text)).map(source => source.sourceRef)])];
+}
+
 function semanticMemorySourceRefs(memory: SemanticCompactionMemory): string[] {
   const refs: string[] = [];
   const add = (entry: SemanticCompactionEntry): void => { refs.push(...entry.sourceRefs); };
@@ -1223,6 +1232,7 @@ export function formatSemanticCompactionMemory(value: unknown, sources: Compacti
     ...memory.decisions.map(entry => ({ title: 'Решение', entry })),
     ...memory.openWork.map(entry => ({ title: 'Открытая работа', entry })),
     ...memory.facts.map(entry => ({ title: 'Сведение', entry })),
+    ...(memory.unresolvedDefects ?? []).map(entry => ({ title: 'НЕУСТРАНЁННЫЙ ДЕФЕКТ', entry })),
   ];
   const position = (entry: SemanticCompactionEntry) => Math.max(...entry.sourceRefs.map(ref =>
     Number((ref.startsWith('t') ? sources.tools.find(tool => tool.ref === ref)!.anchorRef : ref).slice(1))));
@@ -1232,13 +1242,6 @@ export function formatSemanticCompactionMemory(value: unknown, sources: Compacti
     lines.push(`${title}: ${renderEntry(entry)}`);
     if (entry.exactQuotes) {
       for (const quote of entry.exactQuotes) if (!entry.text.includes(quote.text)) lines.push(`  Дословная цитата ${quote.sourceRef}: ${JSON.stringify(quote.text)}`);
-    }
-  }
-  if (memory.unresolvedDefects?.length) {
-    lines.push('НЕУСТРАНЁННЫЙ ДЕФЕКТ. Дословные свидетельства дополняют сохранённые результаты, не заменяя их:');
-    for (const defect of memory.unresolvedDefects) {
-      if (defect.exactQuotes?.length) for (const quote of defect.exactQuotes) lines.push(`- ${JSON.stringify(quote.text)} (источник: ${quote.sourceRef})`);
-      else lines.push(renderEntry(defect));
     }
   }
   lines.push('Если запрошен итог проверки, сохраняй указанный пользователем формат ответа. Цитируй связанные подтверждённые результаты, открытые дефекты и непроверенное вместе, без обобщения.');
