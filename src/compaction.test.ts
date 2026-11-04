@@ -893,6 +893,41 @@ test('critical assistant data requires retention or a cited earlier user origin'
   assert.throws(() => compileRolling({ ...rolling.classifications, m2: 'drop' }), /Критичный первичный/);
 });
 
+test('historical user requests retain text without becoming observed facts or permissions', () => {
+  const question = 'Which checks passed, and is the upload complete? Return the result as JSON.';
+  const messages = [user('policy', 'Do not edit local data; field ownerCode may be named but its values must stay private.'), assistant('ack', 'Understood.'),
+    user('task', 'Investigate the unresolved upload mismatch.'), assistant('ack-task', 'Noted.'), user('question', question), assistant('answer', 'The investigation is still pending.')];
+  const sources = createCompactionSources(messages, [], []), archive = serializeSemanticCompactionTranscript(sources), refs = getSemanticCompactionCoverageRefSet(sources);
+  const draft = (ids: string[]) => JSON.stringify({ taskSubject: 'Upload investigation', state: 'Mismatch remains unresolved.', activeTask: 'm2', topics: [], notes: Object.fromEntries(ids.map(ref => [ref, 'Incomplete extraction.'])), verbatim: Object.fromEntries(ids.map(ref => [ref, false])) });
+  const selection = { topicUpdates: {}, sourceUpdates: Object.fromEntries(refs.map(ref => [ref, 'none'])), assistantOrigins: { m1: 'm0', m3: 'm2', m5: 'm4' },
+    classifications: { m0: 'constraint', m1: 'drop', m2: 'openWork', m3: 'drop', m4: 'request', m5: 'drop' }, activeTask: 'm2', unresolvedDefects: '' };
+  const memory = JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify(selection), draft(refs), sources, refs, archive));
+  assert.deepEqual(memory.historicalRequests, [{ sourceRefs: ['m4'], text: question }]);
+  assert.deepEqual(memory.facts, []);
+  assert.equal(memory.constraints[0].text, messages[0]!.text);
+  assert.ok(formatSemanticCompactionMemory(JSON.stringify(memory), sources).includes(question));
+  assert.throws(() => validateSemanticCompactionMemory(JSON.stringify({ ...memory, historicalRequests: [{ text: question, sourceRefs: ['m1'] }] }), sources), /USER-источников/);
+  assert.throws(() => validateSemanticCompactionMemory(JSON.stringify({ ...memory, facts: [{ text: question, sourceRefs: ['m4'] }] }), sources), /Архивный запрос/);
+  assert.throws(() => validateSemanticCompactionMemory(JSON.stringify({ ...memory, decisions: Array.from({ length: 32 }, () => ({ text: 'A decision.', sourceRefs: ['m2'] })) }), sources), /общего лимита/);
+  const index = semanticReviewEvidenceIndex(archive), proof = Object.keys(index).find(id => index[id]!.sourceRef === 'm4')!;
+  const grouped = JSON.stringify({ ...JSON.parse(draft(refs)), topics: [{ subject: 'Investigation', evidence: 'Investigate the unresolved upload mismatch.', firstSource: 'm0', lastSource: 'm3' }] });
+  assert.throws(() => compileResolvedSemanticCompactionMemory(JSON.stringify({ ...selection, topicUpdates: { Investigation: `closes:${proof}` } }), grouped, sources, refs, archive), /user-свидетельства/);
+  const continuedSources = createCompactionSources([...messages, user('continue', 'Continue investigating without actions.')], [], []);
+  const continuedArchive = serializeSemanticCompactionTranscript(continuedSources, memory, 6), continuedRefs = getSemanticCompactionCoverageRefSet(continuedSources, memory, 6);
+  const continued = { state: 'Investigation remains open.', topicUpdates: {}, sourceUpdates: Object.fromEntries(continuedRefs.map(ref => [ref, ref === 'm4' ? 'keep' : 'none'])),
+    classifications: { m0: 'constraint', m2: 'openWork', m4: 'request', m6: 'openWork' }, activeTask: 'm2', unresolvedDefects: '' };
+  const compile = (classes = continued.classifications) => JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...continued, classifications: classes }), draft(continuedRefs), continuedSources, continuedRefs, continuedArchive));
+  assert.deepEqual(compile().historicalRequests, memory.historicalRequests);
+  assert.deepEqual(JSON.parse(continuedArchive.slice(continuedArchive.indexOf('\n') + 1)).messages.map((message: { sourceRef: string }) => message.sourceRef), ['m6']);
+  assert.throws(() => compile({ ...continued.classifications, m4: 'fact' }), /Архивный запрос/);
+  assert.throws(() => compile({ ...continued.classifications, m4: 'drop' }), /Архивный запрос/);
+  assert.throws(() => compile({ ...continued.classifications, m0: 'request' }), /понизить/);
+  const schema = semanticCompactionResponseFormat(undefined, continuedArchive, `ЗАМЕТКИ\n${draft(continuedRefs)}`).schema;
+  assert.ok('classifications' in schema.properties);
+  assert.deepEqual(schema.properties.classifications.properties.m4!.enum, ['request']);
+  assert.ok(!schema.properties.classifications.properties.m0!.enum.includes('request'));
+});
+
 test('review witnesses retain short user instructions with their qualifications and bound long fragments', () => {
   const text = 'Finish the chart discussion. The import is still pending; do not edit its backups.';
   const long = 'Long observations. '.repeat(100);

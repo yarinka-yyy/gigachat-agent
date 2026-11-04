@@ -732,7 +732,7 @@ test('builds an independent semantic review from the exact current archive and a
   for (const record of records) {
     const ref = record.sourceRef as string;
     assert.deepEqual(record.review, {
-      categories: record.role === 'assistant' ? ['decision', ...sources.messages.filter(source => source.role === 'user' && Number(source.ref.slice(1)) < Number(ref.slice(1))).map(source => `paraphrase:${source.ref}`), ...(verbatim[ref] ? [] : ['drop'])] : ['constraint', 'decision', 'openWork', 'fact', 'defect'], topic: null, note: notes[ref], verbatim: verbatim[ref],
+      categories: record.role === 'assistant' ? ['decision', ...sources.messages.filter(source => source.role === 'user' && Number(source.ref.slice(1)) < Number(ref.slice(1))).map(source => `paraphrase:${source.ref}`), ...(verbatim[ref] ? [] : ['drop'])] : ['constraint', 'decision', 'openWork', 'fact', 'defect', 'request'], topic: null, note: notes[ref], verbatim: verbatim[ref],
       evidence: Object.fromEntries(Object.entries(quoteIndex).filter(([, quote]) => quote.sourceRef === ref).map(([id, quote]) => [`${ref}/${id}`, { text: quote.text }])) });
   }
   const metadata = decode(wire.messages[2]!.content[0]!.text!);
