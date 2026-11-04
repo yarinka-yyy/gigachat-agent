@@ -619,6 +619,8 @@ test('topic ranges include anchored tools without reading raw history outside th
   const formatted = formatSemanticReviewSources(indexedArchive, `ЗАМЕТКИ\n${notes}`);
   const metadata = JSON.parse(formatted.records[0]!.slice(formatted.records[0]!.indexOf('\n') + 1));
   assert.deepEqual(metadata.topicSources.Reading.sourceRefs, ['m0', 'm1', 't0']);
+  assert.equal(metadata.topicSources.Reading.evidence, undefined, 'independent review must not inherit a proposed closure witness');
+  assert.ok(formatted.records.every(record => !record.includes('An untrusted draft proposal.')), 'a fabricated draft citation is not presented as evidence');
   assert.deepEqual(metadata.sourceReviews.t0.topic, ['Reading']);
 });
 

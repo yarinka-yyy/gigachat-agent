@@ -302,7 +302,7 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
   const evidenceIds = Object.keys(index).sort((left, right) => Number(left.slice(1)) - Number(right.slice(1)));
   const archiveMessages = (JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)).messages as Array<{ sourceRef: string; role: string; text: string }>);
   const assistantRefs = new Set(archiveMessages.filter(source => source.role === 'assistant').map(source => source.sourceRef));
-  metadata.topicSources = Object.fromEntries(groups.map(topic => [topic.subject, { sourceRefs: topic.sourceRefs, evidence: topic.evidence }]));
+  metadata.topicSources = Object.fromEntries(groups.map(topic => [topic.subject, { sourceRefs: topic.sourceRefs }]));
   const requestRefs = new Set(historicalSemanticRequestRefs(metadata.previousMemory, archiveMessages));
   const review = (ref: string) => ({ categories: requestRefs.has(ref) ? ['request'] : assistantRefs.has(ref) ? ['decision', ...archiveMessages.filter(source => source.role === 'user' && Number(source.sourceRef.slice(1)) < Number(ref.slice(1))).map(source => `paraphrase:${source.sourceRef}`), ...(verbatim[ref] ? [] : ['drop'])] : [...SOURCE_CATEGORIES, 'defect', ...(archiveMessages.some(source => source.sourceRef === ref && source.role === 'user') ? ['request'] : ['drop'])],
     topic: topicByRef[ref] ?? null, note: notes[ref] ?? null, verbatim: verbatim[ref] ?? null,
