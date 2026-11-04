@@ -479,6 +479,19 @@ test('validates and formats versioned semantic memory with paraphrases and exact
   assert.match(formatted, /Дословная цитата m2: "\|"/);
 });
 
+test('readout preserves revision order across primary categories and tool anchors', () => {
+  const sources = semanticSources();
+  for (const [olderCategory, newerCategory] of [['facts', 'decisions'], ['decisions', 'facts']] as const) {
+    const candidate = semanticCandidate({ constraints: [], decisions: [], facts: [], pastTopics: [],
+      [olderCategory]: [{ text: 'Earlier value.', sourceRefs: ['m1'] }],
+      [newerCategory]: [{ text: 'Revised value.', sourceRefs: ['m2'] }],
+    });
+    const formatted = formatSemanticCompactionMemory(candidate, sources);
+    assert.ok(formatted.indexOf('Earlier value.') < formatted.indexOf('Revised value.'));
+    assert.ok(formatted.indexOf('Получить следующий результат только чтением.') < formatted.indexOf('Earlier value.'), 'a tool uses its message anchor rather than a category position');
+  }
+});
+
 test('limits semantic candidate refs to the current archive inventory while preserving stored-memory validation', () => {
   const sources = semanticSources();
   const sourceRefs = getSemanticCompactionCoverageRefSet(sources);
@@ -684,6 +697,18 @@ test('topic closure removes all its details and defect state survives compilatio
   const rollingResolution = { ...rolling, assistantOrigins: {}, sourceUpdates: Object.fromEntries(rollingRefs.map(ref => [ref, 'none'])) };
   const continued = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson(rollingResolution), rollingNotes, rollingSources, rollingRefs, rollingArchive));
   assert.deepEqual(continued.closedTopics, memory.closedTopics, 'later review cannot silently reopen closed details');
+  const closedSchema = semanticCompactionResponseFormat(undefined, rollingArchive, `ЗАМЕТКИ\n${rollingNotes}`).schema;
+  assert.ok('classifications' in closedSchema.properties && 'sourceUpdates' in closedSchema.properties);
+  for (const ref of ['m1', 'm3']) {
+    assert.deepEqual(closedSchema.properties.classifications.properties[ref]!.enum, ['drop']);
+    assert.equal(closedSchema.properties.sourceUpdates.properties[ref]!.pattern, '^(?:none)$');
+    assert.throws(() => compileResolvedSemanticCompactionMemory(reviewJson({ ...rollingResolution,
+      sourceUpdates: { ...rollingResolution.sourceUpdates, [ref]: `closes:${Object.keys(rollingIndex).find(id => rollingIndex[id]!.sourceRef === 'm6')}` },
+    }), rollingNotes, rollingSources, rollingRefs, rollingArchive), /Закрытый источник/);
+    assert.throws(() => compileResolvedSemanticCompactionMemory(reviewJson({ ...rollingResolution,
+      classifications: { ...rollingResolution.classifications, [ref]: 'fact' },
+    }), rollingNotes, rollingSources, rollingRefs, rollingArchive), /Закрытый источник|первичного источника/);
+  }
   assert.deepEqual(continued.unresolvedDefects, memory.unresolvedDefects, 'state survives a second compaction without prefix accumulation');
   assert.throws(() => compileResolvedSemanticCompactionMemory(reviewJson({ ...rollingResolution, unresolvedDefects: '' }), rollingNotes,
     rollingSources, rollingRefs, rollingArchive), /нельзя потерять/);
