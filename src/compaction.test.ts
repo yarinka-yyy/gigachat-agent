@@ -1011,7 +1011,7 @@ test('review decision schema requires every source once and only later new user 
   for (const [id, proof] of Object.entries(evidence)) {
     assert.equal(actual.properties.sourceUpdates.properties.m0!.enum.includes(`closes:${proof.sourceRef}/${id}`), proof.role === 'user' && Number(proof.sourceRef.slice(1)) > 0);
   }
-  assert.equal(Object.keys(actual.properties)[0], 'evidence');
+  assert.deepEqual(Object.keys(actual.properties), ['sourceUpdates', 'classifications', 'activeTask', 'topicUpdates', 'unresolvedDefects', 'evidence'], 'select transitions before copying their witnesses');
 });
 
 test('rolling review decisions retain previous tools without replaying their raw prefix', () => {

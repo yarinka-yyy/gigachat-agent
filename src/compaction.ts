@@ -173,7 +173,7 @@ const SOURCE_CLASSES = ['drop', 'defect', 'request', ...Array.from({ length: 15 
 
 
 const SEMANTIC_REVIEW_FIELDS = ['sourceUpdates', 'topicUpdates', 'assistantOrigins', 'activeTask', 'classifications', 'unresolvedDefects'] as const;
-const SEMANTIC_GLOBAL_REVIEW_FIELDS = ['evidence', 'topicUpdates', 'sourceUpdates', 'classifications', 'activeTask', 'unresolvedDefects'] as const;
+const SEMANTIC_GLOBAL_REVIEW_FIELDS = ['sourceUpdates', 'classifications', 'activeTask', 'topicUpdates', 'unresolvedDefects', 'evidence'] as const;
 const topicWitnessAddress = (id: string, proof: SemanticCompactionQuote): string => `${proof.sourceRef}/${id}: ${proof.text}`;
 
 function semanticReviewDecisionResponseFormat(refs: string[], primary: string[], retained: string[], protectedRefs: string[], updateEvidence: Record<string, string[]>, independentEvidence: Record<string, string[]>, topicEvidence: Record<string, string[]>, assistantOrigins: Record<string, string[]>, exactRefs: string[], requestRefs: string[], closedRefs: string[], witnesses: string[]) {
@@ -184,11 +184,6 @@ function semanticReviewDecisionResponseFormat(refs: string[], primary: string[],
     : ['decision', ...(assistantOrigins[ref] ?? []).map(origin => `paraphrase:${origin}`), ...(exactRefs.includes(ref) ? [] : ['drop'])])
     .filter(value => (value !== 'request' || requestRefs.includes(ref) || primary.includes(ref) && !retained.includes(ref)) && (value !== 'drop' || !protectedRefs.includes(ref)));
   return { type: 'json_schema', strict: true, schema: { type: 'object', properties: {
-    evidence: { type: 'array', description: 'Only literal witnesses used by closes/supersedes/independent sourceUpdates. none, keep and classifications need no witness. Use [] when no source transitions are selected.', maxItems: Math.min(refs.length, witnesses.length), uniqueItems: true, items: quoteSchema },
-    topicUpdates: { type: 'object', properties: Object.fromEntries(Object.entries(topicEvidence).map(([scope, ids]) => [scope, {
-      type: 'object', properties: { closed: { type: 'boolean', enum: ids.length ? [false, true] : [false] },
-        evidence: ids.length ? quoteSchema : { type: 'string', enum: ['none'] } }, required: ['closed', 'evidence'], additionalProperties: false,
-    }])), required: Object.keys(topicEvidence), additionalProperties: false },
     sourceUpdates: { type: 'object', properties: Object.fromEntries(refs.map(ref => [ref, { type: 'string', maxLength: 512,
       enum: ['none', ...(retained.includes(ref) && protectedRefs.includes(ref) ? ['keep'] : []),
         ...independentEvidence[ref]!.map(id => `independent:${id}`),
@@ -196,7 +191,12 @@ function semanticReviewDecisionResponseFormat(refs: string[], primary: string[],
     }])), required: refs, additionalProperties: false },
     classifications: { type: 'object', properties: Object.fromEntries(refs.map(ref => [ref, { type: 'string', enum: category(ref) }])), required: refs, additionalProperties: false },
     activeTask: { type: 'string', enum: [...primary, 'none'] },
+    topicUpdates: { type: 'object', properties: Object.fromEntries(Object.entries(topicEvidence).map(([scope, ids]) => [scope, {
+      type: 'object', properties: { closed: { type: 'boolean', enum: ids.length ? [false, true] : [false] },
+        evidence: ids.length ? quoteSchema : { type: 'string', enum: ['none'] } }, required: ['closed', 'evidence'], additionalProperties: false,
+    }])), required: Object.keys(topicEvidence), additionalProperties: false },
     unresolvedDefects: { type: 'string', maxLength: 512 },
+    evidence: { type: 'array', description: 'After choosing sourceUpdates, copy only their used literal witnesses. This is not a list of retained sources. none, keep and classifications need no witness. Use [] when no source transitions are selected.', maxItems: Math.min(refs.length, witnesses.length), uniqueItems: true, items: quoteSchema },
   }, required: [...SEMANTIC_GLOBAL_REVIEW_FIELDS], additionalProperties: false } };
 }
 
