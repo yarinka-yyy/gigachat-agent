@@ -569,7 +569,7 @@ test('source notes cover every source before compression without becoming a snap
   const refs = ['m0', 'm1', 't0'];
   const notes = { m0: 'Earlier restriction stays active.', m1: 'Discussion closed.', t0: 'Read passed; import untested.' };
   const verbatim = Object.fromEntries(refs.map(ref => [ref, false]));
-  const topics = [{ subject: 'Read discussion', sourceRefs: ['m1', 't0'] }];
+  const topics = [{ subject: 'Read discussion', evidence: 'Read discussion is closed.', sourceRefs: ['m1', 't0'] }];
   assert.deepEqual(JSON.parse(compileSemanticSourceNotes(JSON.stringify({ taskSubject: 'Current task', state: 'Current task.', activeTask: 'm0', topics, notes, verbatim }), refs)), { taskSubject: 'Current task', state: 'Current task.', activeTask: 'm0', topics, notes, verbatim });
   assert.deepEqual(semanticSourceNotesResponseFormat(refs).schema.properties.notes.required, refs);
   for (const invalid of [{ notes: { m0: notes.m0 } }, { notes: { ...notes, unknown: 'extra' } },
@@ -620,7 +620,7 @@ test('topic closure removes all its details and defect state survives compilatio
   assert.deepEqual(emptyState.closedTopics ?? [], [], 'an explicitly empty closure selection is valid');
   const corrected = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ ...resolution, activeTask: 'm5' }), notes, sources, refs, archive));
   assert.deepEqual(corrected.activeTask.sourceRefs, ['m5'], 'review may correct a draft selection explicitly');
-  const mistakenDraft = JSON.stringify({ ...JSON.parse(notes), topics: [{ subject: 'Mixed discussion', sourceRefs: refs }] });
+  const mistakenDraft = JSON.stringify({ ...JSON.parse(notes), topics: [{ subject: 'Mixed discussion', evidence: index[idsFor('m4')[0]!]!.text, sourceRefs: refs }] });
   assert.deepEqual(JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson({ ...resolution, topicUpdates: { 'Mixed discussion': 'none' } }), mistakenDraft, sources, refs, archive)).closedTopics,
     corrected.closedTopics, 'draft grouping cannot replace independent literal review proof');
   const memory = JSON.parse(compileResolvedSemanticCompactionMemory(reviewJson(resolution), notes, sources, refs, archive));
@@ -730,7 +730,7 @@ test('source state transitions override stale categories without dropping durabl
   assert.ok('sourceUpdates' in schema.properties);
   assert.deepEqual(schema.properties.sourceUpdates.required, Object.keys(sourceUpdates));
 
-  const grouped = JSON.stringify({ ...JSON.parse(notes), topics: [{ subject: 'Chart', sourceRefs: ['m1', 'm2', 'm3', 'm7'] }] });
+  const grouped = JSON.stringify({ ...JSON.parse(notes), topics: [{ subject: 'Chart', evidence: evidence[idsFor('m5')[0]!]!.text, sourceRefs: ['m1', 'm2', 'm3', 'm7'] }] });
   const topicReview = { ...resolution, topicUpdates: { Chart: `closes:${idsFor('m5')[0]}` },
     sourceUpdates: { ...sourceUpdates, m1: 'keep', m2: 'none', m3: 'none' },
     assistantOrigins: { m3: 'self', m9: 'm0' }, classifications: { ...resolution.classifications, m9: 'decision' } };
@@ -748,7 +748,11 @@ test('source state transitions override stale categories without dropping durabl
   const groupedSchema = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${grouped}`).schema;
   assert.ok('topicUpdates' in groupedSchema.properties);
   const witness = `${evidence[idsFor('m5')[0]!]!.text} [${idsFor('m5')[0]}]`;
-  assert.ok(groupedSchema.properties.topicUpdates.properties.Chart!.enum.includes(witness));
+  assert.deepEqual(groupedSchema.properties.topicUpdates.properties.Chart!.enum, ['active', witness]);
+  for (const proof of ['A fabricated closure.', evidence[idsFor('m0')[0]!]!.text, messages[3]!.text]) {
+    const invalid = JSON.stringify({ ...JSON.parse(grouped), topics: [{ subject: 'Chart', evidence: proof, sourceRefs: ['m2', 'm3'] }] });
+    assert.throws(() => semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${invalid}`), /USER/);
+  }
   const decision = { state: 'Chart closed; independent queue and the observed mismatch remain open.',
     topicUpdates: { Chart: witness }, sourceUpdates: topicReview.sourceUpdates,
     activeTask: 'm5', unresolvedDefects: '', classifications: { ...topicReview.classifications, m9: 'paraphrase' } };
