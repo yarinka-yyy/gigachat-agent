@@ -334,7 +334,6 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
     if (typeof update !== 'string') throw new Error('Некорректное состояние темы.');
     const [kind, id, extra] = update.split(':'), proof = evidenceIndex[id!];
     if (kind !== 'closes' || extra !== undefined || !proof || proof.role !== 'user' || !userRefs.includes(proof.sourceRef)
-      || draft.topics.find(proposal => proposal.subject === topic)!.evidence !== proof.text
       || !sourceRefs.some(ref => topicByRef[ref] === topic && sourcePosition(ref) < sourcePosition(proof.sourceRef))) throw new Error('Закрытие темы требует более позднего нового user-свидетельства.');
     topicClosures.set(topic, id!);
   }
@@ -482,12 +481,8 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   const draft = candidate ? JSON.parse(compileSemanticSourceNotes(candidate, refs)) as { topics: DraftTopic[] } : null;
   const position = (ref: string) => ref.startsWith('t') ? Number(archive.tools.find(tool => tool.sourceRef === ref)?.anchorRef.slice(1) ?? -1) : Number(ref.slice(1));
   const updateEvidence = Object.fromEntries(refs.map(ref => [ref, evidenceIds.filter(id => position(evidenceIndex[id]!.sourceRef) > position(ref))]));
-  const scopes = draft ? draft.topics : Array.from({ length: MAX_GENERATED_PAST_TOPICS }, (_, i) => ({ subject: `${i}`.padEnd(MAX_SEMANTIC_SUBJECT_CHARS, 'X'), sourceRefs: refs, evidence: null }));
-  const topicEvidence = Object.fromEntries(scopes.map(topic => {
-    const ids = evidenceIds.filter(id => (topic.evidence === null || topic.evidence === evidenceIndex[id]!.text) && topic.sourceRefs.some(ref => position(ref) < position(evidenceIndex[id]!.sourceRef)));
-    if (topic.evidence !== null && ids.length !== 1) throw new Error('Предложение закрытия требует однозначного более позднего нового USER-свидетельства.');
-    return [topic.subject, ids];
-  }));
+  const scopes = draft ? draft.topics : Array.from({ length: MAX_GENERATED_PAST_TOPICS }, (_, i) => ({ subject: `${i}`.padEnd(MAX_SEMANTIC_SUBJECT_CHARS, 'X'), sourceRefs: refs }));
+  const topicEvidence = Object.fromEntries(scopes.map(topic => [topic.subject, evidenceIds.filter(id => topic.sourceRefs.some(ref => position(ref) < position(evidenceIndex[id]!.sourceRef)))]));
   return semanticReviewDecisionResponseFormat(refs, primary, archive.previousMemory ? semanticMemorySourceRefs(archive.previousMemory) : [], updateEvidence, topicEvidence, evidenceIndex);
 }
 

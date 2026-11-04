@@ -748,10 +748,13 @@ test('source state transitions override stale categories without dropping durabl
   const groupedSchema = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${grouped}`).schema;
   assert.ok('topicUpdates' in groupedSchema.properties);
   const witness = `${evidence[idsFor('m5')[0]!]!.text} [${idsFor('m5')[0]}]`;
-  assert.deepEqual(groupedSchema.properties.topicUpdates.properties.Chart!.enum, ['active', witness]);
+  assert.ok(groupedSchema.properties.topicUpdates.properties.Chart!.enum.includes(witness));
   for (const proof of ['A fabricated closure.', evidence[idsFor('m0')[0]!]!.text, messages[3]!.text]) {
     const invalid = JSON.stringify({ ...JSON.parse(grouped), topics: [{ subject: 'Chart', evidence: proof, sourceRefs: ['m2', 'm3'] }] });
-    assert.throws(() => semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${invalid}`), /USER/);
+    const schema = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${invalid}`).schema;
+    assert.ok('topicUpdates' in schema.properties);
+    assert.ok(schema.properties.topicUpdates.properties.Chart!.enum.includes(witness), 'untrusted draft evidence must remain correctable by independent review');
+    assert.deepEqual(JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...topicReview, topicUpdates: { Chart: `closes:${idsFor('m5')[0]}` } }), invalid, sources, refs, archive)), memory);
   }
   const decision = { state: 'Chart closed; independent queue and the observed mismatch remain open.',
     topicUpdates: { Chart: witness }, sourceUpdates: topicReview.sourceUpdates,
