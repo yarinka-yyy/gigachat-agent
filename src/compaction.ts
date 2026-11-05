@@ -465,21 +465,23 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
         witness, first: candidates[witness]!.first, last: candidates[witness]!.last, subject: candidates[witness]!.subject,
       }));
       for (const topic of approved) approvedTopicSubjects.add(topic.subject);
+      const approvedWitnesses = new Set(approved.map(topic => topic.witness));
       const updates = [...approved, ...review.other];
-      if (updates.length > MAX_GENERATED_PAST_TOPICS || updates.length === 0 && witnesses.size > 0 && !Object.keys(candidates).length) {
+      if (review.other.length > MAX_GENERATED_PAST_TOPICS || updates.length === 0 && witnesses.size > 0 && !Object.keys(candidates).length) {
         throw new Error('Review требует явное решение о закрытии тем.');
       }
       const seenWitnesses = new Set<string>();
       selection.topicUpdates = Object.fromEntries(updates.flatMap(update => {
         if (!isRecord(update) || !hasOnlyKeys(update, ['witness', 'first', 'last', 'subject'])
           || typeof update.witness !== 'string' || typeof update.first !== 'string' || typeof update.last !== 'string'
-          || typeof update.subject !== 'string' || !update.subject.trim() || [...update.subject].length > MAX_SEMANTIC_SUBJECT_CHARS
-          || resolvedTopics.has(update.subject)) {
+          || typeof update.subject !== 'string' || !update.subject.trim() || [...update.subject].length > MAX_SEMANTIC_SUBJECT_CHARS) {
           throw new Error('Review требует решения и границы для каждой темы.');
         }
         const { witness: address, first, subject } = update;
         if (address === 'none' && witnesses.size > 0 && updates.length === 1
           && first === 'none' && update.last === 'none' && subject === 'none') return [];
+        if (seenWitnesses.has(address) && approvedWitnesses.has(address)) return [];
+        if (resolvedTopics.has(subject) || resolvedTopics.size >= MAX_GENERATED_PAST_TOPICS) throw new Error('Review требует решения и границы для каждой темы.');
         if (!witnesses.has(address) || seenWitnesses.has(address)) throw new Error('Закрытие темы требует допустимого USER-свидетельства.');
         seenWitnesses.add(address);
         const witness = address.split('/')[0]!;
