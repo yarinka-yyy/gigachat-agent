@@ -778,7 +778,7 @@ test('source state transitions override stale categories without dropping durabl
     user('pending', 'The upload queue remains unresolved; return to it after the chart discussion.'),
     user('chart', 'Compare chart borders and spacing.'), assistant('legend', 'Use a small legend and two columns.'),
     user('old', 'The tentative budget is 900; this does not authorize spending.'),
-    user('close', 'The chart discussion is closed. Continue investigating the upload queue without writing files.'),
+    user('close', 'Continue investigating the upload queue without writing files, although the chart discussion is closed.'),
     user('revision', 'Replace the old budget with 640. No purchase or local write is authorized.'),
     user('return', 'Return only to the chart legend later; this aside does not close the upload investigation.'),
     user('outcome', 'READ-43: the copy and checksum passed on Linux build 2.8; restored path differs. Upload was not attempted; the mismatch remains unresolved.'),
@@ -883,8 +883,9 @@ test('source state transitions override stale categories without dropping durabl
   const { records } = formatSemanticReviewSources(indexedArchive, `ЗАМЕТКИ\n${grouped}`);
   const focusRecord = records[records.length - 1]!;
   const focus = JSON.parse(focusRecord.slice(focusRecord.indexOf('\n') + 1));
-  assert.equal(focus.topicStatus[`m5/${witness}`], 'The chart discussion is closed.');
-  assert.equal(focus.witnesses[`m5/${witness}`].text, messages[5]!.text);
+  assert.equal(focus.topicStatus[`m5/${witness}`], 'the chart discussion is closed.');
+  const witnessRecord = records.map(record => JSON.parse(record.slice(record.indexOf('\n') + 1))).find(record => record.sourceRef === 'm5');
+  assert.equal(witnessRecord.review.evidence[`m5/${witness}`].text, messages[5]!.text);
   assert.equal(focus.witnesses[`m5/${witness}`].lastBeforeWitness, 'm4');
   assert.equal(focus.topics, undefined);
   assert.ok(focus.witnesses[`m8/${idsFor('m8')[0]}`], 'unranked witnesses stay available');

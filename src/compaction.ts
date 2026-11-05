@@ -279,6 +279,13 @@ function topicStatusSentence(text: string): string | undefined {
     && /(?:закрыт|заверш[её]н|продолжа|открыт|\b(?:closed|complete[ds]?|finished|open|ongoing)\b)/iu.test(part));
 }
 
+function reviewTopicStatus(text: string): string | undefined {
+  const sentence = topicStatusSentence(text);
+  if (!sentence) return undefined;
+  const clauses = sentence.split(/,\s+(?:хотя|although|though)\s+/iu);
+  return clauses.find(clause => topicStatusSentence(clause)) ?? sentence;
+}
+
 export function formatSemanticDraftTopicStatus(archiveText: string): string {
   const { messages } = JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)) as {
     messages: Array<{ sourceRef: string; role: string }>;
@@ -323,19 +330,19 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
     .flatMap(topic => topic.properties.evidence.enum.filter(address => address !== 'none')))];
   const topicStatus = witnessAddresses.flatMap(address => {
     const quote = index[address.split('/')[1]!]!;
-    const sentence = topicStatusSentence(quote.text);
+    const sentence = reviewTopicStatus(quote.text);
     return sentence ? [[address, sentence]] : [];
   });
   const topicReview = witnessAddresses.length || Object.keys(primaryNotes).length ? [
     'КАНДИДАТЫ СВИДЕТЕЛЬСТВ ЗАКРЫТИЯ JSON. Цитаты USER и недоверенные заметки draft.\n' + JSON.stringify({
-      topicStatus: Object.fromEntries(topicStatus),
       timeline: witnessAddresses.length ? userTimeline : {},
       witnesses: Object.fromEntries(witnessAddresses.map(address => {
         const quote = index[address.split('/')[1]!]!;
         const lastBeforeWitness = [...messageRefs].filter(ref => Number(ref.slice(1)) < Number(quote.sourceRef.slice(1))).pop();
-        return [address, { text: quote.text, lastBeforeWitness }];
+        return [address, { lastBeforeWitness }];
       })),
       primaryNotes,
+      topicStatus: Object.fromEntries(topicStatus),
     }),
   ] : [];
   delete metadata.evidenceIndex;
@@ -651,7 +658,7 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   const scopes = draft ? draftTopicSources(draft.topics, refs, archive.tools) : Array.from({ length: MAX_GENERATED_PAST_TOPICS }, (_, i) => ({ subject: `${i}`.padEnd(MAX_SEMANTIC_SUBJECT_CHARS, 'X'), sourceRefs: [firstAvailable] }));
   const topicCandidates = evidenceIds.filter(id => position(firstAvailable) < position(evidenceIndex[id]!.sourceRef));
   const explicitClosure = new Set(topicCandidates.filter(id => /(?<!\p{L})(?:закрыт[аоы]?|заверш[её]н[аоы]?|closed|finished|completed)[.!»"’”\s]*$/iu
-    .test(topicStatusSentence(evidenceIndex[id]!.text) ?? '')));
+    .test(reviewTopicStatus(evidenceIndex[id]!.text) ?? '')));
   const orderedTopicCandidates = [...topicCandidates.filter(id => explicitClosure.has(id)), ...topicCandidates.filter(id => !explicitClosure.has(id))];
   const topicEvidence = Object.fromEntries(scopes.map(topic => [topic.subject, orderedTopicCandidates]));
   const independentEvidence = Object.fromEntries(refs.map(ref => [ref, !closedRefs.includes(ref) && (!draft || scopes.length > 0)
