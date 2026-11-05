@@ -319,6 +319,13 @@ function reviewTopicRangeCandidates(messages: Array<{ sourceRef: string; role: s
   }).slice(0, MAX_GENERATED_PAST_TOPICS));
 }
 
+function reviewDefectCandidates(index: Record<string, SemanticCompactionQuote & { role: string }>, userRefs: Set<string>) {
+  return Object.fromEntries(Object.entries(index).filter(([, quote]) => quote.role === 'user' && userRefs.has(quote.sourceRef)
+    && /(?:открыт|остал|не\s+(?:устран|реш)|unresolved|still|remains)/iu.test(quote.text)
+    && /(?:несовпад|несоответств|расхожд|дефект|ошибк|mismatch|defect|failure|error)/iu.test(quote.text))
+    .slice(-4).map(([id, quote]) => [`${quote.sourceRef}/${id}`, quote.text]));
+}
+
 export function formatSemanticDraftTopicStatus(archiveText: string): string {
   const { messages } = JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)) as {
     messages: Array<{ sourceRef: string; role: string }>;
@@ -371,6 +378,7 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
   const orderedMessageRefs = [...messageRefs];
   const lastBefore = (ref: string) => orderedMessageRefs[orderedMessageRefs.indexOf(ref) - 1];
   const proposedRanges = reviewTopicRangeCandidates(messages, witnessAddresses, index);
+  const defectCandidates = reviewDefectCandidates(index, new Set(Object.keys(userTimeline)));
   const closureWindows = Object.fromEntries(topicStatus.filter(([, sentence]) => suggestsTopicClosure(sentence))
     .slice(0, MAX_GENERATED_PAST_TOPICS).map(([address, statement]) => {
       const witnessRef = address!.split('/')[0]!;
@@ -379,7 +387,7 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
         first, last: lastBefore(priorUsers[index + 1]?.[0] ?? witnessRef), startsWith,
       })) }];
     }));
-  const topicReview = witnessAddresses.length || Object.keys(primaryNotes).length ? [
+  const topicReview = witnessAddresses.length || Object.keys(primaryNotes).length || Object.keys(defectCandidates).length ? [
     'КАНДИДАТЫ СВИДЕТЕЛЬСТВ ЗАКРЫТИЯ JSON. Цитаты USER и недоверенные заметки draft.\n' + JSON.stringify({
       timeline: witnessAddresses.length ? userTimeline : {},
       witnesses: Object.fromEntries(witnessAddresses.map(address => {
@@ -389,6 +397,7 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
       primaryNotes,
       topicStatus: Object.fromEntries(topicStatus),
       closureWindows,
+      defectCandidates,
     }),
   ] : [];
   delete metadata.evidenceIndex;
@@ -420,6 +429,8 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
     previousMemory: SemanticCompactionMemory | null; messages: Array<{ sourceRef: string; role: string; text: string }>; tools: Array<{ sourceRef: string; anchorRef: string }>;
   };
   let topicByRef = topicSources(draftTopicSources(draft.topics, sourceRefs, archive.tools));
+  const approvedTopicSubjects = new Set<string>();
+  const evidenceIndex = semanticReviewEvidenceIndex(archiveText);
   if (isRecord(selection) && !Object.prototype.hasOwnProperty.call(selection, 'assistantOrigins')) {
     const format = semanticCompactionResponseFormat(undefined, archiveText, `ЗАМЕТКИ\n${notesValue}`);
     if (!('sourceUpdates' in format.schema.properties)) throw new Error('Review требует контракт выбора источников.');
@@ -429,7 +440,19 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
     if (typeof selection.activeTask !== 'string' || !format.schema.properties.activeTask.enum.includes(selection.activeTask)) throw new Error('Активная задача требует допустимого первичного источника.');
     if (pairedReview) {
       const witnesses = new Set(Object.values(format.schema.properties.topicUpdates.properties).flatMap(topic => topic.properties.evidence.enum.slice(1)));
-      const candidates = reviewTopicRangeCandidates(archive.messages, [...witnesses], semanticReviewEvidenceIndex(archiveText));
+      const candidates = reviewTopicRangeCandidates(archive.messages, [...witnesses], evidenceIndex);
+      const defectCandidates = reviewDefectCandidates(evidenceIndex, new Set(archive.messages.filter(source => source.role === 'user').map(source => source.sourceRef)));
+      const defectReview = selection.unresolvedDefects;
+      if (!isRecord(defectReview) || !hasOnlyKeys(defectReview, ['proposed', 'other']) || !isRecord(defectReview.proposed)
+        || !hasOnlyKeys(defectReview.proposed, Object.keys(defectCandidates)) || typeof defectReview.other !== 'string'
+        || Object.values(defectReview.proposed).some(decision => typeof decision !== 'boolean')) throw new Error('Review требует решения по каждому предложенному свидетельству дефекта.');
+      const otherDefects = defectReview.other ? defectReview.other.split(';') : [];
+      const cited = new Set(otherDefects.flatMap(group => group.split(',').map(address => address.trim())));
+      for (const [address, accepted] of Object.entries(defectReview.proposed)) {
+        if (!accepted && cited.has(address)) throw new Error('Review содержит противоречивое решение о свидетельстве дефекта.');
+        if (accepted && !cited.has(address)) otherDefects.push(address);
+      }
+      selection.unresolvedDefects = otherDefects.join(';');
       const messageRefs = archive.messages.map(source => source.sourceRef);
       const resolvedTopics = new Map<string, DraftTopic>();
       const classifications = selection.classifications as Record<string, string>;
@@ -441,6 +464,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
       const approved = Object.entries(review.proposed).filter(([, accepted]) => accepted).map(([witness]) => ({
         witness, first: candidates[witness]!.first, last: candidates[witness]!.last, subject: candidates[witness]!.subject,
       }));
+      for (const topic of approved) approvedTopicSubjects.add(topic.subject);
       const updates = [...approved, ...review.other];
       if (updates.length > MAX_GENERATED_PAST_TOPICS || updates.length === 0 && witnesses.size > 0 && !Object.keys(candidates).length) {
         throw new Error('Review требует явное решение о закрытии тем.');
@@ -469,7 +493,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
       }));
       topicByRef = topicSources(draftTopicSources([...resolvedTopics.values()], sourceRefs, archive.tools));
     }
-    selection = expandSemanticReviewDecision(selection, topicByRef, semanticReviewEvidenceIndex(archiveText), archive.messages,
+    selection = expandSemanticReviewDecision(selection, topicByRef, evidenceIndex, archive.messages,
       protectedSemanticMemoryRefs(archive.previousMemory));
   }
   if (!isRecord(selection) || !hasOnlyKeys(selection, [...SEMANTIC_REVIEW_FIELDS])
@@ -477,7 +501,6 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
     || !isRecord(selection.classifications) || !hasOnlyKeys(selection.classifications, [...sourceRefs])
     || sourceRefs.some(ref => { const value = (selection.classifications as Record<string, unknown>)[ref]; return typeof value !== 'string'
       || value.length > 96 || !SOURCE_CLASSES.includes(value); })) throw new Error('Review требует классификации каждого источника ровно один раз.');
-  const evidenceIndex = semanticReviewEvidenceIndex(archiveText);
   const previous = archive.previousMemory;
   const priorProtectedRefs = new Set(protectedSemanticMemoryRefs(previous));
   const priorClosedRefs = new Set(closedSemanticMemoryRefs(previous));
@@ -550,9 +573,10 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
       if (classes[ref] === 'drop' && !active.includes(ref)) throw new Error('Сохранение независимого источника требует активной категории.');
       continue;
     }
-    if (update === 'none' && !priorProtectedRefs.has(ref)
-      && (!pairedReview || !classes[ref]!.split('+').some(category => category === 'constraint' || category === 'openWork'))) {
+    const categories = classes[ref]!.split('+');
+    if (update === 'none' && !priorProtectedRefs.has(ref) && (!pairedReview || !categories.includes('constraint'))) {
       const closures = [...new Set((topicByRef[ref] ?? []).flatMap(topic => {
+        if (pairedReview && categories.includes('openWork') && !approvedTopicSubjects.has(topic)) return [];
         const id = topicClosures.get(topic);
         return id && sourcePosition(ref) < sourcePosition(evidenceIndex[id]!.sourceRef) ? [id] : [];
       }))];
@@ -736,7 +760,9 @@ export function semanticCompactionWireResponseFormat(archiveText?: string, revie
   const metadata = JSON.parse(reviewMetadata!.slice(reviewMetadata!.indexOf('\n') + 1)) as { messages: Array<{ sourceRef: string; role: string; text: string }> };
   const boundaries = metadata.messages.map(source => source.sourceRef);
   const witnesses = [...new Set(Object.values(topicUpdates.properties).flatMap(topic => topic.properties.evidence.enum.slice(1)))];
-  const candidates = Object.keys(reviewTopicRangeCandidates(metadata.messages, witnesses, semanticReviewEvidenceIndex(reviewMetadata!)));
+  const evidence = semanticReviewEvidenceIndex(reviewMetadata!);
+  const candidates = Object.keys(reviewTopicRangeCandidates(metadata.messages, witnesses, evidence));
+  const defectCandidates = Object.keys(reviewDefectCandidates(evidence, new Set(metadata.messages.filter(source => source.role === 'user').map(source => source.sourceRef))));
   const alternatives = (values: string[]) => values.map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
   return { ...format, schema: { type: 'object', properties: {
     topicUpdates: { type: 'object', properties: {
@@ -752,7 +778,10 @@ export function semanticCompactionWireResponseFormat(archiveText?: string, revie
       } },
     }, required: ['proposed', 'other'], additionalProperties: false },
     state: { type: 'string', minLength: 1, maxLength: 160, description: 'Summarize what remains open and which restrictions remain active across the whole archive.' },
-    unresolvedDefects,
+    unresolvedDefects: { type: 'object', properties: {
+      proposed: { type: 'object', properties: Object.fromEntries(defectCandidates.map(address => [address, { type: 'boolean' }])), required: defectCandidates, additionalProperties: false },
+      other: unresolvedDefects,
+    }, required: ['proposed', 'other'], additionalProperties: false },
     sources: { type: 'object', properties: Object.fromEntries(sourceUpdates.required.map(ref => {
       const updates = sourceUpdates.properties[ref]!.enum;
       const independent = updates.filter(value => value.startsWith('independent:')).map(value => value.slice('independent:'.length));

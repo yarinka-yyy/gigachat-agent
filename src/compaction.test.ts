@@ -871,14 +871,17 @@ test('source state transitions override stale categories without dropping durabl
   assert.deepEqual(groupedCompile(shared), memory, 'topic and source transitions reuse one indexed literal witness');
   const closure = { witness: `m5/${witness}`, first: 'm1', last: 'm3', subject: 'Chart' };
   const reviewTopics = (other: typeof closure[]) => ({ proposed: { [closure.witness]: false }, other });
+  const defectAddress = `m8/${idsFor('m8')[0]}`;
   const paired = { state: 'Chart discussion is complete; queue investigation remains open.', sources: Object.fromEntries(Object.entries(shared.sourceUpdates).map(([ref, update]) => [ref, `${ref === 'm8' ? 'fact' : shared.classifications[ref as keyof typeof shared.classifications]}|${update}`])),
-    activeTask: shared.activeTask, topicUpdates: reviewTopics([closure]), unresolvedDefects: idsFor('m8').map(id => `m8/${id}`).join(',') };
+    activeTask: shared.activeTask, topicUpdates: reviewTopics([closure]), unresolvedDefects: { proposed: { [defectAddress]: true }, other: '' } };
   assert.deepEqual(groupedCompile(paired), memory, 'one source row keeps category and transition together without changing provenance');
   const pairedSchema = semanticCompactionWireResponseFormat(undefined, archive, `ЗАМЕТКИ\n${grouped}`).schema;
   assert.ok('sources' in pairedSchema.properties);
   assert.equal(Object.keys(pairedSchema.properties)[0], 'topicUpdates', 'closure selects its literal before subject and state');
   const closureChoices = pairedSchema.properties.topicUpdates.properties.other.items.properties.witness.enum;
   assert.deepEqual(pairedSchema.properties.topicUpdates.properties.proposed.required, [closure.witness]);
+  assert.deepEqual(pairedSchema.properties.unresolvedDefects.properties.proposed.required, [defectAddress]);
+  assert.throws(() => groupedCompile({ ...paired, unresolvedDefects: { proposed: {}, other: '' } }), /свидетельству дефекта/);
   const indexedArchive = archive.slice(0, archive.indexOf('\n') + 1) + JSON.stringify({
     ...JSON.parse(archive.slice(archive.indexOf('\n') + 1)), evidenceIndex: evidence,
   });
@@ -899,8 +902,10 @@ test('source state transitions override stale categories without dropping durabl
   assert.equal(closureChoices[closureChoices.length - 1], 'none');
   assert.throws(() => groupedCompile({ ...paired, topicUpdates: { proposed: {}, other: [] } }), /каждому предложенному диапазону/);
   assert.doesNotThrow(() => groupedCompile({ ...paired, topicUpdates: reviewTopics([]) }));
-  const acceptedRange = groupedCompile({ ...paired, topicUpdates: { proposed: { [closure.witness]: true }, other: [] } });
+  const acceptedRange = groupedCompile({ ...paired, sources: { ...paired.sources, m2: 'openWork|none' }, topicUpdates: { proposed: { [closure.witness]: true }, other: [] } });
   assert.ok(acceptedRange.closedTopics.some((topic: { sourceRefs: string[]; closedBy: string }) => topic.closedBy === 'm5' && topic.sourceRefs.includes('m2')));
+  const independent = groupedCompile({ ...paired, sources: { ...paired.sources, m2: `openWork|independent:m2/${idsFor('m2')[0]}` }, topicUpdates: { proposed: { [closure.witness]: true }, other: [] } });
+  assert.ok(independent.openWork.some((entry: { sourceRefs: string[] }) => entry.sourceRefs.includes('m2')));
   for (const proof of [`m5/${witness}: fabricated`, `m3/${witness}`, `m0/${witness}`]) {
     assert.ok(!closureChoices.includes(proof));
     assert.throws(() => groupedCompile({ ...paired, topicUpdates: reviewTopics([{ ...closure, witness: proof }]) }), /свидетельства/);
