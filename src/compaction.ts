@@ -326,6 +326,15 @@ function reviewDefectCandidates(index: Record<string, SemanticCompactionQuote & 
     .slice(-4).map(([id, quote]) => [`${quote.sourceRef}/${id}`, quote.text]));
 }
 
+function rangePreserveChoices(range: { first: string; last: string }, updates: Record<string, { enum: string[] }>): string[] {
+  const first = Number(range.first.slice(1)), last = Number(range.last.slice(1));
+  return Object.entries(updates).flatMap(([ref, options]) => {
+    const position = Number(ref.slice(1));
+    return ref.startsWith('m') && position >= first && position <= last
+      ? options.enum.filter(value => value.startsWith('independent:')).map(value => value.slice('independent:'.length)) : [];
+  });
+}
+
 export function formatSemanticDraftTopicStatus(archiveText: string): string {
   const { messages } = JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)) as {
     messages: Array<{ sourceRef: string; role: string }>;
@@ -459,11 +468,29 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
       const activeTask = selection.activeTask;
       const review = selection.topicUpdates;
       if (!isRecord(review) || !hasOnlyKeys(review, ['proposed', 'other']) || !isRecord(review.proposed)
-        || !hasOnlyKeys(review.proposed, Object.keys(candidates)) || !Array.isArray(review.other)
-        || Object.values(review.proposed).some(decision => typeof decision !== 'boolean')) throw new Error('Review требует решения по каждому предложенному диапазону.');
-      const approved = Object.entries(review.proposed).filter(([, accepted]) => accepted).map(([witness]) => ({
-        witness, first: candidates[witness]!.first, last: candidates[witness]!.last, subject: candidates[witness]!.subject,
-      }));
+        || !hasOnlyKeys(review.proposed, Object.keys(candidates)) || !Array.isArray(review.other)) throw new Error('Review требует решения по каждому предложенному диапазону.');
+      const rangeSources = new Set<string>(), preserved = new Map<string, string>();
+      const approved = Object.entries(review.proposed).flatMap(([witness, decision]) => {
+        if (!isRecord(decision) || !hasOnlyKeys(decision, ['closed', 'preserve']) || typeof decision.closed !== 'boolean'
+          || !Array.isArray(decision.preserve) || (!decision.closed && decision.preserve.length)) throw new Error('Review требует закрытия и списка исключений для диапазона.');
+        if (!decision.closed) return [];
+        const { first, last, subject } = candidates[witness]!;
+        const choices = rangePreserveChoices({ first, last }, allowed);
+        for (const address of decision.preserve) {
+          if (typeof address !== 'string' || !choices.includes(address)) throw new Error('Исключение требует собственного USER-свидетельства внутри диапазона.');
+          const ref = address.split('/')[0]!;
+          if (preserved.has(ref)) throw new Error('Повторное исключение из диапазона.');
+          preserved.set(ref, address);
+        }
+        for (const address of choices) rangeSources.add(address.split('/')[0]!);
+        return [{ witness, first, last, subject }];
+      });
+      for (const ref of rangeSources) {
+        const update = selected[ref] as string, address = preserved.get(ref);
+        if (address && (update.startsWith('closes:') || update.startsWith('supersedes:'))) throw new Error('Исключение противоречит переходу источника.');
+        if (address) selected[ref] = `independent:${address}`;
+        else if (update.startsWith('independent:')) selected[ref] = 'none';
+      }
       for (const topic of approved) approvedTopicSubjects.add(topic.subject);
       const approvedWitnesses = new Set(approved.map(topic => topic.witness));
       const updates = [...approved, ...review.other];
@@ -763,12 +790,18 @@ export function semanticCompactionWireResponseFormat(archiveText?: string, revie
   const boundaries = metadata.messages.map(source => source.sourceRef);
   const witnesses = [...new Set(Object.values(topicUpdates.properties).flatMap(topic => topic.properties.evidence.enum.slice(1)))];
   const evidence = semanticReviewEvidenceIndex(reviewMetadata!);
-  const candidates = Object.keys(reviewTopicRangeCandidates(metadata.messages, witnesses, evidence));
+  const ranges = reviewTopicRangeCandidates(metadata.messages, witnesses, evidence);
+  const candidates = Object.keys(ranges);
   const defectCandidates = Object.keys(reviewDefectCandidates(evidence, new Set(metadata.messages.filter(source => source.role === 'user').map(source => source.sourceRef))));
   const alternatives = (values: string[]) => values.map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
   return { ...format, schema: { type: 'object', properties: {
     topicUpdates: { type: 'object', properties: {
-      proposed: { type: 'object', properties: Object.fromEntries(candidates.map(address => [address, { type: 'boolean' }])),
+      proposed: { type: 'object', properties: Object.fromEntries(Object.entries(ranges).map(([address, range]) => {
+        const choices = rangePreserveChoices(range, sourceUpdates.properties);
+        return [address, { type: 'object', properties: { closed: { type: 'boolean' },
+          preserve: { type: 'array', maxItems: choices.length, items: choices.length ? { type: 'string', enum: choices } : { type: 'string' } },
+        }, required: ['closed', 'preserve'], additionalProperties: false }];
+      })),
         required: candidates, additionalProperties: false },
       other: { type: 'array', minItems: witnesses.length && !candidates.length ? 1 : 0, maxItems: witnesses.length ? MAX_GENERATED_PAST_TOPICS : 0, items: {
       type: 'object', properties: {
