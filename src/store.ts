@@ -3034,7 +3034,12 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
     migrateProjectInstructions: (idInput) => serialize(async () => {
       const project = projects.find((item) => item.id === requireId(idInput));
       if (!project) throw new Error('Проект не найден.');
-      await externalInstructionsPath(project);
+      try {
+        await externalInstructionsPath(project);
+      } catch (error) {
+        if (isMissingFile(error)) return;
+        throw error;
+      }
       await copyLegacyInstructions(project);
     }),
     projectInstructionsBackupPath: (idInput) => serialize(async () => {

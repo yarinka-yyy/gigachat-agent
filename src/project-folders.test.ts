@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createNumberedProjectFolder, prepareProjectFolders } from './project-folders';
@@ -85,6 +85,30 @@ test('existing folder AGENTS.md wins and legacy text is retained', async (t) => 
   await store.saveProjectInstructions(project.id, 'Новые правила', updatedInstructions.revision);
   assert.equal(await readFile(join(folder, 'AGENTS.md'), 'utf8'), 'Новые правила');
   assert.equal(await readFile(backup, 'utf8'), 'Старые правила');
+});
+
+test('startup defers migration when a saved project folder is missing and retries when it returns', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'gigachat-project-folder-missing-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const folder = join(root, 'workspace');
+  const offlineFolder = join(root, 'offline-workspace');
+  const profile = join(root, 'data');
+  await mkdir(folder);
+  const store = await openStore(profile);
+  const project = await store.createProject('Проект', folder);
+  const legacyPath = join(profile, 'project-instructions', project.id, 'AGENTS.md');
+  await mkdir(dirname(legacyPath), { recursive: true });
+  await writeFile(legacyPath, 'legacy project rules');
+  await rename(folder, offlineFolder);
+
+  assert.deepEqual(await prepareProjectFolders(store, root), []);
+  assert.equal((await store.listProjects())[0]?.workingFolder, folder);
+  assert.equal(await readFile(legacyPath, 'utf8'), 'legacy project rules');
+  await assert.rejects(readdir(folder), { code: 'ENOENT' });
+
+  await rename(offlineFolder, folder);
+  assert.deepEqual(await prepareProjectFolders(store, root), []);
+  assert.equal(await readFile(join(folder, 'AGENTS.md'), 'utf8'), 'legacy project rules');
 });
 
 test('reports an instruction-transfer warning while keeping a newly assigned folder bound', async (t) => {
