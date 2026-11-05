@@ -870,24 +870,26 @@ test('source state transitions override stale categories without dropping durabl
     sourceUpdates: { ...decision.sourceUpdates, m2: `closes:m5/${witness}`, m3: `closes:m5/${witness}` } };
   assert.deepEqual(groupedCompile(shared), memory, 'topic and source transitions reuse one indexed literal witness');
   const paired = { state: 'Chart discussion is complete; queue investigation remains open.', sources: Object.fromEntries(Object.entries(shared.sourceUpdates).map(([ref, update]) => [ref, `${shared.classifications[ref as keyof typeof shared.classifications]}|${update}`])),
-    activeTask: shared.activeTask, topicUpdates: { Chart: { closed: true, through: 'none', evidence: `m5/${witness}: ${evidence[witness]!.text}` } }, unresolvedDefects: shared.unresolvedDefects };
+    activeTask: shared.activeTask, topicUpdates: { Chart: `m3>m5/${witness}` }, unresolvedDefects: shared.unresolvedDefects };
   assert.deepEqual(groupedCompile(paired), memory, 'one source row keeps category and transition together without changing provenance');
   const pairedSchema = semanticCompactionWireResponseFormat(undefined, archive, `ЗАМЕТКИ\n${grouped}`).schema;
   assert.ok('sources' in pairedSchema.properties);
   assert.equal(Object.keys(pairedSchema.properties)[0], 'state', 'independent state is established before source choices');
   assert.equal(Object.keys(pairedSchema.properties)[1], 'topicUpdates', 'closure selects its literal before the per-source rows');
-  const literalChoices = pairedSchema.properties.topicUpdates.properties.Chart!.properties.evidence.enum;
-  assert.ok(literalChoices.includes(paired.topicUpdates.Chart.evidence));
-  assert.ok(literalChoices.includes('none'));
-  for (const proof of [`m5/${witness}`, evidence[witness]!.text, `m5/${witness}: A fabricated closure.`, `m3/${witness}: ${messages[3]!.text}`, `m0/${witness}: ${evidence[witness]!.text}`]) {
-    assert.ok(!literalChoices.includes(proof));
-    assert.throws(() => groupedCompile({ ...paired, topicUpdates: { Chart: { ...paired.topicUpdates.Chart, evidence: proof } } }), /свидетельства/);
+  const closurePattern = new RegExp(pairedSchema.properties.topicUpdates.properties.Chart!.pattern);
+  assert.match(paired.topicUpdates.Chart, closurePattern);
+  assert.match('none', closurePattern);
+  for (const proof of [`m5/${witness}`, `m3>m5/${witness}: fabricated`, `m3>m3/${witness}`, `m3>m0/${witness}`]) {
+    assert.doesNotMatch(proof, closurePattern);
+    assert.throws(() => groupedCompile({ ...paired, topicUpdates: { Chart: proof } }), /свидетельства/);
   }
+  assert.deepEqual(groupedCompile({ ...paired, sources: { ...paired.sources, m5: 'request|none' } }), memory,
+    'the explicitly selected active task is still open work when its USER message also witnesses closure');
   const shortRange = JSON.stringify({ ...JSON.parse(grouped), topics: [{ ...JSON.parse(grouped).topics[0], lastSource: 'm2' }] });
   const extend = (through: string) => JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...paired,
-    sources: { ...paired.sources, m3: 'decision|none' }, topicUpdates: { Chart: { ...paired.topicUpdates.Chart, through } },
+    sources: { ...paired.sources, m3: 'decision|none' }, topicUpdates: { Chart: `${through}>m5/${witness}` },
   }), shortRange, sources, refs, archive));
-  assert.ok(!extend('none').closedTopics[0].sourceRefs.includes('m3'));
+  assert.ok(!extend('m2').closedTopics[0].sourceRefs.includes('m3'));
   assert.deepEqual(extend('m3'), memory, 'review closes the omitted tail with the same later literal witness');
   assert.throws(() => extend('m5'), /после всего диапазона/);
   assert.throws(() => extend('m0'), /после исходной границы/);
