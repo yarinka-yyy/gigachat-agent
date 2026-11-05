@@ -586,6 +586,10 @@ test('source notes cover every source before compression without becoming a snap
   const topics = [{ subject: 'Read discussion', evidence: 'Read discussion is closed.', firstSource: 'm1', lastSource: 'm1' }];
   assert.deepEqual(JSON.parse(compileSemanticSourceNotes(JSON.stringify({ taskSubject: 'Current task', state: 'Current task.', activeTask: 'm0', topics, notes, verbatim }), refs)), { taskSubject: 'Current task', state: 'Current task.', activeTask: 'm0', topics, notes, verbatim });
   assert.deepEqual(semanticSourceNotesResponseFormat(refs).schema.properties.notes.required, refs);
+  const omitted = JSON.parse(compileSemanticSourceNotes(JSON.stringify({ taskSubject: 'Current task', state: 'Current task.', activeTask: 'm0', topics,
+    notes: { ...notes, m1: '{...}' }, verbatim }), refs));
+  assert.equal(omitted.verbatim.m1, true);
+  assert.notEqual(omitted.notes.m1, '{...}');
   for (const invalid of [{ notes: { m0: notes.m0 } }, { notes: { ...notes, unknown: 'extra' } },
     { notes: { ...notes, m1: '' } }, { notes: { ...notes, m1: 'x'.repeat(161) } }, { notes, facts: [] },
     { notes, topics: {} }, { notes, topics: [{ subject: 'Read', sourceRefs: ['unknown'] }] },

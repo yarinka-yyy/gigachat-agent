@@ -890,10 +890,12 @@ export function compileSemanticSourceNotes(value: unknown, sourceRefs: readonly 
   }
   for (const ref of sourceRefs) {
     const note = parsed.notes[ref];
-    const text = validateSemanticText(typeof note === 'string' ? note.trim() : note, MAX_SEMANTIC_ENTRY_BYTES);
+    const trimmed = typeof note === 'string' ? note.trim() : note;
+    const omitted = typeof trimmed === 'string' && /^(?:\.\.\.|…|\{(?:\.\.\.|…)\}|\[(?:\.\.\.|…)\])$/u.test(trimmed);
+    const text = omitted ? 'Содержание доступно в источнике.' : validateSemanticText(trimmed, MAX_SEMANTIC_ENTRY_BYTES);
     if ([...text].length > MAX_SOURCE_NOTE_CHARS) throw new Error('Смысловая заметка слишком длинная.');
     notes[ref] = text;
-    verbatim[ref] = parsed.verbatim[ref] as boolean;
+    verbatim[ref] = omitted || parsed.verbatim[ref] as boolean;
   }
   const compiled = canonicalJson({ taskSubject, state, activeTask: parsed.activeTask, topics: parsed.topics, notes, verbatim });
   if (Buffer.byteLength(compiled, 'utf8') > MAX_COMPACT_SUMMARY_BYTES) throw new Error('Смысловые заметки превышают резерв review.');
