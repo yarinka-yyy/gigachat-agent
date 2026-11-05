@@ -273,6 +273,25 @@ export function semanticReviewEvidenceIndex(archiveText: string): Record<string,
   return index;
 }
 
+function topicStatusSentence(text: string): string | undefined {
+  return text.split(/(?<=[.!?])\s+|\r?\n/u).find(part =>
+    /(?<!\p{L})(?:тем(?:а|ы|у|е|ой)|ветк(?:а|и|у|е|ой)|обсуждени[еяию]|дискусси[яиюе]|topic|thread|discussion|conversation)(?!\p{L})/iu.test(part)
+    && /(?:закрыт|заверш[её]н|продолжа|открыт|\b(?:closed|complete[ds]?|finished|open|ongoing)\b)/iu.test(part));
+}
+
+export function formatSemanticDraftTopicStatus(archiveText: string): string {
+  const { messages } = JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)) as {
+    messages: Array<{ sourceRef: string; role: string }>;
+  };
+  const userRefs = new Set(messages.filter(source => source.role === 'user').map(source => source.sourceRef));
+  const status = Object.entries(semanticReviewEvidenceIndex(archiveText)).flatMap(([id, quote]) => {
+    const sentence = quote.role === 'user' && userRefs.has(quote.sourceRef) ? topicStatusSentence(quote.text) : undefined;
+    return sentence ? [[`${quote.sourceRef}/${id}`, sentence]] : [];
+  });
+  return status.length ? '\nСОСТОЯНИЕ ТЕМ В USER-РЕПЛИКАХ JSON. Дословные указатели для сверки с полной историей.\n'
+    + JSON.stringify(Object.fromEntries(status)) : '';
+}
+
 export function formatSemanticReviewSources(archiveText: string, candidateText: string): { candidate: string; records: string[] } {
   const offset = candidateText.indexOf('\n') + 1;
   const candidate = candidateText.slice(offset);
@@ -310,9 +329,7 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
   const witnessAddresses = [...new Set(Object.values(topicChoices).flatMap(topic => topic.witnesses))];
   const topicStatus = witnessAddresses.flatMap(address => {
     const quote = index[address.split('/')[1]!]!;
-    const sentence = quote.text.split(/(?<=[.!?])\s+|\r?\n/u).find(part =>
-      /(?<!\p{L})(?:тем(?:а|ы|у|е|ой)|ветк(?:а|и|у|е|ой)|обсуждени[еяию]|дискусси[яиюе]|topic|thread|discussion|conversation)(?!\p{L})/iu.test(part)
-      && /(?:закрыт|заверш[её]н|продолжа|открыт|\b(?:closed|complete[ds]?|finished|open|ongoing)\b)/iu.test(part));
+    const sentence = topicStatusSentence(quote.text);
     return sentence ? [[address, sentence]] : [];
   });
   const topicReview = Object.keys(topicChoices).length || Object.keys(primaryNotes).length ? [

@@ -9,7 +9,7 @@ import { discoveredModelRegistry, failedModelRegistry, isModelAvailable, require
 import { billingFamilyForUsageLabel, CHAT_MODEL_FAMILIES, isChatModelAvailable } from './model-catalog';
 import { attachmentContentType, inspectLocalAttachmentContent, LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES, PROVIDER_MEDIA_LIMIT_BYTES, PROVIDER_REQUEST_LIMIT_BYTES } from './attachment-policy';
 import { validateProviderV2FunctionWire } from './provider-wire';
-import { COMPACTION_OUTPUT_TOKEN_LIMIT, splitSemanticCompactionTranscript, formatSemanticReviewSources, semanticCompactionWireResponseFormat } from './compaction';
+import { COMPACTION_OUTPUT_TOKEN_LIMIT, splitSemanticCompactionTranscript, formatSemanticDraftTopicStatus, formatSemanticReviewSources, semanticCompactionWireResponseFormat } from './compaction';
 
 export const GIGACHAT_API_BASE_URL = 'https://api.giga.chat/v1';
 const GIGACHAT_V2_CHAT_COMPLETIONS_URL = 'https://api.giga.chat/v2/chat/completions';
@@ -176,7 +176,9 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
       } catch { throw new GigaChatProviderError('protocol'); }
       continue;
     }
-    const content: Array<Record<string, unknown>> = [{ text: message.text }];
+    const draftStatus = request.compactionFormat === 'semantic' && message.id === 'request-semantic-draft-task'
+      && request.messages[0]?.id === 'request-compaction-transcript' ? formatSemanticDraftTopicStatus(request.messages[0].text) : '';
+    const content: Array<Record<string, unknown>> = [{ text: message.text + draftStatus }];
     if (messageAttachments.length) content.push({ files: messageAttachments.map(({ fileId }) => ({ id: fileId })) });
     messages.push({
       role: message.role,
