@@ -4,9 +4,10 @@ import { constants } from 'node:fs';
 import { copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
+import { MAX_ASSISTANT_CHARS } from './contracts';
 import { DEFAULT_NOTIFICATION_SETTINGS, isImageProtocolDiagnostic, PROVIDER_ERROR_CATEGORIES, type AcceptedTurnInput, type BalanceFamilyId, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type ChatTurnRecord, type CompactSnapshot, type CompactionPrefix, type HomeDraftAttachment, type HomeDraftInput, type HomeDraftRecord, type HookEvent, type HookRunResult, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderBalanceFamily, type ProviderBalanceObservation, type ProviderErrorCategory, type ProviderGeneratedImageLedgerEntry, type ProviderProtocolExchange, type ProviderToolName, type ProviderUploadLedgerEntry, type ProviderV2FunctionWire, type RuntimeActivity, type RuntimeTurnSnapshot, type Settings, type SettingsPatch, type StudioBalanceAnchorInput, type Theme, type UsageLedgerSummary, type UsageProfileView, type UsageReceipt } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
-import { IMAGE_GENERATION_MODEL_ID } from './image-mode';
+import { IMAGE_GENERATION_MODEL_ID, IMAGE_RECOVERY_REQUIRED_MESSAGE } from './image-mode';
 import { requireModelId } from './models';
 import { isSkillId } from './skills';
 import { validateProjectFolder, validateProjectInstructionsPath } from './project-paths';
@@ -955,6 +956,8 @@ function validateChatTurnRecord(value: unknown): ChatTurnRecord {
     || (value.endedAt !== undefined && !Number.isFinite(Date.parse(String(value.endedAt))))
     || (value.queueDurationMs !== undefined && (!Number.isSafeInteger(value.queueDurationMs) || (value.queueDurationMs as number) < 0 || (value.queueDurationMs as number) > MAX_TURN_DURATION_MS))
     || (value.activeDurationMs !== undefined && (!Number.isSafeInteger(value.activeDurationMs) || (value.activeDurationMs as number) < 0 || (value.activeDurationMs as number) > MAX_TURN_DURATION_MS))
+    || (value.draft !== undefined && (typeof value.draft !== 'string' || value.draft.length > MAX_ASSISTANT_CHARS
+      || value.status === 'queued' || value.status === 'completed' || value.operation === 'compaction'))
     || (value.error !== undefined && (typeof value.error !== 'string' || value.error.length > 1000))
     || (value.errorCategory !== undefined && !(PROVIDER_ERROR_CATEGORIES as readonly unknown[]).includes(value.errorCategory))
     || (value.imageProtocolDiagnostic !== undefined
@@ -984,6 +987,7 @@ function validateChatTurnRecord(value: unknown): ChatTurnRecord {
     ...(value.queueDurationMs === undefined ? {} : { queueDurationMs: value.queueDurationMs as number }),
     ...(value.activeDurationMs === undefined ? {} : { activeDurationMs: value.activeDurationMs as number }),
     activity: value.activity.map(validateRuntimeActivity),
+    ...(value.draft === undefined ? {} : { draft: value.draft as string }),
     ...(value.error === undefined ? {} : { error: value.error as string }),
     ...(value.errorCategory === undefined ? {} : { errorCategory: value.errorCategory as ProviderErrorCategory }),
     ...(value.imageProtocolDiagnostic === undefined ? {} : { imageProtocolDiagnostic: value.imageProtocolDiagnostic as ChatTurnRecord['imageProtocolDiagnostic'] }),
@@ -1027,6 +1031,7 @@ function recordFromRuntimeTurn(turn: RuntimeTurnSnapshot): ChatTurnRecord {
     ...(turn.queueDurationMs === undefined ? {} : { queueDurationMs: turn.queueDurationMs }),
     ...(turn.activeDurationMs === undefined ? {} : { activeDurationMs: turn.activeDurationMs }),
     activity: turn.activity,
+    ...(turn.draft === undefined || turn.operation ? {} : { draft: turn.draft }),
     ...(turn.error === undefined ? {} : { error: turn.error }),
     ...(turn.errorCategory === undefined ? {} : { errorCategory: turn.errorCategory }),
     ...(turn.imageProtocolDiagnostic === undefined ? {} : { imageProtocolDiagnostic: turn.imageProtocolDiagnostic }),
@@ -3525,6 +3530,9 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       if (!chat.messages.some((message) => message.id === original.messageId && message.role === 'user')) {
         throw new Error('Исходное сообщение для повтора отсутствует.');
       }
+      if (chat.kind === 'image' && providerGeneratedImageEntries.some((row) => row.chatId === chat.id && row.anchorMessageId === original.messageId)) {
+        throw new Error(IMAGE_RECOVERY_REQUIRED_MESSAGE);
+      }
       if (turnReservations.has(retry.turnId)) throw new Error('Ход с таким идентификатором уже принят.');
 
       const currentRevisions = selectionRevisions.get(chat.id) ?? { permissionProfile: 0, skill: 0 };
@@ -3652,7 +3660,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       if (anchor < 0) throw new Error('Ответ не привязан к принятому сообщению чата.');
       const generatedArtifactId = generatedArtifactIdInput === undefined ? null : requireId(generatedArtifactIdInput);
       const isGeneratedImage = generatedArtifactId !== null;
-      if (typeof textInput !== 'string' || (!textInput.trim() && !isGeneratedImage) || textInput.length > 100_000) {
+      if (typeof textInput !== 'string' || (!textInput.trim() && !isGeneratedImage) || textInput.length > MAX_ASSISTANT_CHARS) {
         throw new Error('Ответ должен содержать от 1 до 100 000 символов.');
       }
       const functionsStateId = functionsStateIdInput === undefined ? null : requireProviderStateId(functionsStateIdInput);
@@ -4094,6 +4102,9 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         const previous = index < 0 ? null : providerUploadEntries[index]!;
         if (!previous) {
           if (entry.state !== 'intent') throw new Error('Загрузка должна начинаться с сохранённого намерения.');
+          if (providerUploadEntries.some((row) => row.attachmentId === entry.attachmentId && (row.state === 'intent' || row.state === 'unknown'))) {
+            throw new Error('Предыдущая загрузка вложения не подтверждена.');
+          }
         } else {
           const sameIdentity = previous.accountScope === entry.accountScope && previous.attachmentId === entry.attachmentId
             && previous.uploadFilename === entry.uploadFilename && previous.name === entry.name
@@ -4255,6 +4266,9 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         const previous = index < 0 ? null : providerGeneratedImageEntries[index]!;
         if (!previous) {
           if (entry.state !== 'intent') throw new Error('Созданное изображение должно начинаться с сохранённого намерения.');
+          if (providerGeneratedImageEntries.some((row) => row.chatId === entry.chatId && row.anchorMessageId === entry.anchorMessageId)) {
+            throw new Error(IMAGE_RECOVERY_REQUIRED_MESSAGE);
+          }
           validateGeneratedImageTurnBinding(entry);
         } else {
           const sameIdentity = previous.accountScope === entry.accountScope && previous.chatId === entry.chatId

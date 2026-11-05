@@ -575,6 +575,8 @@ export interface RuntimeTurnSnapshot {
   retryEligible?: boolean;
 }
 
+export const MAX_ASSISTANT_CHARS = 100_000;
+
 export interface ChatTurnRecord {
   turnId: string;
   anchorMessageId: string;
@@ -592,6 +594,7 @@ export interface ChatTurnRecord {
   queueDurationMs?: number;
   activeDurationMs?: number;
   activity: RuntimeActivity[];
+  draft?: string;
   error?: string;
   errorCategory?: ProviderErrorCategory;
   imageProtocolDiagnostic?: ImageProtocolDiagnostic;

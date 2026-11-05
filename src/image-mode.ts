@@ -1,6 +1,7 @@
 import type { ChatKind, ChatMessage } from './contracts';
 
 export const IMAGE_GENERATION_MODEL_ID = 'GigaChat-3-Ultra' as const;
+export const IMAGE_RECOVERY_REQUIRED_MESSAGE = 'Предыдущая попытка изображения не подтверждена. Повторная генерация не отправлена.';
 
 export function imageChatModelBlocker(kind: ChatKind, modelId: string | null): string | null {
   if (kind !== 'image' || modelId === IMAGE_GENERATION_MODEL_ID) return null;

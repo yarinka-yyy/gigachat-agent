@@ -139,13 +139,6 @@ function createRuntimeForImageStore(store: LocalStore, imageProvider: ImageGener
       await store.recordUsageReceipt(receipt);
     },
     validateRetry: async (retry, original) => {
-      const owner = await captureProviderStateOwner(guard, getKey);
-      assertProviderStateOwner(owner, guard);
-      const rows = await store.getProviderGeneratedImageEntries(owner.accountScope);
-      assertProviderStateOwner(owner, guard);
-      if (rows.some((row) => row.chatId === original.chatId && row.anchorMessageId === original.messageId)) {
-        throw new Error(IMAGE_RECOVERY_REQUIRED_MESSAGE);
-      }
       await store.reserveRetryTurn(original, retry);
     },
     runHooks: async (_turn, input) => {
@@ -597,6 +590,7 @@ test('network failure before a descriptor retains the original unknown-intent co
   let generations = 0;
   let downloads = 0;
   let deletions = 0;
+  let currentKey = TEST_KEY;
   const imageProvider: ImageGenerationProvider = {
     generateImage: () => {
       generations += 1;
@@ -608,7 +602,7 @@ test('network failure before a descriptor retains the original unknown-intent co
     downloadGeneratedImage: async () => { downloads += 1; return PNG; },
     deleteFile: async () => { deletions += 1; },
   };
-  const harness = createRuntimeForImageStore(store, imageProvider);
+  const harness = createRuntimeForImageStore(store, imageProvider, { getKey: async () => currentKey });
   const accepted = await acceptImageTurn(store, chat.id, 'image-unknown-network-turn', 'Create an image.');
   assert.equal(harness.runtime.enqueue(accepted.turn), accepted.turn.turnId);
   await harness.runtime.whenIdle();
@@ -620,6 +614,13 @@ test('network failure before a descriptor retains the original unknown-intent co
   assert.equal(entries[0]?.remoteFileId, null);
   assert.deepEqual({ downloads, deletions, prepareProviderRequest: harness.preparationCalls.length }, { downloads: 0, deletions: 0, prepareProviderRequest: 0 });
   assert.equal((await store.getUsageLedger()).byChat.find((row) => row.key === chat.id)?.totalTokens.knownTokens, USAGE.totalTokens);
+  const finishTransition = harness.guard.beginTransition();
+  currentKey = `${TEST_KEY} B`;
+  finishTransition();
+  try {
+    await assert.rejects(harness.runtime.retry(accepted.turn.turnId), { message: IMAGE_RECOVERY_REQUIRED_MESSAGE });
+  } finally { await harness.runtime.whenIdle(); }
+  assert.equal(generations, 1);
 });
 
 test('cleanup 404 remains pending and missing local bytes never authorize deletion', async (t) => {

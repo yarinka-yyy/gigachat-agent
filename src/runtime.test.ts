@@ -2126,6 +2126,50 @@ test('does not start the next stream until timed out iterator cleanup and its pe
   assert.equal(runtime.list('chat-two')[0]?.status, 'completed');
 });
 
+test('late stop confirmation preserves cancellation, measured usage, and terminal Hooks before FIFO advances', async () => {
+  const allowStop = deferred();
+  const waiting = deferred();
+  const events: string[] = [];
+  const usageReceipts: UsageReceipt[] = [];
+  const runtime = makeRuntime(makeProvider((request) => (async function* () {
+    const text = request.messages[0]?.text;
+    if (text === 'chat-one') {
+      yield { type: 'usage', promptTokens: 25, completionTokens: 7, totalTokens: 32, precachedPromptTokens: 3 } as const;
+      waiting.resolve();
+      await allowStop.promise;
+      return;
+    }
+    events.push('next');
+    yield { type: 'text-delta', text: 'Следующий ответ' } as const;
+    yield { type: 'completed' } as const;
+  }())), {
+    timeouts: { stopMs: 10 }, usageReceipts,
+    runHooks: async (turn, input) => {
+      if (turn.chatId === 'chat-one' && (input.event === 'interrupt' || input.event === 'stop')) {
+        events.push(`${input.event}:${input.outcome}`);
+      }
+      return [];
+    },
+  });
+  const first = runtime.enqueue(turnFor('chat-one'));
+  runtime.enqueue(turnFor('chat-two'));
+  try {
+    await waiting.promise;
+    assert.equal(runtime.cancel(first), true);
+    await waitUntil(() => Boolean(runtime.list('chat-one')[0]?.error));
+    assert.equal(runtime.list('chat-one')[0]?.status, 'running');
+    await assert.rejects(runtime.whenIdle(), /очередь приостановлена/i);
+    assert.deepEqual(events, []);
+  } finally { allowStop.resolve(); }
+  await waitUntil(() => runtime.list('chat-two')[0]?.status === 'completed');
+  await runtime.whenIdle();
+  assert.equal(runtime.list('chat-one')[0]?.status, 'cancelled');
+  assert.deepEqual(events, ['interrupt:cancelled', 'stop:cancelled', 'next']);
+  const receipt = usageReceipts.filter(item => item.chatId === 'chat-one').slice(-1)[0];
+  assert.equal(receipt?.status, 'cancelled');
+  assert.equal(receipt?.totalTokens, 32);
+});
+
 test('does not append or advance while a started local tool still lacks its terminal event', async () => {
   const started: string[] = [];
   const appended: string[] = [];
@@ -2282,7 +2326,13 @@ test('never calls a provider with an unset model', async () => {
   assert.match(runtime.list('chat-one')[0]?.error ?? '', /Выберите модель/);
 });
 
-test('publishes partial provider text while streaming and clears the draft after a completed save', async () => {
+test('checkpoints streamed text for restart and clears it when the answer commits', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'runtime-draft-restart-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  await store.updateSettings({ defaultModelId: 'GigaChat-2-Pro' });
+  const chat = await store.createChat();
+  const accepted = await store.acceptLocalMessage(chat.id, 'Исходный вопрос', 'draft-checkpoint');
   const finishStream = deferred();
   const updates: RuntimeTurnSnapshot[] = [];
   const provider = makeProvider(async function* () {
@@ -2291,23 +2341,42 @@ test('publishes partial provider text while streaming and clears the draft after
     await finishStream.promise;
     yield { type: 'completed' };
   });
-  const runtime = makeRuntime(provider, { onUpdate: (turn) => updates.push(turn) });
-  const id = runtime.enqueue(turnFor('chat-one'));
+  const runtime = createTurnRuntime({
+    provider, tools: testTools, prepareTurn: async (turn) => requestFor(turn),
+    consumeTurn: async () => undefined, releaseTurn: () => undefined,
+    recordUsageReceipt: store.recordUsageReceipt, persistTurnRecord: store.updateRuntimeTurn,
+    appendAssistant: async (turn, text, signal, _stateId, terminal) => {
+      await store.appendAssistantMessageFromRuntime(turn, text, terminal, signal);
+    },
+    onUpdate: (turn) => updates.push(turn),
+  });
+  const id = runtime.enqueue(accepted.turn);
   assert.ok(id);
-  await waitUntil(() => runtime.list('chat-one')[0]?.draft === 'Промежуточный текст ответа');
-  const streaming = runtime.list('chat-one')[0];
+  try {
+    await waitUntil(() => runtime.list(chat.id)[0]?.draft === 'Промежуточный текст ответа');
+    const deadline = Date.now() + 1000;
+    while ((await store.getChat(chat.id)).turns[0]?.draft === undefined && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    const recovered = await (await openStore(directory)).getChat(chat.id);
+    assert.equal(recovered.turns[0]?.status, 'interrupted');
+    assert.equal(recovered.turns[0]?.draft, 'Промежуточный текст ответа');
+    assert.deepEqual(recovered.messages.map(message => message.text), ['Исходный вопрос']);
+  } finally { finishStream.resolve(); }
+  const streaming = updates.find(turn => turn.status === 'running' && turn.draft);
   assert.equal(streaming?.status, 'running');
   assert.equal(streaming?.activity[0]?.kind, 'provider');
   assert.equal(JSON.stringify(streaming).includes('Промежуточный текст ответа'), true);
 
-  finishStream.resolve();
   await runtime.whenIdle();
-  const snapshot = runtime.list('chat-one')[0];
+  const snapshot = runtime.list(chat.id)[0];
   assert.equal(snapshot?.status, 'completed');
   assert.equal(snapshot?.draft, undefined);
   assert.equal(JSON.stringify(snapshot).includes('Промежуточный текст ответа'), false);
   assert.equal(typeof snapshot?.activeDurationMs, 'number');
-  assert.ok(updates.some((turn) => turn.status === 'running' && turn.draft === 'Промежуточный текст ответа'));
+  const completed = await (await openStore(directory)).getChat(chat.id);
+  assert.equal(completed.turns[0]?.draft, undefined);
+  assert.equal(completed.messages.slice(-1)[0]?.text, 'Промежуточный текст ответа');
 });
 
 test('provider session cancellation keeps the partial draft and waits for stream stop before the next FIFO turn', async () => {

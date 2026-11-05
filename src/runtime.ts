@@ -20,7 +20,7 @@ import type {
   UsageReceipt,
   UsageReceiptStatus,
 } from './contracts';
-import { isImageProtocolDiagnostic, PROVIDER_ERROR_CATEGORIES } from './contracts';
+import { isImageProtocolDiagnostic, MAX_ASSISTANT_CHARS, PROVIDER_ERROR_CATEGORIES } from './contracts';
 import { LocalToolError, LocalWriteError, type LocalToolEvent, type LocalTools } from './local-tools';
 import { HookDispatchAbortError } from './hooks';
 import { MAX_USAGE_COUNT, mergeUsageReceipt } from './usage';
@@ -38,8 +38,8 @@ export function appendRuntimeActivity(previous: readonly RuntimeActivity[], acti
   return [...previous.slice(-(MAX_ACTIVITY_PER_TURN - 1)), activity];
 }
 
-const MAX_ASSISTANT_CHARS = 100_000;
 const DRAFT_UPDATE_INTERVAL_MS = 50;
+const DRAFT_CHECKPOINT_INTERVAL_MS = 1_000;
 const DEFAULT_PREPARE_TIMEOUT_MS = 15_000;
 const DEFAULT_NEXT_TIMEOUT_MS = 120_000;
 const DEFAULT_STOP_TIMEOUT_MS = 10_000;
@@ -168,7 +168,7 @@ interface StopState {
   waiters: Set<() => void>;
   pendingOperationCount: number;
   pendingOutcome: { status: 'completed' | 'failed' | 'cancelled'; error?: string; errorCategory?: ProviderErrorCategory; imageProtocolDiagnostic?: ImageProtocolDiagnostic } | null;
-  runDeferredTerminalHooks?: (outcome: 'failed' | 'cancelled') => Promise<void>;
+  finalizeDeferredStop?: (outcome: 'failed' | 'cancelled') => Promise<void>;
   terminalRecordSaved?: boolean;
 }
 
@@ -610,12 +610,12 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     if (!state || !stopConfirmed(state) || state.pendingOperationCount > 0) return;
     if (blockedTurnId !== turnId) return;
     const turn = turns.get(turnId);
-    if (turn && state.pendingOutcome) {
-      if (state.pendingOutcome.status !== 'completed' && state.runDeferredTerminalHooks) {
-        const runHooks = state.runDeferredTerminalHooks;
-        delete state.runDeferredTerminalHooks;
+    if (turn && state.pendingOutcome && !state.terminalRecordSaved) {
+      if (state.pendingOutcome.status !== 'completed' && state.finalizeDeferredStop) {
+        const finalize = state.finalizeDeferredStop;
+        delete state.finalizeDeferredStop;
         state.pendingOperationCount += 1;
-        void runHooks(state.pendingOutcome.status).finally(() => {
+        void finalize(state.pendingOutcome.status).finally(() => {
           state.pendingOperationCount -= 1;
           maybeUnblock(turnId);
         });
@@ -778,16 +778,18 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     });
   };
 
-  const markStopUnconfirmed = (turn: RuntimeTurn): void => {
+  const markStopUnconfirmed = (turn: RuntimeTurn, cancelled = turn.cancelRequested): void => {
     blockedTurnId = turn.id;
-    turn.status = 'failed';
+    if (!cancelled) {
+      turn.status = 'failed';
+      turn.endedAt = new Date().toISOString();
+    }
     delete turn.retryEligible;
     delete turn.errorCategory;
     delete turn.imageProtocolDiagnostic;
     turn.error = 'Не удалось подтвердить остановку потока или локального инструмента; очередь приостановлена.';
-    turn.endedAt = new Date().toISOString();
     const state = stopStates.get(turn.id);
-    if (state) state.pendingOutcome = { status: 'failed', error: turn.error };
+    if (state) state.pendingOutcome = cancelled ? { status: 'cancelled' } : { status: 'failed', error: turn.error };
     publish(turn);
     refreshRetryEligibility();
     finishIdleWaiters();
@@ -827,6 +829,17 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     let usagePersistenceTimedOut = false;
     let draftTimer: ReturnType<typeof setTimeout> | null = null;
     let lastDraftPublishedAt = 0;
+    let draftCheckpointTimer: ReturnType<typeof setTimeout> | undefined;
+    let lastDraftCheckpointAt = 0;
+    const stopDraftCheckpoint = (): void => {
+      clearTimeout(draftCheckpointTimer);
+      draftCheckpointTimer = undefined;
+    };
+    const checkpointDraft = (): void => {
+      draftCheckpointTimer = undefined;
+      lastDraftCheckpointAt = Date.now();
+      void scheduleTurnRecord(turn).catch(() => undefined);
+    };
     const turnTimer = setTimeout(() => { turnTimedOut = true; controller.abort(); }, turnTimeoutMs);
     const flushDraft = (): void => {
       if (draftTimer) clearTimeout(draftTimer);
@@ -841,6 +854,11 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       const delayMs = DRAFT_UPDATE_INTERVAL_MS - (Date.now() - lastDraftPublishedAt);
       if (delayMs <= 0) flushDraft();
       else if (!draftTimer) draftTimer = setTimeout(flushDraft, delayMs);
+      if (options.persistTurnRecord && !turn.input.operation && !draftCheckpointTimer) {
+        const checkpointDelayMs = DRAFT_CHECKPOINT_INTERVAL_MS - (Date.now() - lastDraftCheckpointAt);
+        if (checkpointDelayMs <= 0) checkpointDraft();
+        else draftCheckpointTimer = setTimeout(checkpointDraft, checkpointDelayMs);
+      }
     };
     const waitTracked = async <T>(
       promise: Promise<T>, timeoutMs: number, timeoutMessage: string, pendingMessage: string,
@@ -964,8 +982,18 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         await runHookEvent({ event: 'stop', projectId: turn.input.projectId, outcome }, signal, turn.input, undefined, flush).catch(() => undefined);
       }
     };
-    // Deferred finalization saves hook activity with the terminal record before reopening FIFO.
-    stopState.runDeferredTerminalHooks = (outcome) => runTerminalHooks(outcome, new AbortController().signal, false);
+    stopState.finalizeDeferredStop = async (outcome) => {
+      const signal = new AbortController().signal;
+      const pending = stopState.pendingOutcome;
+      try { await finishActiveUsage(outcome, signal); }
+      catch {
+        if (outcome === 'failed' && pending && stopState.pendingOutcome === pending) {
+          pending.errorCategory = 'storage';
+          pending.error = 'Не удалось сохранить usage; запрос не будет продолжен.';
+        }
+      }
+      await runTerminalHooks(outcome, signal, false);
+    };
     const invokeTool = async (call: ProviderFunctionCall, args: Record<string, unknown>): Promise<unknown> => {
       const scope = { signal: controller.signal, expectedWorkingFolder: turn.input.projectWorkingFolder, skillId: turn.input.skillId };
       switch (providerActivityTool(call.name)) {
@@ -1407,7 +1435,9 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           if (draftTimer) clearTimeout(draftTimer);
           draftTimer = null;
           answer = '';
+          stopDraftCheckpoint();
           delete turn.draft;
+          if (lastDraftCheckpointAt) void scheduleTurnRecord(turn).catch(() => undefined);
           publish(turn);
           continue;
         }
@@ -1453,6 +1483,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           await runHookEvent({ event: 'after-compaction', projectId: turn.input.projectId }).catch(() => undefined);
           continue;
         }
+        stopDraftCheckpoint();
         stopHooksRan = true;
         await runHookEvent({ event: 'stop', projectId: turn.input.projectId }, new AbortController().signal).catch(() => undefined);
         await flushTurnPersistence();
@@ -1511,13 +1542,14 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         break;
       }
     } catch (error) {
+      stopDraftCheckpoint();
       if (!providerCallStarted) turn.pendingSkillId = null;
       flushDraft();
       if (!turn.cancelRequested && !isAbortError(error) && !naturallyDone) controller.abort();
       if (!(await confirmStop(turn, iterator, pendingNext, naturallyDone))) {
         controller.abort();
         flushDraft();
-        markStopUnconfirmed(turn);
+        markStopUnconfirmed(turn, turn.cancelRequested || isAbortError(error) && !turnTimedOut);
       } else if (stopState.pendingOperationCount > 0) {
         const errorCategory = runtimeErrorCategory(error, turnTimedOut);
         const imageProtocolDiagnostic = imageGenerationTurn && errorCategory === 'protocol'
@@ -1613,6 +1645,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       }
     } finally {
       clearTimeout(turnTimer);
+      stopDraftCheckpoint();
       if (draftTimer) clearTimeout(draftTimer);
       draftTimer = null;
       if (!reservationConsumed) options.releaseTurn(turn.input);

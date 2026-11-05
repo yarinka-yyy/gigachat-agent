@@ -24,7 +24,7 @@ import { createSecureStore } from './secure-store';
 import { createGigaChatProvider, createHttpsTransport, GIGACHAT_ROOT_CA_SHA256, GigaChatProviderError, serializeProviderTurnRequest, type GigaChatProviderConnection, type ProviderTransport } from './gigachat-provider';
 import { prepareTurnAttachments } from './attachments';
 import { attachmentConnectionBlocker, attachmentContentType, attachmentSendBlocker, inspectLocalAttachmentContent, PROVIDER_IMAGE_LIMIT_BYTES } from './attachment-policy';
-import { createImageGenerationStream, IMAGE_GENERATION_MODEL_ID, IMAGE_RECOVERY_REQUIRED_MESSAGE, type GeneratedImageDimensions } from './image-generation';
+import { createImageGenerationStream, IMAGE_GENERATION_MODEL_ID, type GeneratedImageDimensions } from './image-generation';
 import { loadGeneratedImageArtifact, writeGeneratedImageCopy } from './image-artifacts';
 import { createOnboardingBrowser, type BrowserBounds } from './onboarding-browser';
 import { createEmbeddedBrowser } from './embedded-browser';
@@ -806,16 +806,6 @@ async function createMainRuntime(
     validateRetry: async (turn, original) => {
       await store.validateAcceptedTurn(turn);
       await store.getMessagesThrough(turn.chatId, turn.messageId);
-      const retryChat = await store.getChat(original.chatId);
-      if (retryChat.kind === 'image') {
-        const owner = await captureProviderStateOwner(providerStateScopeGuard, () => secureStore.load(), new AbortController().signal);
-        assertProviderStateOwner(owner, providerStateScopeGuard);
-        const imageRows = await store.getProviderGeneratedImageEntries(owner.accountScope);
-        assertProviderStateOwner(owner, providerStateScopeGuard);
-        if (imageRows.some((row) => row.chatId === original.chatId && row.anchorMessageId === original.messageId)) {
-          throw new Error(IMAGE_RECOVERY_REQUIRED_MESSAGE);
-        }
-      }
       if (providerConnection.getConnectionStatus().state !== 'connected') {
         throw new Error('Подключите GigaChat перед повтором этого хода.');
       }
@@ -1109,12 +1099,8 @@ async function createMainRuntime(
         void showLocalNotification(store, 'taskStarted', 'Ход начался', 'Очередь начала обработку запроса.');
       } else if (turn.status === 'completed') {
         void showLocalNotification(store, 'taskCompleted', 'Ответ готов', 'Ответ сохранён в чате.');
-        lastNotifiedStatus.delete(turn.id);
       } else if (turn.status === 'failed') {
         void showLocalNotification(store, 'failures', 'Ход завершился с ошибкой', 'Откройте чат, чтобы проверить состояние.');
-        lastNotifiedStatus.delete(turn.id);
-      } else if (turn.status === 'cancelled') {
-        lastNotifiedStatus.delete(turn.id);
       }
     },
   });

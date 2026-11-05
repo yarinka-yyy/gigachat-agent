@@ -202,7 +202,8 @@ export async function prepareTurnAttachments(
       remoteFileId: null,
       createdAt: new Date((options.now ?? Date.now)()).toISOString(),
     };
-    await options.store.putProviderUploadEntry(intent);
+    try { await options.store.putProviderUploadEntry(intent); }
+    catch { throw new GigaChatProviderError('storage'); }
     let uploaded;
     try {
       throwIfAborted(signal);

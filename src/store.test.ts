@@ -338,8 +338,11 @@ test('provider upload ledger keeps app-owned file references durable and account
 
   const restored = await openStore(directory) as typeof ledger;
   assert.deepEqual(await restored.getProviderUploadEntries(accountScope), [intent]);
+  const foreign = { ...intent, accountScope: 'b'.repeat(64) };
+  await assert.rejects(restored.putProviderUploadEntry(foreign), /Предыдущая загрузка вложения не подтверждена/);
   const unknown = { ...intent, state: 'unknown' as const };
   assert.deepEqual(await restored.putProviderUploadEntry(unknown), unknown);
+  await assert.rejects(restored.putProviderUploadEntry(foreign), /Предыдущая загрузка вложения не подтверждена/);
   const uploaded = { ...unknown, state: 'uploaded' as const, remoteFileId: 'provider-file_1' };
   assert.deepEqual(await restored.putProviderUploadEntry(uploaded), uploaded);
   const cleanup = { ...uploaded, state: 'cleanup-pending' as const };

@@ -20,15 +20,14 @@ import { GigaChatProviderError } from './gigachat-provider';
 import type { ProviderStateOwner } from './provider-state';
 import type { LocalStore } from './store';
 
-import { IMAGE_GENERATION_MODEL_ID } from './image-mode';
-export { IMAGE_GENERATION_MODEL_ID } from './image-mode';
+import { IMAGE_GENERATION_MODEL_ID, IMAGE_RECOVERY_REQUIRED_MESSAGE } from './image-mode';
+export { IMAGE_GENERATION_MODEL_ID, IMAGE_RECOVERY_REQUIRED_MESSAGE } from './image-mode';
 const MAX_IMAGE_BYTES = Math.min(PROVIDER_IMAGE_LIMIT_BYTES, LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES);
 const MAX_IMAGE_EDGE = 8_192;
 const MAX_IMAGE_PIXELS = 32_000_000;
 const MAX_IMAGE_ASSISTANT_TEXT_CHARS = 100_000;
 const SAFE_REMOTE_ID = /^[A-Za-z0-9_-]{1,256}$/;
 
-export const IMAGE_RECOVERY_REQUIRED_MESSAGE = 'Предыдущая попытка изображения не подтверждена. Повторная генерация не отправлена.';
 
 export interface GeneratedImageDimensions {
   width: number;
