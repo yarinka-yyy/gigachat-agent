@@ -870,13 +870,15 @@ test('source state transitions override stale categories without dropping durabl
     sourceUpdates: { ...decision.sourceUpdates, m2: `closes:m5/${witness}`, m3: `closes:m5/${witness}` } };
   assert.deepEqual(groupedCompile(shared), memory, 'topic and source transitions reuse one indexed literal witness');
   const closure = { witness: `m5/${witness}`, first: 'm1', last: 'm3', subject: 'Chart' };
+  const reviewTopics = (other: typeof closure[]) => ({ proposed: { [closure.witness]: false }, other });
   const paired = { state: 'Chart discussion is complete; queue investigation remains open.', sources: Object.fromEntries(Object.entries(shared.sourceUpdates).map(([ref, update]) => [ref, `${shared.classifications[ref as keyof typeof shared.classifications]}|${update}`])),
-    activeTask: shared.activeTask, topicUpdates: [closure], unresolvedDefects: shared.unresolvedDefects };
+    activeTask: shared.activeTask, topicUpdates: reviewTopics([closure]), unresolvedDefects: shared.unresolvedDefects };
   assert.deepEqual(groupedCompile(paired), memory, 'one source row keeps category and transition together without changing provenance');
   const pairedSchema = semanticCompactionWireResponseFormat(undefined, archive, `ЗАМЕТКИ\n${grouped}`).schema;
   assert.ok('sources' in pairedSchema.properties);
   assert.equal(Object.keys(pairedSchema.properties)[0], 'topicUpdates', 'closure selects its literal before subject and state');
-  const closureChoices = pairedSchema.properties.topicUpdates.items.properties.witness.enum;
+  const closureChoices = pairedSchema.properties.topicUpdates.properties.other.items.properties.witness.enum;
+  assert.deepEqual(pairedSchema.properties.topicUpdates.properties.proposed.required, [closure.witness]);
   const indexedArchive = archive.slice(0, archive.indexOf('\n') + 1) + JSON.stringify({
     ...JSON.parse(archive.slice(archive.indexOf('\n') + 1)), evidenceIndex: evidence,
   });
@@ -887,7 +889,7 @@ test('source state transitions override stale categories without dropping durabl
   const witnessRecord = records.map(record => JSON.parse(record.slice(record.indexOf('\n') + 1))).find(record => record.sourceRef === 'm5');
   assert.equal(witnessRecord.review.evidence[`m5/${witness}`].text, messages[5]!.text);
   assert.equal(focus.witnesses[`m5/${witness}`].lastBeforeWitness, 'm4');
-  assert.deepEqual(focus.closureWindows[`m5/${witness}`].proposedRange, { after: 'm1', first: 'm2', last: 'm4' });
+  assert.deepEqual(focus.closureWindows[`m5/${witness}`].proposedRange, { after: 'm1', first: 'm2', last: 'm4', subject: 'the chart discussion is closed.' });
   assert.deepEqual(focus.closureWindows[`m5/${witness}`].priorExchanges.map((exchange: { first: string; last: string }) => [exchange.first, exchange.last]),
     [['m0', 'm0'], ['m1', 'm1'], ['m2', 'm3'], ['m4', 'm4']]);
   assert.equal(focus.topics, undefined);
@@ -895,18 +897,20 @@ test('source state transitions override stale categories without dropping durabl
   assert.ok(closureChoices.includes(closure.witness));
   assert.equal(closureChoices[0], closure.witness);
   assert.equal(closureChoices[closureChoices.length - 1], 'none');
-  assert.throws(() => groupedCompile({ ...paired, topicUpdates: [] }), /явное решение/);
-  assert.doesNotThrow(() => groupedCompile({ ...paired, topicUpdates: [{ witness: 'none', first: 'none', last: 'none', subject: 'none' }] }));
+  assert.throws(() => groupedCompile({ ...paired, topicUpdates: { proposed: {}, other: [] } }), /каждому предложенному диапазону/);
+  assert.doesNotThrow(() => groupedCompile({ ...paired, topicUpdates: reviewTopics([]) }));
+  const acceptedRange = groupedCompile({ ...paired, topicUpdates: { proposed: { [closure.witness]: true }, other: [] } });
+  assert.ok(acceptedRange.closedTopics.some((topic: { sourceRefs: string[]; closedBy: string }) => topic.closedBy === 'm5' && topic.sourceRefs.includes('m2')));
   for (const proof of [`m5/${witness}: fabricated`, `m3/${witness}`, `m0/${witness}`]) {
     assert.ok(!closureChoices.includes(proof));
-    assert.throws(() => groupedCompile({ ...paired, topicUpdates: [{ ...closure, witness: proof }] }), /свидетельства/);
+    assert.throws(() => groupedCompile({ ...paired, topicUpdates: reviewTopics([{ ...closure, witness: proof }]) }), /свидетельства/);
   }
   assert.deepEqual(groupedCompile({ ...paired, sources: { ...paired.sources, m5: 'request|none' } }), memory,
     'the explicitly selected active task is still open work when its USER message also witnesses closure');
   assert.throws(() => groupedCompile({ ...paired, sources: { ...paired.sources, m0: 'request|none' } }), /архивного запроса/);
   const shortRange = JSON.stringify({ ...JSON.parse(grouped), topics: [{ ...JSON.parse(grouped).topics[0], firstSource: 'm6', lastSource: 'm7' }] });
   const extend = (through: string, first = 'm1') => JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...paired,
-    sources: { ...paired.sources, m3: 'decision|none' }, topicUpdates: [{ ...closure, first, last: through }],
+    sources: { ...paired.sources, m3: 'decision|none' }, topicUpdates: reviewTopics([{ ...closure, first, last: through }]),
   }), shortRange, sources, refs, archive));
   assert.ok(!extend('m2').closedTopics[0].sourceRefs.includes('m3'));
   assert.deepEqual(extend('m3'), memory, 'review relocates a draft range that incorrectly starts after the witness');
@@ -914,8 +918,8 @@ test('source state transitions override stale categories without dropping durabl
   assert.throws(() => extend('m5'), /после всего диапазона/);
   assert.throws(() => extend('m0'), /исходном порядке/);
   assert.throws(() => extend('m99'), /доступного диапазона/);
-  assert.throws(() => groupedCompile({ ...paired, topicUpdates: [{ ...closure, witness: 'none' }] }), /свидетельства/);
-  assert.throws(() => groupedCompile({ ...paired, topicUpdates: [closure, closure] }), /решения и границы/);
+  assert.throws(() => groupedCompile({ ...paired, topicUpdates: reviewTopics([{ ...closure, witness: 'none' }]) }), /свидетельства/);
+  assert.throws(() => groupedCompile({ ...paired, topicUpdates: reviewTopics([closure, closure]) }), /решения и границы/);
   for (const [ref, row] of Object.entries(paired.sources)) assert.match(row, new RegExp(pairedSchema.properties.sources.properties[ref]!.pattern));
   for (const ref of refs) {
     const pattern = new RegExp(pairedSchema.properties.sources.properties[ref]!.pattern);
