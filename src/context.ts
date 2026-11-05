@@ -356,6 +356,10 @@ export function buildSemanticCompactionReviewRequest(
   catch { return null; }
   const archiveMessage = request.messages[0];
   if (!archiveMessage) return null;
+  const archive = JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1));
+  const rollingReview = archive.previousMemory
+    ? '\nСначала сопоставь новые USER-реплики с previousMemory. Если пользователь явно заменил прежнее значение, для строки прежнего источника выбери supersedes:адрес новой цитаты. Для строки с новым точным значением выбери fact. Укажи замену у каждого затронутого прежнего источника. Сохрани остальные прежние факты, ограничения, открытые задачи и дефекты.'
+    : '';
   const reviewRequest: ProviderTurnRequest = {
     ...request,
     system: request.system.map((layer) => layer === taskLayer
@@ -371,7 +375,7 @@ export function buildSemanticCompactionReviewRequest(
       {
         id: 'request-semantic-review-archive', role: 'user',
         text: archiveText.slice(0, archiveText.indexOf('\n') + 1) + JSON.stringify({
-          ...JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)), evidenceIndex: semanticReviewEvidenceIndex(archiveText),
+          ...archive, evidenceIndex: semanticReviewEvidenceIndex(archiveText),
         }),
         createdAt: archiveMessage.createdAt,
       },
@@ -386,6 +390,7 @@ export function buildSemanticCompactionReviewRequest(
     maxOutputTokens: COMPACTION_OUTPUT_TOKEN_LIMIT,
     compactionFormat: 'semantic',
   };
+  reviewRequest.messages[2]!.text += rollingReview;
   try { serializeProviderTurnRequest(reviewRequest); }
   catch { return null; }
   return reviewRequest;

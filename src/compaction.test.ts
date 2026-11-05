@@ -1015,6 +1015,10 @@ test('critical assistant data requires retention or a cited earlier user origin'
   const compileRolling = (classifications: Record<string, string>) => JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...rolling, classifications }), rollingNotes, continuedSources, rollingRefs, rollingArchive));
   assert.deepEqual(compileRolling(rolling.classifications).assistantReports, memory.assistantReports, 'the report survives using previous memory, without replaying the source prefix');
   assert.deepEqual(JSON.parse(rollingArchive.slice(rollingArchive.indexOf('\n') + 1)).messages.map((message: { sourceRef: string }) => message.sourceRef), ['m4']);
+  const suffixDraft = JSON.stringify({ ...JSON.parse(rollingNotes), topics: [{ subject: 'Planning', firstSource: 'm4', lastSource: 'm4', evidence: 'Continue planning without operations.' }] });
+  const suffixReview = semanticCompactionWireResponseFormat(undefined, rollingArchive, `ЗАМЕТКИ\n${suffixDraft}`).schema;
+  assert.ok('sources' in suffixReview.properties);
+  assert.equal(suffixReview.properties.topicUpdates.properties.other.maxItems, 0, 'a new witness cannot close a range starting in previously compacted history');
   assert.throws(() => compileRolling({ ...rolling.classifications, m2: 'fact' }), /первичного источника/);
   assert.throws(() => compileRolling({ ...rolling.classifications, m2: 'drop' }), /Критичный первичный/);
 });
@@ -1109,7 +1113,7 @@ test('rolling review decisions retain previous tools without replaying their raw
   const schema = semanticCompactionResponseFormat(undefined, archive).schema;
   assert.ok('sourceUpdates' in schema.properties);
   assert.deepEqual(schema.properties.sourceUpdates.required, getSemanticCompactionCoverageRefSet(sources, previous, 64));
-  assert.deepEqual(Object.values(schema.properties.topicUpdates.properties)[0]!.properties.closed.enum, [false, true]);
+  assert.deepEqual(Object.values(schema.properties.topicUpdates.properties)[0]!.properties.closed.enum, [false]);
   for (const [id, proof] of Object.entries(evidence)) assert.equal(schema.properties.sourceUpdates.properties.m0!.enum.includes(`closes:${proof.sourceRef}/${id}`), proof.role === 'user' && Number(proof.sourceRef.slice(1)) >= 64);
   assert.ok(schema.properties.sourceUpdates.properties.t0);
   assert.equal(schema.properties.sourceUpdates.properties.m2, undefined);

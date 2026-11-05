@@ -766,7 +766,7 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   const position = (ref: string) => ref.startsWith('t') ? Number(archive.tools.find(tool => tool.sourceRef === ref)?.anchorRef.slice(1) ?? -1) : Number(ref.slice(1));
   const closedRefs = closedSemanticMemoryRefs(archive.previousMemory);
   const updateEvidence = Object.fromEntries(refs.map(ref => [ref, closedRefs.includes(ref) ? [] : evidenceIds.filter(id => position(evidenceIndex[id]!.sourceRef) > position(ref))]));
-  const firstAvailable = refs.filter(ref => ref.startsWith('m')).sort((a, b) => Number(a.slice(1)) - Number(b.slice(1)))[0]!;
+  const firstAvailable = archive.messages[0]!.sourceRef;
   const scopes = draft ? draftTopicSources(draft.topics, refs, archive.tools) : Array.from({ length: MAX_GENERATED_PAST_TOPICS }, (_, i) => ({ subject: `${i}`.padEnd(MAX_SEMANTIC_SUBJECT_CHARS, 'X'), sourceRefs: [firstAvailable] }));
   const topicCandidates = evidenceIds.filter(id => position(firstAvailable) < position(evidenceIndex[id]!.sourceRef));
   const explicitClosure = new Set(topicCandidates.filter(id => suggestsTopicClosure(reviewTopicStatus(evidenceIndex[id]!.text))));
