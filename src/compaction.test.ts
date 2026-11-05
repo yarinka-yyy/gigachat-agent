@@ -877,6 +877,15 @@ test('source state transitions override stale categories without dropping durabl
   assert.equal(Object.keys(pairedSchema.properties)[0], 'state', 'independent state is established before source choices');
   assert.equal(Object.keys(pairedSchema.properties)[1], 'topicUpdates', 'closure selects its literal before the per-source rows');
   const closurePattern = new RegExp(pairedSchema.properties.topicUpdates.properties.Chart!.pattern);
+  const indexedArchive = archive.slice(0, archive.indexOf('\n') + 1) + JSON.stringify({
+    ...JSON.parse(archive.slice(archive.indexOf('\n') + 1)), evidenceIndex: evidence,
+  });
+  const { records } = formatSemanticReviewSources(indexedArchive, `ЗАМЕТКИ\n${grouped}`);
+  const focusRecord = records[records.length - 1]!;
+  const focus = JSON.parse(focusRecord.slice(focusRecord.indexOf('\n') + 1));
+  assert.equal(focus.topicStatus[`m5/${witness}`], 'The chart discussion is closed.');
+  assert.equal(focus.witnesses[`m5/${witness}`].text, messages[5]!.text);
+  assert.ok(focus.topics.Chart.witnesses.includes(`m8/${idsFor('m8')[0]}`), 'unranked witnesses stay available');
   assert.match(paired.topicUpdates.Chart, closurePattern);
   assert.match('none', closurePattern);
   for (const proof of [`m5/${witness}`, `m3>m5/${witness}: fabricated`, `m3>m3/${witness}`, `m3>m0/${witness}`]) {

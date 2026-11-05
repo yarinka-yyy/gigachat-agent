@@ -306,6 +306,13 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
       witnesses: topic.properties.evidence.enum.filter(address => address !== 'none') }];
   }));
   const witnessAddresses = [...new Set(Object.values(topicChoices).flatMap(topic => topic.witnesses))];
+  const topicStatus = witnessAddresses.flatMap(address => {
+    const quote = index[address.split('/')[1]!]!;
+    const sentence = quote.text.split(/(?<=[.!?])\s+|\r?\n/u).find(part =>
+      /(?<!\p{L})(?:тем(?:а|ы|у|е|ой)|ветк(?:а|и|у|е|ой)|обсуждени[еяию]|дискусси[яиюе]|topic|thread|discussion|conversation)(?!\p{L})/iu.test(part)
+      && /(?:закрыт|заверш[её]н|продолжа|открыт|\b(?:closed|complete[ds]?|finished|open|ongoing)\b)/iu.test(part));
+    return sentence ? [[address, sentence]] : [];
+  });
   const topicReview = Object.keys(topicChoices).length ? [
     'КАНДИДАТЫ СВИДЕТЕЛЬСТВ ЗАКРЫТИЯ JSON. Данные из исходных USER-реплик.\n' + JSON.stringify({
       topics: topicChoices,
@@ -314,6 +321,7 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
         const preceding = [...messageRefs].filter(ref => Number(ref.slice(1)) < Number(quote.sourceRef.slice(1))).pop();
         return [address, { text: quote.text, preceding }];
       })),
+      topicStatus: Object.fromEntries(topicStatus),
     }),
   ] : [];
   delete metadata.evidenceIndex;
