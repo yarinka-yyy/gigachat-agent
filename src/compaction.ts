@@ -286,6 +286,10 @@ function reviewTopicStatus(text: string): string | undefined {
   return clauses.find(clause => topicStatusSentence(clause)) ?? sentence;
 }
 
+function suggestsTopicClosure(status: string | undefined): boolean {
+  return /(?<!\p{L})(?:закрыт[аоы]?|заверш[её]н[аоы]?|closed|finished|completed)[.!»"’”\s]*$/iu.test(status ?? '');
+}
+
 export function formatSemanticDraftTopicStatus(archiveText: string): string {
   const { messages } = JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)) as {
     messages: Array<{ sourceRef: string; role: string }>;
@@ -333,16 +337,26 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
     const sentence = reviewTopicStatus(quote.text);
     return sentence ? [[address, sentence]] : [];
   });
+  const orderedMessageRefs = [...messageRefs];
+  const lastBefore = (ref: string) => orderedMessageRefs[orderedMessageRefs.indexOf(ref) - 1];
+  const closureWindows = Object.fromEntries(topicStatus.filter(([, sentence]) => suggestsTopicClosure(sentence))
+    .slice(0, MAX_GENERATED_PAST_TOPICS).map(([address, statement]) => {
+      const witnessRef = address!.split('/')[0]!;
+      const priorUsers = Object.entries(userTimeline).filter(([ref]) => Number(ref.slice(1)) < Number(witnessRef.slice(1))).slice(-24);
+      return [address, { statement, priorExchanges: priorUsers.map(([first, startsWith], index) => ({
+        first, last: lastBefore(priorUsers[index + 1]?.[0] ?? witnessRef), startsWith,
+      })) }];
+    }));
   const topicReview = witnessAddresses.length || Object.keys(primaryNotes).length ? [
     'КАНДИДАТЫ СВИДЕТЕЛЬСТВ ЗАКРЫТИЯ JSON. Цитаты USER и недоверенные заметки draft.\n' + JSON.stringify({
       timeline: witnessAddresses.length ? userTimeline : {},
       witnesses: Object.fromEntries(witnessAddresses.map(address => {
         const quote = index[address.split('/')[1]!]!;
-        const lastBeforeWitness = [...messageRefs].filter(ref => Number(ref.slice(1)) < Number(quote.sourceRef.slice(1))).pop();
-        return [address, { lastBeforeWitness }];
+        return [address, { lastBeforeWitness: lastBefore(quote.sourceRef) }];
       })),
       primaryNotes,
       topicStatus: Object.fromEntries(topicStatus),
+      closureWindows,
     }),
   ] : [];
   delete metadata.evidenceIndex;
@@ -657,8 +671,7 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   const firstAvailable = refs.filter(ref => ref.startsWith('m')).sort((a, b) => Number(a.slice(1)) - Number(b.slice(1)))[0]!;
   const scopes = draft ? draftTopicSources(draft.topics, refs, archive.tools) : Array.from({ length: MAX_GENERATED_PAST_TOPICS }, (_, i) => ({ subject: `${i}`.padEnd(MAX_SEMANTIC_SUBJECT_CHARS, 'X'), sourceRefs: [firstAvailable] }));
   const topicCandidates = evidenceIds.filter(id => position(firstAvailable) < position(evidenceIndex[id]!.sourceRef));
-  const explicitClosure = new Set(topicCandidates.filter(id => /(?<!\p{L})(?:закрыт[аоы]?|заверш[её]н[аоы]?|closed|finished|completed)[.!»"’”\s]*$/iu
-    .test(reviewTopicStatus(evidenceIndex[id]!.text) ?? '')));
+  const explicitClosure = new Set(topicCandidates.filter(id => suggestsTopicClosure(reviewTopicStatus(evidenceIndex[id]!.text))));
   const orderedTopicCandidates = [...topicCandidates.filter(id => explicitClosure.has(id)), ...topicCandidates.filter(id => !explicitClosure.has(id))];
   const topicEvidence = Object.fromEntries(scopes.map(topic => [topic.subject, orderedTopicCandidates]));
   const independentEvidence = Object.fromEntries(refs.map(ref => [ref, !closedRefs.includes(ref) && (!draft || scopes.length > 0)
