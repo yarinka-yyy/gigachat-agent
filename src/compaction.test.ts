@@ -870,7 +870,7 @@ test('source state transitions override stale categories without dropping durabl
     sourceUpdates: { ...decision.sourceUpdates, m2: `closes:m5/${witness}`, m3: `closes:m5/${witness}` } };
   assert.deepEqual(groupedCompile(shared), memory, 'topic and source transitions reuse one indexed literal witness');
   const paired = { state: 'Chart discussion is complete; queue investigation remains open.', sources: Object.fromEntries(Object.entries(shared.sourceUpdates).map(([ref, update]) => [ref, `${shared.classifications[ref as keyof typeof shared.classifications]}|${update}`])),
-    activeTask: shared.activeTask, topicUpdates: { Chart: `m5/${witness}>m3` }, unresolvedDefects: shared.unresolvedDefects };
+    activeTask: shared.activeTask, topicUpdates: { Chart: `m1>m5/${witness}>m3` }, unresolvedDefects: shared.unresolvedDefects };
   assert.deepEqual(groupedCompile(paired), memory, 'one source row keeps category and transition together without changing provenance');
   const pairedSchema = semanticCompactionWireResponseFormat(undefined, archive, `ЗАМЕТКИ\n${grouped}`).schema;
   assert.ok('sources' in pairedSchema.properties);
@@ -888,23 +888,25 @@ test('source state transitions override stale categories without dropping durabl
   assert.ok(focus.topics.Chart.witnesses.includes(`m8/${idsFor('m8')[0]}`), 'unranked witnesses stay available');
   assert.match(paired.topicUpdates.Chart, closurePattern);
   assert.match('none', closurePattern);
-  for (const proof of [`m5/${witness}`, `m5/${witness}: fabricated>m3`, `m3/${witness}>m3`, `m0/${witness}>m3`]) {
+  for (const proof of [`m5/${witness}`, `m1>m5/${witness}: fabricated>m3`, `m1>m3/${witness}>m3`, `m1>m0/${witness}>m3`]) {
     assert.doesNotMatch(proof, closurePattern);
     assert.throws(() => groupedCompile({ ...paired, topicUpdates: { Chart: proof } }), /свидетельства/);
   }
   assert.deepEqual(groupedCompile({ ...paired, sources: { ...paired.sources, m5: 'request|none' } }), memory,
     'the explicitly selected active task is still open work when its USER message also witnesses closure');
-  const shortRange = JSON.stringify({ ...JSON.parse(grouped), topics: [{ ...JSON.parse(grouped).topics[0], lastSource: 'm2' }] });
-  const extend = (through: string) => JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...paired,
-    sources: { ...paired.sources, m3: 'decision|none' }, topicUpdates: { Chart: `m5/${witness}>${through}` },
+  assert.throws(() => groupedCompile({ ...paired, sources: { ...paired.sources, m0: 'request|none' } }), /архивного запроса/);
+  const shortRange = JSON.stringify({ ...JSON.parse(grouped), topics: [{ ...JSON.parse(grouped).topics[0], firstSource: 'm2', lastSource: 'm2' }] });
+  const extend = (through: string, first = 'm1') => JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...paired,
+    sources: { ...paired.sources, m3: 'decision|none' }, topicUpdates: { Chart: `${first}>m5/${witness}>${through}` },
   }), shortRange, sources, refs, archive));
   assert.ok(!extend('m2').closedTopics[0].sourceRefs.includes('m3'));
   assert.deepEqual(extend('m3'), memory, 'review closes the omitted tail with the same later literal witness');
   assert.throws(() => extend('m5'), /после всего диапазона/);
-  assert.doesNotMatch(`m5/${witness}>m5`, closurePattern);
-  assert.doesNotMatch(`m5/${witness}>m2`, closurePattern);
-  assert.throws(() => extend('m0'), /после исходной границы/);
-  assert.throws(() => extend('m99'), /доступного сообщения/);
+  assert.doesNotMatch(`m1>m5/${witness}>m5`, closurePattern);
+  assert.doesNotMatch(`m1>m5/${witness}>m2`, closurePattern);
+  assert.throws(() => extend('m0'), /исходного диапазона/);
+  assert.throws(() => extend('m99'), /доступных сообщений/);
+  assert.throws(() => extend('m3', 'm3'), /исходного диапазона/);
   for (const [ref, row] of Object.entries(paired.sources)) assert.match(row, new RegExp(pairedSchema.properties.sources.properties[ref]!.pattern));
   for (const ref of refs) {
     const pattern = new RegExp(pairedSchema.properties.sources.properties[ref]!.pattern);
