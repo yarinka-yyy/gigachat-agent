@@ -341,10 +341,10 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
       const topics = format.schema.properties.topicUpdates.properties;
       selection.topicUpdates = Object.fromEntries(Object.entries(selection.topicUpdates).map(([subject, update]) => {
         if (!isRecord(update) || update.closed !== true) return [subject, update];
-        const matches = (topics[subject]?.properties.evidence.enum ?? [])
-          .filter(address => address !== 'none' && index[address.split('/')[1]!]!.text === update.evidence);
-        if (update.evidence === 'none' || matches.length !== 1) throw new Error('Закрытие темы требует однозначного дословного USER-свидетельства.');
-        return [subject, { ...update, evidence: matches[0] }];
+        const address = (topics[subject]?.properties.evidence.enum ?? []).find(address =>
+          address !== 'none' && `${address}: ${index[address.split('/')[1]!]!.text}` === update.evidence);
+        if (!address) throw new Error('Закрытие темы требует точного адреса и дословного USER-свидетельства.');
+        return [subject, { ...update, evidence: address }];
       }));
     }
     selection = expandSemanticReviewDecision(selection, topicByRef, semanticReviewEvidenceIndex(archiveText), archive.messages,
@@ -604,17 +604,11 @@ export function semanticCompactionWireResponseFormat(archiveText?: string, revie
   const alternatives = (values: string[]) => values.map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
   return { ...format, schema: { type: 'object', properties: {
     state: { type: 'string', minLength: 1, maxLength: 160, description: 'First establish what is completed, what remains open and which restrictions remain active across the whole archive. This is your independent review, not a draft quotation.' },
-    topicUpdates: { ...topicUpdates, properties: Object.fromEntries(Object.entries(topicUpdates.properties).map(([subject, topic]) => {
-      const counts = new Map<string, number>();
-      for (const address of topic.properties.evidence.enum) {
-        if (address === 'none') continue;
-        const quote = index[address.split('/')[1]!]!.text;
-        if (quote !== 'none') counts.set(quote, (counts.get(quote) ?? 0) + 1);
-      }
-      const quotes = [...counts].filter(([, count]) => count === 1).map(([quote]) => quote);
-      return [subject, { ...topic, properties: { closed: { ...topic.properties.closed, enum: quotes.length ? [false, true] : [false] },
-        evidence: { type: 'string', enum: ['none', ...quotes], description: 'Select the exact USER quotation explicitly completing this topic. Use none for an open topic.' } } }];
-    })) },
+    topicUpdates: { ...topicUpdates, properties: Object.fromEntries(Object.entries(topicUpdates.properties).map(([subject, topic]) => [subject,
+      { ...topic, properties: { ...topic.properties, evidence: { type: 'string',
+        enum: topic.properties.evidence.enum.map(address => address === 'none' ? address : `${address}: ${index[address.split('/')[1]!]!.text}`),
+        description: 'Select the address and exact text of the USER message explicitly completing this topic. Use none for an open topic.' } } },
+    ])) },
     sources: { type: 'object', properties: Object.fromEntries(sourceUpdates.required.map(ref => {
       const updates = sourceUpdates.properties[ref]!.enum;
       const independent = updates.filter(value => value.startsWith('independent:')).map(value => value.slice('independent:'.length));

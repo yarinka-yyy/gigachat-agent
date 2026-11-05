@@ -870,16 +870,16 @@ test('source state transitions override stale categories without dropping durabl
     sourceUpdates: { ...decision.sourceUpdates, m2: `closes:m5/${witness}`, m3: `closes:m5/${witness}` } };
   assert.deepEqual(groupedCompile(shared), memory, 'topic and source transitions reuse one indexed literal witness');
   const paired = { state: 'Chart discussion is complete; queue investigation remains open.', sources: Object.fromEntries(Object.entries(shared.sourceUpdates).map(([ref, update]) => [ref, `${shared.classifications[ref as keyof typeof shared.classifications]}|${update}`])),
-    activeTask: shared.activeTask, topicUpdates: { Chart: { closed: true, evidence: evidence[witness]!.text } }, unresolvedDefects: shared.unresolvedDefects };
+    activeTask: shared.activeTask, topicUpdates: { Chart: { closed: true, evidence: `m5/${witness}: ${evidence[witness]!.text}` } }, unresolvedDefects: shared.unresolvedDefects };
   assert.deepEqual(groupedCompile(paired), memory, 'one source row keeps category and transition together without changing provenance');
   const pairedSchema = semanticCompactionWireResponseFormat(undefined, archive, `ЗАМЕТКИ\n${grouped}`).schema;
   assert.ok('sources' in pairedSchema.properties);
   assert.equal(Object.keys(pairedSchema.properties)[0], 'state', 'independent state is established before source choices');
   assert.equal(Object.keys(pairedSchema.properties)[1], 'topicUpdates', 'closure selects its literal before the per-source rows');
   const literalChoices = pairedSchema.properties.topicUpdates.properties.Chart!.properties.evidence.enum;
-  assert.ok(literalChoices.includes(evidence[witness]!.text));
+  assert.ok(literalChoices.includes(paired.topicUpdates.Chart.evidence));
   assert.ok(literalChoices.includes('none'));
-  for (const proof of [`m5/${witness}`, 'A fabricated closure.', messages[3]!.text, messages[0]!.text]) {
+  for (const proof of [`m5/${witness}`, evidence[witness]!.text, `m5/${witness}: A fabricated closure.`, `m3/${witness}: ${messages[3]!.text}`, `m0/${witness}: ${evidence[witness]!.text}`]) {
     assert.ok(!literalChoices.includes(proof));
     assert.throws(() => groupedCompile({ ...paired, topicUpdates: { Chart: { closed: true, evidence: proof } } }), /свидетельства/);
   }
