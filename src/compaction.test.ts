@@ -908,6 +908,11 @@ test('source state transitions override stale categories without dropping durabl
   assert.ok(acceptedRange.closedTopics.some((topic: { sourceRefs: string[]; closedBy: string }) => topic.closedBy === 'm5' && topic.sourceRefs.includes('m2')));
   assert.deepEqual(groupedCompile({ ...paired, sources: rangeSources,
     topicUpdates: reviewTopics([{ ...closure, first: 'm5', last: 'm5' }], true) }), acceptedRange, 'a repeated witness cannot change a separately confirmed range');
+  const earlyWitness = `m1/${idsFor('m1')[0]}`;
+  const impossibleExtra = { witness: earlyWitness, first: 'm1', last: 'm1', subject: 'Deferred work' };
+  assert.ok(closureChoices.includes(earlyWitness));
+  assert.deepEqual(groupedCompile({ ...paired, sources: rangeSources,
+    topicUpdates: reviewTopics([impossibleExtra], true) }), acceptedRange);
   assert.deepEqual(groupedCompile({ ...paired, sources: { ...rangeSources, m2: `openWork|independent:${independentAddress}` },
     topicUpdates: reviewTopics([], true) }), acceptedRange);
   const independent = groupedCompile({ ...paired, sources: rangeSources, topicUpdates: reviewTopics([], true, [independentAddress]) });

@@ -516,6 +516,8 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
         if (!last || !messageRefs.includes(first) || !messageRefs.includes(last) || Number(first.slice(1)) > Number(last.slice(1))) {
           throw new Error('Закрытие темы требует доступного диапазона сообщений в исходном порядке.');
         }
+        // An impossible extra range cannot close any sources or invalidate an independently approved range.
+        if (approved.length && Number(last.slice(1)) >= Number(witness.slice(1))) return [];
         resolvedTopics.set(subject, { subject, firstSource: first, lastSource: last, evidence: address });
         if (witness === activeTask && classifications[witness] === 'request') classifications[witness] = 'openWork';
         return [[subject, { closed: true, evidence: address }]];
