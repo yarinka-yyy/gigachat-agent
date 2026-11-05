@@ -1024,6 +1024,13 @@ test('critical assistant data requires retention or a cited earlier user origin'
   assert.doesNotMatch('constraint+openWork|none', new RegExp(suffixReview.properties.sources.properties.m0!.pattern));
   assert.throws(() => compileRolling({ ...rolling.classifications, m2: 'fact' }), /первичного источника/);
   assert.throws(() => compileRolling({ ...rolling.classifications, m2: 'drop' }), /Критичный первичный/);
+  const formatOnly = 'Return JSON with keys status and pendingItems.';
+  const formatSources = createCompactionSources([...continuedSources.messages.slice(0, 4).map(source => ({ ...source, id: source.ref, createdAt: '2026-10-01T00:00:00.000Z' })), user('format', formatOnly)], [], []);
+  const formatArchive = serializeSemanticCompactionTranscript(formatSources, memory, 4);
+  const formatDraft = { ...JSON.parse(rollingNotes), verbatim: { ...JSON.parse(rollingNotes).verbatim, m4: true } };
+  const formatSchema = semanticCompactionWireResponseFormat(undefined, formatArchive, `ЗАМЕТКИ\n${JSON.stringify(formatDraft)}`).schema;
+  assert.ok('sources' in formatSchema.properties);
+  assert.match('request|none', new RegExp(formatSchema.properties.sources.properties.m4!.pattern));
 });
 
 test('historical user requests retain text without becoming observed facts or permissions', () => {

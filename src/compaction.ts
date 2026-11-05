@@ -305,6 +305,10 @@ function suggestsTopicClosure(status: string | undefined): boolean {
   return /(?<!\p{L})(?:закрыт[аоы]?|заверш[её]н[аоы]?|closed|finished|completed)[.!»"’”\s]*$/iu.test(status ?? '');
 }
 
+function hasRequestCue(text: string): boolean {
+  return /[?？]/u.test(text) || /^\s*(?:верни|выведи|ответь|return|output|respond)\s+[^.!?\r\n]{0,80}\bJSON\b/iu.test(text);
+}
+
 function topicQualifier(text: string): string | undefined {
   return text.match(/(?<!\p{L})(\p{L}{5,})\s+(?:тем[аыеуой]{1,2}|ветк[аиеуой]{1,2}|обсуждени[еяию]|topic|thread|discussion)(?!\p{L})/iu)?.[1]
     ?.toLowerCase().replace(/(?:ого|его|ому|ему|ая|яя|ое|ее|ой|ей|ую|юю|ым|им|ом|ем|ый|ий)$/u, '');
@@ -532,8 +536,8 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
         if (!last || !messageRefs.includes(first) || !messageRefs.includes(last) || Number(first.slice(1)) > Number(last.slice(1))) {
           throw new Error('Закрытие темы требует доступного диапазона сообщений в исходном порядке.');
         }
-        // An impossible extra range cannot close any sources or invalidate an independently approved range.
-        if (approved.length && Number(last.slice(1)) >= Number(witness.slice(1))) return [];
+        // An impossible extra range cannot close any sources or invalidate verified memory.
+        if ((approved.length || archive.previousMemory) && Number(last.slice(1)) >= Number(witness.slice(1))) return [];
         resolvedTopics.set(subject, { subject, firstSource: first, lastSource: last, evidence: address });
         if (witness === activeTask && classifications[witness] === 'request') classifications[witness] = 'openWork';
         return [[subject, { closed: true, evidence: address }]];
@@ -685,7 +689,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
   ], sources);
   const closed = new Set(closedTopics.flatMap(topic => topic.sourceRefs.filter(ref => ref !== topic.closedBy)));
   if (pairedReview && archive.messages.some(source => source.role === 'user' && classes[source.sourceRef] === 'request'
-    && verbatim[source.sourceRef] && !/[?？]/u.test(source.text) && !requestRefs.includes(source.sourceRef)
+    && verbatim[source.sourceRef] && !hasRequestCue(source.text) && !requestRefs.includes(source.sourceRef)
     && !closed.has(source.sourceRef) && !superseded.has(source.sourceRef))) {
     throw new Error('Дословный USER-источник нельзя понизить до архивного запроса.');
   }
@@ -799,7 +803,7 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   const withSources = (choices: Record<string, string[]>) => Object.fromEntries(Object.entries(choices).map(([key, ids]) => [key, ids.map(id => `${evidenceIndex[id]!.sourceRef}/${id}`)]));
   const assistantOrigins = Object.fromEntries(archive.messages.filter(source => source.role === 'assistant').map(source => [source.sourceRef, userRefs.filter(ref => Number(ref.slice(1)) < Number(source.sourceRef.slice(1)))]));
   const requestCandidates = archive.messages.filter(source => source.role === 'user'
-    && (!draft?.verbatim[source.sourceRef] || /[?？]/u.test(source.text))).map(source => source.sourceRef);
+    && (!draft?.verbatim[source.sourceRef] || hasRequestCue(source.text))).map(source => source.sourceRef);
   const format = semanticReviewDecisionResponseFormat(refs, taskRefs, archive.previousMemory ? semanticMemorySourceRefs(archive.previousMemory).filter(ref => !reportRefs.has(ref)) : [], protectedRefs, withSources(updateEvidence), withSources(independentEvidence), withSources(topicEvidence), assistantOrigins,
     refs.filter(ref => draft ? draft.verbatim[ref] : false), requestRefs, requestCandidates, closedRefs);
   for (const [ref, category] of Object.entries(retainedReviewCategories(archive.previousMemory))) {
