@@ -520,6 +520,21 @@ test('groups literal reports with their open defect by shared record ID and rend
     assert.equal(currentMessage.content[0].text, current.text);
     assert.ok(currentMessage.content[1].text.includes(`${report} ${defect.text}`));
     assert.match(currentMessage.content[2].text, /Служебное правило чтения архива/);
+
+    for (const [question, useOutcome] of [
+      ['Какой текущий контрольный маркер проекта? Не выполняй никаких действий.', false],
+      ['Что известно о RUN-170? Без инструментов.', false],
+      ['Что известно о RUN-17? Без инструментов.', true],
+      ['Перечисли результаты проверки. Не выполняй никаких действий.', true],
+      ['Укажи ID последней проверки, фактические результаты и непроверенные действия. Без инструментов.', true],
+    ] as const) {
+      const wire = serializeProviderTurnRequest({ modelId: 'GigaChat-3-Lightning', functionCallMode: 'none', system: [],
+        permissionProfile: 'ask', messages: [user('request-semantic-memory', readout), user('recall', question)] });
+      const [archive, anchor] = JSON.parse(wire.body).messages;
+      assert.equal(anchor.content[0].text, question);
+      assert.equal(anchor.content.length, useOutcome ? 3 : 1);
+      assert.equal(archive.content[0].text.includes('Связанный итог RUN-17'), !useOutcome);
+    }
   }
 });
 

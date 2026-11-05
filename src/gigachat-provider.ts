@@ -135,6 +135,9 @@ const ARCHIVE_RECALLED_ANSWER_GUIDANCE = [
   'Если запрошено поле с целью сборки, его строка имеет вид «<целевая система>, сборка <полная версия>». Возьми обе части из источника. Перед отправкой проверь наличие версии именно в поле цели сборки. Версия в другом поле его не заполняет.',
 ].join('\n');
 
+// shortcut: explicit outcome wording or a record ID, until archive recall can rank evidence by relevance.
+const ARCHIVE_OUTCOME_QUESTION = /(?<![\p{L}\p{N}])(?:(?:итог|результат|отч[её]т|последн|прошл)\p{L}*\s+(?:проверк|тест|испытан)\p{L}*|(?:latest|previous|test|check|verification|validation)\s+(?:results?|outcomes?|reports?))(?![\p{L}\p{N}])/iu;
+
 function isReadOnlyArchiveContinuation(request: Pick<ProviderTurnRequest, 'functionCallMode'>
   & Partial<Pick<ProviderTurnRequest, 'messages'>>): boolean {
   return request.functionCallMode === 'none' && request.messages?.[0]?.id === 'request-semantic-memory';
@@ -186,12 +189,17 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
   ];
   let reviewSources: ReturnType<typeof formatSemanticReviewSources> | undefined;
   const lastMessage = request.messages[request.messages.length - 1];
-  const recallAnchor = isReadOnlyArchiveContinuation(request) && request.messages.length > 1 && lastMessage?.role === 'user'
+  const readOnlyAnchor = isReadOnlyArchiveContinuation(request) && request.messages.length > 1 && lastMessage?.role === 'user'
+    && typeof lastMessage.text === 'string'
     ? lastMessage : undefined;
-  const archive = recallAnchor ? request.messages[0] : undefined;
+  const archive = readOnlyAnchor ? request.messages[0] : undefined;
   const archiveLines = typeof archive?.text === 'string' ? archive.text.split('\n') : [];
   const linkedOutcomes = archiveLines.filter(line => line.startsWith(SEMANTIC_LINKED_OUTCOME_PREFIX));
-  const linkedOutcome = linkedOutcomes.length === 1 ? linkedOutcomes[0] : undefined;
+  const singleOutcome = linkedOutcomes.length === 1 ? linkedOutcomes[0] : undefined;
+  const outcomeId = singleOutcome?.slice(SEMANTIC_LINKED_OUTCOME_PREFIX.length).split(' ', 1)[0];
+  const recallAnchor = readOnlyAnchor && (ARCHIVE_OUTCOME_QUESTION.test(readOnlyAnchor.text)
+    || outcomeId && readOnlyAnchor.text.match(/\b[A-Z][A-Z0-9]*[-_]\d+\b/g)?.includes(outcomeId)) ? readOnlyAnchor : undefined;
+  const linkedOutcome = recallAnchor ? singleOutcome : undefined;
   if (request.compactionFormat === 'semantic' && request.messages[0]?.id === 'request-semantic-review-candidate') {
     try { reviewSources = formatSemanticReviewSources(request.messages[1]!.text, request.messages[0].text); }
     catch { throw new GigaChatProviderError('protocol'); }
