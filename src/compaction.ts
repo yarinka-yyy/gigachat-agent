@@ -19,6 +19,15 @@ export const COMPACTION_OUTPUT_TOKEN_LIMIT = 4096;
 const RETAINED_SOURCE_REFS_MARKER = 'retained-source-refs';
 export const SEMANTIC_COMPACTION_FORMAT = 'gigachat-semantic-memory' as const;
 
+// Only fixed validation messages belong here. Parser errors can contain provider text.
+class CompactionValidationError extends Error {}
+
+export function compactionValidationRule(error: unknown): string {
+  if (error instanceof CompactionValidationError) return error.message;
+  if (error instanceof SyntaxError) return 'Ожидается корректный JSON.';
+  return 'Внутренняя ошибка проверки кандидата.';
+}
+
 const semanticSourceRefsSchema = {
   type: 'array',
   minItems: 1,
@@ -212,37 +221,37 @@ function semanticReviewDecisionResponseFormat(refs: string[], primary: string[],
 
 function expandSemanticReviewDecision(value: Record<string, unknown>, scopes: Record<string, string[]>, index: Record<string, SemanticCompactionQuote & { role: string }>, messages: Array<{ sourceRef: string; role: string }>, priorProtected: string[]): Record<string, unknown> {
   if (!hasOnlyKeys(value, [...SEMANTIC_GLOBAL_REVIEW_FIELDS])
-    || !isRecord(value.topicUpdates) || !isRecord(value.classifications) || !isRecord(value.sourceUpdates)) throw new Error('Некорректное решение review.');
+    || !isRecord(value.topicUpdates) || !isRecord(value.classifications) || !isRecord(value.sourceUpdates)) throw new CompactionValidationError('Некорректное решение review.');
   const groups = [...new Set(Object.values(scopes).flat())];
   const resolveEvidence = (reference: string): string => {
     const [sourceRef, id, extra] = reference.split('/');
-    if (extra !== undefined || !id || !index[id] || index[id]!.sourceRef !== sourceRef) throw new Error('Свидетельство требует точной пары sourceRef/qN.');
+    if (extra !== undefined || !id || !index[id] || index[id]!.sourceRef !== sourceRef) throw new CompactionValidationError('Свидетельство требует точной пары sourceRef/qN.');
     return id;
   };
   const assistantRefs = messages.filter(source => source.role === 'assistant').map(source => source.sourceRef);
   const origins = Object.fromEntries(assistantRefs.map(ref => [ref, 'self']));
   for (const [ref, category] of Object.entries(value.classifications)) if (typeof category === 'string' && category.startsWith('paraphrase:')) {
     const origin = category.slice('paraphrase:'.length);
-    if (!assistantRefs.includes(ref) || !messages.some(source => source.sourceRef === origin && source.role === 'user') || Number(origin.slice(1)) >= Number(ref.slice(1))) throw new Error('Пересказ требует более раннего USER-первоисточника.');
+    if (!assistantRefs.includes(ref) || !messages.some(source => source.sourceRef === origin && source.role === 'user') || Number(origin.slice(1)) >= Number(ref.slice(1))) throw new CompactionValidationError('Пересказ требует более раннего USER-первоисточника.');
     origins[ref] = origin;
   }
-  if (!hasOnlyKeys(value.topicUpdates, groups)) throw new Error('Review требует решения для каждой побочной ветки.');
+  if (!hasOnlyKeys(value.topicUpdates, groups)) throw new CompactionValidationError('Review требует решения для каждой побочной ветки.');
   const topicUpdates = Object.fromEntries(groups.map(scope => {
     const choice = (value.topicUpdates as Record<string, unknown>)[scope];
-    if (!isRecord(choice) || !hasOnlyKeys(choice, ['closed', 'evidence']) || typeof choice.closed !== 'boolean' || typeof choice.evidence !== 'string') throw new Error('Ветка требует явного closed и evidence.');
-    if (!choice.closed) { if (choice.evidence !== 'none') throw new Error('Открытая ветка не может иметь основание закрытия.'); return [scope, 'none']; }
+    if (!isRecord(choice) || !hasOnlyKeys(choice, ['closed', 'evidence']) || typeof choice.closed !== 'boolean' || typeof choice.evidence !== 'string') throw new CompactionValidationError('Ветка требует явного closed и evidence.');
+    if (!choice.closed) { if (choice.evidence !== 'none') throw new CompactionValidationError('Открытая ветка не может иметь основание закрытия.'); return [scope, 'none']; }
     const id = resolveEvidence(choice.evidence);
     return [scope, `closes:${id}`];
   }));
   const sourceUpdates = Object.fromEntries(Object.entries(value.sourceUpdates).map(([ref, update]) => {
-    if (update === 'keep' && !priorProtected.includes(ref)) throw new Error('Новый независимый источник требует собственного USER-свидетельства.');
+    if (update === 'keep' && !priorProtected.includes(ref)) throw new CompactionValidationError('Новый независимый источник требует собственного USER-свидетельства.');
     if (typeof update !== 'string' || !update.includes(':')) return [ref, update];
     const separator = update.indexOf(':'), kind = update.slice(0, separator), id = resolveEvidence(update.slice(separator + 1)), proof = index[id];
     if (kind !== 'independent') return [ref, `${kind}:${id}`];
-    if (!proof || proof.role !== 'user' || proof.sourceRef !== ref || !messages.some(source => source.sourceRef === ref && source.role === 'user')) throw new Error('Независимое обязательство требует собственного первичного USER-свидетельства.');
+    if (!proof || proof.role !== 'user' || proof.sourceRef !== ref || !messages.some(source => source.sourceRef === ref && source.role === 'user')) throw new CompactionValidationError('Независимое обязательство требует собственного первичного USER-свидетельства.');
     return [ref, 'keep'];
   }));
-  if (typeof value.unresolvedDefects !== 'string') throw new Error('Некорректные свидетельства дефекта.');
+  if (typeof value.unresolvedDefects !== 'string') throw new CompactionValidationError('Некорректные свидетельства дефекта.');
   const unresolvedDefects = value.unresolvedDefects ? value.unresolvedDefects.split(';').map(group => group.split(',').map(resolveEvidence).join(',')).join(';') : '';
   return { sourceUpdates, topicUpdates, activeTask: value.activeTask, unresolvedDefects,
     classifications: Object.fromEntries(Object.entries(value.classifications).map(([ref, category]) => [ref, typeof category === 'string' && category.startsWith('paraphrase:') ? 'decision' : category])),
@@ -374,7 +383,7 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
   const records = splitSemanticCompactionTranscript(archiveText);
   const metadata = JSON.parse(records[0]!.slice(records[0]!.indexOf('\n') + 1));
   const format = semanticCompactionResponseFormat(undefined, archiveText, candidateText);
-  if (!('sourceUpdates' in format.schema.properties)) throw new Error('Review требует контракт выбора источников.');
+  if (!('sourceUpdates' in format.schema.properties)) throw new CompactionValidationError('Review требует контракт выбора источников.');
   const choices = format.schema.properties;
   const index = metadata.evidenceIndex as Record<string, SemanticCompactionQuote & { role: string }>;
   const evidenceIds = Object.keys(index).sort((left, right) => Number(left.slice(1)) - Number(right.slice(1)));
@@ -437,17 +446,17 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
 export function compileResolvedSemanticCompactionMemory(value: string, notesValue: string, sources: CompactionSources, sourceRefs: readonly string[], archiveText: string): string {
   const draft = JSON.parse(compileSemanticSourceNotes(notesValue, sourceRefs)) as { notes: Record<string, string>; verbatim: Record<string, boolean>; activeTask: string; topics: DraftTopic[] };
   const { notes, verbatim } = draft;
-  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > 4096) throw new Error('Review превышает ограничение 4096 байт.');
+  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > 4096) throw new CompactionValidationError('Review превышает ограничение 4096 байт.');
   let selection: unknown = JSON.parse(value);
   const pairedReview = isRecord(selection) && Object.prototype.hasOwnProperty.call(selection, 'sources');
   if (isRecord(selection) && pairedReview) {
     if (!hasOnlyKeys(selection, ['state', 'sources', 'activeTask', 'topicUpdates', 'unresolvedDefects']) || typeof selection.state !== 'string'
       || !selection.state.trim() || [...selection.state].length > 160 || !isRecord(selection.sources)
-      || !hasOnlyKeys(selection.sources, [...sourceRefs])) throw new Error('Review требует одной записи на каждый источник.');
+      || !hasOnlyKeys(selection.sources, [...sourceRefs])) throw new CompactionValidationError('Review требует одной записи на каждый источник.');
     const rows = Object.entries(selection.sources).map(([ref, row]) => {
-      if (typeof row !== 'string') throw new Error('Решение источника требует строки категория|переход.');
+      if (typeof row !== 'string') throw new CompactionValidationError('Решение источника требует строки категория|переход.');
       const parts = row.split('|').map(part => part.trim());
-      if (parts.length !== 2 || parts.some(part => !part) || parts[0] === 'defect') throw new Error('Решение источника требует категории и перехода; дефект указывается точным свидетельством.');
+      if (parts.length !== 2 || parts.some(part => !part) || parts[0] === 'defect') throw new CompactionValidationError('Решение источника требует категории и перехода; дефект указывается точным свидетельством.');
       return { ref, category: parts[0]!, update: parts[1]! };
     });
     selection = { activeTask: selection.activeTask, topicUpdates: selection.topicUpdates, unresolvedDefects: selection.unresolvedDefects,
@@ -461,11 +470,11 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
   const evidenceIndex = semanticReviewEvidenceIndex(archiveText);
   if (isRecord(selection) && !Object.prototype.hasOwnProperty.call(selection, 'assistantOrigins')) {
     const format = semanticCompactionResponseFormat(undefined, archiveText, `ЗАМЕТКИ\n${notesValue}`);
-    if (!('sourceUpdates' in format.schema.properties)) throw new Error('Review требует контракт выбора источников.');
+    if (!('sourceUpdates' in format.schema.properties)) throw new CompactionValidationError('Review требует контракт выбора источников.');
     const selected = selection.sourceUpdates, allowed = format.schema.properties.sourceUpdates.properties;
     if (!isRecord(selected) || !hasOnlyKeys(selected, [...sourceRefs])
-      || sourceRefs.some(ref => typeof selected[ref] !== 'string' || !allowed[ref]!.enum.includes(selected[ref] as string))) throw new Error('Review содержит недопустимое изменение источника.');
-    if (typeof selection.activeTask !== 'string' || !format.schema.properties.activeTask.enum.includes(selection.activeTask)) throw new Error('Активная задача требует допустимого первичного источника.');
+      || sourceRefs.some(ref => typeof selected[ref] !== 'string' || !allowed[ref]!.enum.includes(selected[ref] as string))) throw new CompactionValidationError('Review содержит недопустимое изменение источника.');
+    if (typeof selection.activeTask !== 'string' || !format.schema.properties.activeTask.enum.includes(selection.activeTask)) throw new CompactionValidationError('Активная задача требует допустимого первичного источника.');
     if (pairedReview) {
       const witnesses = new Set(Object.values(format.schema.properties.topicUpdates.properties).flatMap(topic => topic.properties.evidence.enum.slice(1)));
       const candidates = reviewTopicRangeCandidates(archive.messages, [...witnesses], evidenceIndex);
@@ -473,11 +482,11 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
       const defectReview = selection.unresolvedDefects;
       if (!isRecord(defectReview) || !hasOnlyKeys(defectReview, ['proposed', 'other']) || !isRecord(defectReview.proposed)
         || !hasOnlyKeys(defectReview.proposed, Object.keys(defectCandidates)) || typeof defectReview.other !== 'string'
-        || Object.values(defectReview.proposed).some(decision => typeof decision !== 'boolean')) throw new Error('Review требует решения по каждому предложенному свидетельству дефекта.');
+        || Object.values(defectReview.proposed).some(decision => typeof decision !== 'boolean')) throw new CompactionValidationError('Review требует решения по каждому предложенному свидетельству дефекта.');
       const otherDefects = defectReview.other ? defectReview.other.split(';') : [];
       const cited = new Set(otherDefects.flatMap(group => group.split(',').map(address => address.trim())));
       for (const [address, accepted] of Object.entries(defectReview.proposed)) {
-        if (!accepted && cited.has(address)) throw new Error('Review содержит противоречивое решение о свидетельстве дефекта.');
+        if (!accepted && cited.has(address)) throw new CompactionValidationError('Review содержит противоречивое решение о свидетельстве дефекта.');
         if (accepted && !cited.has(address)) otherDefects.push(address);
       }
       selection.unresolvedDefects = otherDefects.join(';');
@@ -488,18 +497,18 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
       const activeTask = selection.activeTask;
       const review = selection.topicUpdates;
       if (!isRecord(review) || !hasOnlyKeys(review, ['proposed', 'other']) || !isRecord(review.proposed)
-        || !hasOnlyKeys(review.proposed, Object.keys(candidates)) || !Array.isArray(review.other)) throw new Error('Review требует решения по каждому предложенному диапазону.');
+        || !hasOnlyKeys(review.proposed, Object.keys(candidates)) || !Array.isArray(review.other)) throw new CompactionValidationError('Review требует решения по каждому предложенному диапазону.');
       const rangeSources = new Set<string>(), preserved = new Map<string, string>();
       const approved = Object.entries(review.proposed).flatMap(([witness, decision]) => {
         if (!isRecord(decision) || !hasOnlyKeys(decision, ['closed', 'preserve']) || typeof decision.closed !== 'boolean'
-          || !Array.isArray(decision.preserve) || (!decision.closed && decision.preserve.length)) throw new Error('Review требует закрытия и списка исключений для диапазона.');
+          || !Array.isArray(decision.preserve) || (!decision.closed && decision.preserve.length)) throw new CompactionValidationError('Review требует закрытия и списка исключений для диапазона.');
         if (!decision.closed) return [];
         const { first, last, subject } = candidates[witness]!;
         const choices = rangePreserveChoices({ first, last }, allowed);
         for (const address of decision.preserve) {
-          if (typeof address !== 'string' || !choices.includes(address)) throw new Error('Исключение требует собственного USER-свидетельства внутри диапазона.');
+          if (typeof address !== 'string' || !choices.includes(address)) throw new CompactionValidationError('Исключение требует собственного USER-свидетельства внутри диапазона.');
           const ref = address.split('/')[0]!;
-          if (preserved.has(ref)) throw new Error('Повторное исключение из диапазона.');
+          if (preserved.has(ref)) throw new CompactionValidationError('Повторное исключение из диапазона.');
           preserved.set(ref, address);
         }
         for (const address of choices) rangeSources.add(address.split('/')[0]!);
@@ -507,7 +516,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
       });
       for (const ref of rangeSources) {
         const update = selected[ref] as string, address = preserved.get(ref);
-        if (address && (update.startsWith('closes:') || update.startsWith('supersedes:'))) throw new Error('Исключение противоречит переходу источника.');
+        if (address && (update.startsWith('closes:') || update.startsWith('supersedes:'))) throw new CompactionValidationError('Исключение противоречит переходу источника.');
         if (address) selected[ref] = `independent:${address}`;
         else if (update.startsWith('independent:')) selected[ref] = 'none';
       }
@@ -515,26 +524,26 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
       const approvedWitnesses = new Set(approved.map(topic => topic.witness));
       const updates = [...approved, ...review.other];
       if (review.other.length > MAX_GENERATED_PAST_TOPICS || updates.length === 0 && witnesses.size > 0 && !Object.keys(candidates).length) {
-        throw new Error('Review требует явное решение о закрытии тем.');
+        throw new CompactionValidationError('Review требует явное решение о закрытии тем.');
       }
       const seenWitnesses = new Set<string>();
       selection.topicUpdates = Object.fromEntries(updates.flatMap(update => {
         if (!isRecord(update) || !hasOnlyKeys(update, ['witness', 'first', 'last', 'subject'])
           || typeof update.witness !== 'string' || typeof update.first !== 'string' || typeof update.last !== 'string'
           || typeof update.subject !== 'string' || !update.subject.trim() || [...update.subject].length > MAX_SEMANTIC_SUBJECT_CHARS) {
-          throw new Error('Review требует решения и границы для каждой темы.');
+          throw new CompactionValidationError('Review требует решения и границы для каждой темы.');
         }
         const { witness: address, first, subject } = update;
         if (address === 'none' && witnesses.size > 0 && updates.length === 1
           && first === 'none' && update.last === 'none' && subject === 'none') return [];
         if (seenWitnesses.has(address) && approvedWitnesses.has(address)) return [];
-        if (resolvedTopics.has(subject) || resolvedTopics.size >= MAX_GENERATED_PAST_TOPICS) throw new Error('Review требует решения и границы для каждой темы.');
-        if (!witnesses.has(address) || seenWitnesses.has(address)) throw new Error('Закрытие темы требует допустимого USER-свидетельства.');
+        if (resolvedTopics.has(subject) || resolvedTopics.size >= MAX_GENERATED_PAST_TOPICS) throw new CompactionValidationError('Review требует решения и границы для каждой темы.');
+        if (!witnesses.has(address) || seenWitnesses.has(address)) throw new CompactionValidationError('Закрытие темы требует допустимого USER-свидетельства.');
         seenWitnesses.add(address);
         const witness = address.split('/')[0]!;
         const last = update.last === 'previous' ? messageRefs[messageRefs.indexOf(witness) - 1] : update.last;
         if (!last || !messageRefs.includes(first) || !messageRefs.includes(last) || Number(first.slice(1)) > Number(last.slice(1))) {
-          throw new Error('Закрытие темы требует доступного диапазона сообщений в исходном порядке.');
+          throw new CompactionValidationError('Закрытие темы требует доступного диапазона сообщений в исходном порядке.');
         }
         // An impossible extra range cannot close any sources or invalidate verified memory.
         if ((approved.length || archive.previousMemory) && Number(last.slice(1)) >= Number(witness.slice(1))) return [];
@@ -551,7 +560,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
     || ['activeTask', 'unresolvedDefects'].some(field => typeof selection[field] !== 'string' || (selection[field] as string).length > 512)
     || !isRecord(selection.classifications) || !hasOnlyKeys(selection.classifications, [...sourceRefs])
     || sourceRefs.some(ref => { const value = (selection.classifications as Record<string, unknown>)[ref]; return typeof value !== 'string'
-      || value.length > 96 || !SOURCE_CLASSES.includes(value); })) throw new Error('Review требует классификации каждого источника ровно один раз.');
+      || value.length > 96 || !SOURCE_CLASSES.includes(value); })) throw new CompactionValidationError('Review требует классификации каждого источника ровно один раз.');
   const previous = archive.previousMemory;
   const priorProtectedRefs = new Set(protectedSemanticMemoryRefs(previous));
   const priorClosedRefs = new Set(closedSemanticMemoryRefs(previous));
@@ -559,28 +568,28 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
     ...(previous?.assistantReports ?? []).flatMap(entry => entry.sourceRefs)]);
   const primaryRefs = new Set([...archive.messages.filter(source => source.role === 'user').map(source => source.sourceRef),
     ...(previous?.activeTask?.sourceRefs ?? []), ...(previous?.openWork ?? []).flatMap(entry => entry.sourceRefs)]);
-  if (selection.activeTask !== 'none' && !primaryRefs.has(selection.activeTask as string)) throw new Error('Активная задача требует первичного user-источника, а не assistant-пересказа.');
+  if (selection.activeTask !== 'none' && !primaryRefs.has(selection.activeTask as string)) throw new CompactionValidationError('Активная задача требует первичного user-источника, а не assistant-пересказа.');
   const classes = { ...selection.classifications } as Record<string, string>;
   const requestRefs = historicalSemanticRequestRefs(previous, archive.messages);
-  if (requestRefs.some(ref => classes[ref] !== 'request')) throw new Error('Архивный запрос нельзя повышать до утверждения или действующего ограничения.');
+  if (requestRefs.some(ref => classes[ref] !== 'request')) throw new CompactionValidationError('Архивный запрос нельзя повышать до утверждения или действующего ограничения.');
   if (sourceRefs.some(ref => classes[ref] === 'request' && !archive.messages.some(source => source.sourceRef === ref && source.role === 'user')
-    && !(previous?.historicalRequests ?? []).some(entry => entry.sourceRefs.includes(ref)))) throw new Error('Нельзя понизить прежнее первичное состояние до архивного запроса.');
+    && !(previous?.historicalRequests ?? []).some(entry => entry.sourceRefs.includes(ref)))) throw new CompactionValidationError('Нельзя понизить прежнее первичное состояние до архивного запроса.');
   const primaryReviewRefs = new Set([...primaryRefs, ...(previous ? semanticMemorySourceRefs(previous).filter(ref => !reportRefs.has(ref)) : [])]);
   if (sourceRefs.some(ref => !primaryReviewRefs.has(ref) && !ref.startsWith('t')
-    && classes[ref] !== 'drop' && classes[ref] !== 'decision')) throw new Error('Факты, ограничения, открытая работа и дефекты требуют первичного источника.');
+    && classes[ref] !== 'drop' && classes[ref] !== 'decision')) throw new CompactionValidationError('Факты, ограничения, открытая работа и дефекты требуют первичного источника.');
   const list = (text: string, allowed: readonly string[], limit: number): string[] => {
     const refs = text ? text.split(',').map(ref => ref.trim()) : [];
-    if (refs.length > limit || new Set(refs).size !== refs.length || refs.some(ref => !allowed.includes(ref))) throw new Error('Некорректные или повторные ссылки review.');
+    if (refs.length > limit || new Set(refs).size !== refs.length || refs.some(ref => !allowed.includes(ref))) throw new CompactionValidationError('Некорректные или повторные ссылки review.');
     return refs;
   };
   const field = (code: string, limit: number) => {
     const refs = sourceRefs.filter(ref => classes[ref]!.split('+').includes(code));
-    if (refs.length > limit) throw new Error('Слишком много источников в категории review.');
+    if (refs.length > limit) throw new CompactionValidationError('Слишком много источников в категории review.');
     return refs;
   };
   const groups = (name: 'unresolvedDefects', limit: number): string[] => {
     const text = selection[name] as string, values = text ? text.split(';') : [];
-    if (values.length > limit || values.some(value => !value.trim())) throw new Error('Некорректные группы review.');
+    if (values.length > limit || values.some(value => !value.trim())) throw new CompactionValidationError('Некорректные группы review.');
     return values;
   };
   const entry = (ref: string) => ({ text: notes[ref]!, sourceRefs: [ref] });
@@ -589,39 +598,39 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
   const closedGroups = new Map<string, string[]>();
   const userRefs = archive.messages.filter(source => source.role === 'user').map(source => source.sourceRef);
   const assistantRefs = archive.messages.filter(source => source.role === 'assistant').map(source => source.sourceRef);
-  if (!isRecord(selection.assistantOrigins) || !hasOnlyKeys(selection.assistantOrigins, assistantRefs)) throw new Error('Review требует первоисточник каждого нового assistant-сообщения.');
+  if (!isRecord(selection.assistantOrigins) || !hasOnlyKeys(selection.assistantOrigins, assistantRefs)) throw new CompactionValidationError('Review требует первоисточник каждого нового assistant-сообщения.');
   for (const ref of assistantRefs) {
     const origin = selection.assistantOrigins[ref];
     if (origin === 'self') continue;
-    if (typeof origin !== 'string' || !userRefs.includes(origin) || Number(origin.slice(1)) >= Number(ref.slice(1))) throw new Error('Assistant-пересказ требует более раннего user-первоисточника.');
-    if (classes[ref] !== 'drop' && classes[origin] === 'drop' && !active.includes(origin)) throw new Error('Нельзя сохранять пересказ вместо отброшенного первоисточника.');
+    if (typeof origin !== 'string' || !userRefs.includes(origin) || Number(origin.slice(1)) >= Number(ref.slice(1))) throw new CompactionValidationError('Assistant-пересказ требует более раннего user-первоисточника.');
+    if (classes[ref] !== 'drop' && classes[origin] === 'drop' && !active.includes(origin)) throw new CompactionValidationError('Нельзя сохранять пересказ вместо отброшенного первоисточника.');
     classes[ref] = 'drop';
   }
-  if (!isRecord(selection.sourceUpdates) || !hasOnlyKeys(selection.sourceUpdates, [...sourceRefs])) throw new Error('Review требует одного решения об изменении состояния каждого источника.');
+  if (!isRecord(selection.sourceUpdates) || !hasOnlyKeys(selection.sourceUpdates, [...sourceRefs])) throw new CompactionValidationError('Review требует одного решения об изменении состояния каждого источника.');
   const superseded = new Map<string, string>(), closureOnly = new Set<string>();
   const sourcePosition = (ref: string) => Number((ref.startsWith('t') ? sources.tools.find(tool => tool.ref === ref)!.anchorRef : ref).slice(1));
   const topics = [...new Set(Object.values(topicByRef).flat())];
-  if (!isRecord(selection.topicUpdates) || !hasOnlyKeys(selection.topicUpdates, topics)) throw new Error('Review требует решения для каждой темы draft.');
+  if (!isRecord(selection.topicUpdates) || !hasOnlyKeys(selection.topicUpdates, topics)) throw new CompactionValidationError('Review требует решения для каждой темы draft.');
   const topicClosures = new Map<string, string>();
   for (const topic of topics) {
     const update = selection.topicUpdates[topic];
     if (update === 'none') continue;
-    if (typeof update !== 'string') throw new Error('Некорректное состояние темы.');
+    if (typeof update !== 'string') throw new CompactionValidationError('Некорректное состояние темы.');
     const [kind, id, extra] = update.split(':'), proof = evidenceIndex[id!];
     if (kind !== 'closes' || extra !== undefined || !proof || proof.role !== 'user' || !userRefs.includes(proof.sourceRef) || classes[proof.sourceRef] === 'request'
-      || !sourceRefs.filter(ref => topicByRef[ref]?.includes(topic)).every(ref => sourcePosition(ref) < sourcePosition(proof.sourceRef))) throw new Error('Закрытие темы требует user-свидетельства после всего диапазона.');
+      || !sourceRefs.filter(ref => topicByRef[ref]?.includes(topic)).every(ref => sourcePosition(ref) < sourcePosition(proof.sourceRef))) throw new CompactionValidationError('Закрытие темы требует user-свидетельства после всего диапазона.');
     topicClosures.set(topic, id!);
   }
   for (const ref of sourceRefs) {
     const selectedUpdate = selection.sourceUpdates[ref];
-    if (typeof selectedUpdate !== 'string' || selectedUpdate.length > 512 || !selectedUpdate) throw new Error('Некорректное изменение состояния источника.');
+    if (typeof selectedUpdate !== 'string' || selectedUpdate.length > 512 || !selectedUpdate) throw new CompactionValidationError('Некорректное изменение состояния источника.');
     if (priorClosedRefs.has(ref)) {
-      if (selectedUpdate !== 'none' || classes[ref] !== 'drop' || active.includes(ref)) throw new Error('Закрытый источник сохраняет прежнее основание закрытия и не может изменяться повторно.');
+      if (selectedUpdate !== 'none' || classes[ref] !== 'drop' || active.includes(ref)) throw new CompactionValidationError('Закрытый источник сохраняет прежнее основание закрытия и не может изменяться повторно.');
       continue;
     }
     let update = selectedUpdate;
     if (update === 'keep') {
-      if (classes[ref] === 'drop' && !active.includes(ref)) throw new Error('Сохранение независимого источника требует активной категории.');
+      if (classes[ref] === 'drop' && !active.includes(ref)) throw new CompactionValidationError('Сохранение независимого источника требует активной категории.');
       continue;
     }
     const categories = classes[ref]!.split('+');
@@ -631,20 +640,20 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
         const id = topicClosures.get(topic);
         return id && sourcePosition(ref) < sourcePosition(evidenceIndex[id]!.sourceRef) ? [id] : [];
       }))];
-      if (closures.length > 1) throw new Error('Пересекающиеся предложения review противоречат друг другу.');
+      if (closures.length > 1) throw new CompactionValidationError('Пересекающиеся предложения review противоречат друг другу.');
       if (closures.length) update = `closes:${closures[0]}`;
     }
     if (update === 'none') continue;
     const [kind, id, extra] = update.split(':');
     const proof = evidenceIndex[id!];
-    if (!['closes', 'supersedes'].includes(kind!) || extra !== undefined || !proof || proof.role !== 'user' || !userRefs.includes(proof.sourceRef) || classes[proof.sourceRef] === 'request') throw new Error('Изменение состояния требует индексированного нового user-свидетельства.');
-    if (sourcePosition(ref) >= sourcePosition(proof.sourceRef)) throw new Error('Изменение состояния требует более позднего user-свидетельства.');
+    if (!['closes', 'supersedes'].includes(kind!) || extra !== undefined || !proof || proof.role !== 'user' || !userRefs.includes(proof.sourceRef) || classes[proof.sourceRef] === 'request') throw new CompactionValidationError('Изменение состояния требует индексированного нового user-свидетельства.');
+    if (sourcePosition(ref) >= sourcePosition(proof.sourceRef)) throw new CompactionValidationError('Изменение состояния требует более позднего user-свидетельства.');
     if (kind === 'closes') {
       closedGroups.set(id!, [...(closedGroups.get(id!) ?? []), ref]);
       if (archive.messages.find(source => source.sourceRef === proof.sourceRef)!.text.trim() === proof.text.trim()) closureOnly.add(proof.sourceRef);
     } else superseded.set(ref, proof.sourceRef);
   }
-  if (closedGroups.size > MAX_GENERATED_PAST_TOPICS) throw new Error('Слишком много закрытых веток review.');
+  if (closedGroups.size > MAX_GENERATED_PAST_TOPICS) throw new CompactionValidationError('Слишком много закрытых веток review.');
   const review = { format: SEMANTIC_COMPACTION_FORMAT, version: 1,
     activeTask: active.length ? entry(active[0]!) : null,
     constraints: field('constraint', MAX_SEMANTIC_COUNTS.constraints).map(ref => ({ scope: `Источник ${ref}`, sourceRefs: [ref] })),
@@ -654,7 +663,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
     facts: field('fact', MAX_SEMANTIC_COUNTS.facts).map(ref => ({ sourceRefs: [ref] })),
     pastTopics: [...closedGroups].map(([id, members]) => {
       const proof = evidenceIndex[id];
-      if (!proof || proof.role !== 'user') throw new Error('Закрытие требует индексированного user-основания.');
+      if (!proof || proof.role !== 'user') throw new CompactionValidationError('Закрытие требует индексированного user-основания.');
       return { text: `Закрытая ветка: ${members.length} источников (${members[0]} … ${members[members.length - 1]}).`,
         sourceRefs: list(members.join(','), sourceRefs, MAX_SEMANTIC_REFS_PER_ENTRY), closureEvidence: proof.text };
     }),
@@ -667,20 +676,20 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
   };
   for (const ref of sourceRefs.filter(ref => classes[ref] === 'defect')) {
     const quotes = Object.values(evidenceIndex).filter(quote => quote.sourceRef === ref).map(({ sourceRef, text }) => ({ sourceRef, text }));
-    if (!quotes.length) throw new Error('Дефект требует доступного дословного свидетельства.');
+    if (!quotes.length) throw new CompactionValidationError('Дефект требует доступного дословного свидетельства.');
     const existing = review.unresolvedDefects.find(defect => defect.sourceRefs.includes(ref));
     if (existing) existing.exactQuotes = [...new Map([...existing.exactQuotes, ...quotes].map(quote => [canonicalJson(quote), quote])).values()];
     else review.unresolvedDefects.push({ sourceRefs: [ref], exactQuotes: quotes });
   }
-  if (!Array.isArray(review.pastTopics)) throw new Error('Некорректные закрытые темы.');
+  if (!Array.isArray(review.pastTopics)) throw new CompactionValidationError('Некорректные закрытые темы.');
   const reviewedClosed = validateClosedTopics(review.pastTopics.map(topic => {
-    if (!isRecord(topic) || !hasOnlyKeys(topic, ['text', 'sourceRefs', 'closureEvidence'])) throw new Error('Закрытие требует дословного основания.');
+    if (!isRecord(topic) || !hasOnlyKeys(topic, ['text', 'sourceRefs', 'closureEvidence'])) throw new CompactionValidationError('Закрытие требует дословного основания.');
     const evidence = validateSemanticText(topic.closureEvidence, MAX_SEMANTIC_QUOTE_BYTES);
     const matches = new Set([
       ...archive.messages.filter(source => source.role === 'user' && source.text.includes(evidence)).map(source => source.sourceRef),
       ...(previous?.closedTopics ?? []).filter(prior => prior.closureEvidence === evidence).map(prior => prior.closedBy),
     ]);
-    if (matches.size !== 1) throw new Error('Основание закрытия должно однозначно находиться в доступном user-источнике.');
+    if (matches.size !== 1) throw new CompactionValidationError('Основание закрытия должно однозначно находиться в доступном user-источнике.');
     return { text: topic.text, sourceRefs: topic.sourceRefs, closedBy: [...matches][0], closureEvidence: evidence };
   }), sources);
   const closedTopics = validateClosedTopics([
@@ -691,24 +700,24 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
   if (pairedReview && archive.messages.some(source => source.role === 'user' && classes[source.sourceRef] === 'request'
     && verbatim[source.sourceRef] && !hasRequestCue(source.text) && !requestRefs.includes(source.sourceRef)
     && !closed.has(source.sourceRef) && !superseded.has(source.sourceRef))) {
-    throw new Error('Дословный USER-источник нельзя понизить до архивного запроса.');
+    throw new CompactionValidationError('Дословный USER-источник нельзя понизить до архивного запроса.');
   }
-  if (active.some(ref => closed.has(ref) || superseded.has(ref))) throw new Error('Активная задача не может ссылаться на закрытый или заменённый источник.');
-  if (draft.activeTask !== 'none' && !active.length && !closed.has(draft.activeTask) && !superseded.has(draft.activeTask)) throw new Error('Review не может стереть активную задачу без подтверждённого закрытия.');
+  if (active.some(ref => closed.has(ref) || superseded.has(ref))) throw new CompactionValidationError('Активная задача не может ссылаться на закрытый или заменённый источник.');
+  if (draft.activeTask !== 'none' && !active.length && !closed.has(draft.activeTask) && !superseded.has(draft.activeTask)) throw new CompactionValidationError('Review не может стереть активную задачу без подтверждённого закрытия.');
   const protectedRefs = new Set([...userRefs, ...priorProtectedRefs]);
   if (sourceRefs.some(ref => protectedRefs.has(ref) && classes[ref] === 'drop' && !active.includes(ref)
-    && !closed.has(ref) && !superseded.has(ref) && !closureOnly.has(ref))) throw new Error('Критичный первичный источник нельзя отбросить без подтверждённого закрытия или замены.');
+    && !closed.has(ref) && !superseded.has(ref) && !closureOnly.has(ref))) throw new CompactionValidationError('Критичный первичный источник нельзя отбросить без подтверждённого закрытия или замены.');
   if (assistantRefs.some(ref => verbatim[ref] && (selection.assistantOrigins as Record<string, unknown>)[ref] === 'self' && classes[ref] === 'drop'
-    && !closed.has(ref) && !superseded.has(ref))) throw new Error('Критичные самостоятельные данные ASSISTANT нельзя отбросить без первоисточника пересказа или закрытия.');
-  if ([...superseded.keys()].some(ref => previous?.unresolvedDefects?.some(defect => defect.sourceRefs.includes(ref)))) throw new Error('Наблюдённый дефект требует подтверждённого закрытия, а не замены.');
-  if ([...superseded.values()].some(ref => !closed.has(ref) && !superseded.has(ref) && classes[ref] === 'drop' && !active.includes(ref))) throw new Error('Замена требует сохранения нового состояния.');
+    && !closed.has(ref) && !superseded.has(ref))) throw new CompactionValidationError('Критичные самостоятельные данные ASSISTANT нельзя отбросить без первоисточника пересказа или закрытия.');
+  if ([...superseded.keys()].some(ref => previous?.unresolvedDefects?.some(defect => defect.sourceRefs.includes(ref)))) throw new CompactionValidationError('Наблюдённый дефект требует подтверждённого закрытия, а не замены.');
+  if ([...superseded.values()].some(ref => !closed.has(ref) && !superseded.has(ref) && classes[ref] === 'drop' && !active.includes(ref))) throw new CompactionValidationError('Замена требует сохранения нового состояния.');
   const sourceTexts = semanticSourceTexts(sources);
   const defects = review.unresolvedDefects.map(entry => {
-    if (!isRecord(entry) || !hasOnlyKeys(entry, ['sourceRefs', 'exactQuotes'])) throw new Error('Дефект требует точных свидетельств результата.');
+    if (!isRecord(entry) || !hasOnlyKeys(entry, ['sourceRefs', 'exactQuotes'])) throw new CompactionValidationError('Дефект требует точных свидетельств результата.');
     const refs = validateSemanticSourceRefs(entry.sourceRefs, sourceTexts);
-    if (refs.some(ref => closed.has(ref) || superseded.has(ref))) throw new Error('Открытый дефект не может принадлежать закрытой или заменённой теме.');
+    if (refs.some(ref => closed.has(ref) || superseded.has(ref))) throw new CompactionValidationError('Открытый дефект не может принадлежать закрытой или заменённой теме.');
     const exactQuotes = validateSemanticQuotes(entry.exactQuotes, refs, sourceTexts);
-    if (!exactQuotes.length || refs.some(ref => !exactQuotes.some(quote => quote.sourceRef === ref))) throw new Error('Каждый источник состояния дефекта требует дословного свидетельства.');
+    if (!exactQuotes.length || refs.some(ref => !exactQuotes.some(quote => quote.sourceRef === ref))) throw new CompactionValidationError('Каждый источник состояния дефекта требует дословного свидетельства.');
     return { sourceRefs: refs, exactQuotes };
   });
   for (const prior of previous?.unresolvedDefects ?? []) {
@@ -717,19 +726,19 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
       defects.push({ sourceRefs: refs, exactQuotes: prior.exactQuotes.filter(quote => refs.includes(quote.sourceRef)) });
     }
     if (prior.sourceRefs.some(ref => !closed.has(ref) && !defects.some(defect => defect.sourceRefs.includes(ref)))) {
-      throw new Error('Наблюдённый дефект нельзя потерять без подтверждённого закрытия.');
+      throw new CompactionValidationError('Наблюдённый дефект нельзя потерять без подтверждённого закрытия.');
     }
     if (prior.exactQuotes?.some(quote => !closed.has(quote.sourceRef)
       && !defects.some(defect => defect.exactQuotes.some(next => next.sourceRef === quote.sourceRef && next.text === quote.text)))) {
-      throw new Error('Точное свидетельство дефекта нельзя заменить пересказом.');
+      throw new CompactionValidationError('Точное свидетельство дефекта нельзя заменить пересказом.');
     }
   }
-  if (defects.length > 16) throw new Error('Слишком много открытых дефектов.');
+  if (defects.length > 16) throw new CompactionValidationError('Слишком много открытых дефектов.');
   const exactRefs = [...new Set([...sourceRefs.filter(ref => verbatim[ref]), ...protectedRefs])];
   const retain = (entries: unknown) => {
-    if (!Array.isArray(entries)) throw new Error('Некорректный список памяти.');
+    if (!Array.isArray(entries)) throw new CompactionValidationError('Некорректный список памяти.');
     return entries.flatMap(entry => {
-      if (!isRecord(entry)) throw new Error('Некорректная запись памяти.');
+      if (!isRecord(entry)) throw new CompactionValidationError('Некорректная запись памяти.');
       const refs = validateSemanticSourceRefs(entry.sourceRefs, sourceTexts);
       const kept = refs.filter(ref => !closed.has(ref) && !superseded.has(ref));
       if (kept.length !== refs.length) exactRefs.push(...kept);
@@ -756,7 +765,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
   if (defects.length) {
     compiled.unresolvedDefects = defects.map(defect => {
       const fact = compiled.facts.find(entry => entry.sourceRefs.length === defect.sourceRefs.length && entry.sourceRefs.every((ref, index) => ref === defect.sourceRefs[index]))!;
-      if (defect.exactQuotes.some(quote => !fact.text.includes(quote.text))) throw new Error('Свидетельство дефекта отсутствует в доступной памяти.');
+      if (defect.exactQuotes.some(quote => !fact.text.includes(quote.text))) throw new CompactionValidationError('Свидетельство дефекта отсутствует в доступной памяти.');
       return { text: `Наблюдённый неустранённый дефект: ${defect.exactQuotes.map(quote => quote.text).join(' ')}`,
         sourceRefs: fact.sourceRefs, exactQuotes: defect.exactQuotes };
     });
@@ -774,7 +783,7 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   const metadata = archiveText === undefined ? reviewMetadata! : splitSemanticCompactionTranscript(archiveText)[0]!;
   const refs: unknown = (JSON.parse(metadata.slice(metadata.indexOf('\n') + 1)) as Record<string, unknown>).coverageRefSet;
   if (!Array.isArray(refs) || !refs.length || new Set(refs).size !== refs.length
-    || refs.some(ref => typeof ref !== 'string' || !/^(m|t)(0|[1-9][0-9]*)$/.test(ref))) throw new Error('Некорректные источники заметок.');
+    || refs.some(ref => typeof ref !== 'string' || !/^(m|t)(0|[1-9][0-9]*)$/.test(ref))) throw new CompactionValidationError('Некорректные источники заметок.');
   const fullArchive = archiveText ?? reviewMetadata!;
   const archive = JSON.parse(fullArchive.slice(fullArchive.indexOf('\n') + 1)) as { messages: Array<{ sourceRef: string; role: string; text: string }>; tools: Array<{ sourceRef: string; anchorRef: string }>; previousMemory: SemanticCompactionMemory | null };
   const primary = [...new Set([...archive.messages.filter(source => source.role === 'user').map(source => source.sourceRef),
@@ -862,30 +871,30 @@ export function semanticCompactionWireResponseFormat(archiveText?: string, revie
 }
 
 export function compileSemanticSourceNotes(value: unknown, sourceRefs: readonly string[]): string {
-  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > MAX_COMPACT_SUMMARY_BYTES) throw new Error('Некорректные смысловые заметки.');
+  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > MAX_COMPACT_SUMMARY_BYTES) throw new CompactionValidationError('Некорректные смысловые заметки.');
   const parsed: unknown = JSON.parse(value);
   if (!isRecord(parsed) || !hasOnlyKeys(parsed, ['taskSubject', 'state', 'activeTask', 'topics', 'notes', 'verbatim']) || !isRecord(parsed.notes) || !isRecord(parsed.verbatim)
     || Object.keys(parsed.notes).length !== sourceRefs.length
     || Object.keys(parsed.verbatim).length !== sourceRefs.length
     || sourceRefs.some(ref => !Object.prototype.hasOwnProperty.call(parsed.notes, ref) || typeof (parsed.verbatim as Record<string, unknown>)[ref] !== 'boolean')) {
-    throw new Error('Смысловые заметки должны покрывать каждый переданный источник ровно один раз.');
+    throw new CompactionValidationError('Смысловые заметки должны покрывать каждый переданный источник ровно один раз.');
   }
   const notes: Record<string, string> = {};
   const verbatim: Record<string, boolean> = {};
   const taskSubject = validateSemanticText(typeof parsed.taskSubject === 'string' ? parsed.taskSubject.trim() : parsed.taskSubject, MAX_SEMANTIC_ENTRY_BYTES);
-  if ([...taskSubject].length > MAX_SEMANTIC_SUBJECT_CHARS || ['__task__', '__policy__', '__pending__', '__other__'].includes(taskSubject)) throw new Error('Некорректное название текущей задачи.');
+  if ([...taskSubject].length > MAX_SEMANTIC_SUBJECT_CHARS || ['__task__', '__policy__', '__pending__', '__other__'].includes(taskSubject)) throw new CompactionValidationError('Некорректное название текущей задачи.');
   const state = validateSemanticText(typeof parsed.state === 'string' ? parsed.state.trim() : parsed.state, MAX_SEMANTIC_ENTRY_BYTES);
-  if ([...state].length > MAX_SEMANTIC_STATE_CHARS) throw new Error('Общий итог слишком длинный.');
-  if (typeof parsed.activeTask !== 'string' || parsed.activeTask !== 'none' && !sourceRefs.includes(parsed.activeTask)) throw new Error('Draft требует явного источника активной задачи или none.');
+  if ([...state].length > MAX_SEMANTIC_STATE_CHARS) throw new CompactionValidationError('Общий итог слишком длинный.');
+  if (typeof parsed.activeTask !== 'string' || parsed.activeTask !== 'none' && !sourceRefs.includes(parsed.activeTask)) throw new CompactionValidationError('Draft требует явного источника активной задачи или none.');
   const topics = parsed.topics;
   const subjects = new Set<string>();
-  if (!Array.isArray(topics) || topics.length > MAX_GENERATED_PAST_TOPICS) throw new Error('Некорректные побочные ветки draft.');
+  if (!Array.isArray(topics) || topics.length > MAX_GENERATED_PAST_TOPICS) throw new CompactionValidationError('Некорректные побочные ветки draft.');
   for (const topic of topics) {
     if (!isRecord(topic) || !hasOnlyKeys(topic, ['subject', 'firstSource', 'lastSource', 'evidence']) || typeof topic.subject !== 'string'
       || !topic.subject.trim() || [...topic.subject].length > MAX_SEMANTIC_SUBJECT_CHARS || subjects.has(topic.subject)
       || typeof topic.evidence !== 'string' || !topic.evidence.trim() || Buffer.byteLength(topic.evidence) > MAX_SEMANTIC_QUOTE_BYTES
       || [topic.firstSource, topic.lastSource].some(ref => typeof ref !== 'string' || !ref.startsWith('m') || !sourceRefs.includes(ref))
-      || Number((topic.firstSource as string).slice(1)) > Number((topic.lastSource as string).slice(1))) throw new Error('Ветки требуют разных названий и упорядоченных доступных границ.');
+      || Number((topic.firstSource as string).slice(1)) > Number((topic.lastSource as string).slice(1))) throw new CompactionValidationError('Ветки требуют разных названий и упорядоченных доступных границ.');
     subjects.add(topic.subject);
   }
   for (const ref of sourceRefs) {
@@ -893,19 +902,19 @@ export function compileSemanticSourceNotes(value: unknown, sourceRefs: readonly 
     const trimmed = typeof note === 'string' ? note.trim() : note;
     const omitted = typeof trimmed === 'string' && /^(?:\.\.\.|…|\{(?:\.\.\.|…)\}|\[(?:\.\.\.|…)\])$/u.test(trimmed);
     const text = omitted ? 'Содержание доступно в источнике.' : validateSemanticText(trimmed, MAX_SEMANTIC_ENTRY_BYTES);
-    if ([...text].length > MAX_SOURCE_NOTE_CHARS) throw new Error('Смысловая заметка слишком длинная.');
+    if ([...text].length > MAX_SOURCE_NOTE_CHARS) throw new CompactionValidationError('Смысловая заметка слишком длинная.');
     notes[ref] = text;
     verbatim[ref] = omitted || parsed.verbatim[ref] as boolean;
   }
   const compiled = canonicalJson({ taskSubject, state, activeTask: parsed.activeTask, topics: parsed.topics, notes, verbatim });
-  if (Buffer.byteLength(compiled, 'utf8') > MAX_COMPACT_SUMMARY_BYTES) throw new Error('Смысловые заметки превышают резерв review.');
+  if (Buffer.byteLength(compiled, 'utf8') > MAX_COMPACT_SUMMARY_BYTES) throw new CompactionValidationError('Смысловые заметки превышают резерв review.');
   return compiled;
 }
 
 export function compileAnchoredSemanticCompactionMemory(value: unknown, sources: CompactionSources, sourceRefs: readonly string[], archiveText: string, exactRefs: readonly string[] = []): string {
-  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > MAX_COMPACTION_CANDIDATE_BYTES) throw new Error('Некорректный результат сжатия.');
+  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > MAX_COMPACTION_CANDIDATE_BYTES) throw new CompactionValidationError('Некорректный результат сжатия.');
   const memory: unknown = JSON.parse(value);
-  if (!isRecord(memory) || !Array.isArray(memory.constraints) || !Array.isArray(memory.facts)) throw new Error('Некорректные якоря памяти.');
+  if (!isRecord(memory) || !Array.isArray(memory.constraints) || !Array.isArray(memory.facts)) throw new CompactionValidationError('Некорректные якоря памяти.');
   splitSemanticCompactionTranscript(archiveText);
   const archive = JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)) as {
     messages: Array<{ sourceRef: string; text: string }>;
@@ -948,19 +957,19 @@ export function compileAnchoredSemanticCompactionMemory(value: unknown, sources:
     if (typeof text === 'string' && text) add(record.sourceRef, text, literalQuotes(record.sourceRef, text));
   }
   const anchor = (entry: unknown, constraint: boolean) => {
-    if (!isRecord(entry) || !hasOnlyKeys(entry, constraint ? ['scope', 'sourceRefs'] : ['sourceRefs'])) throw new Error('Якорь не может содержать пересказ.');
+    if (!isRecord(entry) || !hasOnlyKeys(entry, constraint ? ['scope', 'sourceRefs'] : ['sourceRefs'])) throw new CompactionValidationError('Якорь не может содержать пересказ.');
     const refs = validateSemanticSourceRefs(entry.sourceRefs, semanticSourceTexts(sources));
-    if (refs.some(ref => !sourceRefs.includes(ref) || !texts.has(ref))) throw new Error('Якорь ссылается на недоступный источник.');
+    if (refs.some(ref => !sourceRefs.includes(ref) || !texts.has(ref))) throw new CompactionValidationError('Якорь ссылается на недоступный источник.');
     const text = [...new Set(refs.flatMap(ref => texts.get(ref)!))].join('\n');
     return constraint ? { scope: entry.scope, sourceRefs: refs, text }
       : { sourceRefs: refs, text, exactQuotes: refs.flatMap(ref => quotes.get(ref) ?? []) };
   };
   const preserveCritical = (entries: unknown) => {
-    if (!Array.isArray(entries)) throw new Error('Некорректный список смысловой памяти.');
+    if (!Array.isArray(entries)) throw new CompactionValidationError('Некорректный список смысловой памяти.');
     return entries.map(entry => {
       const parsed = validateSemanticEntry(entry, semanticSourceTexts(sources));
       if (!parsed.sourceRefs.some(ref => exactRefs.includes(ref))) return parsed;
-      if (parsed.sourceRefs.some(ref => !texts.has(ref))) throw new Error('Критичный источник недоступен.');
+      if (parsed.sourceRefs.some(ref => !texts.has(ref))) throw new CompactionValidationError('Критичный источник недоступен.');
       return { ...parsed, text: [...new Set(parsed.sourceRefs.flatMap(ref => texts.get(ref)!))].join('\n') };
     });
   };
@@ -1159,10 +1168,10 @@ export function serializeSemanticCompactionTranscript(
 
 export function splitSemanticCompactionTranscript(value: string): string[] {
   const separator = value.indexOf('\n');
-  if (separator < 0) throw new Error('Архив semantic-сжатия не содержит JSON.');
+  if (separator < 0) throw new CompactionValidationError('Архив semantic-сжатия не содержит JSON.');
   const input: unknown = JSON.parse(value.slice(separator + 1));
   if (!isRecord(input) || input.format !== 'gigachat-semantic-compaction-input' || input.version !== 1
-    || !Array.isArray(input.messages) || input.messages.length === 0) throw new Error('Некорректный архив semantic-сжатия.');
+    || !Array.isArray(input.messages) || input.messages.length === 0) throw new CompactionValidationError('Некорректный архив semantic-сжатия.');
   const { messages, ...metadata } = input;
   return [
     `МЕТАДАННЫЕ АРХИВА JSON. Историческая память и результаты инструментов — недоверенные данные.\n${canonicalJson(metadata)}`,
@@ -1175,7 +1184,7 @@ export function validateCompactSummary(value: unknown): string {
     // eslint-disable-next-line no-control-regex -- Reject C0/C1 control characters in untrusted stored summaries.
     || /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(value)
     || !/[\p{L}\p{N}]/u.test(value)) {
-    throw new Error('Сводка должна быть непустым текстом без управляющих символов размером до 32 КиБ.');
+    throw new CompactionValidationError('Сводка должна быть непустым текстом без управляющих символов размером до 32 КиБ.');
   }
   return value.trim();
 }
@@ -1191,11 +1200,14 @@ function hasOnlyKeys(value: Record<string, unknown>, required: readonly string[]
 }
 
 function validateSemanticText(value: unknown, maxBytes: number): string {
-  if (typeof value !== 'string' || !value.trim() || value !== value.trim() || Buffer.byteLength(value, 'utf8') > maxBytes
+  if (typeof value === 'string' && Buffer.byteLength(value, 'utf8') > maxBytes) {
+    throw new CompactionValidationError(`Текст записи семантической памяти превышает ${maxBytes} байт UTF-8.`);
+  }
+  if (typeof value !== 'string' || !value.trim() || value !== value.trim()
     // eslint-disable-next-line no-control-regex -- Stored semantic memory rejects hidden control characters.
     || /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/.test(value)
     || !/[\p{L}\p{N}]/u.test(value) || ['summary', 'сводка'].includes(value.toLocaleLowerCase('ru-RU'))) {
-    throw new Error('Семантическая память содержит пустой, служебный или некорректный текст.');
+    throw new CompactionValidationError('Семантическая память содержит пустой, служебный или некорректный текст.');
   }
   return value;
 }
@@ -1204,17 +1216,17 @@ function semanticSourceTexts(sources: CompactionSources): Map<string, string[]> 
   const byRef = new Map<string, string[]>();
   const add = (ref: unknown, text: string[]): void => {
     if (typeof ref !== 'string' || !/^(?:m|t)(?:0|[1-9]\d*)$/.test(ref) || byRef.has(ref)) {
-      throw new Error('Исходники семантической памяти содержат неверную или повторную ссылку.');
+      throw new CompactionValidationError('Исходники семантической памяти содержат неверную или повторную ссылку.');
     }
     byRef.set(ref, text);
   };
   for (const message of sources.messages) {
-    if (typeof message.text !== 'string') throw new Error('Исходник сообщения семантической памяти повреждён.');
+    if (typeof message.text !== 'string') throw new CompactionValidationError('Исходник сообщения семантической памяти повреждён.');
     add(message.ref, [message.text]);
   }
   for (const tool of sources.tools) {
     if (tool.content !== null && typeof tool.content !== 'string' || tool.result !== null && typeof tool.result !== 'string') {
-      throw new Error('Исходник инструмента семантической памяти повреждён.');
+      throw new CompactionValidationError('Исходник инструмента семантической памяти повреждён.');
     }
     add(tool.ref, [tool.content, tool.result].filter((text): text is string => typeof text === 'string'));
   }
@@ -1223,12 +1235,12 @@ function semanticSourceTexts(sources: CompactionSources): Map<string, string[]> 
 
 function validateSemanticCoverageRefSet(value: unknown, sourceTexts: ReadonlyMap<string, readonly string[]>): string[] {
   if (!Array.isArray(value) || value.length === 0 || value.length > sourceTexts.size) {
-    throw new Error('Список исходников semantic-сжатия должен быть непустым и не превышать количество проверенных исходников.');
+    throw new CompactionValidationError('Список исходников semantic-сжатия должен быть непустым и не превышать количество проверенных исходников.');
   }
   const seen = new Set<string>();
   return value.map((ref) => {
     if (typeof ref !== 'string' || !sourceTexts.has(ref) || seen.has(ref)) {
-      throw new Error('Список исходников semantic-сжатия содержит неизвестную или повторную ссылку.');
+      throw new CompactionValidationError('Список исходников semantic-сжатия содержит неизвестную или повторную ссылку.');
     }
     seen.add(ref);
     return ref;
@@ -1276,13 +1288,13 @@ export function getSemanticCompactionCoverageRefSet(
   fromMessageIndex = 0,
 ): string[] {
   if (!Number.isSafeInteger(fromMessageIndex) || fromMessageIndex < 0 || fromMessageIndex > sources.messages.length) {
-    throw new Error('Граница нового фрагмента истории сжатия некорректна.');
+    throw new CompactionValidationError('Граница нового фрагмента истории сжатия некорректна.');
   }
   const sourceTexts = semanticSourceTexts(sources);
   const orderedRefs: string[] = [];
   const seen = new Set<string>();
   const add = (ref: string): void => {
-    if (!sourceTexts.has(ref)) throw new Error('Исходник semantic-сжатия содержит неизвестную ссылку.');
+    if (!sourceTexts.has(ref)) throw new CompactionValidationError('Исходник semantic-сжатия содержит неизвестную ссылку.');
     if (!seen.has(ref)) {
       seen.add(ref);
       orderedRefs.push(ref);
@@ -1303,12 +1315,12 @@ export function getSemanticCompactionCoverageRefSet(
 
 function validateSemanticSourceRefs(value: unknown, sourceTexts: ReadonlyMap<string, readonly string[]>): string[] {
   if (!Array.isArray(value) || value.length === 0 || value.length > MAX_SEMANTIC_REFS_PER_ENTRY) {
-    throw new Error('Записи семантической памяти должны ссылаться на ограниченный набор исходников.');
+    throw new CompactionValidationError('Записи семантической памяти должны ссылаться на ограниченный набор исходников.');
   }
   const seen = new Set<string>();
   return value.map((ref) => {
     if (typeof ref !== 'string' || !sourceTexts.has(ref) || seen.has(ref)) {
-      throw new Error('Семантическая память содержит неизвестную или повторную ссылку.');
+      throw new CompactionValidationError('Семантическая память содержит неизвестную или повторную ссылку.');
     }
     seen.add(ref);
     return ref;
@@ -1317,7 +1329,7 @@ function validateSemanticSourceRefs(value: unknown, sourceTexts: ReadonlyMap<str
 
 function validateSemanticEntry(value: unknown, sourceTexts: ReadonlyMap<string, readonly string[]>): SemanticCompactionEntry {
   if (!isRecord(value) || !hasOnlyKeys(value, ['text', 'sourceRefs'])) {
-    throw new Error('Запись семантической памяти имеет неверную структуру.');
+    throw new CompactionValidationError('Запись семантической памяти имеет неверную структуру.');
   }
   return {
     text: validateSemanticText(value.text, MAX_SEMANTIC_ENTRY_BYTES),
@@ -1330,31 +1342,31 @@ function validateSemanticEntries(
   sourceTexts: ReadonlyMap<string, readonly string[]>,
   maxCount: number,
 ): SemanticCompactionEntry[] {
-  if (!Array.isArray(value) || value.length > maxCount) throw new Error('Список семантической памяти превышает допустимый размер.');
+  if (!Array.isArray(value) || value.length > maxCount) throw new CompactionValidationError('Список семантической памяти превышает допустимый размер.');
   return value.map((entry) => validateSemanticEntry(entry, sourceTexts));
 }
 
 function parseSemanticCompactionMemory(value: unknown, sources: CompactionSources): SemanticCompactionMemory {
   if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > MAX_COMPACTION_CANDIDATE_BYTES) {
-    throw new Error('Кандидат семантической памяти превышает допустимый размер.');
+    throw new CompactionValidationError('Кандидат семантической памяти превышает допустимый размер.');
   }
   let parsed: unknown;
   try { parsed = JSON.parse(value); }
-  catch { throw new Error('Кандидат семантической памяти должен быть корректным JSON.'); }
+  catch { throw new CompactionValidationError('Кандидат семантической памяти должен быть корректным JSON.'); }
   if (!isRecord(parsed) || !hasOnlyKeys(parsed,
     ['format', 'version', 'activeTask', 'constraints', 'decisions', 'openWork', 'facts', 'pastTopics'], ['closedTopics', 'unresolvedDefects', 'assistantReports', 'historicalRequests'])
     || parsed.format !== SEMANTIC_COMPACTION_FORMAT || parsed.version !== 1) {
-    throw new Error('Кандидат семантической памяти имеет неверную версию или структуру.');
+    throw new CompactionValidationError('Кандидат семантической памяти имеет неверную версию или структуру.');
   }
 
   const sourceTexts = semanticSourceTexts(sources);
   const activeTask = parsed.activeTask === null ? null : validateSemanticEntry(parsed.activeTask, sourceTexts);
   if (!Array.isArray(parsed.constraints) || parsed.constraints.length > MAX_SEMANTIC_COUNTS.constraints) {
-    throw new Error('Список ограничений семантической памяти превышает допустимый размер.');
+    throw new CompactionValidationError('Список ограничений семантической памяти превышает допустимый размер.');
   }
   const constraints = parsed.constraints.map((item): SemanticCompactionConstraint => {
     if (!isRecord(item) || !hasOnlyKeys(item, ['scope', 'text', 'sourceRefs'])) {
-      throw new Error('Ограничение семантической памяти имеет неверную структуру.');
+      throw new CompactionValidationError('Ограничение семантической памяти имеет неверную структуру.');
     }
     return {
       scope: validateSemanticText(item.scope, MAX_SEMANTIC_SCOPE_BYTES),
@@ -1365,16 +1377,16 @@ function parseSemanticCompactionMemory(value: unknown, sources: CompactionSource
   const decisions = validateSemanticEntries(parsed.decisions, sourceTexts, MAX_SEMANTIC_COUNTS.decisions);
   const assistantReports = parsed.assistantReports === undefined ? [] : validateSemanticEntries(parsed.assistantReports, sourceTexts, MAX_SEMANTIC_COUNTS.decisions);
   const historicalRequests = parsed.historicalRequests === undefined ? [] : validateSemanticEntries(parsed.historicalRequests, sourceTexts, MAX_SEMANTIC_COUNTS.decisions);
-  if (historicalRequests.some(entry => entry.sourceRefs.some(ref => !sources.messages.some(source => source.ref === ref && source.role === 'user')))) throw new Error('Архивные запросы требуют USER-источников.');
+  if (historicalRequests.some(entry => entry.sourceRefs.some(ref => !sources.messages.some(source => source.ref === ref && source.role === 'user')))) throw new CompactionValidationError('Архивные запросы требуют USER-источников.');
   if (assistantReports.length + decisions.length + historicalRequests.length > MAX_SEMANTIC_COUNTS.decisions
-    || assistantReports.some(entry => entry.sourceRefs.some(ref => !sources.messages.some(source => source.ref === ref && source.role === 'assistant')))) throw new Error('Сообщения ASSISTANT и архивные запросы требуют собственных источников и общего лимита решений.');
+    || assistantReports.some(entry => entry.sourceRefs.some(ref => !sources.messages.some(source => source.ref === ref && source.role === 'assistant')))) throw new CompactionValidationError('Сообщения ASSISTANT и архивные запросы требуют собственных источников и общего лимита решений.');
   const openWork = validateSemanticEntries(parsed.openWork, sourceTexts, MAX_SEMANTIC_COUNTS.openWork);
   if (!Array.isArray(parsed.facts) || parsed.facts.length > MAX_SEMANTIC_COUNTS.facts) {
-    throw new Error('Список фактов семантической памяти превышает допустимый размер.');
+    throw new CompactionValidationError('Список фактов семантической памяти превышает допустимый размер.');
   }
   const facts = parsed.facts.map((item): SemanticCompactionFact => {
     if (!isRecord(item) || !hasOnlyKeys(item, ['text', 'sourceRefs'], ['exactQuotes'])) {
-      throw new Error('Факт семантической памяти имеет неверную структуру.');
+      throw new CompactionValidationError('Факт семантической памяти имеет неверную структуру.');
     }
     const sourceRefs = validateSemanticSourceRefs(item.sourceRefs, sourceTexts);
     const fact: SemanticCompactionFact = {
@@ -1387,7 +1399,7 @@ function parseSemanticCompactionMemory(value: unknown, sources: CompactionSource
   const pastTopics = validateSemanticEntries(parsed.pastTopics, sourceTexts, MAX_SEMANTIC_COUNTS.pastTopics);
   const totalEntries = Number(activeTask !== null) + constraints.length + decisions.length + assistantReports.length + historicalRequests.length + openWork.length + facts.length + pastTopics.length;
   if (totalEntries === 0 || totalEntries > MAX_SEMANTIC_TOTAL_ENTRIES) {
-    throw new Error('Кандидат семантической памяти пуст или содержит слишком много записей.');
+    throw new CompactionValidationError('Кандидат семантической памяти пуст или содержит слишком много записей.');
   }
   const memory: SemanticCompactionMemory = {
     format: SEMANTIC_COMPACTION_FORMAT,
@@ -1403,20 +1415,20 @@ function parseSemanticCompactionMemory(value: unknown, sources: CompactionSource
   };
   if (parsed.closedTopics !== undefined) memory.closedTopics = validateClosedTopics(parsed.closedTopics, sources);
   if (parsed.unresolvedDefects !== undefined) {
-    if (!Array.isArray(parsed.unresolvedDefects) || parsed.unresolvedDefects.length > 16) throw new Error('Некорректные состояния дефектов.');
+    if (!Array.isArray(parsed.unresolvedDefects) || parsed.unresolvedDefects.length > 16) throw new CompactionValidationError('Некорректные состояния дефектов.');
     memory.unresolvedDefects = parsed.unresolvedDefects.map(item => {
-      if (!isRecord(item) || !hasOnlyKeys(item, ['text', 'sourceRefs'], ['exactQuotes'])) throw new Error('Некорректное состояние дефекта.');
+      if (!isRecord(item) || !hasOnlyKeys(item, ['text', 'sourceRefs'], ['exactQuotes'])) throw new CompactionValidationError('Некорректное состояние дефекта.');
       const entry = validateSemanticEntry({ text: item.text, sourceRefs: item.sourceRefs }, sourceTexts);
       return { ...entry, ...(item.exactQuotes === undefined ? {} : { exactQuotes: validateSemanticQuotes(item.exactQuotes, entry.sourceRefs, sourceTexts) }) };
     });
   }
   const closed = new Set((memory.closedTopics ?? []).flatMap(topic => topic.sourceRefs.filter(ref => ref !== topic.closedBy)));
   if ([activeTask, ...constraints, ...decisions, ...openWork, ...facts, ...assistantReports, ...historicalRequests, ...(memory.unresolvedDefects ?? [])]
-    .some(entry => entry?.sourceRefs.some(ref => closed.has(ref)))) throw new Error('Закрытые подробности не могут быть активной памятью.');
+    .some(entry => entry?.sourceRefs.some(ref => closed.has(ref)))) throw new CompactionValidationError('Закрытые подробности не могут быть активной памятью.');
   const reportRefs = new Set(assistantReports.flatMap(entry => entry.sourceRefs));
-  if ([activeTask, ...constraints, ...decisions, ...openWork, ...facts, ...(memory.unresolvedDefects ?? [])].some(entry => entry?.sourceRefs.some(ref => reportRefs.has(ref)))) throw new Error('Сообщение ASSISTANT не может одновременно быть первичным решением, ограничением или подтверждённым фактом.');
+  if ([activeTask, ...constraints, ...decisions, ...openWork, ...facts, ...(memory.unresolvedDefects ?? [])].some(entry => entry?.sourceRefs.some(ref => reportRefs.has(ref)))) throw new CompactionValidationError('Сообщение ASSISTANT не может одновременно быть первичным решением, ограничением или подтверждённым фактом.');
   const requestRefs = new Set(historicalRequests.flatMap(entry => entry.sourceRefs));
-  if ([activeTask, ...constraints, ...decisions, ...openWork, ...facts, ...(memory.unresolvedDefects ?? [])].some(entry => entry?.sourceRefs.some(ref => requestRefs.has(ref)))) throw new Error('Архивный запрос не может одновременно быть первичным утверждением или действующим ограничением.');
+  if ([activeTask, ...constraints, ...decisions, ...openWork, ...facts, ...(memory.unresolvedDefects ?? [])].some(entry => entry?.sourceRefs.some(ref => requestRefs.has(ref)))) throw new CompactionValidationError('Архивный запрос не может одновременно быть первичным утверждением или действующим ограничением.');
   for (const defect of memory.unresolvedDefects ?? []) {
     if (!defect.text.startsWith('Наблюдённый неустранённый дефект: ')
       || !openWork.some(entry => entry.text === defect.text && canonicalJson(entry.sourceRefs) === canonicalJson(defect.sourceRefs))
@@ -1426,53 +1438,53 @@ function parseSemanticCompactionMemory(value: unknown, sources: CompactionSource
             && defect.sourceRefs.every(ref => defect.exactQuotes!.some(quote => quote.sourceRef === ref))
             && defect.exactQuotes.every(quote => entry.text.includes(quote.text))
             && defect.text === `Наблюдённый неустранённый дефект: ${defect.exactQuotes.map(quote => quote.text).join(' ')}`))) {
-      throw new Error('Состояние дефекта должно сохранять результат и открытую работу вместе.');
+      throw new CompactionValidationError('Состояние дефекта должно сохранять результат и открытую работу вместе.');
     }
   }
   if (Buffer.byteLength(canonicalJson(memory), 'utf8') > MAX_COMPACT_SUMMARY_BYTES) {
-    throw new Error('Семантическая память превышает ограничение 32 КиБ.');
+    throw new CompactionValidationError('Семантическая память превышает ограничение 32 КиБ.');
   }
   return memory;
 }
 
 function validateSemanticQuotes(value: unknown, sourceRefs: readonly string[], sourceTexts: Map<string, string[]>): SemanticCompactionQuote[] {
-  if (!Array.isArray(value) || value.length > MAX_SEMANTIC_QUOTES_PER_FACT) throw new Error('Список точных цитат семантической памяти превышает допустимый размер.');
+  if (!Array.isArray(value) || value.length > MAX_SEMANTIC_QUOTES_PER_FACT) throw new CompactionValidationError('Список точных цитат семантической памяти превышает допустимый размер.');
   const seen = new Set<string>();
   return value.map(quote => {
     if (!isRecord(quote) || !hasOnlyKeys(quote, ['sourceRef', 'text'])
-      || typeof quote.sourceRef !== 'string' || !sourceRefs.includes(quote.sourceRef)) throw new Error('Точная цитата не связана с исходником факта.');
+      || typeof quote.sourceRef !== 'string' || !sourceRefs.includes(quote.sourceRef)) throw new CompactionValidationError('Точная цитата не связана с исходником факта.');
     const text = quote.text;
     if (typeof text !== 'string' || !text || Buffer.byteLength(text, 'utf8') > MAX_SEMANTIC_QUOTE_BYTES
       // eslint-disable-next-line no-control-regex -- Exact quotes cannot contain hidden control characters.
-      || /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/.test(text)) throw new Error('Точная цитата семантической памяти имеет неверный текст.');
+      || /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/.test(text)) throw new CompactionValidationError('Точная цитата семантической памяти имеет неверный текст.');
     const key = `${quote.sourceRef}\u0000${text}`;
-    if (seen.has(key)) throw new Error('Семантическая память содержит повторную точную цитату.');
+    if (seen.has(key)) throw new CompactionValidationError('Семантическая память содержит повторную точную цитату.');
     seen.add(key);
-    if (!sourceTexts.get(quote.sourceRef)?.some(source => source.includes(text))) throw new Error('Точная цитата не совпадает с текстом исходного сообщения или результата инструмента.');
+    if (!sourceTexts.get(quote.sourceRef)?.some(source => source.includes(text))) throw new CompactionValidationError('Точная цитата не совпадает с текстом исходного сообщения или результата инструмента.');
     return { sourceRef: quote.sourceRef, text };
   });
 }
 
 function validateClosedTopics(value: unknown, sources: CompactionSources): SemanticClosedTopic[] {
-  if (!Array.isArray(value) || value.length > MAX_GENERATED_PAST_TOPICS) throw new Error('Некорректные закрытые темы.');
+  if (!Array.isArray(value) || value.length > MAX_GENERATED_PAST_TOPICS) throw new CompactionValidationError('Некорректные закрытые темы.');
   const sourceTexts = semanticSourceTexts(sources), members = new Set<string>();
   return value.map(topic => {
-    if (!isRecord(topic) || !hasOnlyKeys(topic, ['text', 'sourceRefs', 'closedBy'], ['closureEvidence'])) throw new Error('Закрытие должно иметь список подробностей и источник подтверждения.');
+    if (!isRecord(topic) || !hasOnlyKeys(topic, ['text', 'sourceRefs', 'closedBy'], ['closureEvidence'])) throw new CompactionValidationError('Закрытие должно иметь список подробностей и источник подтверждения.');
     const entry = validateSemanticEntry({ text: topic.text, sourceRefs: topic.sourceRefs }, sourceTexts);
     const closedBy = validateSemanticSourceRefs([topic.closedBy], sourceTexts)[0]!;
     if ([...entry.text].length > MAX_GENERATED_PAST_TOPIC_CHARS
-      || !sources.messages.some(source => source.ref === closedBy && source.role === 'user')) throw new Error('Закрытие темы требует первичного пользовательского подтверждения.');
+      || !sources.messages.some(source => source.ref === closedBy && source.role === 'user')) throw new CompactionValidationError('Закрытие темы требует первичного пользовательского подтверждения.');
     const closureIndex = sources.messages.findIndex(source => source.ref === closedBy);
     if (entry.sourceRefs.some(ref => sources.messages.some((source, index) => source.ref === ref && source.role === 'user' && index > closureIndex))) {
-      throw new Error('Закрытие не может предшествовать более позднему пользовательскому содержимому темы.');
+      throw new CompactionValidationError('Закрытие не может предшествовать более позднему пользовательскому содержимому темы.');
     }
     for (const ref of entry.sourceRefs) {
-      if (members.has(ref)) throw new Error('Подробность не может принадлежать двум закрытым темам.');
+      if (members.has(ref)) throw new CompactionValidationError('Подробность не может принадлежать двум закрытым темам.');
       members.add(ref);
     }
     if (topic.closureEvidence === undefined) return { ...entry, closedBy };
     const closureEvidence = validateSemanticText(topic.closureEvidence, MAX_SEMANTIC_QUOTE_BYTES);
-    if (!sourceTexts.get(closedBy)?.some(text => text.includes(closureEvidence))) throw new Error('Основание закрытия не совпадает с user-источником.');
+    if (!sourceTexts.get(closedBy)?.some(text => text.includes(closureEvidence))) throw new CompactionValidationError('Основание закрытия не совпадает с user-источником.');
     return { ...entry, closedBy, closureEvidence };
   });
 }
@@ -1491,7 +1503,7 @@ export function compileSemanticCompactionMemory(
     const sourceTexts = semanticSourceTexts(sources);
     const allowed = new Set(validateSemanticCoverageRefSet(allowedSourceRefs, sourceTexts));
     if (semanticMemorySourceRefs(memory).some((ref) => !allowed.has(ref))) {
-      throw new Error('Семантическая память ссылается на исходник вне текущего архива.');
+      throw new CompactionValidationError('Семантическая память ссылается на исходник вне текущего архива.');
     }
   }
   return canonicalJson(memory);
@@ -1500,7 +1512,7 @@ export function compileSemanticCompactionMemory(
 export function compileGeneratedSemanticCompactionMemory(value: unknown, sources: CompactionSources, allowedSourceRefs: readonly string[]): string {
   const memory = parseSemanticCompactionMemory(value, sources);
   if (memory.facts.some(fact => !fact.exactQuotes?.length)) {
-    throw new Error('Каждый новый semantic-факт должен содержать дословное основание из источника.');
+    throw new CompactionValidationError('Каждый новый semantic-факт должен содержать дословное основание из источника.');
   }
   return compileSemanticCompactionMemory(canonicalJson(memory), sources, allowedSourceRefs);
 }

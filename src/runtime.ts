@@ -24,7 +24,7 @@ import { isImageProtocolDiagnostic, MAX_ASSISTANT_CHARS, PROVIDER_ERROR_CATEGORI
 import { LocalToolError, LocalWriteError, type LocalToolEvent, type LocalTools } from './local-tools';
 import { HookDispatchAbortError } from './hooks';
 import { MAX_USAGE_COUNT, mergeUsageReceipt } from './usage';
-import { COMPACTION_OUTPUT_TOKEN_LIMIT, semanticReviewInputReserve, compileExtractiveCompaction, compileResolvedSemanticCompactionMemory, type CompactionSources } from './compaction';
+import { COMPACTION_OUTPUT_TOKEN_LIMIT, semanticReviewInputReserve, compactionValidationRule, compileExtractiveCompaction, compileResolvedSemanticCompactionMemory, type CompactionSources } from './compaction';
 import { buildSemanticCompactionReviewRequest, getSemanticCompactionRequestSourceRefs } from './context';
 import { isCurrentChatModelId } from './model-catalog';
 import { withLiteNormalOutputCap } from './context-budget';
@@ -256,15 +256,24 @@ function runtimeErrorCategory(error: unknown, turnTimedOut = false): ProviderErr
   }
 }
 
+class CompactionCandidateRejected extends Error {
+  constructor(readonly diagnostic?: string) {
+    super('COMPACTION_CANDIDATE_REJECTED');
+  }
+}
+
 function compileCompactionCandidate(value: string, sources: CompactionSources, semanticSourceRefs: readonly string[] | null, archiveText?: string, notes?: string): string {
   try {
     if (semanticSourceRefs === null) return compileExtractiveCompaction(value, sources);
     const decision = JSON.parse(value);
-    if (!decision || typeof decision !== 'object' || !Object.prototype.hasOwnProperty.call(decision, 'sources') || Object.prototype.hasOwnProperty.call(decision, 'assistantOrigins')) throw new Error('Review requires the public wire contract.');
+    if (!decision || typeof decision !== 'object' || !Object.prototype.hasOwnProperty.call(decision, 'sources') || Object.prototype.hasOwnProperty.call(decision, 'assistantOrigins')) {
+      throw new CompactionCandidateRejected('Этап Review. Требуется публичная схема решения по источникам.');
+    }
     return compileResolvedSemanticCompactionMemory(value, notes!, sources, semanticSourceRefs, archiveText!);
   }
-  catch {
-    throw Object.assign(new Error('COMPACTION_CANDIDATE_REJECTED'), { category: 'context' as const });
+  catch (error) {
+    if (error instanceof CompactionCandidateRejected) throw error;
+    throw new CompactionCandidateRejected(semanticSourceRefs === null ? undefined : `Этап Review. ${compactionValidationRule(error)}`);
   }
 }
 
@@ -1454,8 +1463,10 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         if (controller.signal.aborted) throw abortError();
         await finishActiveUsage('completed');
         if (semanticSourceRefs !== null && !semanticReviewStarted) {
-          const review = buildSemanticCompactionReviewRequest(request, compactionContext!.sources, semanticSourceRefs, answer);
-          if (!review) throw Object.assign(new Error('COMPACTION_CANDIDATE_REJECTED'), { category: 'context' as const });
+          let rule = 'Не удалось собрать запрос для review из проверенного архива и заметок.';
+          const review = buildSemanticCompactionReviewRequest(request, compactionContext!.sources, semanticSourceRefs, answer,
+            invalidRule => { rule = invalidRule; });
+          if (!review) throw new CompactionCandidateRejected(`Этап Draft. ${rule}`);
           semanticNotes = answer;
           request = review;
           semanticReviewStarted = true;
@@ -1595,8 +1606,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
                   ? 'Подготовка хода превысила ограниченное время ожидания.'
                   : terminalError instanceof Error && terminalError.message === 'PROMPT_PREFLIGHT_TIMEOUT'
                     ? 'Проверка контекста превысила ограниченное время; запрос не отправлен.'
-                  : terminalError instanceof Error && terminalError.message === 'COMPACTION_CANDIDATE_REJECTED'
-                    ? 'Сжатие отклонено; прежний контекст сохранён.'
+                  : terminalError instanceof CompactionCandidateRejected
+                    ? `Сжатие отклонено; прежний контекст сохранён.${terminalError.diagnostic ? ` ${terminalError.diagnostic}` : ''}`
                   : terminalError instanceof Error && terminalError.message === 'COMPACTION_INPUT_TOO_LARGE'
                     ? 'Запрос превышает проверенный предел GigaChat Lite. Уменьшите новый ввод или историю.'
                   : terminalError instanceof Error && ['COMPACTION_REVIEW_BUDGET_UNAVAILABLE', 'COMPACTION_REVIEW_RESERVE_EXCEEDED'].includes(terminalError.message)

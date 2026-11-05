@@ -1225,7 +1225,7 @@ test('bounds past topics, individual entries and aggregate serialized semantic m
   const base = JSON.parse(semanticCandidate()) as Record<string, unknown>;
   const tooManyTopics = Array.from({ length: 9 }, (_, index) => ({ text: `Закрытая тема ${index + 1}.`, sourceRefs: ['m0'] }));
   assert.throws(() => validateSemanticCompactionMemory(JSON.stringify({ ...base, pastTopics: tooManyTopics }), sources), /Список семантической памяти превышает/);
-  assert.throws(() => validateSemanticCompactionMemory(semanticCandidate({ activeTask: { text: 'x'.repeat(4 * 1024 + 1), sourceRefs: ['m0'] } }), sources), /служебный или некорректный текст/);
+  assert.throws(() => validateSemanticCompactionMemory(semanticCandidate({ activeTask: { text: 'я'.repeat(2049), sourceRefs: ['m0'] } }), sources), /превышает 4096 байт UTF-8/);
   const oversizedFacts = Array.from({ length: 8 }, (_, index) => ({ text: `${index + 1}${'x'.repeat(4 * 1024 - 1)}`, sourceRefs: ['m1'] }));
   assert.throws(() => compileSemanticCompactionMemory(semanticCandidate({ facts: oversizedFacts }), sources), /ограничение 32 КиБ/);
 

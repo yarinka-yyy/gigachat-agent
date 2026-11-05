@@ -1098,7 +1098,7 @@ test('auto Compact uses one slot and resumes the same accepted turn without repl
 });
 
 test('semantic failures keep the previous checkpoint and never retry the draft or review', async (t) => {
-  for (const fault of ['missing-preflight', 'reserve-budget', 'reserve-mutation', 'missing-reserve-budget', 'zero-reserve-budget', 'invalid-reserve-budget', 'excessive-reserve-budget', 'model-switch', 'changed-archive', 'changed-service-task', 'invalid-draft', 'invalid-review',
+  for (const fault of ['missing-preflight', 'reserve-budget', 'reserve-mutation', 'missing-reserve-budget', 'zero-reserve-budget', 'invalid-reserve-budget', 'excessive-reserve-budget', 'model-switch', 'changed-archive', 'changed-service-task', 'invalid-draft', 'invalid-review', 'missing-review-source',
     'missing-source-note', 'unquoted-review', 'private-review-shape', 'review-budget', 'missing-review-count', 'invalid-review-count', 'review-reserve-exceeded', 'review-network', 'review-cancel', 'unexpected-function'] as const) await t.test(fault, async () => {
     const input = { ...compactionTurnFor(`semantic-fault-${fault}`), modelId: 'GigaChat-3-Lightning' };
     const memory = JSON.stringify({ format: 'gigachat-semantic-memory', version: 1,
@@ -1117,8 +1117,10 @@ test('semantic failures keep the previous checkpoint and never retry the draft o
               sourceUpdates: Object.fromEntries(input.messages.map((_, index) => [`m${index}`, 'none'])), activeTask: 'm0',
               classifications: Object.fromEntries(input.messages.map((message, index) => [`m${index}`, message.role === 'assistant' ? 'decision' : 'fact'])), unresolvedDefects: '' })
           : fault === 'unquoted-review'
-            ? JSON.stringify({ ...JSON.parse(memory), unresolvedDefects: [], facts: [{ text: 'Unquoted fact.', sourceRefs: ['m0'], exactQuotes: [] }] }) : memory;
-        yield { type: 'text-delta', text: fault === 'invalid-draft' || calls === 2 && fault === 'invalid-review' ? '{}' : candidate };
+            ? JSON.stringify({ ...JSON.parse(memory), unresolvedDefects: [], facts: [{ text: 'Unquoted fact.', sourceRefs: ['m0'], exactQuotes: [] }] })
+            : fault === 'missing-review-source'
+              ? JSON.stringify({ state: 'Open.', sources: {}, activeTask: 'm0', topicUpdates: {}, unresolvedDefects: {} }) : memory;
+        yield { type: 'text-delta', text: fault === 'invalid-draft' || calls === 2 && fault === 'invalid-review' ? '{provider-private-text' : candidate };
         yield { type: 'completed' };
       }), tools: testTools,
       prepareTurn: async turn => {
@@ -1153,6 +1155,17 @@ test('semantic failures keep the previous checkpoint and never retry the draft o
     await runtime.whenIdle();
     assert.equal(saves, 0);
     assert.equal(runtime.list()[0]?.status, fault === 'review-cancel' ? 'cancelled' : 'failed');
+    const diagnostic = {
+      'invalid-draft': 'Этап Draft. Ожидается корректный JSON.',
+      'invalid-review': 'Этап Review. Ожидается корректный JSON.',
+      'missing-source-note': 'Этап Draft. Смысловые заметки должны покрывать каждый переданный источник ровно один раз.',
+      'missing-review-source': 'Этап Review. Review требует одной записи на каждый источник.',
+      'private-review-shape': 'Этап Review. Требуется публичная схема решения по источникам.',
+    };
+    if (Object.prototype.hasOwnProperty.call(diagnostic, fault)) {
+      assert.equal(runtime.list()[0]?.errorCategory, 'context');
+      assert.equal(runtime.list()[0]?.error, `Сжатие отклонено; прежний контекст сохранён. ${diagnostic[fault as keyof typeof diagnostic]}`);
+    }
     assert.equal(calls, ['missing-preflight', 'reserve-budget', 'reserve-mutation', 'missing-reserve-budget', 'zero-reserve-budget', 'invalid-reserve-budget', 'excessive-reserve-budget', 'model-switch', 'changed-archive', 'changed-service-task'].includes(fault) ? 0
       : ['invalid-draft', 'missing-source-note', 'review-budget', 'missing-review-count', 'invalid-review-count', 'review-reserve-exceeded', 'unexpected-function'].includes(fault) ? 1 : 2);
   });

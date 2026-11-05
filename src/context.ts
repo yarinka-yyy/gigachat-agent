@@ -8,7 +8,7 @@ import { filterProviderStateForOutboundRequest, type ProviderStateOutboundFilter
 import { COMPACTION_OUTPUT_TOKEN_LIMIT, createCompactionSources, formatArchivedCompactionNotes, formatSemanticCompactionMemory,
   getSemanticCompactionCoverageRefSet, selectRetainedCompactionMessages, serializeCompactionTranscript,
   serializeSemanticCompactionTranscript, semanticCompactionWireResponseFormat, validateCompactSummary, validateSemanticCompactionMemory,
-  compileSemanticSourceNotes, semanticReviewEvidenceIndex, type CompactionSources, type SemanticCompactionMemory } from './compaction';
+  compactionValidationRule, compileSemanticSourceNotes, semanticReviewEvidenceIndex, type CompactionSources, type SemanticCompactionMemory } from './compaction';
 import { LOCAL_TOKENIZER_MODEL_ID } from './local-tokenizer';
 import { withLiteNormalOutputCap } from './context-budget';
 
@@ -368,6 +368,7 @@ export function buildSemanticCompactionReviewRequest(
   sources: CompactionSources,
   expectedSourceRefs: readonly string[],
   candidate: string | null,
+  onInvalidCandidate?: (rule: string) => void,
 ): ProviderTurnRequest | null {
   const sourceRefs = getSemanticCompactionRequestSourceRefs(request, sources);
   if (!sourceRefs || !Array.isArray(expectedSourceRefs) || sourceRefs.length !== expectedSourceRefs.length
@@ -377,7 +378,10 @@ export function buildSemanticCompactionReviewRequest(
   let compiledCandidate: string;
   // null builds the review envelope for the pre-draft byte-bound reservation only.
   try { compiledCandidate = candidate === null ? '' : compileSemanticSourceNotes(candidate, sourceRefs); }
-  catch { return null; }
+  catch (error) {
+    onInvalidCandidate?.(compactionValidationRule(error));
+    return null;
+  }
   const archiveMessage = request.messages[0];
   if (!archiveMessage) return null;
   const archive = JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1));
