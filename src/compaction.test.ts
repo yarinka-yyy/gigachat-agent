@@ -610,7 +610,7 @@ test('critical anchors are materialized without model paraphrases and reject una
   assert.throws(() => compileAnchoredSemanticCompactionMemory(JSON.stringify(value), sources, ['t0'], archive));
 });
 
-test('topic ranges include anchored tools without reading raw history outside the available archive', () => {
+test('review retains anchored tools without exposing draft topic ranges', () => {
   const sources = semanticSources(), refs = getSemanticCompactionCoverageRefSet(sources), archive = serializeSemanticCompactionTranscript(sources);
   const notes = JSON.stringify({ taskSubject: 'Report', state: 'Report pending.', activeTask: 'm0',
     topics: [{ subject: 'Reading', firstSource: 'm0', lastSource: 'm1', evidence: 'An untrusted draft proposal.' }],
@@ -618,10 +618,10 @@ test('topic ranges include anchored tools without reading raw history outside th
   const indexedArchive = archive.slice(0, archive.indexOf('\n') + 1) + JSON.stringify({ ...JSON.parse(archive.slice(archive.indexOf('\n') + 1)), evidenceIndex: semanticReviewEvidenceIndex(archive) });
   const formatted = formatSemanticReviewSources(indexedArchive, `ЗАМЕТКИ\n${notes}`);
   const metadata = JSON.parse(formatted.records[0]!.slice(formatted.records[0]!.indexOf('\n') + 1));
-  assert.deepEqual(metadata.topicSources.Reading.sourceRefs, ['m0', 'm1', 't0']);
-  assert.equal(metadata.topicSources.Reading.evidence, undefined, 'independent review must not inherit a proposed closure witness');
+  assert.equal(metadata.topicSources, undefined);
   assert.ok(formatted.records.every(record => !record.includes('An untrusted draft proposal.')), 'a fabricated draft citation is not presented as evidence');
-  assert.deepEqual(metadata.sourceReviews.t0.topic, ['Reading']);
+  assert.ok(metadata.sourceReviews.t0);
+  assert.equal(metadata.sourceReviews.t0.topic, undefined);
 });
 
 test('topic closure removes all its details and defect state survives compilation and recall formatting', () => {
@@ -885,7 +885,9 @@ test('source state transitions override stale categories without dropping durabl
   const focus = JSON.parse(focusRecord.slice(focusRecord.indexOf('\n') + 1));
   assert.equal(focus.topicStatus[`m5/${witness}`], 'The chart discussion is closed.');
   assert.equal(focus.witnesses[`m5/${witness}`].text, messages[5]!.text);
-  assert.ok(focus.topics.Chart.witnesses.includes(`m8/${idsFor('m8')[0]}`), 'unranked witnesses stay available');
+  assert.equal(focus.witnesses[`m5/${witness}`].lastBeforeWitness, 'm4');
+  assert.deepEqual(focus.topics, ['Chart']);
+  assert.ok(focus.witnesses[`m8/${idsFor('m8')[0]}`], 'unranked witnesses stay available');
   assert.ok(closureChoices.includes(paired.topicUpdates.Chart.witness));
   assert.ok(closureChoices.includes('none'));
   for (const proof of [`m5/${witness}: fabricated`, `m3/${witness}`, `m0/${witness}`]) {

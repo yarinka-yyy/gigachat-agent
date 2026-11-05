@@ -295,22 +295,18 @@ export function formatSemanticDraftTopicStatus(archiveText: string): string {
 export function formatSemanticReviewSources(archiveText: string, candidateText: string): { candidate: string; records: string[] } {
   const offset = candidateText.indexOf('\n') + 1;
   const candidate = candidateText.slice(offset);
-  const { topics = [], notes = {}, verbatim = {} } = candidate ? JSON.parse(candidate) : {};
+  const { notes = {}, verbatim = {} } = candidate ? JSON.parse(candidate) : {};
   const records = splitSemanticCompactionTranscript(archiveText);
   const metadata = JSON.parse(records[0]!.slice(records[0]!.indexOf('\n') + 1));
-  const groups = draftTopicSources(topics, metadata.coverageRefSet, metadata.tools);
-  const topicByRef = topicSources(groups);
   const format = semanticCompactionResponseFormat(undefined, archiveText, candidateText);
   if (!('sourceUpdates' in format.schema.properties)) throw new Error('Review требует контракт выбора источников.');
   const choices = format.schema.properties;
   const index = metadata.evidenceIndex as Record<string, SemanticCompactionQuote & { role: string }>;
   const evidenceIds = Object.keys(index).sort((left, right) => Number(left.slice(1)) - Number(right.slice(1)));
-  metadata.topicSources = Object.fromEntries(groups.map(topic => [topic.subject, { sourceRefs: topic.sourceRefs }]));
   const review = (ref: string) => ({ categories: [...new Set(choices.classifications.properties[ref]!.enum.flatMap(value => value.split('+')))],
     updates: { stable: choices.sourceUpdates.properties[ref]!.enum.filter(value => !value.includes(':')),
       independent: choices.sourceUpdates.properties[ref]!.enum.filter(value => value.startsWith('independent:')).map(value => value.slice('independent:'.length)),
       changes: choices.sourceUpdates.properties[ref]!.enum.some(value => value.startsWith('closes:')) },
-    topic: topicByRef[ref] ?? null,
     evidence: Object.fromEntries(evidenceIds.filter(id => index[id]!.sourceRef === ref).map(id => [`${ref}/${id}`, { text: index[id]!.text }])) });
   const messageRefs = new Set<string>();
   const primaryNotes: Record<string, string> = {};
@@ -323,33 +319,25 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
     return record.slice(0, record.indexOf('\n') + 1) + JSON.stringify({ ...value, review: review(value.sourceRef) });
   });
   metadata.sourceReviews = Object.fromEntries((metadata.coverageRefSet as string[]).filter(ref => !messageRefs.has(ref)).map(ref => [ref, review(ref)]));
-  const topicChoices = Object.fromEntries(Object.entries(choices.topicUpdates.properties).map(([subject, topic]) => {
-    const range = groups.find(group => group.subject === subject);
-    return [subject, { first: range?.firstSource ?? null, proposedEnd: range?.lastSource ?? null,
-      witnesses: topic.properties.evidence.enum.filter(address => address !== 'none') }];
-  }));
-  const witnessAddresses = [...new Set(Object.values(topicChoices).flatMap(topic => topic.witnesses))];
+  const topics = Object.keys(choices.topicUpdates.properties);
+  const witnessAddresses = [...new Set(Object.values(choices.topicUpdates.properties)
+    .flatMap(topic => topic.properties.evidence.enum.filter(address => address !== 'none')))];
   const topicStatus = witnessAddresses.flatMap(address => {
     const quote = index[address.split('/')[1]!]!;
     const sentence = topicStatusSentence(quote.text);
     return sentence ? [[address, sentence]] : [];
   });
-  const draftWitnessHints = Object.fromEntries(groups.flatMap(topic => {
-    const matching = topicStatus.filter(([, sentence]) => sentence === topic.evidence);
-    return matching.length === 1 ? [[topic.subject, matching[0]![0]]] : [];
-  }));
-  const topicReview = Object.keys(topicChoices).length || Object.keys(primaryNotes).length ? [
+  const topicReview = topics.length || Object.keys(primaryNotes).length ? [
     'КАНДИДАТЫ СВИДЕТЕЛЬСТВ ЗАКРЫТИЯ JSON. Цитаты USER и недоверенные заметки draft.\n' + JSON.stringify({
-      topics: topicChoices,
+      topics,
+      topicStatus: Object.fromEntries(topicStatus),
+      timeline: topics.length ? userTimeline : {},
       witnesses: Object.fromEntries(witnessAddresses.map(address => {
         const quote = index[address.split('/')[1]!]!;
-        const preceding = [...messageRefs].filter(ref => Number(ref.slice(1)) < Number(quote.sourceRef.slice(1))).pop();
-        return [address, { text: quote.text, preceding }];
+        const lastBeforeWitness = [...messageRefs].filter(ref => Number(ref.slice(1)) < Number(quote.sourceRef.slice(1))).pop();
+        return [address, { text: quote.text, lastBeforeWitness }];
       })),
-      topicStatus: Object.fromEntries(topicStatus),
-      draftWitnessHints,
       primaryNotes,
-      timeline: Object.keys(topicChoices).length ? userTimeline : {},
     }),
   ] : [];
   delete metadata.evidenceIndex;
