@@ -740,13 +740,13 @@ test('builds an independent semantic review from the exact current archive and a
   for (const record of records) {
     const ref = record.sourceRef as string;
     assert.deepEqual(record.review, {
-      categories: [...new Set(contract.properties.classifications.properties[ref]!.enum.flatMap(value => value.split('+')))],
+      categories: [...new Set(contract.properties.classifications.properties[ref]!.enum.filter(value => value !== 'defect').flatMap(value => value.split('+')))],
       updates: { stable: ['none'], independent: [], changes: Object.values(quoteIndex).some(quote => quote.role === 'user' && Number(quote.sourceRef.slice(1)) > Number(ref.slice(1))) },
       evidence: Object.fromEntries(Object.entries(quoteIndex).filter(([, quote]) => quote.sourceRef === ref).map(([id, quote]) => [`${ref}/${id}`, { text: quote.text }])) });
   }
   const metadata = decode(wire.messages[2]!.content[0]!.text!);
   const toolReviews = metadata.sourceReviews as Record<string, unknown>;
-  assert.deepEqual(toolReviews.t0, { categories: [...new Set(contract.properties.classifications.properties.t0!.enum.flatMap(value => value.split('+')))],
+  assert.deepEqual(toolReviews.t0, { categories: [...new Set(contract.properties.classifications.properties.t0!.enum.filter(value => value !== 'defect').flatMap(value => value.split('+')))],
     updates: { stable: ['none'], independent: [], changes: Object.values(quoteIndex).some(quote => quote.role === 'user' && Number(quote.sourceRef.slice(1)) > 2) },
     evidence: Object.fromEntries(Object.entries(quoteIndex).filter(([, quote]) => quote.sourceRef === 't0').map(([id, quote]) => [`t0/${id}`, { text: quote.text }])) });
   assert.equal(metadata.evidenceIndex, undefined, 'literal evidence is local to its source, not duplicated in a distant index');

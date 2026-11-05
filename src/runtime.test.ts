@@ -1108,14 +1108,15 @@ test('persists three semantic runtime cycles with only previous memory and the n
         notes: Object.fromEntries(archive.coverageRefSet.map(ref => [ref, `Сохранить источник ${ref}.`])),
         verbatim: Object.fromEntries(archive.coverageRefSet.map(ref => [ref, !covered && ['m0', 'm2', 'm8'].includes(ref)])) });
       else {
+        const evidence = semanticReviewEvidenceIndex(archiveText);
         const sourceUpdates: Record<string, string> = Object.fromEntries(archive.coverageRefSet.map(ref => [ref, 'none']));
         if (!covered) {
-          const evidence = semanticReviewEvidenceIndex(archiveText);
           const proof = Object.keys(evidence).find(id => evidence[id]!.sourceRef === 'm6')!;
           sourceUpdates.m4 = sourceUpdates.m5 = `closes:m6/${proof}`;
         }
+        const unresolvedDefects = Object.entries(evidence).filter(([, quote]) => quote.sourceRef === 'm8').map(([id]) => `m8/${id}`).join(',');
         answer = JSON.stringify({ state: 'Old topic closed; import defect and restrictions remain active.', topicUpdates: { proposed: {}, other: [] }, sources: Object.fromEntries(archive.coverageRefSet.map(ref => [ref,
-          `${['m0', 'm10'].includes(ref) ? 'constraint' : ref === 'm2' ? 'openWork' : ref === 'm8' ? 'defect' : ref === 'm12' ? 'fact' : 'drop'}|${sourceUpdates[ref]}`])), activeTask: 'm2', unresolvedDefects: '' });
+          `${['m0', 'm10'].includes(ref) ? 'constraint' : ref === 'm2' ? 'openWork' : ['m8', 'm12'].includes(ref) ? 'fact' : 'drop'}|${sourceUpdates[ref]}`])), activeTask: 'm2', unresolvedDefects });
         assert.ok(Buffer.byteLength(answer) <= 4096);
       }
       yield { type: 'text-delta', text: answer }; yield { type: 'completed' };

@@ -871,8 +871,8 @@ test('source state transitions override stale categories without dropping durabl
   assert.deepEqual(groupedCompile(shared), memory, 'topic and source transitions reuse one indexed literal witness');
   const closure = { witness: `m5/${witness}`, first: 'm1', last: 'm3', subject: 'Chart' };
   const reviewTopics = (other: typeof closure[]) => ({ proposed: { [closure.witness]: false }, other });
-  const paired = { state: 'Chart discussion is complete; queue investigation remains open.', sources: Object.fromEntries(Object.entries(shared.sourceUpdates).map(([ref, update]) => [ref, `${shared.classifications[ref as keyof typeof shared.classifications]}|${update}`])),
-    activeTask: shared.activeTask, topicUpdates: reviewTopics([closure]), unresolvedDefects: shared.unresolvedDefects };
+  const paired = { state: 'Chart discussion is complete; queue investigation remains open.', sources: Object.fromEntries(Object.entries(shared.sourceUpdates).map(([ref, update]) => [ref, `${ref === 'm8' ? 'fact' : shared.classifications[ref as keyof typeof shared.classifications]}|${update}`])),
+    activeTask: shared.activeTask, topicUpdates: reviewTopics([closure]), unresolvedDefects: idsFor('m8').map(id => `m8/${id}`).join(',') };
   assert.deepEqual(groupedCompile(paired), memory, 'one source row keeps category and transition together without changing provenance');
   const pairedSchema = semanticCompactionWireResponseFormat(undefined, archive, `ЗАМЕТКИ\n${grouped}`).schema;
   assert.ok('sources' in pairedSchema.properties);
@@ -923,11 +923,14 @@ test('source state transitions override stale categories without dropping durabl
   for (const [ref, row] of Object.entries(paired.sources)) assert.match(row, new RegExp(pairedSchema.properties.sources.properties[ref]!.pattern));
   for (const ref of refs) {
     const pattern = new RegExp(pairedSchema.properties.sources.properties[ref]!.pattern);
-    for (const update of groupedSchema.properties.sourceUpdates.properties[ref]!.enum) assert.match(`${groupedSchema.properties.classifications.properties[ref]!.enum[0]}|${update}`, pattern);
-    for (const category of groupedSchema.properties.classifications.properties[ref]!.enum) assert.match(`${category}|none`, pattern);
+    const categories = groupedSchema.properties.classifications.properties[ref]!.enum.filter(category => category !== 'defect');
+    for (const update of groupedSchema.properties.sourceUpdates.properties[ref]!.enum) assert.match(`${categories[0]}|${update}`, pattern);
+    for (const category of categories) assert.match(`${category}|none`, pattern);
+    assert.doesNotMatch('defect|none', pattern);
   }
   assert.match('constraint+decision|none', new RegExp(pairedSchema.properties.sources.properties.m0!.pattern));
   assert.doesNotMatch('constraintdecision|none', new RegExp(pairedSchema.properties.sources.properties.m0!.pattern));
+  assert.throws(() => groupedCompile({ ...paired, sources: { ...paired.sources, m0: 'defect|none' } }), /дефект указывается точным свидетельством/);
   for (const sources of [{ ...paired.sources, m0: 'constraint' }, { ...paired.sources, m0: 'constraint|none|none' },
     { ...paired.sources, m0: 'constraint|closes:m0/q0' }, { ...paired.sources, m0: 'paraphrase:m1|none' }]) assert.throws(() => groupedCompile({ ...paired, sources }));
   assert.equal(JSON.stringify(shared).includes(evidence[witness]!.text), false, 'the compiler materializes exact archive text instead of asking the model to copy it');

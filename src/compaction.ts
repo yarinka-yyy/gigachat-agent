@@ -343,7 +343,7 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
   const choices = format.schema.properties;
   const index = metadata.evidenceIndex as Record<string, SemanticCompactionQuote & { role: string }>;
   const evidenceIds = Object.keys(index).sort((left, right) => Number(left.slice(1)) - Number(right.slice(1)));
-  const review = (ref: string) => ({ categories: [...new Set(choices.classifications.properties[ref]!.enum.flatMap(value => value.split('+')))],
+  const review = (ref: string) => ({ categories: [...new Set(choices.classifications.properties[ref]!.enum.filter(value => value !== 'defect').flatMap(value => value.split('+')))],
     updates: { stable: choices.sourceUpdates.properties[ref]!.enum.filter(value => !value.includes(':')),
       independent: choices.sourceUpdates.properties[ref]!.enum.filter(value => value.startsWith('independent:')).map(value => value.slice('independent:'.length)),
       changes: choices.sourceUpdates.properties[ref]!.enum.some(value => value.startsWith('closes:')) },
@@ -410,7 +410,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
     const rows = Object.entries(selection.sources).map(([ref, row]) => {
       if (typeof row !== 'string') throw new Error('Решение источника требует строки категория|переход.');
       const parts = row.split('|').map(part => part.trim());
-      if (parts.length !== 2 || parts.some(part => !part)) throw new Error('Решение источника требует категории и перехода.');
+      if (parts.length !== 2 || parts.some(part => !part) || parts[0] === 'defect') throw new Error('Решение источника требует категории и перехода; дефект указывается точным свидетельством.');
       return { ref, category: parts[0]!, update: parts[1]! };
     });
     selection = { activeTask: selection.activeTask, topicUpdates: selection.topicUpdates, unresolvedDefects: selection.unresolvedDefects,
@@ -752,6 +752,7 @@ export function semanticCompactionWireResponseFormat(archiveText?: string, revie
       } },
     }, required: ['proposed', 'other'], additionalProperties: false },
     state: { type: 'string', minLength: 1, maxLength: 160, description: 'Summarize what remains open and which restrictions remain active across the whole archive.' },
+    unresolvedDefects,
     sources: { type: 'object', properties: Object.fromEntries(sourceUpdates.required.map(ref => {
       const updates = sourceUpdates.properties[ref]!.enum;
       const independent = updates.filter(value => value.startsWith('independent:')).map(value => value.slice('independent:'.length));
@@ -760,10 +761,10 @@ export function semanticCompactionWireResponseFormat(archiveText?: string, revie
         ...(independent.length ? [`independent:(?:${alternatives(independent)})`] : []),
         ...(changes.length ? [`(?:closes|supersedes):(?:${alternatives(changes)})`] : [])].join('|');
       return [ref, { type: 'string', minLength: 3, maxLength: 609,
-      pattern: `^(?:${alternatives(classifications.properties[ref]!.enum)})\\|(?:${updatePattern})$`,
+      pattern: `^(?:${alternatives(classifications.properties[ref]!.enum.filter(value => value !== 'defect'))})\\|(?:${updatePattern})$`,
       description: 'category|update for this source, using its review.categories and review.updates. Example: constraint|none.',
-    }]; })), required: sourceUpdates.required, additionalProperties: false }, activeTask, unresolvedDefects,
-  }, required: ['topicUpdates', 'state', 'sources', 'activeTask', 'unresolvedDefects'], additionalProperties: false } };
+    }]; })), required: sourceUpdates.required, additionalProperties: false }, activeTask,
+  }, required: ['topicUpdates', 'state', 'unresolvedDefects', 'sources', 'activeTask'], additionalProperties: false } };
 }
 
 export function compileSemanticSourceNotes(value: unknown, sourceRefs: readonly string[]): string {
@@ -1446,7 +1447,7 @@ export function formatSemanticCompactionMemory(value: unknown, sources: Compacti
       for (const quote of entry.exactQuotes) if (!entry.text.includes(quote.text)) lines.push(`  Дословная цитата ${quote.sourceRef}: ${JSON.stringify(quote.text)}`);
     }
   }
-  lines.push('Если запрошен итог проверки, сохраняй указанный пользователем формат ответа. Цитируй связанные подтверждённые результаты, открытые дефекты и непроверенное вместе, без обобщения.');
+  lines.push('Для итога проверки соблюдай запрошенный формат и тип каждого поля. Если поле должно быть строкой, собери в одной строке короткие дословные фразы о фактически выполненной проверке и её результате, наблюдённом несоответствии и отдельно непроверенной части. Сохрани все эти части, если они подтверждены источниками.');
   const formatted = lines.join('\n');
   if (Buffer.byteLength(formatted, 'utf8') > MAX_COMPACT_SUMMARY_BYTES) {
     throw new Error('Форматированная семантическая память превышает ограничение 32 КиБ.');
