@@ -870,13 +870,13 @@ test('source state transitions override stale categories without dropping durabl
     sourceUpdates: { ...decision.sourceUpdates, m2: `closes:m5/${witness}`, m3: `closes:m5/${witness}` } };
   assert.deepEqual(groupedCompile(shared), memory, 'topic and source transitions reuse one indexed literal witness');
   const paired = { state: 'Chart discussion is complete; queue investigation remains open.', sources: Object.fromEntries(Object.entries(shared.sourceUpdates).map(([ref, update]) => [ref, `${shared.classifications[ref as keyof typeof shared.classifications]}|${update}`])),
-    activeTask: shared.activeTask, topicUpdates: { Chart: `m1>m5/${witness}>m3` }, unresolvedDefects: shared.unresolvedDefects };
+    activeTask: shared.activeTask, topicUpdates: { Chart: { witness: `m5/${witness}`, first: 'm1', last: 'm3' } }, unresolvedDefects: shared.unresolvedDefects };
   assert.deepEqual(groupedCompile(paired), memory, 'one source row keeps category and transition together without changing provenance');
   const pairedSchema = semanticCompactionWireResponseFormat(undefined, archive, `ЗАМЕТКИ\n${grouped}`).schema;
   assert.ok('sources' in pairedSchema.properties);
   assert.equal(Object.keys(pairedSchema.properties)[0], 'state', 'independent state is established before source choices');
   assert.equal(Object.keys(pairedSchema.properties)[1], 'topicUpdates', 'closure selects its literal before the per-source rows');
-  const closurePattern = new RegExp(pairedSchema.properties.topicUpdates.properties.Chart!.pattern);
+  const closureChoices = pairedSchema.properties.topicUpdates.properties.Chart!.properties.witness.enum;
   const indexedArchive = archive.slice(0, archive.indexOf('\n') + 1) + JSON.stringify({
     ...JSON.parse(archive.slice(archive.indexOf('\n') + 1)), evidenceIndex: evidence,
   });
@@ -886,27 +886,25 @@ test('source state transitions override stale categories without dropping durabl
   assert.equal(focus.topicStatus[`m5/${witness}`], 'The chart discussion is closed.');
   assert.equal(focus.witnesses[`m5/${witness}`].text, messages[5]!.text);
   assert.ok(focus.topics.Chart.witnesses.includes(`m8/${idsFor('m8')[0]}`), 'unranked witnesses stay available');
-  assert.match(paired.topicUpdates.Chart, closurePattern);
-  assert.match('none', closurePattern);
-  for (const proof of [`m5/${witness}`, `m1>m5/${witness}: fabricated>m3`, `m1>m3/${witness}>m3`, `m1>m0/${witness}>m3`]) {
-    assert.doesNotMatch(proof, closurePattern);
-    assert.throws(() => groupedCompile({ ...paired, topicUpdates: { Chart: proof } }), /свидетельства/);
+  assert.ok(closureChoices.includes(paired.topicUpdates.Chart.witness));
+  assert.ok(closureChoices.includes('none'));
+  for (const proof of [`m5/${witness}: fabricated`, `m3/${witness}`, `m0/${witness}`]) {
+    assert.ok(!closureChoices.includes(proof));
+    assert.throws(() => groupedCompile({ ...paired, topicUpdates: { Chart: { ...paired.topicUpdates.Chart, witness: proof } } }), /свидетельства/);
   }
   assert.deepEqual(groupedCompile({ ...paired, sources: { ...paired.sources, m5: 'request|none' } }), memory,
     'the explicitly selected active task is still open work when its USER message also witnesses closure');
   assert.throws(() => groupedCompile({ ...paired, sources: { ...paired.sources, m0: 'request|none' } }), /архивного запроса/);
-  const shortRange = JSON.stringify({ ...JSON.parse(grouped), topics: [{ ...JSON.parse(grouped).topics[0], firstSource: 'm2', lastSource: 'm2' }] });
+  const shortRange = JSON.stringify({ ...JSON.parse(grouped), topics: [{ ...JSON.parse(grouped).topics[0], firstSource: 'm6', lastSource: 'm7' }] });
   const extend = (through: string, first = 'm1') => JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...paired,
-    sources: { ...paired.sources, m3: 'decision|none' }, topicUpdates: { Chart: `${first}>m5/${witness}>${through}` },
+    sources: { ...paired.sources, m3: 'decision|none' }, topicUpdates: { Chart: { ...paired.topicUpdates.Chart, first, last: through } },
   }), shortRange, sources, refs, archive));
   assert.ok(!extend('m2').closedTopics[0].sourceRefs.includes('m3'));
-  assert.deepEqual(extend('m3'), memory, 'review closes the omitted tail with the same later literal witness');
+  assert.deepEqual(extend('m3'), memory, 'review relocates a draft range that incorrectly starts after the witness');
   assert.throws(() => extend('m5'), /после всего диапазона/);
-  assert.doesNotMatch(`m1>m5/${witness}>m5`, closurePattern);
-  assert.doesNotMatch(`m1>m5/${witness}>m2`, closurePattern);
-  assert.throws(() => extend('m0'), /исходного диапазона/);
-  assert.throws(() => extend('m99'), /доступных сообщений/);
-  assert.throws(() => extend('m3', 'm3'), /исходного диапазона/);
+  assert.throws(() => extend('m0'), /исходном порядке/);
+  assert.throws(() => extend('m99'), /доступного диапазона/);
+  assert.throws(() => groupedCompile({ ...paired, topicUpdates: { Chart: { ...paired.topicUpdates.Chart, witness: 'none' } } }), /Открытая тема/);
   for (const [ref, row] of Object.entries(paired.sources)) assert.match(row, new RegExp(pairedSchema.properties.sources.properties[ref]!.pattern));
   for (const ref of refs) {
     const pattern = new RegExp(pairedSchema.properties.sources.properties[ref]!.pattern);
@@ -965,7 +963,13 @@ test('critical assistant data requires retention or a cited earlier user origin'
   const endNotes = JSON.stringify({ ...JSON.parse(notes), topics: [{ subject: 'Unfinished last source', firstSource: 'm3', lastSource: 'm3', evidence: sources.messages[3]!.text }] });
   const endSchema = semanticCompactionResponseFormat(undefined, archive, `ЗАМЕТКИ\n${endNotes}`).schema;
   assert.ok('topicUpdates' in endSchema.properties);
-  assert.deepEqual(endSchema.properties.topicUpdates.properties['Unfinished last source']!.properties.closed.enum, [false], 'without a later user witness the schema permits only the open branch');
+  const endChoices = endSchema.properties.topicUpdates.properties['Unfinished last source']!.properties;
+  assert.deepEqual(endChoices.closed.enum, [false, true], 'review can choose a witness for a corrected earlier range');
+  const earlierWitness = endChoices.evidence.enum.find(value => value !== 'none');
+  assert.ok(earlierWitness);
+  assert.throws(() => compileResolvedSemanticCompactionMemory(JSON.stringify({ ...decision,
+    topicUpdates: { 'Unfinished last source': { closed: true, evidence: earlierWitness } },
+  }), endNotes, sources, refs, archive), /после всего диапазона/);
   const continuedSources = createCompactionSources([...sources.messages.map(source => ({ id: source.ref, role: source.role, text: source.text, createdAt: '2026-10-01T00:00:00.000Z' })), user('continue', 'Continue planning without operations.')], [], []);
   const rollingArchive = serializeSemanticCompactionTranscript(continuedSources, memory, 4), rollingRefs = getSemanticCompactionCoverageRefSet(continuedSources, memory, 4);
   const rollingNotes = JSON.stringify({ taskSubject: 'Test plan', state: 'Still open.', activeTask: 'm4', topics: [], notes: Object.fromEntries(rollingRefs.map(ref => [ref, 'An incomplete note.'])), verbatim: Object.fromEntries(rollingRefs.map(ref => [ref, false])) });

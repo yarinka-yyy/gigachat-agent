@@ -334,6 +334,10 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
     const sentence = topicStatusSentence(quote.text);
     return sentence ? [[address, sentence]] : [];
   });
+  const draftWitnessHints = Object.fromEntries(groups.flatMap(topic => {
+    const matching = topicStatus.filter(([, sentence]) => sentence === topic.evidence);
+    return matching.length === 1 ? [[topic.subject, matching[0]![0]]] : [];
+  }));
   const topicReview = Object.keys(topicChoices).length || Object.keys(primaryNotes).length ? [
     'КАНДИДАТЫ СВИДЕТЕЛЬСТВ ЗАКРЫТИЯ JSON. Цитаты USER и недоверенные заметки draft.\n' + JSON.stringify({
       topics: topicChoices,
@@ -343,6 +347,7 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
         return [address, { text: quote.text, preceding }];
       })),
       topicStatus: Object.fromEntries(topicStatus),
+      draftWitnessHints,
       primaryNotes,
       timeline: Object.keys(topicChoices).length ? userTimeline : {},
     }),
@@ -391,14 +396,18 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
       const activeTask = selection.activeTask;
       selection.topicUpdates = Object.fromEntries(Object.entries(selection.topicUpdates).map(([subject, update]) => {
         const topic = resolvedTopics.get(subject);
-        if (!topic || typeof update !== 'string') throw new Error('Review требует решения и границы для каждой темы.');
-        if (update === 'none') return [subject, { closed: false, evidence: 'none' }];
-        const [first, address, last, extra] = update.split('>');
-        if (extra !== undefined || !first || !last || !address || address === 'none'
-          || !topics[subject]?.properties.evidence.enum.includes(address)) throw new Error('Закрытие темы требует допустимого USER-свидетельства.');
-        if (!messageRefs.has(first) || !messageRefs.has(last) || Number(first.slice(1)) > Number(topic.firstSource.slice(1))
-          || Number(last.slice(1)) < Number(topic.lastSource.slice(1))) {
-          throw new Error('Расширение темы требует доступных сообщений по обе стороны исходного диапазона.');
+        if (!topic || !isRecord(update) || !hasOnlyKeys(update, ['witness', 'first', 'last'])
+          || typeof update.witness !== 'string' || typeof update.first !== 'string' || typeof update.last !== 'string') {
+          throw new Error('Review требует решения и границы для каждой темы.');
+        }
+        const { witness: address, first, last } = update;
+        if (address === 'none') {
+          if (first !== 'none' || last !== 'none') throw new Error('Открытая тема не может задавать диапазон закрытия.');
+          return [subject, { closed: false, evidence: 'none' }];
+        }
+        if (!topics[subject]?.properties.evidence.enum.includes(address)) throw new Error('Закрытие темы требует допустимого USER-свидетельства.');
+        if (!messageRefs.has(first) || !messageRefs.has(last) || Number(first.slice(1)) > Number(last.slice(1))) {
+          throw new Error('Закрытие темы требует доступного диапазона сообщений в исходном порядке.');
         }
         resolvedTopics.set(subject, { ...topic, firstSource: first, lastSource: last });
         const witness = address.split('/')[0]!;
@@ -651,7 +660,8 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   const updateEvidence = Object.fromEntries(refs.map(ref => [ref, closedRefs.includes(ref) ? [] : evidenceIds.filter(id => position(evidenceIndex[id]!.sourceRef) > position(ref))]));
   const firstAvailable = refs.filter(ref => ref.startsWith('m')).sort((a, b) => Number(a.slice(1)) - Number(b.slice(1)))[0]!;
   const scopes = draft ? draftTopicSources(draft.topics, refs, archive.tools) : Array.from({ length: MAX_GENERATED_PAST_TOPICS }, (_, i) => ({ subject: `${i}`.padEnd(MAX_SEMANTIC_SUBJECT_CHARS, 'X'), sourceRefs: [firstAvailable] }));
-  const topicEvidence = Object.fromEntries(scopes.map(topic => [topic.subject, evidenceIds.filter(id => topic.sourceRefs.every(ref => position(ref) < position(evidenceIndex[id]!.sourceRef)))]));
+  const topicEvidence = Object.fromEntries(scopes.map(topic => [topic.subject,
+    evidenceIds.filter(id => position(firstAvailable) < position(evidenceIndex[id]!.sourceRef))]));
   const independentEvidence = Object.fromEntries(refs.map(ref => [ref, !closedRefs.includes(ref) && (!draft || scopes.length > 0)
     ? evidenceIds.filter(id => evidenceIndex[id]!.sourceRef === ref) : []]));
   const reportRefs = new Set((archive.previousMemory?.assistantReports ?? []).flatMap(entry => entry.sourceRefs));
@@ -669,29 +679,16 @@ export function semanticCompactionWireResponseFormat(archiveText?: string, revie
   if (!('sourceUpdates' in format.schema.properties)) return format;
   const { sourceUpdates, classifications, activeTask, topicUpdates, unresolvedDefects } = format.schema.properties;
   const metadata = JSON.parse(reviewMetadata!.slice(reviewMetadata!.indexOf('\n') + 1)) as { messages: Array<{ sourceRef: string }> };
-  const draftText = reviewNotes?.slice(reviewNotes.indexOf('\n') + 1);
-  const boundaries = new Map<string, DraftTopic>(draftText
-    ? (JSON.parse(draftText).topics as DraftTopic[]).map(topic => [topic.subject, topic])
-    : []);
+  const boundaries = { type: 'string', enum: [...metadata.messages.map(source => source.sourceRef), 'none'] };
   const alternatives = (values: string[]) => values.map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
   return { ...format, schema: { type: 'object', properties: {
     state: { type: 'string', minLength: 1, maxLength: 160, description: 'First establish what is completed, what remains open and which restrictions remain active across the whole archive. This is your independent review, not a draft quotation.' },
-    topicUpdates: { ...topicUpdates, properties: Object.fromEntries(Object.entries(topicUpdates.properties).map(([subject, topic]) => {
-      const boundary = boundaries.get(subject);
-      const starts = metadata.messages.map(source => source.sourceRef)
-        .filter(ref => !boundary || Number(ref.slice(1)) <= Number(boundary.firstSource.slice(1)));
-      const closedChoices = topic.properties.evidence.enum.slice(1).flatMap(address => {
-        const witnessPosition = Number(address.split('/')[0]!.slice(1));
-        const ends = metadata.messages.map(source => source.sourceRef).filter(ref => {
-          const position = Number(ref.slice(1));
-          return position >= Number(boundary?.lastSource.slice(1) ?? 0) && position < witnessPosition;
-        });
-        return ends.length ? [`${address}>(?:${alternatives(ends)})`] : [];
-      });
-      const closedRange = starts.length && closedChoices.length ? `|(?:${alternatives(starts)})>(?:${closedChoices.join('|')})` : '';
-      return [subject, { type: 'string', pattern: `^(?:none${closedRange})$`,
-        description: 'none or first message > address of the explicit later USER witness > last message, without spaces.' }];
-    })) },
+    topicUpdates: { ...topicUpdates, properties: Object.fromEntries(Object.entries(topicUpdates.properties).map(([subject, topic]) => [subject, {
+      type: 'object', properties: {
+        witness: { type: 'string', enum: [...topic.properties.evidence.enum.slice(1), 'none'] },
+        first: boundaries, last: boundaries,
+      }, required: ['witness', 'first', 'last'], additionalProperties: false,
+    }])) },
     sources: { type: 'object', properties: Object.fromEntries(sourceUpdates.required.map(ref => {
       const updates = sourceUpdates.properties[ref]!.enum;
       const independent = updates.filter(value => value.startsWith('independent:')).map(value => value.slice('independent:'.length));
