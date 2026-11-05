@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type {
   ChatDetail,
+  ChatMessage,
   ContextBlockSize,
   ContextPreviewBlockSummary,
   ContextPreviewRequest,
@@ -13,10 +14,11 @@ import type {
   Project,
   Settings,
 } from './contracts';
-import { buildNextTurnContext, estimateProviderPromptTokens, hashCompactionPrefix, type BuildNextTurnContextOptions, type NextTurnContext, type NextTurnContextInput } from './context';
+import { buildNextTurnContext, hashCompactionPrefix, type BuildNextTurnContextOptions, type NextTurnContext, type NextTurnContextInput } from './context';
 import { calculateLiteWorkingBudget } from './context-budget';
 import { getModelContextLimit } from './model-capabilities';
 import { LOCAL_TOKENIZER_MODEL_ID } from './local-tokenizer';
+import { attachmentContentType, requestedArchivedDocumentNames } from './attachment-policy';
 import type { LocalStore, ProviderStateOwnershipView } from './store';
 import type { SkillRegistry } from './skills';
 
@@ -157,9 +159,21 @@ function sumAttachmentSizes(attachments: readonly { size: number }[]): number {
   return attachments.reduce((total, attachment) => total + attachment.size, 0);
 }
 
-function historicalAttachmentSummary(detail: ChatDetail | null): { count: number; sizeBytes: number | null; metadataMissing: boolean } {
+function historicalAttachmentSummary(detail: ChatDetail | null, messages: readonly ChatMessage[], pendingText: string): { count: number; sizeBytes: number | null; metadataMissing: boolean } {
   if (!detail) return { count: 0, sizeBytes: 0, metadataMissing: false };
-  const referenced = new Set(detail.messages.flatMap((message) => message.role === 'user' ? message.attachmentIds ?? [] : []));
+  const compacted = messages.some((message) => message.id === 'request-semantic-memory');
+  const visible = new Set(messages.map((message) => message.id));
+  const requested = compacted ? requestedArchivedDocumentNames(pendingText) : new Set<string>();
+  const byId = new Map(detail.artifacts.map((artifact) => [artifact.id, artifact]));
+  const referenced = new Set(detail.messages.flatMap((message) => {
+    if (message.role !== 'user') return [];
+    const ids = message.attachmentIds ?? [];
+    if (!compacted || visible.has(message.id)) return ids;
+    return ids.filter((id) => {
+      const artifact = byId.get(id);
+      return artifact?.messageId === message.id && requested.has(artifact.name) && attachmentContentType(artifact.name)?.kind === 'document';
+    });
+  }));
   if (!referenced.size) return { count: 0, sizeBytes: 0, metadataMissing: false };
   const linkedArtifacts = new Map(detail.artifacts
     .filter((artifact) => artifact.messageId !== null && referenced.has(artifact.id))
@@ -297,7 +311,7 @@ export async function createContextPreview(
     }
   }
 
-  const historyAttachments = historicalAttachmentSummary(detail);
+  const historyAttachments = historicalAttachmentSummary(detail, context.request.messages, previewMessage.text);
   let promptEstimate = unknownPromptEstimate(modelId === LOCAL_TOKENIZER_MODEL_ID ? 'tokenizer-unavailable' : 'unsupported-model');
   let compactionOverheadTokens: number | null | undefined = null;
   if (modelId === LOCAL_TOKENIZER_MODEL_ID && dependencies.estimatePromptTokens) {

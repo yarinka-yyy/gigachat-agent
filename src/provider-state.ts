@@ -172,7 +172,8 @@ export function filterProviderStateForOutboundRequest(
     removedState = true;
   }
 
-  const hasHistoricalUserAttachments = input.rawMessages.some((message) =>
+  const attachmentMessages = request.messages.some((message) => message.id === 'request-semantic-memory') ? request.messages : input.rawMessages;
+  const hasHistoricalUserAttachments = attachmentMessages.some((message) =>
     message.role === 'user'
     && message.id !== input.currentAnchorMessageId
     && Array.isArray(message.attachmentIds)

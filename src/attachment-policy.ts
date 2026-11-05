@@ -6,6 +6,23 @@ export const LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES = 25 * 1024 * 1024;
 export const PROVIDER_IMAGE_LIMIT_BYTES = 15_000_000;
 export const PROVIDER_MEDIA_LIMIT_BYTES = 80_000_000;
 export const PROVIDER_REQUEST_LIMIT_BYTES = 2 * 1024 * 1024;
+// shortcut: V2 Ultra only read the first image; raise the app limit after both pass a live read.
+export const MAX_VERIFIED_IMAGES_PER_TURN = 1;
+
+export function archivedDocumentReadLine(name: string): string {
+  return `Прочитай файл ${JSON.stringify(name)}`;
+}
+
+export function requestedArchivedDocumentNames(text: string): ReadonlySet<string> {
+  const names = new Set<string>();
+  for (const line of text.trimStart().split(/\r?\n/u)) {
+    const match = /^Прочитай файл ("(?:[^"\\]|\\.)*")\.?$/iu.exec(line.trim());
+    if (!match) break;
+    try { names.add(JSON.parse(match[1]!)); }
+    catch { break; }
+  }
+  return names;
+}
 
 export function attachmentConnectionBlocker(
   connection: Pick<ProviderConnectionSnapshot, 'state'>,
@@ -94,7 +111,9 @@ export function attachmentSendBlocker(
   }
 
   const imageAttachments = attachments.filter((attachment) => attachmentContentType(attachment.name)?.kind === 'image');
-  if (imageAttachments.length > 10) return 'За один запрос можно прикрепить не более 10 изображений. Файлы останутся в черновике.';
+  if (imageAttachments.length > MAX_VERIFIED_IMAGES_PER_TURN) {
+    return 'Отправьте одно изображение за раз. Уберите лишние изображения из черновика.';
+  }
   let imageBytes = 0;
   for (const attachment of attachments) {
     if (!Number.isSafeInteger(attachment.size) || attachment.size <= 0 || attachment.size > LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES

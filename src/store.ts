@@ -3459,9 +3459,6 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
             throw new Error('Нет нового старого префикса для сжатия; сохранённый контекст не изменён.');
           }
         }
-        if (prefix.messages.some((message) => message.role === 'user' && (message.attachmentIds?.length ?? 0) > 0)) {
-          throw new Error('Сжатие истории с прикреплёнными файлами пока не проверено; исходная история сохранена.');
-        }
       }
       if (detail.projectId && !projects.some((item) => item.id === detail.projectId)) {
         throw new Error('Проект чата больше недоступен.');

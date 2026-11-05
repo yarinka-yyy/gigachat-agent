@@ -80,7 +80,7 @@ const MODEL_CAPABILITIES: Readonly<Record<string, Readonly<ModelCapabilities>>> 
     evidence: {
       source: 'app/.qa/capability-spike/summary.md; app/.qa/post-api-011/stage3-live-893676a7-ae44-4c80-b57c-d0db174e0140; app/.qa/post-api-011/stage3-supplemental-live-26aabefe-ce02-4c2e-8d55-2c0bb65b0196',
       verifiedAt: '2026-10-13',
-      details: 'Semantic text answer, local read tool roundtrip, TXT/MD/PDF/PNG/JPEG markers, and usage receipt passed. Pairing multiple images remains unverified; XLSX is unavailable.',
+      details: 'Semantic text answer, local read tool roundtrip, TXT/MD/PDF/PNG/JPEG markers, and usage receipt passed. The app allows one image per turn after the second image was not read in the 2026-11-05 V2 checks. XLSX is unavailable.',
     },
   },
   'GigaChat-2-Max': {

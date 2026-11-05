@@ -959,7 +959,9 @@ async function createMainRuntime(
       if (!boundary) return null;
       const boundaryIndex = detail.messages.indexOf(boundary);
       const anchors = new Set(detail.messages.slice(0, boundaryIndex + 1).filter(message => message.role === 'user').map(message => message.id));
-      if (detail.messages.slice(0, boundaryIndex + 1).some(message => message.attachmentIds?.length)
+      const previouslyCovered = detail.compactSnapshot?.version === 2
+        ? detail.messages.findIndex(message => message.id === detail.compactSnapshot?.coveredThroughMessageId) : -1;
+      if (detail.messages.slice(previouslyCovered + 1, boundaryIndex + 1).some(message => message.attachmentIds?.length)
         || detail.toolReceipts.some(receipt => anchors.has(receipt.anchorMessageId) && receipt.status === 'pending')) return null;
       const prepared = await prepareCompaction(turn, detail, boundary.id, detail.compactSnapshot?.id ?? null);
       const coveredIds = new Set(prepared.messages.map(message => message.id));

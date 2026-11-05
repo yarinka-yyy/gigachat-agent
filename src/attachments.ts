@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import { extname, resolve } from 'node:path';
 import type { AcceptedTurnInput, ChatArtifact, ProviderAttachmentReference, ProviderFileRecord, ProviderTurnRequest, ProviderUploadLedgerEntry } from './contracts';
-import { attachmentContentType, inspectLocalAttachmentContent } from './attachment-policy';
+import { attachmentContentType, attachmentSendBlocker, inspectLocalAttachmentContent, MAX_VERIFIED_IMAGES_PER_TURN, requestedArchivedDocumentNames } from './attachment-policy';
 import { GigaChatProviderError, type GigaChatProviderConnection } from './gigachat-provider';
 import { HistoricalProviderStateAttachmentsError } from './provider-state';
 import type { LocalStore } from './store';
@@ -65,6 +65,10 @@ export async function prepareTurnAttachments(
   const accountScope = createHash('sha256').update(authorizationKey, 'utf8').digest('hex');
   const entries = await options.store.getProviderUploadEntries(accountScope);
   const detail = await options.store.getChat(turn.chatId);
+  const archived = request.messages.some((message) => message.id === 'request-semantic-memory');
+  const visibleAnchors = new Set(request.messages.map((message) => message.id));
+  const requestedNames = archived ? requestedArchivedDocumentNames(acceptedMessage.text) : new Set<string>();
+  const requestedOriginals: ChatArtifact[] = [];
   let providerFiles: Promise<ProviderFileRecord[]> | null = null;
   const listProviderFiles = (): Promise<ProviderFileRecord[]> => {
     providerFiles ??= options.provider.listFiles(signal);
@@ -79,14 +83,30 @@ export async function prepareTurnAttachments(
   }> = [];
   for (const origin of origins) {
     throwIfAborted(signal);
+    const covered = archived && !visibleAnchors.has(origin.messageId);
+    if (covered && requestedNames.size === 0) continue;
     const artifactMatches = detail.artifacts.filter((item) => item.id === origin.attachmentId && item.messageId === origin.messageId);
     if (artifactMatches.length !== 1) throw new GigaChatProviderError('storage');
     const artifact = artifactMatches[0]!;
-    if (origin.historical && attachmentContentType(artifact.name)?.kind === 'image') continue;
-    selected.push({ ...origin, artifact, declaredKind: attachmentContentType(artifact.name)?.kind ?? null });
+    const declaredKind = attachmentContentType(artifact.name)?.kind ?? null;
+    if (origin.historical && declaredKind === 'image') continue;
+    if (covered) {
+      if (declaredKind !== 'document' || !requestedNames.has(artifact.name)) continue;
+      requestedOriginals.push(artifact);
+    }
+    selected.push({ ...origin, artifact, declaredKind });
   }
 
-  if (selected.length > 32 || selected.filter((item) => !item.historical && item.declaredKind === 'image').length > 10) {
+  if (requestedNames.size > 0) {
+    const matches = selected.filter((item) => requestedNames.has(item.artifact.name));
+    if (matches.length !== requestedNames.size || new Set(matches.map((item) => item.artifact.name)).size !== requestedNames.size
+      || requestedOriginals.some(({ sha256 }) => !sha256)
+      || attachmentSendBlocker(request.modelId, acceptedMessage.text, requestedOriginals.map((artifact) => ({ ...artifact, sha256: artifact.sha256 ?? '' })))) {
+      throw new HistoricalProviderStateAttachmentsError();
+    }
+  }
+
+  if (selected.length > 32 || selected.filter((item) => !item.historical && item.declaredKind === 'image').length > MAX_VERIFIED_IMAGES_PER_TURN) {
     throw new GigaChatProviderError('context');
   }
 

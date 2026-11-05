@@ -98,7 +98,7 @@ import ContextIndicator from './components/ContextIndicator';
 import BrowserPanel from './components/BrowserPanel';
 import { createPreviewExitTimer, maxSidebarWidth as computeMaxSidebarWidth } from './sidebar-behavior';
 import { sidebarSections } from './sidebar-sections';
-import { attachmentContentType, attachmentSendBlocker, evaluateAttachmentPolicy } from './attachment-policy';
+import { archivedDocumentReadLine, attachmentContentType, attachmentSendBlocker, evaluateAttachmentPolicy, requestedArchivedDocumentNames } from './attachment-policy';
 import { hookEventLabel, mergeRuntimeTurnSnapshots, mergeTranscriptTurns } from './chat-transcript';
 import type { TranscriptTurn } from './chat-transcript';
 import { isNearChatScrollEnd, preserveChatScrollAnchor } from './chat-navigation';
@@ -1682,7 +1682,9 @@ export default function App() {
   const composerModelAvailable = isChatModelAvailable(modelRegistry, composerModelId);
   const compactChatDetail = route.page === 'chat' && chatDetail?.id === route.id ? chatDetail : null;
   const compactBoundary = compactChatDetail ? latestCompactionBoundary(compactChatDetail.messages, compactChatDetail.compactSnapshot) : null;
-  const compactBoundaryIndex = compactBoundary ? compactChatDetail?.messages.findIndex((message) => message.id === compactBoundary.id) ?? -1 : -1;
+  const coveredDocumentThrough = compactChatDetail?.compactSnapshot?.version === 2
+    ? compactChatDetail.messages.findIndex((message) => message.id === compactChatDetail.compactSnapshot?.coveredThroughMessageId) : -1;
+  const coveredDocumentAnchors = new Set(compactChatDetail?.messages.slice(0, coveredDocumentThrough + 1).map((message) => message.id));
   const compactionSuggestionAvailable = Boolean(runtimeAvailability?.compactionAvailable
     && runtimeAvailability.providerConfigured
     && runtimeMode === 'api'
@@ -1694,9 +1696,7 @@ export default function App() {
     && isChatModelAvailable(modelRegistry, 'GigaChat-3-Lightning')
     && !compactChatDetail.turns.some((turn) => turn.status === 'queued' || turn.status === 'running')
     && !runtimeTurns.some((turn) => turn.chatId === route.id && (turn.status === 'queued' || turn.status === 'running'))
-    && compactBoundary !== null
-    && compactBoundaryIndex >= 0
-    && !compactChatDetail.messages.slice(0, compactBoundaryIndex + 1).some((message) => message.role === 'user' && message.attachmentIds?.length));
+    && compactBoundary !== null);
   const composerModelFamily = modelFamilyForId(composerModelId);
   const composerModelUnknown = !composerIsImageChat && Boolean(composerModelId && !composerModelFamily);
   const composerLegacyUpgrade = composerIsImageChat ? null : legacyModelUpgrade(composerModelId);
@@ -2045,14 +2045,8 @@ export default function App() {
       return;
     }
     const boundary = latestCompactionBoundary(detail.messages, detail.compactSnapshot);
-    const boundaryIndex = boundary ? detail.messages.findIndex((message) => message.id === boundary.id) : -1;
-    if (!boundary || boundaryIndex < 0) {
+    if (!boundary) {
       setNotice('Нет новой завершённой истории для сжатия; прежний контекст сохранён.');
-      return;
-    }
-    if (detail.messages.slice(0, boundaryIndex + 1)
-      .some((message) => message.role === 'user' && (message.attachmentIds?.length ?? 0) > 0)) {
-      setNotice('Сжатие истории с прикреплёнными файлами пока не проверено; исходная история сохранена.');
       return;
     }
     if (sending || sendInProgress.current) return;
@@ -2426,6 +2420,18 @@ export default function App() {
       const input = composerInputRef.current;
       input?.focus();
       input?.setSelectionRange(next.length, next.length);
+    });
+  }
+
+  function requestArchivedDocument(name: string): void {
+    const current = draftRef.current;
+    if (!requestedArchivedDocumentNames(current).has(name)) {
+      changeDraft(`${archivedDocumentReadLine(name)}\n${current}`);
+    }
+    window.requestAnimationFrame(() => {
+      const input = composerInputRef.current;
+      input?.focus();
+      input?.setSelectionRange(input.value.length, input.value.length);
     });
   }
 
@@ -3644,11 +3650,18 @@ export default function App() {
                       return <GeneratedImageResult key={`${chatDetail.id}:${artifact.id}`} chatId={chatDetail.id} artifact={artifact}
                         runOperation={trackRendererOperation} disabled={closePending || Boolean(closeFailure)} />;
                     }
-                    return <button type="button" className="message-attachment" key={artifact.id}
-                      aria-label={`Открыть ${artifact.name}`} onClick={() => void window.gigaChat.chats.openArtifact(chatDetail.id, artifact.id).catch((error: unknown) => setNotice(getErrorMessage(error)))}>
-                      <AttachmentThumbnail source="artifact" chatId={chatDetail.id} attachmentId={artifact.id} image={attachmentContentType(artifact.name)?.kind === 'image'} />
-                      <span className="message-attachment-copy"><strong>{artifact.name}</strong><small>{attachmentFormatLabel(artifact.name)} · {attachmentSizeLabel(artifact.size)}</small></span>
-                    </button>;
+                    const attachmentButton = <button type="button" className="message-attachment" key={artifact.id}
+                        aria-label={`Открыть ${artifact.name}`} onClick={() => void window.gigaChat.chats.openArtifact(chatDetail.id, artifact.id).catch((error: unknown) => setNotice(getErrorMessage(error)))}>
+                        <AttachmentThumbnail source="artifact" chatId={chatDetail.id} attachmentId={artifact.id} image={attachmentContentType(artifact.name)?.kind === 'image'} />
+                        <span className="message-attachment-copy"><strong>{artifact.name}</strong><small>{attachmentFormatLabel(artifact.name)} · {attachmentSizeLabel(artifact.size)}</small></span>
+                      </button>;
+                    if (!coveredDocumentAnchors.has(message.id) || message.role !== 'user'
+                      || attachmentContentType(artifact.name)?.kind !== 'document') return attachmentButton;
+                    return <div key={artifact.id} className="message-attachment-actions">
+                      {attachmentButton}
+                      <button type="button" className="quiet-button" aria-label={`Добавить запрос на чтение ${artifact.name}`}
+                        disabled={sending || closePending || Boolean(closeFailure)} onClick={() => requestArchivedDocument(artifact.name)}>Читать в чате</button>
+                    </div>;
                   })}
                 </div> : null;
               }}

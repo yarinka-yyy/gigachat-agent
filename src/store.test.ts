@@ -12,6 +12,9 @@ import { instructionFileHash } from './instruction-documents';
 import { createTurnRuntime, type PreparedTurn } from './runtime';
 import { IMAGE_GENERATION_MODEL_ID } from './image-mode';
 import { CHAT_MODEL_FAMILIES } from './model-catalog';
+import { archivedDocumentReadLine } from './attachment-policy';
+import { prepareTurnAttachments } from './attachments';
+import { serializeProviderTurnRequest } from './gigachat-provider';
 
 const timestamp = '2026-09-24T10:00:00.000Z';
 
@@ -1277,6 +1280,74 @@ test('full-history semantic snapshots include the final answer, reopen with an e
     store.releaseTurnReservation(compact.turn.turnId);
     await assert.rejects(store.acceptCompactionTurn(chat.id, 'repeat-compact', first.turn.messageId), /Нет нового/);
   });
+});
+
+test('reopens compacted document history and replays only an explicitly named owned original', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'gigachat-compact-document-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = await openStore(directory);
+  const chat = await store.createChat();
+  const modelId = 'GigaChat-3-Lightning';
+  await store.updateChat(chat.id, { modelId });
+  const paths = ['first.txt', 'second.md'].map((name) => join(directory, name));
+  for (const path of paths) {
+    await writeFile(path, `Original fixture bytes for ${path.split(/[\\/]/).pop()}`);
+    await store.stageChatDraftFile(chat.id, path);
+  }
+  const staged = await store.getChat(chat.id);
+  const accepted = await store.acceptLocalMessage(chat.id, 'Compare the document headings.', 'documents', staged.draftAttachments.map((item) => item.id));
+  const files: Array<{ id: string; filename: string; bytes: number; purpose: 'general' }> = [];
+  const loadAuthorizationKey = async () => 'synthetic-owned-document-key';
+  const provider = {
+    async uploadFile(input: { filename: string; bytes: Uint8Array }) {
+      const file = { id: `owned_${files.length + 1}`, filename: input.filename, bytes: input.bytes.byteLength, purpose: 'general' as const };
+      files.push(file);
+      return file;
+    },
+    async listFiles() { return files.slice(); },
+    async deleteFile() { assert.fail('Referenced originals must be kept.'); },
+  };
+  const signal = new AbortController().signal;
+  const firstRequest = buildNextTurnContext({ globalText: '', modelId, permissionProfile: 'ask', messages: accepted.turn.messages }).request;
+  await prepareTurnAttachments(accepted.turn, firstRequest, signal, { store, provider, loadAuthorizationKey });
+  await appendAcceptedAnswer(store, accepted.turn, 'Both headings were read.');
+  const before = await store.getChat(chat.id);
+  const compact = await store.acceptCompactionTurn(chat.id, 'compact-documents', accepted.turn.messageId);
+  const prefix = await store.getCompactionPrefix(chat.id, compact.turn.messageId);
+  const sources = createCompactionSources(prefix.messages, [], before.artifacts);
+  assert.equal(sources.messages[0]?.attachments.length, 2);
+  const text = compileSemanticCompactionMemory(JSON.stringify({ format: 'gigachat-semantic-memory', version: 1,
+    activeTask: { text: 'Compare the document headings.', sourceRefs: ['m0'] }, constraints: [], decisions: [], facts: [], pastTopics: [], openWork: [] }), sources);
+  const snapshot: CompactSnapshot = { id: 'documents-snapshot', version: 2, boundaryMessageId: accepted.turn.messageId,
+    coveredThroughMessageId: prefix.coveredThroughMessageId, coveredPrefixHash: prefix.coveredPrefixHash,
+    text, modelId, provenance: 'fixture', createdAt: timestamp };
+  const compactRecord = compact.detail.turns.find((record) => record.turnId === compact.turn.turnId)!;
+  await store.commitCompactSnapshot(chat.id, snapshot, null, undefined, completedCompactionTurn(compact.turn, compactRecord.createdAt));
+
+  const reopened = await openStore(directory);
+  const detail = await reopened.getChat(chat.id);
+  assert.deepEqual(detail.messages, before.messages);
+  assert.deepEqual(detail.artifacts, before.artifacts);
+  assert.deepEqual(detail.compactSnapshot, snapshot);
+  const original = detail.artifacts.find((item) => item.name === 'second.md')!;
+  assert.deepEqual(await readFile(await reopened.getArtifactPath(chat.id, original.id)), await readFile(paths[1]!));
+  const continuation = async (text: string, id: string, key = loadAuthorizationKey) => {
+    const { turn } = await reopened.acceptLocalMessage(chat.id, text, id);
+    const request = buildNextTurnContext({ globalText: '', modelId, permissionProfile: 'ask', messages: turn.messages,
+      compactSnapshot: detail.compactSnapshot, compactionArtifacts: detail.artifacts, compactionToolReceipts: [] }).request;
+    return prepareTurnAttachments(turn, request, signal, { store: reopened, provider, loadAuthorizationKey: key });
+  };
+  assert.deepEqual((await continuation('Continue without files.', 'ordinary-after-compact')).attachments, []);
+  const explicit = `${archivedDocumentReadLine(original.name)}\nWhat is the unseen value?`;
+  const prepared = await continuation(explicit, 'named-after-compact');
+  assert.deepEqual(prepared.attachments?.map(({ attachmentId, fileId }) => [attachmentId, fileId]), [[original.id, 'owned_2']]);
+  const wire = JSON.parse(serializeProviderTurnRequest(prepared).body);
+  assert.deepEqual(wire.messages.flatMap((message: { content: Array<{ files?: unknown[] }> }) => message.content.flatMap((part) => part.files ?? [])), [{ id: 'owned_2' }]);
+  await assert.rejects(continuation(explicit, 'other-account', async () => 'other-key'), /Нельзя подтвердить доступ/);
+  assert.equal(files.length, 2, 'account switch must not upload the original');
+  files.pop();
+  await assert.rejects(continuation(explicit, 'expired-remote'), /Нельзя подтвердить доступ/);
+  assert.equal(files.length, 1, 'expired remote must not be silently replaced');
 });
 
 test('full-history acceptance rejects a pending tool even after an assistant answer exists', async (t) => {

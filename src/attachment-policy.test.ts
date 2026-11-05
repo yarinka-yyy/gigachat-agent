@@ -91,10 +91,9 @@ test('attachment acceptance requires a live connection and the selected model to
 test('main send gate enforces image count and conservative media bytes while document bytes use their own bounds', () => {
   const hash = 'b'.repeat(64);
   const image = (index: number, size = 1) => ({ name: `image-${index}.png`, size, sha256: hash });
-  assert.match(attachmentSendBlocker('GigaChat-3-Ultra', '', Array.from({ length: 11 }, (_, index) => image(index))) ?? '', /не более 10 изображений/i);
+  assert.match(attachmentSendBlocker('GigaChat-3-Ultra', '', [image(1), image(2)]) ?? '', /одно изображение за раз/i);
   assert.match(attachmentSendBlocker('GigaChat-3-Ultra', '', [image(1, 15_000_001)]) ?? '', /15 МБ/i);
-  assert.equal(attachmentSendBlocker('GigaChat-3-Ultra', '', Array.from({ length: 5 }, (_, index) => image(index, 15_000_000))), null);
-  assert.match(attachmentSendBlocker('GigaChat-3-Ultra', '', Array.from({ length: 6 }, (_, index) => image(index, 13_000_000))) ?? '', /общий лимит/i);
+  assert.equal(attachmentSendBlocker('GigaChat-3-Ultra', '', [image(1, 15_000_000)]), null);
   const documents = Array.from({ length: 4 }, (_, index) => ({
     name: `document-${index}.txt`, size: LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, sha256: hash,
   }));
