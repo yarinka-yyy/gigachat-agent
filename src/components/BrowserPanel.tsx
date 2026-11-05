@@ -425,7 +425,6 @@ export default function BrowserPanel({
         id="workspace-chat-panel"
         role={fullView ? 'tabpanel' : undefined}
         aria-labelledby={fullView ? 'workspace-chat-tab' : undefined}
-        aria-hidden={fullView && activeSurface === 'browser' ? true : undefined}
         hidden={fullView && activeSurface === 'browser'}
         inert={fullView && activeSurface === 'browser'}
       >{fullView && activeSurface === 'chat' && error && <p className="runtime-error browser-surface-error" role="alert">{error}</p>}{chatContent}</div>
@@ -436,7 +435,6 @@ export default function BrowserPanel({
         role="tabpanel"
         aria-labelledby={status.activeTabId ? `browser-tab-${status.activeTabId}` : undefined}
         aria-label={status.activeTabId ? undefined : 'Встроенный браузер'}
-        aria-hidden={fullView && activeSurface === 'chat' ? true : undefined}
         hidden={fullView && activeSurface === 'chat'}
         inert={fullView && activeSurface === 'chat'}
         style={{ width: closing ? 0 : layoutWidth }}

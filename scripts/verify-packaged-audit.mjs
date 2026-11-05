@@ -32,6 +32,16 @@ function capturedText(state) {
   return `${state.parts.join('')}${state.truncated ? '\n[child log truncated at 512 KiB]\n' : ''}`;
 }
 
+async function rendererQaRoot() {
+  const qaDirectory = await realpath(join(repo, '.qa'));
+  const requestedRoot = process.env.GIGACHAT_RENDERER_QA_ROOT;
+  if (!requestedRoot) return qaDirectory;
+  const fixtureRoot = await realpath(requestedRoot);
+  assert.equal(fixtureRoot, resolve(requestedRoot), 'renderer QA root must not traverse a link');
+  assert.equal(dirname(fixtureRoot), qaDirectory, 'renderer QA root must be a direct child of ignored app/.qa');
+  return fixtureRoot;
+}
+
 async function runNodeDriver() {
   const nativeWorkspaceMode = process.argv.includes('--native-browser-workspace');
   const holdForReview = process.argv.includes('--hold-for-review');
@@ -50,15 +60,13 @@ async function runNodeDriver() {
   const forgeWebpackDist = dirname(forgeWebpackEntry);
   const relocatorModule = await import(pathToFileURL(join(forgeWebpackDist, 'util', 'AssetRelocatorPatch.js')).href);
   const AssetRelocatorPatch = relocatorModule.default ?? relocatorModule.AssetRelocatorPatch;
-  const qaDirectory = await realpath(join(repo, '.qa')).catch(async () => {
-    await mkdir(join(repo, '.qa'), { recursive: true });
-    return realpath(join(repo, '.qa'));
-  });
+  await mkdir(join(repo, '.qa'), { recursive: true });
+  const fixtureRoot = await rendererQaRoot();
   const fixturePrefix = compactionSmoke ? 'plan011-compaction-smoke-'
     : imageGenerationSmoke ? 'plan011-image-generation-smoke-'
     : nativeWorkspaceMode ? 'plan009-browser-workspace-native-' : 'plan009-browser-workspace-renderer-';
-  const fixture = await import('node:fs/promises').then(({ mkdtemp }) => mkdtemp(join(qaDirectory, fixturePrefix)));
-  assert.equal(dirname(fixture), qaDirectory, 'fixture must be a direct child of ignored app/.qa');
+  const fixture = await import('node:fs/promises').then(({ mkdtemp }) => mkdtemp(join(fixtureRoot, fixturePrefix)));
+  assert.equal(dirname(fixture), fixtureRoot, 'fixture must stay inside the renderer QA root');
   console.log(`Renderer QA fixture: ${fixture}`);
   const bundleDirectory = join(fixture, 'renderer');
   const userDataDirectory = join(fixture, 'user-data');
@@ -311,7 +319,7 @@ async function runElectronHost() {
   const fixture = process.env.GIGACHAT_AUDIT_ROOT;
   assert.ok(fixture, 'synthetic GIGACHAT_AUDIT_ROOT is required');
   const fixturePath = await realpath(fixture);
-  assert.equal(dirname(fixturePath), await realpath(join(repo, '.qa')));
+  assert.equal(dirname(fixturePath), await rendererQaRoot());
   const profile = join(fixturePath, 'user-data');
   const sessionData = join(fixturePath, 'session-data');
   const bundleDirectory = join(fixturePath, 'renderer');
@@ -2498,6 +2506,7 @@ async function runElectronHost() {
       return;
     }
 
+    window.show();
     const originalSize = window.getSize();
     const originalZoom = window.webContents.getZoomFactor();
     for (const [width, height, zoom] of [[1120, 760, 1], [960, 720, 1], [802, 720, 1], [560, 480, 1], [960, 720, 0.8], [1424, 892, 1]]) {
@@ -2510,7 +2519,6 @@ async function runElectronHost() {
     window.webContents.setZoomFactor(originalZoom);
     await sleep(180);
     await measureSidebarTracks();
-    window.show();
     window.focus();
     window.webContents.focus();
     await evaluate('new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
@@ -3143,12 +3151,14 @@ async function runElectronHost() {
     await sendKey('ESC');
     await clickChat('Chat A');
     await waitDom('return to Chat A after legacy model preview', `document.querySelector('.chat-header-title')?.textContent === 'Chat A'`);
-    assert.equal(await evaluate(`document.querySelector('.context-indicator')?.getAttribute('aria-label')`), 'Размер контекста неизвестен');
+    assert.equal(await evaluate(`document.querySelector('.context-indicator')?.getAttribute('aria-describedby')`), 'context-indicator-tooltip');
+    assert.equal(await evaluate(`document.querySelector('.context-indicator .context-ring-fill')`), null,
+      'unknown context must not be displayed as a measured fill');
     const historyBeforeCompact = state.details.get('chat-a').messages.length;
     const appendsBeforeCompact = state.appendCalls.length;
     await fillTextarea(draftSelector, '/compact');
     await click('.send-button-wrap .send-button');
-    await waitDom('unverified compaction remains unavailable', `document.querySelector('.notice')?.textContent.includes('/compact выключена')`);
+    await waitDom('unavailable compaction explains that history is unchanged', `document.querySelector('.notice')?.textContent.includes('История чата не изменена')`);
     assert.equal(state.details.get('chat-a').messages.length, historyBeforeCompact, 'unavailable compaction must leave visible history unchanged');
     assert.equal(state.appendCalls.length, appendsBeforeCompact, 'unavailable compaction must not save a new user turn');
     const draftUpdatesBeforeClear = state.updateCalls.length;
@@ -3237,9 +3247,11 @@ async function runElectronHost() {
     const heatBSelector = '.profile-heat-cell[aria-label^="28 февраля 2024"]';
     await evaluate(`(() => {
       const cell = document.querySelector(${JSON.stringify(heatASelector)});
-      cell?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-      cell?.focus();
+      cell?.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
     })()`);
+    window.webContents.sendInputEvent({ type: 'mouseMove', x: 5, y: 5 });
+    await waitDom('pointer is outside the calendar before keyboard focus', `!document.querySelector('.profile-heat-cell:hover')`);
+    await evaluate(`document.querySelector(${JSON.stringify(heatASelector)})?.focus({ preventScroll: true })`);
     await waitDom('keyboard focus previews its own calendar day', `document.activeElement?.matches(${JSON.stringify(heatASelector)})
       && document.querySelector('.profile-heat-detail')?.textContent.includes('27 февраля 2024')`);
     const focusedHeatBeforeHover = JSON.parse(await evaluate(`JSON.stringify((() => {
@@ -5030,6 +5042,10 @@ async function runElectronHost() {
     console.log('Plan009 browser check: stale success after switching surfaces');
     await click('#workspace-chat-tab');
     await waitDom('chat surface selected before stale success', `document.querySelector('.browser-workspace.is-full.surface-chat')`);
+    await waitDom('hidden browser surface releases the address focus', `(() => {
+      const panel = document.querySelector('#browser-workspace-panel');
+      return panel?.hidden && panel.inert && !panel.contains(document.activeElement);
+    })()`);
     state.deferBrowserMethod = 'newTab';
     await click('.browser-new-tab');
     await waitUntil('second new-tab request deferred from chat surface', () => state.pendingBrowserActions.filter((item) => item.method === 'newTab').length === 2);
@@ -5788,7 +5804,7 @@ async function runElectronHost() {
       assertCompactBubble(resting, 'at rest');
       assert.equal(resting.timeOpacity, resting.hoverNone ? '1' : '0', `${name}: the timestamp is quiet at rest unless touch rules keep it available`);
       assert.equal(resting.copyOpacity, resting.hoverNone ? '1' : '0', `${name}: copy is quiet at rest unless touch rules keep it available`);
-      await evaluate(`document.querySelector('[data-message-id="stage4-theme-user"] .transcript-copy')?.focus()`);
+      await evaluate(`document.querySelector('[data-message-id="stage4-theme-user"] .transcript-copy')?.focus({ preventScroll: true })`);
       await waitDom(`${name} keyboard focus reveals the compact message controls`, `(() => {
         const message = document.querySelector('[data-message-id="stage4-theme-user"]');
         const time = message?.querySelector('.transcript-message-meta time');
@@ -5801,7 +5817,15 @@ async function runElectronHost() {
       await capture(`stage4-chat-transcript-${name}-short-yo`);
       await evaluate(`document.activeElement?.blur()`);
       if (!resting.hoverNone) {
-        await movePointerTo('[data-message-id="stage4-theme-user"] .transcript-bubble');
+        const bubbleSelector = '[data-message-id="stage4-theme-user"] .transcript-bubble';
+        await evaluate(`document.querySelector(${JSON.stringify(bubbleSelector)})?.scrollIntoView({ block: 'center', behavior: 'instant' })`);
+        await waitDom(`${name} compact message is the pointer hit target`, `(() => {
+          const bubble = document.querySelector(${JSON.stringify(bubbleSelector)});
+          const rect = bubble?.getBoundingClientRect();
+          return rect && bubble.contains(document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2));
+        })()`);
+        const beforeHover = await readShortBubbleState();
+        await movePointerTo(bubbleSelector);
         await waitDom(`${name} pointer hover reveals both compact message controls`, `(() => {
           const message = document.querySelector('[data-message-id="stage4-theme-user"]');
           const time = message?.querySelector('.transcript-message-meta time');
@@ -5810,7 +5834,7 @@ async function runElectronHost() {
         })()`);
         const hovered = await readShortBubbleState();
         assertCompactBubble(hovered, 'with pointer hover');
-        assertReservedGeometry(resting, hovered, 'pointer hover');
+        assertReservedGeometry(beforeHover, hovered, 'pointer hover');
       }
       await movePointerTo('.chat-header-title');
       await evaluate(`(() => { const area = document.querySelector('.view-area'); area.scrollTop = area.scrollHeight; })()`);
@@ -6076,6 +6100,13 @@ async function runElectronHost() {
     await sleep(350);
     console.log(`Rendered title evidence ${JSON.stringify({ shortTitleGeometry, longTitleGeometry })}`);
     passed('Rendered chat header keeps title 2 readable and ellipsizes a long title at 560x480');
+
+    for (const name of ['Создать видео', 'Подкасты']) {
+      await clickText('.nav-action', name);
+      await waitDom(`${name} opens a placeholder`, `document.querySelector('.content-page .future-badge')?.textContent === 'FUTURE'
+        && document.querySelector('.content-page h1')?.textContent === ${JSON.stringify(name === 'Подкасты' ? name : 'Создание видео')}`);
+    }
+    passed('Permanent video and podcast actions open their planned-feature pages');
 
     window.hide();
     passed('Rendered nested chat menus suspend native browser bounds until the last overlay closes');
