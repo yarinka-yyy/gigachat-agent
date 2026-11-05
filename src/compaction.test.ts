@@ -1046,6 +1046,7 @@ test('historical user requests retain text without becoming observed facts or pe
   assert.deepEqual(memory.facts, []);
   assert.equal(memory.constraints[0].text, messages[0]!.text);
   assert.ok(formatSemanticCompactionMemory(JSON.stringify(memory), sources).includes(question));
+  assert.ok(!formatSemanticCompactionMemory(JSON.stringify(memory), sources, new Set([question])).includes(question));
   assert.throws(() => validateSemanticCompactionMemory(JSON.stringify({ ...memory, historicalRequests: [{ text: question, sourceRefs: ['m1'] }] }), sources), /USER-источников/);
   assert.throws(() => validateSemanticCompactionMemory(JSON.stringify({ ...memory, facts: [{ text: question, sourceRefs: ['m4'] }] }), sources), /Архивный запрос/);
   assert.throws(() => validateSemanticCompactionMemory(JSON.stringify({ ...memory, decisions: Array.from({ length: 32 }, () => ({ text: 'A decision.', sourceRefs: ['m2'] })) }), sources), /общего лимита/);

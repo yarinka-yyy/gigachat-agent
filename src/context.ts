@@ -209,7 +209,7 @@ export function buildNextTurnContext(
         }
         semanticSummaryText = formatSemanticCompactionMemory(input.compactSnapshot.text, createCompactionSources(
           selected.coveredPrefix.messages, input.compactionToolReceipts, input.compactionArtifacts,
-        ));
+        ), new Set(selectedMessages.filter(message => message.role === 'user').map(message => message.text)));
         protocolHistory = (input.protocolHistory ?? [])
           .filter((exchange) => !selected.coveredPrefix!.coveredAnchors.has(exchange.anchorMessageId))
           .map((exchange) => structuredClone(exchange));
