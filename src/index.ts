@@ -11,7 +11,7 @@ import { isLitePromptOverMeasuredInputGuard, liteAutoCompactionPreflight, liteHa
 import { createContextPreview } from './context-preview';
 import { createLocalTextTokenCounter } from './local-tokenizer';
 import { createLocalTools, createPowerShellHelper, resolvePowerShellHelperPath } from './local-tools';
-import { createTurnRuntime, queueAcceptedTurnOrMarkNotSent, type PreparedCompactionContext, type TurnRuntime } from './runtime';
+import { appendRuntimeActivity, createTurnRuntime, queueAcceptedTurnOrMarkNotSent, type PreparedCompactionContext, type TurnRuntime } from './runtime';
 import type { AcceptedTurnInput, AttachmentImportBatchResult, ChatArtifact, ChatDetail, ChatPatch, CompactSnapshot, FolderOpener, HomeDraftAttachment, HookRunResult, ModelRegistrySnapshot, NotificationSettings, PreferredOpener, RuntimeAvailability, SettingsPatch, Theme, VoiceAvailability } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { requireModelId } from './models';
@@ -1058,9 +1058,12 @@ async function createMainRuntime(
       const afterBytes = buildMeasuredContext(snapshot);
       assertCompactionWireReduction(beforeBytes, afterBytes);
       assertProviderStateOwner(owner, providerStateScopeGuard, signal);
-      await store.commitCompactSnapshot(turn.chatId, snapshot, context.expectedSnapshotId, signal, terminalTurn,
+      const activity = appendRuntimeActivity(terminalTurn.activity, {
+        kind: 'compaction', phase: 'completed', at: terminalTurn.endedAt!, beforeBytes: beforeBytes!, afterBytes: afterBytes!,
+      });
+      await store.commitCompactSnapshot(turn.chatId, snapshot, context.expectedSnapshotId, signal, { ...terminalTurn, activity },
         functionsStateId ? { accountScope: owner.accountScope, functionsStateId } : undefined);
-      return { beforeBytes: beforeBytes!, afterBytes: afterBytes! };
+      return activity;
     },
     compactionEnabled: SEMANTIC_COMPACTION_QUALITY_VERIFIED,
     recordUsageReceipt: (receipt) => store.recordUsageReceipt(receipt),

@@ -1544,7 +1544,6 @@ export function formatSemanticCompactionMemory(value: unknown, sources: Compacti
       for (const quote of entry.exactQuotes) if (!entry.text.includes(quote.text)) lines.push(`  Дословная цитата ${quote.sourceRef}: ${JSON.stringify(quote.text)}`);
     }
   }
-  lines.push('Для итога проверки соблюдай запрошенный формат и тип каждого поля. Если поле должно быть строкой, собери в одной строке короткие дословные фразы о фактически выполненной проверке и её результате, наблюдённом несоответствии и отдельно непроверенной части. Сохрани все эти части, если они подтверждены источниками.');
   const formatted = lines.join('\n');
   if (Buffer.byteLength(formatted, 'utf8') > MAX_COMPACT_SUMMARY_BYTES) {
     throw new Error('Форматированная семантическая память превышает ограничение 32 КиБ.');

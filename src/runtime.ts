@@ -34,6 +34,10 @@ import type { ProviderStateOwner } from './provider-state';
 import { validateProviderV2FunctionWire } from './provider-wire';
 
 const MAX_ACTIVITY_PER_TURN = 50;
+export function appendRuntimeActivity(previous: readonly RuntimeActivity[], activity: RuntimeActivity): RuntimeActivity[] {
+  return [...previous.slice(-(MAX_ACTIVITY_PER_TURN - 1)), activity];
+}
+
 const MAX_ASSISTANT_CHARS = 100_000;
 const DRAFT_UPDATE_INTERVAL_MS = 50;
 const DEFAULT_PREPARE_TIMEOUT_MS = 15_000;
@@ -96,7 +100,7 @@ export interface TurnRuntimeOptions {
   appendAssistant(turn: AcceptedTurnInput, text: string, signal: AbortSignal, functionsStateId: string | undefined,
     terminalTurn: RuntimeTurnSnapshot, providerStateOwner?: ProviderStateOwner, generatedArtifactId?: string): Promise<void>;
   appendCompaction?(turn: AcceptedTurnInput, text: string, signal: AbortSignal, context: PreparedCompactionContext,
-    terminalTurn: RuntimeTurnSnapshot, functionsStateId?: string, providerStateOwner?: ProviderStateOwner): Promise<void | CompactionReduction>;
+    terminalTurn: RuntimeTurnSnapshot, functionsStateId?: string, providerStateOwner?: ProviderStateOwner): Promise<void | RuntimeActivity[]>;
   compactionEnabled?: boolean;
   recordUsageReceipt(receipt: UsageReceipt): Promise<void>;
   beginToolReceipt?(turn: AcceptedTurnInput, receipt: ToolReceiptInput, providerStateOwner?: ProviderStateOwner,
@@ -554,8 +558,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
   };
 
   const addActivity = (turn: RuntimeTurn, activity: RuntimeActivity, persistAs?: RuntimeTurnSnapshot): void => {
-    if (turn.activity.length >= MAX_ACTIVITY_PER_TURN) turn.activity.shift();
-    turn.activity.push(activity);
+    turn.activity = appendRuntimeActivity(turn.activity, activity);
     const snapshot = persistAs
       ? { ...structuredClone(persistAs), activity: structuredClone(turn.activity) }
       : undefined;
@@ -1412,8 +1415,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           ? options.appendCompaction && compactionContext
             ? options.appendCompaction(turn.input, compileCompactionCandidate(answer, compactionContext.sources, semanticSourceRefs, semanticArchiveText, semanticNotes), controller.signal, compactionContext,
               terminalTurn, completedFunctionsStateId, providerStateOwner)
-              .then(async (reduction) => {
-                if (reduction) addActivity(turn, { kind: 'compaction', at: new Date().toISOString(), phase: 'completed', ...reduction }, terminalTurn);
+              .then(async (activity) => {
+                if (activity) turn.activity = terminalTurn.activity = activity;
                 await runHookEvent({ event: 'after-compaction', projectId: turn.input.projectId }, new AbortController().signal, turn.input, terminalTurn).catch(() => undefined);
               })
             : Promise.reject(new Error('COMPACTION_SAVE_UNAVAILABLE'))

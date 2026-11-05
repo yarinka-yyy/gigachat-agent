@@ -806,6 +806,8 @@ test('source state transitions override stale categories without dropping durabl
   assert.ok(memory.facts.some((entry: { sourceRefs: string[] }) => entry.sourceRefs.includes('m7')), 'a later return is retained without reopening old details');
   assert.equal(memory.facts.find((entry: { sourceRefs: string[] }) => entry.sourceRefs.includes('m6')).text, messages[6]!.text);
   assert.equal(memory.unresolvedDefects[0].text, `Наблюдённый неустранённый дефект: ${idsFor('m8').map(id => evidence[id]!.text).join(' ')}`);
+  const readout = formatSemanticCompactionMemory(JSON.stringify(memory), sources);
+  assert.match(readout, /НЕУСТРАНЁННЫЙ ДЕФЕКТ: - "Наблюдённый неустранённый дефект/);
   assert.ok(Buffer.byteLength(JSON.stringify(memory)) <= 32768);
   for (const updates of [
     { ...sourceUpdates, m0: undefined }, { ...sourceUpdates, m99: 'none' },

@@ -10,7 +10,7 @@ import type { CustomPolicy } from './custom-permissions';
 import type { LocalTools, LocalToolsOptions, PowerShellRequest } from './local-tools';
 import { createLocalTools, LocalToolError } from './local-tools';
 import { createHookApprovalGate, createHookDispatcher, createHookRegistry, HookDispatchAbortError, type HookExecutionContext } from './hooks';
-import { createTurnRuntime, queueAcceptedTurnOrMarkNotSent, type PreparedCompactionContext, type PreparedTurn, type ToolReceiptInput, type ToolReceiptStart, type TurnRuntimeOptions } from './runtime';
+import { appendRuntimeActivity, createTurnRuntime, queueAcceptedTurnOrMarkNotSent, type PreparedCompactionContext, type PreparedTurn, type ToolReceiptInput, type ToolReceiptStart, type TurnRuntimeOptions } from './runtime';
 import { buildNextTurnContext, COMPACTION_TASK_INSTRUCTION, estimateProviderPromptTokens } from './context';
 import { CHAT_MODEL_FAMILIES } from './model-catalog';
 import { isLitePromptOverMeasuredInputGuard, liteHardInputLimit, reserveSemanticReviewInput, withLiteNormalOutputCap } from './context-budget';
@@ -968,10 +968,11 @@ test('semantic compaction reviews once on the selected model and accounts for bo
       },
       consumeTurn: async () => undefined, releaseTurn: () => undefined,
       appendAssistant: async () => { assert.fail('a compact candidate must not become a visible assistant reply'); },
-      appendCompaction: async (_turn, text, _signal, _context, _terminal, state) => {
+      appendCompaction: async (_turn, text, _signal, _context, terminal, state) => {
         assert.equal(requests.length, 2);
         assert.equal(state, 'review-state');
         saved.push(text);
+        return appendRuntimeActivity(terminal.activity, { kind: 'compaction', phase: 'completed', at: terminal.endedAt!, beforeBytes: 1000, afterBytes: 600 });
       },
       compactionEnabled: true,
       recordUsageReceipt: async receipt => {
@@ -983,6 +984,7 @@ test('semantic compaction reviews once on the selected model and accounts for bo
     assert.ok(runtime.enqueueCompaction(input));
     await runtime.whenIdle();
     assert.equal(runtime.list()[0]?.status, 'completed');
+    assert.deepEqual(runtime.list()[0]?.activity.filter(event => event.kind === 'compaction').map(event => event.phase), ['started', 'completed']);
     assert.equal(requests.length, 2);
     assert.equal(preflights.length, 3, 'reserve review, exact draft, exact review');
     assert.equal(saved.length, 1);

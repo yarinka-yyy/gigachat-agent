@@ -317,6 +317,10 @@ test('uses a v2 semantic archive only after covered-prefix hash and source valid
   assert.deepEqual(context.request.messages.map((message) => message.id), ['request-semantic-memory', currentUser.id]);
   assert.equal(context.request.messages[0]?.role, 'user');
   assert.equal(context.request.system.some(layer => layer.source === 'summary'), false, 'archived source claims must not become system instructions');
+  const policy = context.request.system.find(layer => layer.label === 'Чтение сохранённого контекста');
+  assert.equal(policy?.source, 'runtime');
+  assert.match(policy.text, /включи в сам итог проверки, даже если он указан и среди открытых задач/);
+  assert.match(policy.text, /«не проверено» и «не подтверждено» его не заменяют/i);
   assert.deepEqual(context.request.protocolHistory, [], 'covered tool calls are archived, not replayed');
   assert.match(summary, /Архивная семантическая память v1/);
   assert.match(summary, /Continue the current task\./);
@@ -344,7 +348,10 @@ test('uses a v2 semantic archive only after covered-prefix hash and source valid
   const projected = projectSemanticCompactionContinuation(live, new Set(covered.map(message => message.id)), { snapshot, sources });
   assert.deepEqual(projected.messages, context.request.messages);
   assert.deepEqual(projected.protocolHistory, [activeTool]);
-  assert.deepEqual(projected.system, live.system);
+  assert.deepEqual(projected.system, context.request.system);
+  const coveredIds = new Set(covered.map(message => message.id));
+  assert.deepEqual(projectSemanticCompactionContinuation(projected, coveredIds, { snapshot, sources }).system, projected.system);
+  assert.deepEqual(projectSemanticCompactionContinuation(projected, coveredIds).system, live.system);
   assert.equal(projected.modelId, live.modelId);
   assert.equal(projected.permissionProfile, live.permissionProfile);
 
