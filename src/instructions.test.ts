@@ -19,6 +19,9 @@ test('builds instruction layers in order and keeps chat history separate', () =>
 
   assert.deepEqual(request.system.map((layer) => layer.source), ['runtime', 'global', 'project', 'project', 'skill']);
   assert.deepEqual(request.system.filter((layer) => layer.source === 'project').map((layer) => layer.scope), ['workspace', 'nested']);
+  assert.match(request.system[1].label, /GIGACHAT\.md.*резервные правила/);
+  assert.match(request.system[3].label, /AGENTS\.md.*основные правила текущего проекта/);
+  assert.match(request.system[4].label, /Выбранный Skill.*Review/);
   assert.deepEqual(request.messages, [userMessage]);
   assert.equal(request.system.some((layer) => layer.text.includes(userMessage.text)), false);
   assert.equal(request.permissionProfile, 'ask');
@@ -28,6 +31,17 @@ test('omits empty optional instruction layers without moving chat messages into 
   const request = buildInstructionRequest({ globalText: '  ', projectInstructions: [], messages: [userMessage], permissionProfile: 'full' });
   assert.deepEqual(request.system.map((layer) => layer.source), ['runtime']);
   assert.equal(request.messages[0]?.text, 'Задача');
+});
+
+test('keeps global instructions active when project and skill texts are empty', () => {
+  const request = buildInstructionRequest({
+    globalText: 'Global preferences',
+    projectInstructions: [{ scope: 'project', text: ' ' }],
+    selectedSkill: { name: 'Review', scope: 'project', text: ' ' },
+    messages: [userMessage],
+    permissionProfile: 'ask',
+  });
+  assert.deepEqual(request.system.slice(1), [{ source: 'global', label: 'GIGACHAT.md', text: 'Global preferences' }]);
 });
 
 test('keeps a provider model ID outside the former static list in the accepted request', () => {

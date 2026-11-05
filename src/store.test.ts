@@ -3455,12 +3455,13 @@ test('V2 side-effect reuse persists the new call and state envelope without repe
   const result = JSON.stringify({ ok: true, result: { bytes: 22 } });
   await store.completeToolReceipt(chat.id, accepted.turn.messageId, firstReceipt.receiptId, 'completed', result);
 
-  const secondReceipt = { ...firstReceipt, receiptId: 'c'.repeat(64), functionsStateId: stateTwo };
+  const secondReceipt = { ...firstReceipt, receiptId: 'c'.repeat(64), functionsStateId: stateTwo,
+    arguments: { contents: 'содержимое', path: 'result.txt' } };
   const secondWire = {
     content: [
       { text: 'Сохраню результат.' },
       { function_call: { id: 'c3e2d3c4-5566-4a88-8b99-aabbccddeeff', name: 'write',
-        arguments: '{"path":"result.txt","contents":"содержимое"}' } },
+        arguments: '{"contents":"содержимое","path":"result.txt"}' } },
     ],
     messageId: 'assistant-write-call-two', toolStateId: stateTwo,
   };

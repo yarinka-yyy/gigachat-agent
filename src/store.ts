@@ -3,6 +3,7 @@ import { Buffer } from 'node:buffer';
 import { constants } from 'node:fs';
 import { copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { DEFAULT_NOTIFICATION_SETTINGS, isImageProtocolDiagnostic, PROVIDER_ERROR_CATEGORIES, type AcceptedTurnInput, type BalanceFamilyId, type BrowserTabRecord, type ChatArtifact, type ChatDetail, type ChatKind, type ChatMessage, type ChatPatch, type ChatSummary, type ChatToolReceipt, type ChatTurnRecord, type CompactSnapshot, type CompactionPrefix, type HomeDraftAttachment, type HomeDraftInput, type HomeDraftRecord, type HookEvent, type HookRunResult, type InstructionCommitRequest, type InstructionCommitResult, type InstructionDocument, type InstructionSaveResult, type LocalUsageStats, type NotificationSettings, type Project, type ProjectPatch, type ProjectUpdateResult, type ProviderBalanceFamily, type ProviderBalanceObservation, type ProviderErrorCategory, type ProviderGeneratedImageLedgerEntry, type ProviderProtocolExchange, type ProviderToolName, type ProviderUploadLedgerEntry, type ProviderV2FunctionWire, type RuntimeActivity, type RuntimeTurnSnapshot, type Settings, type SettingsPatch, type StudioBalanceAnchorInput, type Theme, type UsageLedgerSummary, type UsageProfileView, type UsageReceipt } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { IMAGE_GENERATION_MODEL_ID } from './image-mode';
@@ -114,7 +115,7 @@ const MAX_HOME_DRAFT_TOTAL_BYTES = 100 * 1024 * 1024;
 const MAX_CHAT_DRAFT_FILES = 32;
 const MAX_CHAT_DRAFT_TOTAL_BYTES = 100 * 1024 * 1024;
 const MAX_GENERATED_IMAGE_BYTES = Math.min(LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES);
-const SIDE_EFFECT_TOOLS = new Set(['write', 'powershell', 'open']);
+const SIDE_EFFECT_TOOLS = new Set(['write', 'replace_text', 'write_lines', 'powershell', 'open']);
 const UNKNOWN_TOOL_RESULT = JSON.stringify({
   ok: false,
   status: 'unknown',
@@ -3270,7 +3271,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       };
       const existingRows = chat.toolReceipts.filter((receipt) => receipt.receiptId === receiptInput.receiptId);
       if (existingRows.some((receipt) => receipt.name !== receiptInput.name
-        || !sameJson(receipt.arguments, receiptInput.arguments)
+        || !isDeepStrictEqual(receipt.arguments, receiptInput.arguments)
         || receipt.effectId !== receiptInput.effectId
         || (!SIDE_EFFECT_TOOLS.has(receiptInput.name)
           && (receipt.content !== receiptInput.content || receipt.functionsStateId !== receiptInput.functionsStateId)))) {
@@ -3292,7 +3293,7 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         ? chat.toolReceipts.filter((receipt) => receipt.effectId === receiptInput.effectId)
         : [];
       if (priorEffectRows.some((receipt) => receipt.anchorMessageId !== messageId || receipt.name !== receiptInput.name
-        || !sameJson(receipt.arguments, receiptInput.arguments))) {
+        || !isDeepStrictEqual(receipt.arguments, receiptInput.arguments))) {
         throw new Error('Идентификатор side effect уже связан с другим запросом.');
       }
       const priorEffect = priorEffectRows[0];

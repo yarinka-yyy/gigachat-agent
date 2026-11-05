@@ -677,7 +677,8 @@ export async function countEstimatedContextTextTokens(
   return countContextTextInputs(context, countTextTokens, signal, cache, 'estimated');
 }
 
-const PINNED_TOOL_SCHEMA_SHA256 = 'b8178d2cf5679c3a22a84a0c564c78869f1263660f552fa755ffb569da5bfac7';
+const PINNED_TOOL_SCHEMA_SHA256 = '402b90eb0ec9efc48e336c09b510f19ef81bfb7b52223481860b9e1e83a65285';
+const PINNED_TOOL_SCHEMA_FRAMING_CORRECTION = 96;
 
 function isPromptRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -866,7 +867,8 @@ export async function estimateSerializedProviderPrompt(
   }
   const visibleComponentTokens = counted.textTokenCount;
   if (visibleComponentTokens === null) return unknownPromptEstimate('invalid-wire-request');
-  const tokens = visibleComponentTokens + 7 + 5 * messages.length - (exactPinnedToolSchema ? 44 : 0) + 14 * functionCallCount;
+  const tokens = visibleComponentTokens + 7 + 5 * messages.length
+    - (exactPinnedToolSchema ? PINNED_TOOL_SCHEMA_FRAMING_CORRECTION : 0) + 14 * functionCallCount;
   if (!Number.isSafeInteger(tokens) || tokens < 0) return unknownPromptEstimate('invalid-wire-request');
   if (reasons.size > 0) {
     return {

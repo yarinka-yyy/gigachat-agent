@@ -89,10 +89,10 @@ internal static class Program
                 Run(args[1]);
                 return 0;
             }
-            if (args.Length == 2 && args[0] == "--write")
+            if (args.Length == 2 && args[0] is "--write" or "--write-checked")
             {
                 stage = "write project file";
-                WriteProjectFile(args[1]);
+                WriteProjectFile(args[1], requireExpectedHash: args[0] == "--write-checked");
                 return 0;
             }
             if (args.Length == 2 && args[0] == "--recover-instructions")
@@ -133,7 +133,7 @@ internal static class Program
         }
     }
 
-    private static void WriteProjectFile(string recoveryDirectoryInput)
+    private static void WriteProjectFile(string recoveryDirectoryInput, bool requireExpectedHash)
     {
         string stage = "validate request";
         try
@@ -146,6 +146,9 @@ internal static class Program
             string[] parts = ValidateRelativeFilePath(request.RelativePath);
             if (request.ContentsBase64 is null)
                 throw new InvalidDataException("Содержимое файла не задано.");
+            if (requireExpectedHash != (request.ExpectedCurrentHash is not null)
+                || (request.ExpectedCurrentHash is not null && !IsSha256(request.ExpectedCurrentHash)))
+                throw new InvalidDataException("Контрольная сумма исходного файла некорректна.");
             if (request.ContentsBase64.Length > checked(((MaxInputBytes + 2) / 3) * 4))
                 throw new InvalidDataException("Содержимое превышает лимит 1 МиБ.");
             byte[] payload = Convert.FromBase64String(request.ContentsBase64);
@@ -175,7 +178,11 @@ internal static class Program
                 EnsureNoReparseComponents(current);
                 current = Path.Combine(current, component);
                 if (File.Exists(current)) throw new InvalidDataException("Компонент пути не является папкой.");
-                if (!Directory.Exists(current)) Directory.CreateDirectory(current);
+                if (!Directory.Exists(current))
+                {
+                    if (request.ExpectedCurrentHash is not null) throw new IOException("Исходный файл больше недоступен.");
+                    Directory.CreateDirectory(current);
+                }
                 EnsureNoReparseComponents(current);
             }
             string parent = Path.GetDirectoryName(target) ?? throw new InvalidDataException("Некорректная папка файла.");
@@ -186,6 +193,9 @@ internal static class Program
             stage = "pin target directory";
             using var directoryPins = new PinnedDirectories(PinDirectoryChain(parent));
             using FileSnapshot before = ReadBrokerSnapshot(target);
+            stage = "check expected source";
+            if (request.ExpectedCurrentHash is not null && !string.Equals(before.Hash, request.ExpectedCurrentHash, StringComparison.Ordinal))
+                throw new IOException("Исходный файл изменился до записи.");
             bool targetExists = before.Exists;
             SecuritySnapshot? originalSecurity = before.Exists ? ReadSecuritySnapshot(target) : null;
             string id = Guid.NewGuid().ToString("N");
@@ -2090,7 +2100,7 @@ internal static class Program
         string? InputDataBase64 = null, bool TrustedFullAccess = false, bool ProjectScoped = true);
     private sealed record RunResult(int ExitCode, string Stdout, string Stderr, bool TimedOut, bool OutputLimited);
     private sealed record ErrorResult(string Error, int Code, string? Stage = null);
-    private sealed record BrokerWriteRequest(string WorkingFolder, string RelativePath, string ContentsBase64);
+    private sealed record BrokerWriteRequest(string WorkingFolder, string RelativePath, string ContentsBase64, string? ExpectedCurrentHash);
     private sealed record BrokerWriteResult(int Bytes, bool ReplacedExisting);
     private sealed record BrokerWriteJournal(int Version, string Id, string WorkingFolder, string RelativePath,
         bool TargetExisted, string? ExpectedHash, string? TargetIdentity, string IntendedHash, string? IntendedIdentity,

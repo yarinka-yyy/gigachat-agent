@@ -315,6 +315,23 @@ try {
     'Successful create and replace must leave no broker temp or backup files.');
   process.stdout.write('PASS generic broker create and replacement fingerprint raw existing bytes.\n');
 
+  const checkedBytes = Buffer.from('\uFEFFupdated\r\nunchanged');
+  const checkedRequest = {
+    WorkingFolder: brokerWriterRoot,
+    RelativePath: 'created.md',
+    ContentsBase64: checkedBytes.toString('base64'),
+    ExpectedCurrentHash: sha256(Buffer.from('stale content')),
+  };
+  const staleSource = invoke(['--write-checked', brokerWriterRuntime], checkedRequest);
+  assert.equal(staleSource.status, 1);
+  assert.equal(parseOutput(staleSource).Stage, 'check expected source');
+  assert.deepEqual(await readFile(createdTarget), createdBytes);
+  const checkedSource = invoke(['--write-checked', brokerWriterRuntime], { ...checkedRequest, ExpectedCurrentHash: sha256(createdBytes) });
+  assert.equal(checkedSource.status, 0, checkedSource.stdout);
+  assert.deepEqual(await readFile(createdTarget), checkedBytes);
+  assert.deepEqual((await readdir(brokerWriterRuntime)).filter((name) => name.startsWith('write-')), []);
+  process.stdout.write('PASS checked broker write refuses a stale source before mutation and preserves exact replacement bytes.\n');
+
   const brokerCleanupRaceRoot = join(root, 'broker-cleanup-race-project');
   const brokerCleanupRaceRuntime = join(root, 'broker-cleanup-race-runtime');
   await Promise.all([mkdir(brokerCleanupRaceRoot), mkdir(brokerCleanupRaceRuntime)]);

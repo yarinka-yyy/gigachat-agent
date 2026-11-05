@@ -1452,7 +1452,7 @@ test('streams V2 SSE across split UTF-8, split CRLF, and a CR-only final delimit
   assert.equal(requestBody.model_options.parallel_tool_calls, false);
   assert.equal(requestBody.model_options.max_tokens, undefined);
   assert.equal(requestBody.model_options.response_format, undefined);
-  assert.deepEqual(requestBody.tools[0]?.functions.specifications.map((fn) => fn.name), ['list', 'search', 'read', 'write', 'open', 'powershell']);
+  assert.deepEqual(requestBody.tools[0]?.functions.specifications.map((fn) => fn.name), ['list', 'search', 'read', 'write', 'replace_text', 'write_lines', 'open', 'powershell']);
   assert.equal(requestBody.messages.filter((message) => message.role === 'system').length, 1);
 });
 

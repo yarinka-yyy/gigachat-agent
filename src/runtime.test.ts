@@ -3748,6 +3748,42 @@ test('returns malformed function arguments to GigaChat without invoking a tool',
   assert.equal(JSON.parse(requests[1]?.protocolHistory?.[0]?.result ?? '{}').error, 'invalid_arguments');
 });
 
+test('routes exact replacements and line writes through the write policy and effect receipts', async () => {
+  const receipts = makeReceiptStore();
+  const writes: unknown[] = [];
+  const hooks: unknown[] = [];
+  const calls = [
+    functionCall('replace_text', { path: 'source.txt', old_text: 'old', new_text: 'new' }),
+    functionCall('write_lines', { path: 'result.csv', lines: ['id,total', 'A,2'], line_ending: 'crlf', final_newline: true }),
+    functionCall('write_lines', { path: 'result.csv', lines: ['no\nembedded newline'], line_ending: 'lf', final_newline: false }),
+  ];
+  const provider = makeProvider(async function* (request) {
+    const count = request.protocolHistory?.length ?? 0;
+    if (count < calls.length) { yield calls[count]!; return; }
+    assert.equal(JSON.parse(request.protocolHistory![2]!.result).stage, 'arguments');
+    yield { type: 'text-delta', text: 'Готово.' };
+    yield { type: 'completed' };
+  });
+  const runtime = makeRuntime(provider, {
+    tools: { write: async (_project: unknown, profile: unknown, path: unknown, contents: unknown) => {
+      writes.push({ profile, path, contents });
+      return { bytes: 1 };
+    } } as LocalTools,
+    runHooks: async (_turn, event) => { if (event.event === 'before-tool') hooks.push(event.tool); return []; },
+    beginToolReceipt: (turn, input) => { assert.match(input.effectId ?? '', /^[a-f0-9]{64}$/); return receipts.begin(turn, input); },
+    completeToolReceipt: receipts.complete,
+  });
+  const turn = turnFor('chat-structured-write');
+  runtime.enqueue(turn);
+  await runtime.whenIdle();
+  assert.equal(runtime.list(turn.chatId)[0]?.status, 'completed');
+  assert.deepEqual(writes, [
+    { profile: turn.permissionProfile, path: 'source.txt', contents: { oldText: 'old', newText: 'new' } },
+    { profile: turn.permissionProfile, path: 'result.csv', contents: 'id,total\r\nA,2\r\n' },
+  ]);
+  assert.deepEqual(hooks, ['write', 'write']);
+});
+
 test('bounds a tool result before returning it to GigaChat', async () => {
   const receipts = makeReceiptStore();
   const requests: ProviderTurnRequest[] = [];
@@ -3877,6 +3913,7 @@ test('keeps FIFO blocked until nested persistence and a cancelled tool receipt b
   let searches = 0;
   let writes = 0;
   let idleOutcome: 'resolved' | 'rejected' | undefined;
+  const terminalHooks: string[] = [];
 
   const provider = makeProvider(async function* (request) {
     const chat = request.messages[0]?.text ?? '';
@@ -3893,6 +3930,7 @@ test('keeps FIFO blocked until nested persistence and a cancelled tool receipt b
       return;
     }
     assert.equal(terminalPersisted.has(firstTurnId), true, 'terminal persistence must retire before the next provider starts');
+    assert.deepEqual(terminalHooks, ['interrupt:cancelled', 'stop:cancelled']);
     yield { type: 'usage', promptTokens: 4, completionTokens: 2, totalTokens: 6, precachedPromptTokens: 0 };
     yield { type: 'text-delta', text: 'second chat completed' };
     yield { type: 'completed' };
@@ -3941,9 +3979,13 @@ test('keeps FIFO blocked until nested persistence and a cancelled tool receipt b
       }
       await receipts.complete(turn, receiptId, status, result);
     },
-    runHooks: async (_turn, input) => input.event === 'after-tool'
-      ? [{ hookId: 'fixture/after-tool', hookName: 'after-tool', event: input.event, status: 'completed' }]
-      : [],
+    runHooks: async (turn, input) => {
+      if (turn.turnId === firstTurnId && (input.event === 'interrupt' || input.event === 'stop')) {
+        assert.equal([...receipts.receipts.values()].find((receipt) => receipt.name === 'search')?.status, 'completed');
+        terminalHooks.push(`${input.event}:${input.outcome}`);
+      } else if (input.event !== 'after-tool') return [];
+      return [{ hookId: `fixture/${input.event}`, hookName: input.event, event: input.event, status: 'completed' }];
+    },
     timeouts: { operationMs: 500, toolMs: 1000, stopMs: 500 },
   });
 
@@ -3994,7 +4036,9 @@ test('keeps FIFO blocked until nested persistence and a cancelled tool receipt b
   assert.equal([...usage.values()].filter((receipt) => receipt.chatId === firstTurn.chatId)
     .reduce((total, receipt) => total + (receipt.totalTokens ?? 0), 0), 33);
   assert.deepEqual({ reads, searches, writes }, { reads: 1, searches: 1, writes: 0 });
-  assert.ok(persisted.some((snapshot) => snapshot.id === firstTurnId && snapshot.status === 'cancelled'));
+  const terminalSnapshot = persisted.find((snapshot) => snapshot.id === firstTurnId && snapshot.status === 'cancelled');
+  assert.deepEqual(terminalSnapshot?.activity.filter((item) => item.kind === 'hook').map((item) => item.event),
+    ['after-tool', 'after-tool', 'interrupt', 'stop']);
 });
 
 test('image provider result completes an empty-text Runtime turn once and keeps usage and hooks', async () => {

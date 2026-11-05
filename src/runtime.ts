@@ -21,7 +21,7 @@ import type {
   UsageReceiptStatus,
 } from './contracts';
 import { isImageProtocolDiagnostic, PROVIDER_ERROR_CATEGORIES } from './contracts';
-import { LocalToolError, type LocalToolEvent, type LocalTools } from './local-tools';
+import { LocalToolError, LocalWriteError, type LocalToolEvent, type LocalTools } from './local-tools';
 import { HookDispatchAbortError } from './hooks';
 import { MAX_USAGE_COUNT, mergeUsageReceipt } from './usage';
 import { COMPACTION_OUTPUT_TOKEN_LIMIT, semanticReviewInputReserve, compileExtractiveCompaction, compileResolvedSemanticCompactionMemory, type CompactionSources } from './compaction';
@@ -51,6 +51,12 @@ const MAX_TOOL_RESULT_BYTES = 16 * 1024;
 const MAX_TOTAL_TOOL_RESULT_BYTES = 128 * 1024;
 const STOP_TIMEOUT = Symbol('stop-timeout');
 const PROVIDER_TOOL_NAMES: readonly ProviderToolName[] = ['list', 'search', 'read', 'write', 'open', 'powershell'];
+type ProviderWriteVariant = 'replace_text' | 'write_lines';
+
+function providerActivityTool(name: string): ProviderToolName | undefined {
+  if (name === 'replace_text' || name === 'write_lines') return 'write';
+  return isProviderToolName(name) ? name : undefined;
+}
 const RETRYABLE_ERROR_CATEGORIES = new Set<ProviderErrorCategory>([
   'auth', 'tls', 'network', 'rate-limit', 'quota', 'protocol', 'tool', 'storage',
 ]);
@@ -162,6 +168,7 @@ interface StopState {
   waiters: Set<() => void>;
   pendingOperationCount: number;
   pendingOutcome: { status: 'completed' | 'failed' | 'cancelled'; error?: string; errorCategory?: ProviderErrorCategory; imageProtocolDiagnostic?: ImageProtocolDiagnostic } | null;
+  runDeferredTerminalHooks?: (outcome: 'failed' | 'cancelled') => Promise<void>;
   terminalRecordSaved?: boolean;
 }
 
@@ -375,7 +382,7 @@ function stableJson(value: unknown): string {
 }
 
 function isExternalEffect(name: string): boolean {
-  return name === 'write' || name === 'powershell' || name === 'open';
+  return providerActivityTool(name) === 'write' || name === 'powershell' || name === 'open';
 }
 
 function receiptIdFor(turn: AcceptedTurnInput, call: ProviderFunctionCall, round: number): string {
@@ -399,12 +406,14 @@ function objectResult(value: unknown): string {
 }
 
 function errorResult(error: unknown, unknownSideEffect = false): string {
+  const diagnostic = error instanceof LocalWriteError ? { stage: error.stage } : {};
   if (unknownSideEffect) return JSON.stringify({
     ok: false, status: 'unknown', error: 'effect_unknown',
     message: 'Выполнение было прервано или завершилось неоднозначно; проверьте состояние перед повтором.',
+    ...diagnostic,
   });
   const message = error instanceof Error ? error.message.slice(0, 1000) : 'Локальный инструмент завершился ошибкой.';
-  return objectResult({ ok: false, error: error instanceof LocalToolError && error.code === 'PERMISSION_DENIED' ? 'permission_denied' : 'tool_error', message });
+  return objectResult({ ok: false, error: error instanceof LocalToolError && error.code === 'PERMISSION_DENIED' ? 'permission_denied' : 'tool_error', message, ...diagnostic });
 }
 
 type ValidatedToolArguments =
@@ -413,11 +422,14 @@ type ValidatedToolArguments =
 
 function validateToolArguments(call: ProviderFunctionCall): ValidatedToolArguments {
   const args = call.arguments;
-  const allowed: Record<ProviderToolName, readonly string[]> = {
-    list: ['path'], search: ['query', 'path'], read: ['path'], write: ['path', 'contents'], open: ['path'],
+  const allowed: Record<ProviderToolName | ProviderWriteVariant, readonly string[]> = {
+    list: ['path'], search: ['query', 'path'], read: ['path'], write: ['path', 'contents'],
+    replace_text: ['path', 'old_text', 'new_text'], write_lines: ['path', 'lines', 'line_ending', 'final_newline'], open: ['path'],
     powershell: ['script', 'external_access'],
   };
-  if (!isProviderToolName(call.name)) return { ok: false, error: 'unknown_function', message: 'Эта функция недоступна в текущем приложении.' };
+  if (!isProviderToolName(call.name) && call.name !== 'replace_text' && call.name !== 'write_lines') {
+    return { ok: false, error: 'unknown_function', message: 'Эта функция недоступна в текущем приложении.' };
+  }
   const keys = allowed[call.name];
   if (Object.getPrototypeOf(args) !== Object.prototype || Object.keys(args).some((key) => !keys.includes(key))) {
     return { ok: false, error: 'invalid_arguments', message: 'Аргументы функции не соответствуют поддерживаемой схеме.' };
@@ -434,10 +446,31 @@ function validateToolArguments(call: ProviderFunctionCall): ValidatedToolArgumen
     if (call.name === 'list') requireString('path', false, 2048, true);
     else if (call.name === 'search') requireString('query', true, 256);
     else if (call.name === 'read') requireString('path', true, 2048);
-    else if (call.name === 'write') {
+    else if (providerActivityTool(call.name) === 'write') {
       requireString('path', true, 2048);
-      const contents = requireString('contents', true, 1_048_576, true) ?? '';
+      if (call.name === 'replace_text') {
+        const oldText = requireString('old_text', true, 1_048_576);
+        const newText = requireString('new_text', true, 1_048_576, true);
+        if (/[\r\n]/.test(oldText ?? '') || /[\r\n]/.test(newText ?? '')) {
+          throw new Error('Точная замена меняет только фрагмент внутри строки. В old_text и new_text не должно быть переносов.');
+        }
+        return { ok: true, args: { path: args.path, contents: { oldText, newText } } };
+      }
+      let contents: string;
+      if (call.name === 'write_lines') {
+        const { lines, line_ending, final_newline } = args;
+        if (!Array.isArray(lines)
+          || lines.some((line) => typeof line !== 'string' || line.includes('\0') || /[\r\n]/.test(line))
+          || (line_ending !== 'lf' && line_ending !== 'crlf') || typeof final_newline !== 'boolean') {
+          throw new Error('Для построчной записи нужны path, lines без переносов, line_ending и final_newline.');
+        }
+        const eol = line_ending === 'crlf' ? '\r\n' : '\n';
+        contents = lines.join(eol) + (final_newline ? eol : '');
+      } else {
+        contents = requireString('contents', true, 1_048_576, true) ?? '';
+      }
       if (Buffer.byteLength(contents, 'utf8') > 1024 * 1024) throw new Error('Содержимое записи превышает лимит 1 МиБ в UTF-8.');
+      return { ok: true, args: { path: args.path, contents } };
     } else if (call.name === 'open') requireString('path', false, 2048, true);
     else if (call.name === 'powershell') {
       requireString('script', true, 16 * 1024);
@@ -578,6 +611,16 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     if (blockedTurnId !== turnId) return;
     const turn = turns.get(turnId);
     if (turn && state.pendingOutcome) {
+      if (state.pendingOutcome.status !== 'completed' && state.runDeferredTerminalHooks) {
+        const runHooks = state.runDeferredTerminalHooks;
+        delete state.runDeferredTerminalHooks;
+        state.pendingOperationCount += 1;
+        void runHooks(state.pendingOutcome.status).finally(() => {
+          state.pendingOperationCount -= 1;
+          maybeUnblock(turnId);
+        });
+        return;
+      }
       turn.status = state.pendingOutcome.status;
       turn.endedAt = turn.pendingTerminal?.endedAt ?? new Date().toISOString();
       if (turn.pendingTerminal?.activeDurationMs !== undefined) turn.activeDurationMs = turn.pendingTerminal.activeDurationMs;
@@ -884,6 +927,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       signal = controller.signal,
       acceptedTurn = turn.input,
       persistAs?: RuntimeTurnSnapshot,
+      flush = true,
     ): Promise<HookRunResult[]> => {
       let results: HookRunResult[];
       try {
@@ -896,7 +940,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
               event: result.event, status: result.status, ...(result.reason ? { reason: result.reason } : {}),
             }, persistAs);
           }
-          await flushTurnPersistence(signal);
+          if (flush) await flushTurnPersistence(signal);
         }
         throw error;
       }
@@ -906,16 +950,25 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           event: result.event, status: result.status, ...(result.reason ? { reason: result.reason } : {}),
         }, persistAs);
       }
-      await flushTurnPersistence(signal);
+      if (flush) await flushTurnPersistence(signal);
       if (signal.aborted) throw abortError();
       return results;
     };
-    const invokeTool = async (call: ProviderFunctionCall): Promise<unknown> => {
-      const validation = validateToolArguments(call);
-      if (!validation.ok) return { ok: false, error: validation.error, message: validation.message };
-      const args = validation.args;
+    const runTerminalHooks = async (outcome: 'failed' | 'cancelled', signal: AbortSignal, flush = true): Promise<void> => {
+      if (outcome === 'cancelled' && !interruptHooksRan) {
+        interruptHooksRan = true;
+        await runHookEvent({ event: 'interrupt', projectId: turn.input.projectId, outcome }, signal, turn.input, undefined, flush).catch(() => undefined);
+      }
+      if (!stopHooksRan) {
+        stopHooksRan = true;
+        await runHookEvent({ event: 'stop', projectId: turn.input.projectId, outcome }, signal, turn.input, undefined, flush).catch(() => undefined);
+      }
+    };
+    // Deferred finalization saves hook activity with the terminal record before reopening FIFO.
+    stopState.runDeferredTerminalHooks = (outcome) => runTerminalHooks(outcome, new AbortController().signal, false);
+    const invokeTool = async (call: ProviderFunctionCall, args: Record<string, unknown>): Promise<unknown> => {
       const scope = { signal: controller.signal, expectedWorkingFolder: turn.input.projectWorkingFolder, skillId: turn.input.skillId };
-      switch (call.name) {
+      switch (providerActivityTool(call.name)) {
         case 'list': return options.tools.list(turn.input.projectId, turn.input.permissionProfile, args.path ?? '', scope);
         case 'search': return options.tools.search(turn.input.projectId, turn.input.permissionProfile, args.query, args.path ?? '', scope);
         case 'read': return options.tools.read(turn.input.projectId, turn.input.permissionProfile, args.path, scope);
@@ -1227,9 +1280,10 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
             return;
           }
           await finishActiveUsage('completed');
+          const activityTool = providerActivityTool(functionCall.name);
           addActivity(turn, {
             kind: 'provider', at: new Date().toISOString(), activity: 'waiting-for-tool',
-            ...(isProviderToolName(functionCall.name) ? { tool: functionCall.name } : {}),
+            ...(activityTool ? { tool: activityTool } : {}),
           });
           await flushTurnPersistence();
           if (!options.beginToolReceipt || !options.completeToolReceipt) {
@@ -1267,14 +1321,15 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
               let resultStatus: 'completed' | 'unknown' = 'completed';
               let abortAfterSave = false;
               let actualToolOutcome: HookDispatchInput['outcome'] = 'failed';
-              if (!validation.ok) resultText = objectResult({ ok: false, error: validation.error, message: validation.message });
+              if (!validation.ok) resultText = objectResult({ ok: false, error: validation.error, message: validation.message,
+                ...(activityTool === 'write' ? { stage: 'arguments' } : {}) });
               else if (controller.signal.aborted) resultText = objectResult({ ok: false, error: 'cancelled', message: 'Инструмент отменён до запуска.' });
               else {
                 let beforeResults: HookRunResult[] = [];
                 try {
                   beforeResults = await runHookEvent({
                     event: 'before-tool', projectId: turn.input.projectId,
-                    ...(isProviderToolName(functionCall!.name) ? { tool: functionCall!.name } : {}),
+                    ...(activityTool ? { tool: activityTool } : {}),
                   });
                 } catch (hookError) {
                   resultText = errorResult(hookError, false);
@@ -1286,12 +1341,13 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
                     ok: false,
                     error: 'hook_blocked',
                     message: failedCheck.reason ?? 'Проверка Hook не разрешила запуск инструмента.',
+                    ...(activityTool === 'write' ? { stage: 'before-hook' } : {}),
                   });
                 }
                 if (resultText === null) {
                   try {
-                    const result = await invokeTool(functionCall!);
-                    const hasSideEffect = functionCall!.name === 'write' || functionCall!.name === 'powershell' || functionCall!.name === 'open';
+                    const result = await invokeTool(functionCall!, validation.args);
+                    const hasSideEffect = isExternalEffect(functionCall!.name);
                     if (controller.signal.aborted && hasSideEffect) {
                       resultStatus = 'unknown';
                       resultText = errorResult(new Error('cancelled'), true);
@@ -1306,16 +1362,17 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
                       resultText = objectResult({ ok: !commandFailed, result });
                     }
                   } catch (toolError) {
-                    const hasSideEffect = functionCall!.name === 'write' || functionCall!.name === 'powershell' || functionCall!.name === 'open';
+                    const hasSideEffect = isExternalEffect(functionCall!.name);
                     const permissionDenied = toolError instanceof LocalToolError && toolError.code === 'PERMISSION_DENIED';
-                    resultStatus = hasSideEffect && !permissionDenied ? 'unknown' : 'completed';
+                    const rejectedBeforeWrite = toolError instanceof LocalWriteError && toolError.stage !== 'writer';
+                    resultStatus = hasSideEffect && !permissionDenied && !rejectedBeforeWrite ? 'unknown' : 'completed';
                     actualToolOutcome = isAbortError(toolError) ? 'cancelled' : 'failed';
-                    resultText = errorResult(toolError, hasSideEffect && !permissionDenied);
+                    resultText = errorResult(toolError, resultStatus === 'unknown');
                   }
                   try {
                     await runHookEvent({
                       event: 'after-tool', projectId: turn.input.projectId,
-                      ...(isProviderToolName(functionCall!.name) ? { tool: functionCall!.name } : {}),
+                      ...(activityTool ? { tool: activityTool } : {}),
                       outcome: actualToolOutcome,
                     });
                   } catch (hookError) {
@@ -1482,17 +1539,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           if (stopState.pendingOperationCount === 0) maybeUnblock(turn.id);
           return;
         }
-        if (cancelled && !interruptHooksRan) {
-          interruptHooksRan = true;
-          await runHookEvent({ event: 'interrupt', projectId: turn.input.projectId, outcome: 'cancelled' }, terminalSignal).catch(() => undefined);
-        }
-        if (!stopHooksRan) {
-          stopHooksRan = true;
-          await runHookEvent({
-            event: 'stop', projectId: turn.input.projectId,
-            outcome: cancelled ? 'cancelled' : 'failed',
-          }, terminalSignal).catch(() => undefined);
-        }
+        await runTerminalHooks(cancelled ? 'cancelled' : 'failed', terminalSignal);
+        if (blockedTurnId === turn.id) return;
         turn.status = turn.cancelRequested || isAbortError(terminalError) && !turnTimedOut ? 'cancelled' : 'failed';
         turn.endedAt = new Date().toISOString();
         turn.activeDurationMs = Math.max(0, Date.now() - started);

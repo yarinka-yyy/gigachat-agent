@@ -913,7 +913,7 @@ test('bounds the complete wire payload including all function schemas and counts
   };
   assert.equal(serialized.wireBytes, Buffer.byteLength(serialized.body, 'utf8'));
   assert.ok(serialized.wireBytes <= MAX_PROVIDER_REQUEST_BYTES);
-  assert.equal(payload.tools[0]?.functions.specifications.length, 6);
+  assert.equal(payload.tools[0]?.functions.specifications.length, 8);
   assert.equal(payload.tool_config.mode, 'auto');
   assert.equal(serialized.textInputs.length, payload.messages.length);
   assert.equal(context.blocks.find((block) => block.source === 'function-schema')?.label, 'Схема инструментов');
@@ -961,7 +961,7 @@ test('estimates actual serialized wire text, function calls, results, tool schem
   const visibleTokens = [...visibleTexts, schemaText].reduce((sum, text) => sum + [...text].length, 0);
 
   assert.deepEqual(estimate, {
-    status: 'complete', tokens: visibleTokens + 7 + 5 * payload.messages.length - 44 + 14,
+    status: 'complete', tokens: visibleTokens + 7 + 5 * payload.messages.length - 96 + 14,
     knownTokens: visibleTokens, provenance: 'estimated', wireMessageCount: payload.messages.length,
     functionCallCount: 1, unknownReasons: [],
   });
@@ -990,7 +990,7 @@ test('estimates actual serialized wire text, function calls, results, tool schem
     countTextTokens, new AbortController().signal);
   assert.equal(outsideDomain.status, 'complete');
   assert.equal(outsideDomain.provenance, 'estimated');
-  assert.equal(outsideDomain.tokens, outsideDomain.knownTokens! + 7 + 5 * longHistory.messages.length - 44);
+  assert.equal(outsideDomain.tokens, outsideDomain.knownTokens! + 7 + 5 * longHistory.messages.length - 96);
   assert.equal(outsideDomain.wireMessageCount, 47);
   assert.equal(outsideDomain.functionCallCount, 0);
   assert.deepEqual(outsideDomain.unknownReasons, []);

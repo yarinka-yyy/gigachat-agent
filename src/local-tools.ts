@@ -1,5 +1,5 @@
 import { spawn as spawnChild, type ChildProcessWithoutNullStreams, type SpawnOptions } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { lstat, realpath } from 'node:fs/promises';
 import { extname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import type { InstructionCommitRequest, InstructionCommitResult, PermissionApprovalRequest, Project } from './contracts';
@@ -59,6 +59,7 @@ export interface ProjectFileWriteRequest {
   workingFolder: string;
   relativePath: string;
   contentsBase64: string;
+  expectedCurrentHash?: string;
   signal?: AbortSignal;
 }
 
@@ -349,15 +350,19 @@ export function createPowerShellHelper(options: PowerShellHelperOptions): PowerS
     if (payload.byteLength > MAX_LOCAL_FILE_BYTES || payload.toString('base64') !== contentsBase64) {
       throw new LocalToolError('Содержимое файла превышает лимит 1 МиБ или имеет неверный формат.');
     }
+    if (request.expectedCurrentHash !== undefined && !/^[a-f0-9]{64}$/.test(request.expectedCurrentHash)) {
+      throw new LocalToolError('Контрольная сумма исходного файла некорректна.');
+    }
     const input = JSON.stringify({
       WorkingFolder: resolve(request.workingFolder),
       RelativePath: pathParts.join('\\'),
       ContentsBase64: contentsBase64,
+      ...(request.expectedCurrentHash ? { ExpectedCurrentHash: request.expectedCurrentHash } : {}),
     });
     let result: HelperProcessResult;
     try {
       result = await invokePowerShellHelper(helperPath,
-        ['--write', recoveryDirectory], input, LOCAL_FILE_WRITE_TIMEOUT_MS, spawnProcess, request.signal);
+        [request.expectedCurrentHash ? '--write-checked' : '--write', recoveryDirectory], input, LOCAL_FILE_WRITE_TIMEOUT_MS, spawnProcess, request.signal);
     } catch {
       await recoverUnlocked().catch(() => {
         throw new LocalToolError('Не удалось восстановить состояние после ошибки запуска файлового writer.');
@@ -382,6 +387,9 @@ export function createPowerShellHelper(options: PowerShellHelperOptions): PowerS
       }
       if (result.timedOut) throw new LocalToolError('Состояние файла после таймаута неизвестно; перечитайте его перед повтором.');
       if (result.responseLimit) throw new LocalToolError('Ответ файлового writer превысил безопасный лимит.');
+      if (request.expectedCurrentHash && isRecord(failure) && failure.Stage === 'check expected source') {
+        throw new LocalWriteError('Исходный файл изменился до записи. Перечитайте его перед повтором.', 'source');
+      }
       const code = isRecord(failure) && Number.isSafeInteger(failure.Code) ? ` (код ${failure.Code})` : '';
       const stage = isRecord(failure) && typeof failure.Stage === 'string' ? `, этап: ${failure.Stage}` : '';
       throw new LocalToolError(`Файловый writer отказал${code}${stage}.`);
@@ -516,6 +524,12 @@ export interface LocalTools {
 export class LocalToolError extends Error {
   constructor(message: string, readonly code: 'LOCAL_TOOL_REJECTED' | 'PERMISSION_DENIED' = 'LOCAL_TOOL_REJECTED') {
     super(message);
+  }
+}
+
+export class LocalWriteError extends LocalToolError {
+  constructor(message: string, readonly stage: 'target' | 'permission' | 'source' | 'contents' | 'writer', code?: LocalToolError['code']) {
+    super(message, code);
   }
 }
 
@@ -817,10 +831,10 @@ async function assertSafeTarget(root: string, target: string, allowMissing: bool
   }
 }
 
-function decodeText(bytes: Uint8Array): string {
+function decodeText(bytes: Uint8Array, preserveBom = false): string {
   if (bytes.byteLength > MAX_LOCAL_FILE_BYTES) throw new LocalToolError('Файл превышает лимит 1 МиБ.');
   if (bytes.includes(0)) throw new LocalToolError('Бинарный файл нельзя читать как текст.');
-  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+  try { return new TextDecoder('utf-8', { fatal: true, ignoreBOM: preserveBom }).decode(bytes); }
   catch { throw new LocalToolError('Файл не содержит корректный UTF-8 текст.'); }
 }
 
@@ -960,6 +974,13 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
     return { root: latest.root, target, projectId: latest.projectId };
   }
 
+  const readText = async (root: string, path: unknown, signal?: AbortSignal): Promise<string> => {
+    throwIfAborted(signal);
+    const output = await runBoundedFileScript(options.runPowerShell, root, buildReadScript(root, requireRelativePath(path, false)),
+      signal, 2 * 1024 * 1024);
+    return decodeText(parseBase64Output(output, MAX_LOCAL_FILE_BYTES), true);
+  };
+
   return {
     list: (projectIdInput, profileInput, pathInput = '', listOptions = {}) => activity('list', async () => {
       const pathParts = requireRelativePath(pathInput, true);
@@ -1006,33 +1027,64 @@ export function createLocalTools(options: LocalToolsOptions): LocalTools {
     read: (projectIdInput, profileInput, pathInput, readOptions = {}) => activity('read', async () => {
       const { root } = await prepareTarget(projectIdInput, profileInput, 'project-files', 'read',
         pathInput, false, false, true, readOptions.signal, undefined, readOptions.expectedWorkingFolder, readOptions.skillId ?? null);
-      throwIfAborted(readOptions.signal);
-      const output = await runBoundedFileScript(options.runPowerShell, root, buildReadScript(root, requireRelativePath(pathInput, false)),
-        readOptions.signal, 2 * 1024 * 1024);
-      return decodeText(parseBase64Output(output, MAX_LOCAL_FILE_BYTES));
+      return readText(root, pathInput, readOptions.signal);
     }),
 
     write: (projectIdInput, profileInput, pathInput, contentsInput, writeOptions = {}) => activity('write', async () => {
-      const { root } = await prepareTarget(projectIdInput, profileInput, 'project-files', 'write',
-        pathInput, false, true, Boolean(options.writeFile), writeOptions.signal, undefined, writeOptions.expectedWorkingFolder, writeOptions.skillId ?? null);
+      const targetError = (error: unknown): never => {
+        if (!(error instanceof LocalToolError)) throw error;
+        throw new LocalWriteError(error.message, error.code === 'PERMISSION_DENIED' ? 'permission' : 'target', error.code);
+      };
+      const replacement = isRecord(contentsInput) && typeof contentsInput.oldText === 'string' && contentsInput.oldText
+        && typeof contentsInput.newText === 'string' ? { oldText: contentsInput.oldText, newText: contentsInput.newText } : null;
+      const { root } = await prepareTarget(projectIdInput, profileInput, 'project-files', replacement ? 'read' : 'write',
+        pathInput, false, !replacement, Boolean(options.writeFile), writeOptions.signal, undefined, writeOptions.expectedWorkingFolder, writeOptions.skillId ?? null)
+        .catch(targetError);
       throwIfAborted(writeOptions.signal);
-      if (typeof contentsInput !== 'string' || contentsInput.includes('\0')) {
-        throw new LocalToolError('Содержимое файла должно быть текстом без NUL.');
+      let contents = contentsInput;
+      let expectedCurrentHash: string | undefined;
+      if (replacement) {
+        const { oldText, newText } = replacement;
+        if (/[\r\n\0]/.test(oldText) || /[\r\n\0]/.test(newText)) {
+          throw new LocalWriteError('Для точной замены укажите фрагменты внутри одной строки без NUL.', 'contents');
+        }
+        const original = await readText(root, pathInput, writeOptions.signal).catch((error: unknown) => {
+          if (!(error instanceof LocalToolError)) throw error;
+          throw new LocalWriteError(error.message, 'source');
+        });
+        const index = original.indexOf(oldText, original.startsWith('\uFEFF') ? 1 : 0);
+        if (index < 0 || original.indexOf(oldText, index + 1) >= 0) {
+          throw new LocalWriteError('Для точной замены исходный фрагмент должен встречаться ровно один раз.', 'contents');
+        }
+        expectedCurrentHash = createHash('sha256').update(original, 'utf8').digest('hex');
+        contents = original.slice(0, index) + newText + original.slice(index + oldText.length);
       }
-      const bytes = Buffer.from(contentsInput, 'utf8');
+      if (typeof contents !== 'string' || contents.includes('\0')) {
+        throw new LocalWriteError('Содержимое файла должно быть текстом без NUL.', 'contents');
+      }
+      const bytes = Buffer.from(contents, 'utf8');
       if (bytes.byteLength > MAX_LOCAL_FILE_BYTES
-        || new TextDecoder('utf-8', { fatal: true }).decode(bytes) !== contentsInput) {
-        throw new LocalToolError('Текст должен помещаться в лимит 1 МиБ и содержать корректный Unicode.');
+        || new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) !== contents) {
+        throw new LocalWriteError('Текст должен помещаться в лимит 1 МиБ и содержать корректный Unicode.', 'contents');
       }
-      if (!options.writeFile) throw new LocalToolError('Структурированная запись проекта пока недоступна.');
+      if (!options.writeFile) throw new LocalWriteError('Структурированная запись проекта пока недоступна.', 'target');
+      if (replacement) {
+        const { root: writeRoot } = await prepareTarget(projectIdInput, profileInput, 'project-files', 'write',
+          pathInput, false, false, true, writeOptions.signal, undefined, root, writeOptions.skillId ?? null).catch(targetError);
+        if (writeRoot !== root) throw new LocalWriteError('Рабочая папка изменилась до записи.', 'target');
+      }
       const result = await options.writeFile({
         workingFolder: root,
         relativePath: requireRelativePath(pathInput, false).join('\\'),
         contentsBase64: bytes.toString('base64'),
+        ...(expectedCurrentHash ? { expectedCurrentHash } : {}),
         ...(writeOptions.signal ? { signal: writeOptions.signal } : {}),
+      }).catch((error: unknown) => {
+        if (!(error instanceof LocalToolError) || error instanceof LocalWriteError) throw error;
+        throw new LocalWriteError(error.message, 'writer');
       });
       if (result.bytes !== bytes.byteLength || typeof result.replacedExisting !== 'boolean') {
-        throw new LocalToolError('Файловый writer вернул неверный размер файла.');
+        throw new LocalWriteError('Файловый writer вернул неверный размер файла.', 'writer');
       }
       return { bytes: bytes.byteLength };
     }),

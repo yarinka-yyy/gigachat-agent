@@ -58,7 +58,23 @@ const GIGACHAT_FUNCTIONS: readonly Record<string, unknown>[] = [
   { name: 'list', description: 'Показывает файлы и папки в доступной рабочей папке с учётом профиля разрешений. Путь задаётся относительно её корня; пустой или отсутствующий путь означает корень. Абсолютные пути и переходы за корень не принимаются.', parameters: { type: 'object', properties: { path: { type: 'string', maxLength: 2048 } }, additionalProperties: false } },
   { name: 'search', description: 'Ищет текст в файле или папке внутри доступной рабочей папки с учётом профиля разрешений. Сопоставляет буквальный фрагмент без учёта регистра; регулярные выражения не поддерживаются. Путь задаётся относительно её корня; пустой или отсутствующий путь означает корень. Абсолютные пути и переходы за корень не принимаются.', parameters: { type: 'object', properties: { query: { type: 'string', minLength: 1, maxLength: 256 }, path: { type: 'string', maxLength: 2048 } }, required: ['query'], additionalProperties: false } },
   { name: 'read', description: 'Читает небольшой текстовый файл внутри доступной рабочей папки с учётом профиля разрешений. Укажите непустой путь относительно её корня; абсолютные пути и переходы за корень не принимаются.', parameters: { type: 'object', properties: { path: { type: 'string', minLength: 1, maxLength: 2048 } }, required: ['path'], additionalProperties: false } },
-  { name: 'write', description: 'Записывает ровно переданный полный UTF-8 текст в файл внутри доступной рабочей папки с учётом профиля разрешений. Укажите непустой путь относительно её корня; абсолютные пути и переходы за корень не принимаются. Содержимое ограничено 1 МиБ.', parameters: { type: 'object', properties: { path: { type: 'string', minLength: 1, maxLength: 2048 }, contents: { type: 'string', maxLength: 1048576, description: 'Передавайте полный текст файла в UTF-8: записывается ровно это содержимое без нормализации переносов или автоматического добавления завершающего перевода строки. При редактировании сохраняйте неизменённые строки, отступы, разделители строк и исходное окончание файла.' } }, required: ['path', 'contents'], additionalProperties: false } },
+  { name: 'write', description: 'Полностью записывает дословный UTF-8 текст без автоматической правки переносов и окончания. Для точечной правки используйте replace_text, для многострочного текста и CSV используйте write_lines.',
+    parameters: { type: 'object', properties: {
+      path: { type: 'string', minLength: 1, maxLength: 2048 },
+      contents: { type: 'string', maxLength: 1048576 },
+    }, required: ['path', 'contents'], additionalProperties: false } },
+  { name: 'replace_text', description: 'Заменяет один фрагмент внутри строки существующего UTF-8 файла. Сначала прочитайте файл. Передайте только старый и новый фрагменты без переносов. Остальной текст, BOM и переносы сохраняются. Путь относительный, лимит результата 1 МиБ.',
+    parameters: { type: 'object', properties: {
+      path: { type: 'string', minLength: 1, maxLength: 2048 },
+      old_text: { type: 'string', minLength: 1, description: 'Дословный фрагмент, который должен встречаться ровно один раз. Сначала прочитайте файл.' },
+      new_text: { type: 'string', description: 'Только новый фрагмент без переноса строки, остальной текст не включайте.' },
+    }, required: ['path', 'old_text', 'new_text'], additionalProperties: false } },
+  { name: 'write_lines', description: 'Записывает многострочный текст или CSV в UTF-8. Передавайте строки массивом, явно укажите перенос и наличие последнего переноса. Путь относительный, лимит результата 1 МиБ.',
+    parameters: { type: 'object', properties: {
+      path: { type: 'string', minLength: 1, maxLength: 2048 },
+      lines: { type: 'array', items: { type: 'string' }, description: 'Точные строки без символов перевода строки внутри элементов.' },
+      line_ending: { type: 'string', enum: ['lf', 'crlf'] }, final_newline: { type: 'boolean' },
+    }, required: ['path', 'lines', 'line_ending', 'final_newline'], additionalProperties: false } },
   { name: 'open', description: 'Открывает или показывает безопасный файл либо папку внутри доступной рабочей папки с учётом профиля разрешений. Путь задаётся относительно её корня; пустой или отсутствующий путь означает корень. Абсолютные пути и переходы за корень не принимаются.', parameters: { type: 'object', properties: { path: { type: 'string', maxLength: 2048 } }, additionalProperties: false } },
   { name: 'powershell', description: 'Выполнение PowerShell через существующий локальный helper и текущий профиль разрешений.', parameters: { type: 'object', properties: { script: { type: 'string', minLength: 1, maxLength: 16384 }, external_access: { type: 'boolean' } }, required: ['script'], additionalProperties: false } },
 ];

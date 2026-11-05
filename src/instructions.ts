@@ -61,19 +61,22 @@ export function buildInstructionRequest(input: InstructionInput): ProviderTurnRe
   const modelId = input.modelId === null || input.modelId === undefined ? null : requireModelId(input.modelId);
   const layers: InstructionLayer[] = [];
   addLayer(layers, 'runtime', 'Правила приложения', APP_RUNTIME_RULES);
-  addLayer(layers, 'global', 'GIGACHAT.md', input.globalText);
+  const hasProjectInstructions = input.projectInstructions?.some((project) => typeof project?.text === 'string' && project.text.trim()) ?? false;
+  const hasSelectedSkill = Boolean(input.selectedSkill?.text.trim());
+  addLayer(layers, 'global', hasProjectInstructions || hasSelectedSkill
+    ? 'GIGACHAT.md · резервные правила для вопросов без более узких указаний' : 'GIGACHAT.md', input.globalText);
   for (const project of input.projectInstructions ?? []) {
     if (!project || typeof project.scope !== 'string' || !project.scope.trim() || typeof project.text !== 'string') {
       throw new Error('Некорректный источник инструкций проекта.');
     }
-    addLayer(layers, 'project', 'AGENTS.md', project.text, project.scope.trim());
+    addLayer(layers, 'project', 'AGENTS.md · основные правила текущего проекта, важнее общих правил', project.text, project.scope.trim());
   }
   const messages = input.messages.map((message) => ({ ...message }));
   if (input.selectedSkill) {
     if (!input.selectedSkill.name.trim() || !input.selectedSkill.scope.trim()) {
       throw new Error('Некорректный источник Skill.');
     }
-    addLayer(layers, 'skill', input.selectedSkill.name.trim(), input.selectedSkill.text, input.selectedSkill.scope.trim());
+    addLayer(layers, 'skill', `Выбранный Skill · ${input.selectedSkill.name.trim()} · правила задачи`, input.selectedSkill.text, input.selectedSkill.scope.trim());
   }
   if (input.compactSnapshot) {
     addLayer(layers, 'summary', 'Сводка предыдущей истории', input.compactSnapshot.text);

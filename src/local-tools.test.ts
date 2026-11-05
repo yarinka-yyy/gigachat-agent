@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { createHash } from 'node:crypto';
 import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import type { ChildProcessWithoutNullStreams, SpawnOptions } from 'node:child_process';
 import { join, relative, resolve, sep } from 'node:path';
@@ -10,6 +11,7 @@ import { DEFAULT_CUSTOM_CONFIG, parseCustomConfig } from './custom-permissions';
 import {
   createLocalTools,
   LocalToolError,
+  LocalWriteError,
   createPowerShellHelper,
   MAX_LOCAL_FILE_BYTES,
   resolvePowerShellHelperPath,
@@ -769,6 +771,42 @@ test('keeps existing file contents when structured broker rejects a write', asyn
   assert.equal(requests[0]?.relativePath, 'existing.txt');
   assert.equal(Buffer.from(requests[0]?.contentsBase64 ?? '', 'base64').toString('utf8'), 'replacement');
   assert.equal(events[events.length - 1]?.phase, 'failed');
+});
+
+test('round-trips an exact UTF-8 file with BOM and rejects invalid Unicode before the writer', async (t) => {
+  const fixture = await createFixture();
+  t.after(fixture.cleanup);
+  const target = join(fixture.projectFolder, 'exact.txt');
+  const original = Buffer.from('\uFEFFname=ёж\r\nstatus=old');
+  await writeFile(target, original);
+  const requests: ProjectFileWriteRequest[] = [];
+  let rebindOnRead = false;
+  const tools = makeTools(fixture.project, [], [], async () => {
+    if (rebindOnRead) fixture.project.workingFolder = fixture.outsideFolder;
+    return { exitCode: 0, stdout: original.toString('base64'), stderr: '', timedOut: false, outputLimited: false };
+  }, async (request) => {
+    requests.push(request);
+    const bytes = Buffer.from(request.contentsBase64, 'base64');
+    await writeFile(target, bytes);
+    return { bytes: bytes.length, replacedExisting: true };
+  });
+  const read = await tools.read(projectId, 'ask', 'exact.txt');
+  assert.equal(read, original.toString('utf8'));
+  await tools.write(projectId, 'ask', 'exact.txt', { oldText: 'old', newText: 'new' });
+  const expected = Buffer.from('\uFEFFname=ёж\r\nstatus=new');
+  assert.deepEqual(await readFile(target), expected);
+  assert.equal(requests[0]?.expectedCurrentHash, createHash('sha256').update(original).digest('hex'));
+  await assert.rejects(tools.write(projectId, 'ask', 'exact.txt', { oldText: '=', newText: ':' }),
+    (error) => error instanceof LocalWriteError && error.stage === 'contents');
+  await assert.rejects(tools.write(projectId, 'ask', 'exact.txt', { oldText: '\uFEFF', newText: '' }),
+    (error) => error instanceof LocalWriteError && error.stage === 'contents');
+  await assert.rejects(tools.write(projectId, 'ask', 'exact.txt', '\uD800'),
+    (error) => error instanceof LocalWriteError && error.stage === 'contents');
+  rebindOnRead = true;
+  await assert.rejects(tools.write(projectId, 'ask', 'exact.txt', { oldText: 'old', newText: 'changed' }),
+    (error) => error instanceof LocalWriteError && error.stage === 'target');
+  assert.equal(requests.length, 1);
+  assert.deepEqual(await readFile(target), expected);
 });
 
 test('rejects traversal, malformed requests, oversized writes, and project symlinks', async (t) => {
