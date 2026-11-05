@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ChatArtifact, ChatMessage, ChatToolReceipt } from './contracts';
+import { serializeProviderTurnRequest } from './gigachat-provider';
 import {
   compileExtractiveCompaction,
   compileSemanticCompactionMemory,
@@ -506,10 +507,19 @@ test('groups literal reports with their open defect by shared record ID and rend
       openWork: [...(reportAsFact ? [] : [outcome]), { text: defect.text, sourceRefs: defect.sourceRefs },
         { text: unrelated, sourceRefs: ['m2'] }], unresolvedDefects: [defect] });
     const readout = formatSemanticCompactionMemory(candidate, sources);
-    assert.ok(readout.includes(`Связанные свидетельства RUN-17:\nДословное свидетельство USER: - ${JSON.stringify(report)} (источники: m0)\nНЕУСТРАНЁННЫЙ ДЕФЕКТ:`));
+    assert.ok(readout.includes(`Связанный итог RUN-17 (дословные свидетельства и статус дефекта): - ${JSON.stringify(`${report} ${defect.text}`)} (источники: m0, m1)`));
     assert.equal(readout.split(observation).length - 1, 1);
-    assert.match(readout, /Открытая работа: - "RUN-18 is scheduled/);
-    assert.doesNotMatch(readout, /Связанные свидетельства RUN-18/);
+    assert.match(readout, /Состояние и открытая работа: - "RUN-18 is scheduled/);
+    assert.doesNotMatch(readout, /Связанный итог RUN-18/);
+
+    const current = user('recall', 'Summarize the latest result. No tools.');
+    const { body } = serializeProviderTurnRequest({ modelId: 'GigaChat-3-Lightning', functionCallMode: 'none', system: [],
+      permissionProfile: 'ask', messages: [user('request-semantic-memory', readout), current] });
+    const [archiveMessage, currentMessage] = JSON.parse(body).messages;
+    assert.doesNotMatch(archiveMessage.content[0].text, /Связанный итог RUN-17/);
+    assert.equal(currentMessage.content[0].text, current.text);
+    assert.ok(currentMessage.content[1].text.includes(`${report} ${defect.text}`));
+    assert.match(currentMessage.content[2].text, /Служебное правило чтения архива/);
   }
 });
 

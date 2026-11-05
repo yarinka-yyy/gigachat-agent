@@ -9,7 +9,7 @@ import { discoveredModelRegistry, failedModelRegistry, isModelAvailable, require
 import { billingFamilyForUsageLabel, CHAT_MODEL_FAMILIES, isChatModelAvailable } from './model-catalog';
 import { attachmentContentType, inspectLocalAttachmentContent, LOCAL_ATTACHMENT_IMPORT_LIMIT_BYTES, PROVIDER_IMAGE_LIMIT_BYTES, PROVIDER_MEDIA_LIMIT_BYTES, PROVIDER_REQUEST_LIMIT_BYTES } from './attachment-policy';
 import { validateProviderV2FunctionWire } from './provider-wire';
-import { COMPACTION_OUTPUT_TOKEN_LIMIT, splitSemanticCompactionTranscript, formatSemanticDraftTopicStatus, formatSemanticReviewSources, semanticCompactionWireResponseFormat } from './compaction';
+import { COMPACTION_OUTPUT_TOKEN_LIMIT, SEMANTIC_LINKED_OUTCOME_PREFIX, splitSemanticCompactionTranscript, formatSemanticDraftTopicStatus, formatSemanticReviewSources, semanticCompactionWireResponseFormat } from './compaction';
 
 export const GIGACHAT_API_BASE_URL = 'https://api.giga.chat/v1';
 const GIGACHAT_V2_CHAT_COMPLETIONS_URL = 'https://api.giga.chat/v2/chat/completions';
@@ -112,6 +112,24 @@ export type ProviderImageGenerationEvent =
   | { type: 'completed' }
   | { type: 'error'; category: ProviderErrorCategory; retryable: boolean; imageProtocolDiagnostic?: ImageProtocolDiagnostic };
 
+const ARCHIVE_RECALLED_ANSWER_GUIDANCE = [
+  'Служебное правило чтения архива. Соблюдай формат ответа и типы полей из текущего вопроса.',
+  'Для итога проверки перенеси вместе дословные фразы о выполненном действии, его результате, наблюдённом дефекте и отдельно непроверенной части. Сохрани предмет проверки: например, исходный объект и его копия обозначают разные вещи.',
+  'Бери выполненные проверки и результаты только из отчёта о выполнении. Переноси их дословно. План и перечень критериев не подтверждают выполнение. Совпадение отдельных показателей не подтверждает совпадение структуры.',
+  'Если запрошено поле с целью сборки, его строка имеет вид «<целевая система>, сборка <полная версия>». Возьми обе части из источника. Перед отправкой проверь наличие версии именно в поле цели сборки. Версия в другом поле его не заполняет.',
+].join('\n');
+
+function isReadOnlyArchiveContinuation(request: Pick<ProviderTurnRequest, 'functionCallMode'>
+  & Partial<Pick<ProviderTurnRequest, 'messages'>>): boolean {
+  return request.functionCallMode === 'none' && request.messages?.[0]?.id === 'request-semantic-memory';
+}
+
+export function providerRequestTemperature(request: Pick<ProviderTurnRequest, 'compactionFormat' | 'functionCallMode'>
+  & Partial<Pick<ProviderTurnRequest, 'messages'>>): number | undefined {
+  if (request.compactionFormat === 'semantic' || isReadOnlyArchiveContinuation(request)) return 0.0001;
+  return undefined;
+}
+
 export function serializeProviderTurnRequest(request: ProviderTurnRequest): SerializedProviderTurnRequest {
   let modelId: string;
   try { modelId = request.modelId === null ? '' : requireModelId(request.modelId); }
@@ -151,6 +169,13 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
     ...(systemPrompt ? [{ role: 'system', content: [{ text: systemPrompt }] }] : []),
   ];
   let reviewSources: ReturnType<typeof formatSemanticReviewSources> | undefined;
+  const lastMessage = request.messages[request.messages.length - 1];
+  const recallAnchor = isReadOnlyArchiveContinuation(request) && request.messages.length > 1 && lastMessage?.role === 'user'
+    ? lastMessage : undefined;
+  const archive = recallAnchor ? request.messages[0] : undefined;
+  const archiveLines = typeof archive?.text === 'string' ? archive.text.split('\n') : [];
+  const linkedOutcomes = archiveLines.filter(line => line.startsWith(SEMANTIC_LINKED_OUTCOME_PREFIX));
+  const linkedOutcome = linkedOutcomes.length === 1 ? linkedOutcomes[0] : undefined;
   if (request.compactionFormat === 'semantic' && request.messages[0]?.id === 'request-semantic-review-candidate') {
     try { reviewSources = formatSemanticReviewSources(request.messages[1]!.text, request.messages[0].text); }
     catch { throw new GigaChatProviderError('protocol'); }
@@ -178,7 +203,12 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
     }
     const draftStatus = request.compactionFormat === 'semantic' && message.id === 'request-semantic-draft-task'
       && request.messages[0]?.id === 'request-compaction-transcript' ? formatSemanticDraftTopicStatus(request.messages[0].text) : '';
-    const content: Array<Record<string, unknown>> = [{ text: message.text + draftStatus }];
+    const text = linkedOutcome && message === archive ? archiveLines.filter(line => line !== linkedOutcome).join('\n') : message.text;
+    const content: Array<Record<string, unknown>> = [{ text: text + draftStatus }];
+    if (message === recallAnchor) {
+      if (linkedOutcome) content.push({ text: `Данные архива, связанные свидетельства:\n${linkedOutcome}` });
+      content.push({ text: ARCHIVE_RECALLED_ANSWER_GUIDANCE });
+    }
     if (messageAttachments.length) content.push({ files: messageAttachments.map(({ fileId }) => ({ id: fileId })) });
     messages.push({
       role: message.role,
@@ -213,6 +243,7 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
   }
   const functionsEnabled = request.compactionFormat !== undefined ? false : request.functionCallMode !== 'none';
   const tools = functionsEnabled ? [{ functions: { specifications: GIGACHAT_FUNCTIONS } }] : undefined;
+  const temperature = providerRequestTemperature(request);
   let body: string;
   try {
     body = JSON.stringify({
@@ -222,7 +253,7 @@ export function serializeProviderTurnRequest(request: ProviderTurnRequest): Seri
       model_options: {
         parallel_tool_calls: false,
         ...(maxOutputTokens !== undefined ? { max_tokens: maxOutputTokens } : {}),
-        ...(request.compactionFormat === 'semantic' ? { temperature: 0.0001 } : {}),
+        ...(temperature === undefined ? {} : { temperature }),
         ...(request.usageKind === 'compaction' ? {
           response_format: request.compactionFormat === 'semantic'
             ? semanticCompactionWireResponseFormat(request.messages[0]?.id === 'request-compaction-transcript' ? request.messages[0].text : undefined,

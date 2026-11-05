@@ -1215,6 +1215,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         if (controller.signal.aborted) throw abortError();
         if (functionCall) {
           if (compactionContext) throw Object.assign(new Error('UNEXPECTED_COMPACTION_FUNCTION'), { category: 'context' });
+          if (request.functionCallMode === 'none') throw Object.assign(new Error('PROVIDER_PROTOCOL'), { category: 'protocol' });
           if (completed) throw new Error('PROVIDER_PROTOCOL');
           if (toolRounds >= MAX_FUNCTION_ROUNDS || (request.protocolHistory?.length ?? 0) >= 256) {
             throw Object.assign(new Error('TOOL_ROUND_LIMIT'), { category: 'tool' });

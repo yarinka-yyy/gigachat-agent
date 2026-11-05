@@ -410,6 +410,23 @@ test('blocks an oversized initial Lite request before any provider call or usage
   assert.deepEqual(receipts, []);
 });
 
+test('rejects an unsolicited tool call when the prepared turn disables tools', async () => {
+  let reads = 0;
+  const provider = makeProvider(async function* () {
+    yield functionCall('read', { path: 'fixture.txt' });
+  });
+  const runtime = makeRuntime(provider, {
+    prepareTurn: async (turn) => ({ ...requestFor(turn), functionCallMode: 'none' }),
+    tools: { read: async () => { reads++; return { contents: 'unexpected' }; } } as unknown as LocalTools,
+  });
+
+  runtime.enqueue(turnFor('disabled-tools'));
+  await runtime.whenIdle();
+
+  assert.equal(runtime.list('disabled-tools')[0]?.errorCategory, 'protocol');
+  assert.equal(reads, 0);
+});
+
 test('preflights each tool continuation and keeps the completed tool receipt without a phantom usage receipt', async () => {
   let providerCalls = 0;
   let preflightCalls = 0;
