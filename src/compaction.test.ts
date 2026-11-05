@@ -870,7 +870,7 @@ test('source state transitions override stale categories without dropping durabl
     sourceUpdates: { ...decision.sourceUpdates, m2: `closes:m5/${witness}`, m3: `closes:m5/${witness}` } };
   assert.deepEqual(groupedCompile(shared), memory, 'topic and source transitions reuse one indexed literal witness');
   const paired = { state: 'Chart discussion is complete; queue investigation remains open.', sources: Object.fromEntries(Object.entries(shared.sourceUpdates).map(([ref, update]) => [ref, `${shared.classifications[ref as keyof typeof shared.classifications]}|${update}`])),
-    activeTask: shared.activeTask, topicUpdates: { Chart: { closed: true, evidence: `m5/${witness}: ${evidence[witness]!.text}` } }, unresolvedDefects: shared.unresolvedDefects };
+    activeTask: shared.activeTask, topicUpdates: { Chart: { closed: true, through: 'none', evidence: `m5/${witness}: ${evidence[witness]!.text}` } }, unresolvedDefects: shared.unresolvedDefects };
   assert.deepEqual(groupedCompile(paired), memory, 'one source row keeps category and transition together without changing provenance');
   const pairedSchema = semanticCompactionWireResponseFormat(undefined, archive, `ЗАМЕТКИ\n${grouped}`).schema;
   assert.ok('sources' in pairedSchema.properties);
@@ -881,8 +881,17 @@ test('source state transitions override stale categories without dropping durabl
   assert.ok(literalChoices.includes('none'));
   for (const proof of [`m5/${witness}`, evidence[witness]!.text, `m5/${witness}: A fabricated closure.`, `m3/${witness}: ${messages[3]!.text}`, `m0/${witness}: ${evidence[witness]!.text}`]) {
     assert.ok(!literalChoices.includes(proof));
-    assert.throws(() => groupedCompile({ ...paired, topicUpdates: { Chart: { closed: true, evidence: proof } } }), /свидетельства/);
+    assert.throws(() => groupedCompile({ ...paired, topicUpdates: { Chart: { ...paired.topicUpdates.Chart, evidence: proof } } }), /свидетельства/);
   }
+  const shortRange = JSON.stringify({ ...JSON.parse(grouped), topics: [{ ...JSON.parse(grouped).topics[0], lastSource: 'm2' }] });
+  const extend = (through: string) => JSON.parse(compileResolvedSemanticCompactionMemory(JSON.stringify({ ...paired,
+    sources: { ...paired.sources, m3: 'decision|none' }, topicUpdates: { Chart: { ...paired.topicUpdates.Chart, through } },
+  }), shortRange, sources, refs, archive));
+  assert.ok(!extend('none').closedTopics[0].sourceRefs.includes('m3'));
+  assert.deepEqual(extend('m3'), memory, 'review closes the omitted tail with the same later literal witness');
+  assert.throws(() => extend('m5'), /после всего диапазона/);
+  assert.throws(() => extend('m0'), /после исходной границы/);
+  assert.throws(() => extend('m99'), /доступного сообщения/);
   for (const [ref, row] of Object.entries(paired.sources)) assert.match(row, new RegExp(pairedSchema.properties.sources.properties[ref]!.pattern));
   for (const ref of refs) {
     const pattern = new RegExp(pairedSchema.properties.sources.properties[ref]!.pattern);
