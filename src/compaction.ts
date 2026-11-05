@@ -1526,25 +1526,53 @@ export function formatSemanticCompactionMemory(value: unknown, sources: Compacti
     for (const entry of memory.pastTopics) lines.push(renderEntry(entry));
   }
   if (memory.activeTask === null) lines.push('Активная задача: отсутствует.');
+  const defects = memory.unresolvedDefects ?? [];
+  const primaryText = new Map(sources.messages.filter(source => source.role === 'user').map(source => [source.ref, source.text]));
+  const recordId = (text: string): string | undefined => {
+    const ids = [...new Set(text.match(/\b[A-Z][A-Z0-9]*[-_]\d+\b/g))];
+    return ids.length === 1 ? ids[0] : undefined;
+  };
+  const defectIds = new Set(defects.flatMap(defect => (defect.exactQuotes ?? []).flatMap(quote => {
+    const id = primaryText.has(quote.sourceRef) && recordId(quote.text);
+    return id ? [id] : [];
+  })));
+  const relatedId = (entry: SemanticCompactionFact): string | undefined => {
+    if (entry.sourceRefs.length !== 1) return undefined;
+    const source = primaryText.get(entry.sourceRefs[0]!);
+    if (!source || (!defects.includes(entry) && entry.text !== source)) return undefined;
+    const id = recordId(entry.text);
+    return id && defectIds.has(id) ? id : undefined;
+  };
+  const readoutEntries = (entries: SemanticCompactionFact[]) => entries.filter(entry => !defects.some(defect =>
+    entry.sourceRefs.length === defect.sourceRefs.length && entry.sourceRefs.every(ref => defect.sourceRefs.includes(ref))
+    && (entry.text === defect.text || defect.exactQuotes?.some(quote => quote.text === entry.text && entry.sourceRefs.includes(quote.sourceRef)))
+    && (entry.exactQuotes ?? []).every(quote => defect.exactQuotes?.some(proof => proof.sourceRef === quote.sourceRef && proof.text === quote.text))));
   const entries: Array<{ title: string; entry: SemanticCompactionFact }> = [
     ...(memory.activeTask ? [{ title: 'Активная задача', entry: memory.activeTask }] : []),
     ...memory.constraints.map(entry => ({ title: `Ограничение [${JSON.stringify(entry.scope)}]`, entry })),
     ...memory.decisions.map(entry => ({ title: 'Решение', entry })),
-    ...memory.openWork.map(entry => ({ title: 'Открытая работа', entry })),
-    ...memory.facts.map(entry => ({ title: 'Сведение', entry })),
-    ...(memory.unresolvedDefects ?? []).map(entry => ({ title: 'НЕУСТРАНЁННЫЙ ДЕФЕКТ', entry })),
+    ...readoutEntries(memory.openWork).map(entry => ({ title: 'Открытая работа', entry })),
+    ...readoutEntries(memory.facts).map(entry => ({ title: 'Сведение', entry })),
+    ...defects.map(entry => ({ title: 'НЕУСТРАНЁННЫЙ ДЕФЕКТ', entry })),
   ];
   const position = (entry: SemanticCompactionEntry) => Math.max(...entry.sourceRefs.map(ref =>
     Number((ref.startsWith('t') ? sources.tools.find(tool => tool.ref === ref)!.anchorRef : ref).slice(1))));
   entries.sort((a, b) => position(a.entry) - position(b.entry));
   lines.push('Первичные сведения по порядку источников. Планы и требования сами по себе не подтверждают выполнение:');
-  for (const { title, entry } of entries) {
-    lines.push(`${title}: ${renderEntry(entry)}`);
-    if (entry.exactQuotes) {
-      for (const quote of entry.exactQuotes) if (!entry.text.includes(quote.text)) lines.push(`  Дословная цитата ${quote.sourceRef}: ${JSON.stringify(quote.text)}`);
+  const render = (group: boolean) => {
+    const result = [...lines];
+    let previousId: string | undefined;
+    for (const { title, entry } of entries) {
+      const id = group && (title === 'Сведение' || title === 'Открытая работа' || title === 'НЕУСТРАНЁННЫЙ ДЕФЕКТ') ? relatedId(entry) : undefined;
+      if (id && id !== previousId) result.push(`Связанные свидетельства ${id}:`);
+      previousId = id;
+      result.push(`${id && title !== 'НЕУСТРАНЁННЫЙ ДЕФЕКТ' ? 'Дословное свидетельство USER' : title}: ${renderEntry(entry)}`);
+      for (const quote of entry.exactQuotes ?? []) if (!entry.text.includes(quote.text)) result.push(`  Дословная цитата ${quote.sourceRef}: ${JSON.stringify(quote.text)}`);
     }
-  }
-  const formatted = lines.join('\n');
+    return result.join('\n');
+  };
+  let formatted = render(defectIds.size > 0);
+  if (defectIds.size > 0 && Buffer.byteLength(formatted, 'utf8') > MAX_COMPACT_SUMMARY_BYTES) formatted = render(false);
   if (Buffer.byteLength(formatted, 'utf8') > MAX_COMPACT_SUMMARY_BYTES) {
     throw new Error('Форматированная семантическая память превышает ограничение 32 КиБ.');
   }

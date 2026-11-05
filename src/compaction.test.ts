@@ -492,6 +492,27 @@ test('readout preserves revision order across primary categories and tool anchor
   }
 });
 
+test('groups literal reports with their open defect by shared record ID and renders its evidence once', () => {
+  const report = 'RUN-17 finished on Debian 12 with build 2.4.3. The reader opened the backup successfully.';
+  const observation = 'RUN-17 still has a mismatch in the restored path. Full restore was not run.';
+  const unrelated = 'RUN-18 is scheduled and the output path is provisional.';
+  const sources = createCompactionSources([user('report', report), user('observation', observation), user('other', unrelated)], [], []);
+  const outcome = { text: report, sourceRefs: ['m0'] };
+  const fact = { text: observation, sourceRefs: ['m1'], exactQuotes: [{ sourceRef: 'm1', text: observation }] };
+  const defect = { ...fact, text: `Наблюдённый неустранённый дефект: ${observation}` };
+  for (const reportAsFact of [true, false]) {
+    const candidate = semanticCandidate({ activeTask: null, constraints: [], decisions: [], pastTopics: [],
+      facts: reportAsFact ? [outcome, fact] : [fact],
+      openWork: [...(reportAsFact ? [] : [outcome]), { text: defect.text, sourceRefs: defect.sourceRefs },
+        { text: unrelated, sourceRefs: ['m2'] }], unresolvedDefects: [defect] });
+    const readout = formatSemanticCompactionMemory(candidate, sources);
+    assert.ok(readout.includes(`Связанные свидетельства RUN-17:\nДословное свидетельство USER: - ${JSON.stringify(report)} (источники: m0)\nНЕУСТРАНЁННЫЙ ДЕФЕКТ:`));
+    assert.equal(readout.split(observation).length - 1, 1);
+    assert.match(readout, /Открытая работа: - "RUN-18 is scheduled/);
+    assert.doesNotMatch(readout, /Связанные свидетельства RUN-18/);
+  }
+});
+
 test('limits semantic candidate refs to the current archive inventory while preserving stored-memory validation', () => {
   const sources = semanticSources();
   const sourceRefs = getSemanticCompactionCoverageRefSet(sources);
