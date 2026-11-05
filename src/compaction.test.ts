@@ -876,7 +876,11 @@ test('source state transitions override stale categories without dropping durabl
   assert.ok('sources' in pairedSchema.properties);
   assert.equal(Object.keys(pairedSchema.properties)[0], 'state', 'independent state is established before source choices');
   assert.equal(Object.keys(pairedSchema.properties)[1], 'topicUpdates', 'closure selects its literal before the per-source rows');
+  const literalChoices = pairedSchema.properties.topicUpdates.properties.Chart!.properties.evidence.enum;
+  assert.ok(literalChoices.includes(evidence[witness]!.text));
+  assert.ok(literalChoices.includes('none'));
   for (const proof of [`m5/${witness}`, 'A fabricated closure.', messages[3]!.text, messages[0]!.text]) {
+    assert.ok(!literalChoices.includes(proof));
     assert.throws(() => groupedCompile({ ...paired, topicUpdates: { Chart: { closed: true, evidence: proof } } }), /свидетельства/);
   }
   for (const [ref, row] of Object.entries(paired.sources)) assert.match(row, new RegExp(pairedSchema.properties.sources.properties[ref]!.pattern));
