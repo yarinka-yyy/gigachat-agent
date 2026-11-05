@@ -290,6 +290,11 @@ function suggestsTopicClosure(status: string | undefined): boolean {
   return /(?<!\p{L})(?:закрыт[аоы]?|заверш[её]н[аоы]?|closed|finished|completed)[.!»"’”\s]*$/iu.test(status ?? '');
 }
 
+function topicQualifier(text: string): string | undefined {
+  return text.match(/(?<!\p{L})(\p{L}{5,})\s+(?:тем[аыеуой]{1,2}|ветк[аиеуой]{1,2}|обсуждени[еяию]|topic|thread|discussion)(?!\p{L})/iu)?.[1]
+    ?.toLowerCase().replace(/(?:ого|его|ому|ему|ая|яя|ое|ее|ой|ей|ую|юю|ым|им|ом|ем|ый|ий)$/u, '');
+}
+
 export function formatSemanticDraftTopicStatus(archiveText: string): string {
   const { messages } = JSON.parse(archiveText.slice(archiveText.indexOf('\n') + 1)) as {
     messages: Array<{ sourceRef: string; role: string }>;
@@ -322,11 +327,18 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
   const messageRefs = new Set<string>();
   const primaryNotes: Record<string, string> = {};
   const userTimeline: Record<string, string> = {};
+  const deferredTopics = new Map<string, string>();
   const aligned = records.slice(1).map(record => {
     const value = JSON.parse(record.slice(record.indexOf('\n') + 1));
     messageRefs.add(value.sourceRef);
     if (value.role === 'user' && verbatim[value.sourceRef]) primaryNotes[value.sourceRef] = notes[value.sourceRef];
-    if (value.role === 'user') userTimeline[value.sourceRef] = [...(value.text as string)].slice(0, 64).join('');
+    if (value.role === 'user') {
+      const text = value.text as string;
+      userTimeline[value.sourceRef] = [...text].slice(0, 64).join('');
+      const after = text.match(/(?<!\p{L})(?:после|after(?:\s+the)?)\s+([^.!?\r\n]+)/iu)?.[1];
+      const qualifier = after && topicQualifier(after);
+      if (qualifier) deferredTopics.set(value.sourceRef, qualifier);
+    }
     return record.slice(0, record.indexOf('\n') + 1) + JSON.stringify({ ...value, review: review(value.sourceRef) });
   });
   metadata.sourceReviews = Object.fromEntries((metadata.coverageRefSet as string[]).filter(ref => !messageRefs.has(ref)).map(ref => [ref, review(ref)]));
@@ -343,7 +355,12 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
     .slice(0, MAX_GENERATED_PAST_TOPICS).map(([address, statement]) => {
       const witnessRef = address!.split('/')[0]!;
       const priorUsers = Object.entries(userTimeline).filter(([ref]) => Number(ref.slice(1)) < Number(witnessRef.slice(1))).slice(-24);
-      return [address, { statement, priorExchanges: priorUsers.map(([first, startsWith], index) => ({
+      const qualifier = topicQualifier(statement!);
+      const anchors = qualifier ? priorUsers.filter(([ref]) => deferredTopics.get(ref) === qualifier) : [];
+      const after = anchors.length === 1 ? anchors[0]![0] : undefined;
+      const first = after ? priorUsers[priorUsers.findIndex(([ref]) => ref === after) + 1]?.[0] : undefined;
+      const proposedRange = first ? { after, first, last: lastBefore(witnessRef) } : undefined;
+      return [address, { statement, proposedRange, priorExchanges: priorUsers.map(([first, startsWith], index) => ({
         first, last: lastBefore(priorUsers[index + 1]?.[0] ?? witnessRef), startsWith,
       })) }];
     }));

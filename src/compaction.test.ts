@@ -887,6 +887,7 @@ test('source state transitions override stale categories without dropping durabl
   const witnessRecord = records.map(record => JSON.parse(record.slice(record.indexOf('\n') + 1))).find(record => record.sourceRef === 'm5');
   assert.equal(witnessRecord.review.evidence[`m5/${witness}`].text, messages[5]!.text);
   assert.equal(focus.witnesses[`m5/${witness}`].lastBeforeWitness, 'm4');
+  assert.deepEqual(focus.closureWindows[`m5/${witness}`].proposedRange, { after: 'm1', first: 'm2', last: 'm4' });
   assert.deepEqual(focus.closureWindows[`m5/${witness}`].priorExchanges.map((exchange: { first: string; last: string }) => [exchange.first, exchange.last]),
     [['m0', 'm0'], ['m1', 'm1'], ['m2', 'm3'], ['m4', 'm4']]);
   assert.equal(focus.topics, undefined);
