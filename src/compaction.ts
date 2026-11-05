@@ -276,7 +276,7 @@ export function semanticReviewEvidenceIndex(archiveText: string): Record<string,
 export function formatSemanticReviewSources(archiveText: string, candidateText: string): { candidate: string; records: string[] } {
   const offset = candidateText.indexOf('\n') + 1;
   const candidate = candidateText.slice(offset);
-  const { notes = {}, verbatim = {}, topics = [] } = candidate ? JSON.parse(candidate) : {};
+  const { topics = [] } = candidate ? JSON.parse(candidate) : {};
   const records = splitSemanticCompactionTranscript(archiveText);
   const metadata = JSON.parse(records[0]!.slice(records[0]!.indexOf('\n') + 1));
   const groups = draftTopicSources(topics, metadata.coverageRefSet, metadata.tools);
@@ -291,7 +291,7 @@ export function formatSemanticReviewSources(archiveText: string, candidateText: 
     updates: { stable: choices.sourceUpdates.properties[ref]!.enum.filter(value => !value.includes(':')),
       independent: choices.sourceUpdates.properties[ref]!.enum.filter(value => value.startsWith('independent:')).map(value => value.slice('independent:'.length)),
       changes: choices.sourceUpdates.properties[ref]!.enum.filter(value => value.startsWith('closes:')).map(value => value.slice('closes:'.length)) },
-    topic: topicByRef[ref] ?? null, note: notes[ref] ?? null, verbatim: verbatim[ref] ?? null,
+    topic: topicByRef[ref] ?? null,
     evidence: Object.fromEntries(evidenceIds.filter(id => index[id]!.sourceRef === ref).map(id => [`${ref}/${id}`, { text: index[id]!.text }])) });
   const messageRefs = new Set<string>();
   const aligned = records.slice(1).map(record => {
