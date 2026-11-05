@@ -1010,7 +1010,7 @@ async function runElectronHost() {
       }
       const detail = state.details.get(chatId);
       if (!detail) throw new Error('Synthetic chat not found.');
-      const boundary = detail.messages.filter((message) => message.role === 'user').at(-3);
+      const boundary = detail.messages.filter((message) => message.role === 'user').at(-1);
       if (!boundary) throw new Error('Synthetic compaction boundary missing.');
       const turnId = `compact-smoke-${state.compactionCalls.length}`;
       const createdAt = new Date().toISOString();
@@ -1792,12 +1792,13 @@ async function runElectronHost() {
       const next = {
         ...existing,
         status,
-        ...(status === 'running' ? { startedAt: new Date().toISOString() } : {}),
+        ...(status === 'running' ? { startedAt: new Date().toISOString(), activity: [{ kind: 'compaction', phase: 'started', at: timestamp }] } : {}),
+        ...(status === 'completed' ? { activity: [...existing.activity, { kind: 'compaction', phase: 'completed', at: timestamp, beforeBytes: 900, afterBytes: 450 }] } : {}),
         ...(status === 'completed' || status === 'failed' ? { endedAt: new Date().toISOString() } : {}),
       };
       state.runtimeTurns.set(chatId, current.map((turn) => turn.id === turnId ? next : turn));
       const persisted = state.details.get(chatId).turns.find((turn) => turn.turnId === turnId);
-      if (persisted) Object.assign(persisted, { status: next.status, ...(next.startedAt ? { startedAt: next.startedAt } : {}), ...(next.endedAt ? { endedAt: next.endedAt } : {}) });
+      if (persisted) Object.assign(persisted, { status: next.status, activity: next.activity, ...(next.startedAt ? { startedAt: next.startedAt } : {}), ...(next.endedAt ? { endedAt: next.endedAt } : {}) });
       window.webContents.send('audit:runtime', clone(next));
       if (assertRendered) {
         await waitDom(`compaction turn becomes ${status}`, `document.querySelector(${JSON.stringify(`[data-turn-id="${turnId}"] .turn-activity-status.status-${status}`)})`);
@@ -1843,13 +1844,16 @@ async function runElectronHost() {
     assert.ok(firstTurnId);
     await waitDom('queued compaction shows its queue action', `document.querySelector(${JSON.stringify(`[data-turn-id="${firstTurnId}"] .runtime-cancel`)})`);
     await publishStatus(firstTurnId, 'running');
+    await waitDom('running compaction shows its activity', `document.body.innerText.includes('Сжатие контекста начато')`);
     await publishStatus(firstTurnId, 'completed');
+    await click(`[data-turn-id="${firstTurnId}"] .turn-activity-summary`);
+    await waitDom('completed compaction shows its byte reduction', `document.body.innerText.includes('900 → 450 байт')`);
 
     await clickChat('Chat B');
     await waitDom('Chat B has insufficient compactable history', `document.querySelector('.chat-header-title')?.textContent === 'Chat B'`);
     await fillTextarea(draftSelector, '/compact');
     await click('.send-button');
-    await waitDom('insufficient history is explained locally', `document.body.innerText.includes('Нужно сохранить два последних обмена')`);
+    await waitDom('insufficient history is explained locally', `document.body.innerText.includes('Нет новой завершённой истории для сжатия')`);
     assert.equal(compactCallCount(), 1, 'ineligible chat does not reach the compact bridge');
     await fillTextarea(draftSelector, '/compact later');
     await click('.send-button');

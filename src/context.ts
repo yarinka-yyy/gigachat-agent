@@ -43,7 +43,7 @@ const SEMANTIC_COMPACTION_REVIEW_TASK_INSTRUCTION = [
   'activeTask — sourceRef первичного USER с главной действующей целью либо none. unresolvedDefects содержит proposed и other. В proposed укажи true или false для каждого точного адреса из defectCandidates. Подтверди только наблюдённое несовпадение, которое остаётся открытым. В other перечисли связанные адреса sourceRef/qN, разделяя адреса запятыми и группы точками с запятой. Для ранее сохранённого дефекта повтори точные доступные адреса в other. Запреты и планы не свидетельствуют о дефекте. Не заменяй конкретное несовпадение общим «не подтверждено».',
 ].join('\n');
 export const COMPACTION_UNAVAILABLE_REASON = 'Ручное сжатие доступно только в API-режиме для текстового чата с моделью GigaChat-3-Lightning. История чата не изменена.';
-export const COMPACTION_QUALITY_VERIFIED = true;
+export const SEMANTIC_COMPACTION_QUALITY_VERIFIED = true;
 const FILES_ONLY_TASK_INSTRUCTION = 'Проанализируй приложенные файлы';
 
 export interface NextTurnContextInput extends InstructionInput {
@@ -402,6 +402,18 @@ export function assertCompactionWireReduction(currentWireBytes: number | null, p
     || proposedWireBytes! >= currentWireBytes!) {
     throw Object.assign(new Error('COMPACTION_NO_REDUCTION'), { category: 'context' as const });
   }
+}
+
+export function projectSemanticCompactionContinuation(request: ProviderTurnRequest, coveredIds: ReadonlySet<string>,
+  compact?: { snapshot: CompactSnapshot; sources: CompactionSources }): ProviderTurnRequest {
+  const messages = request.messages.filter(message => !coveredIds.has(message.id) && message.id !== 'request-semantic-memory');
+  if (compact) {
+    const currentRequests = new Set(messages.filter(message => message.role === 'user').map(message => message.text));
+    const text = formatSemanticCompactionMemory(compact.snapshot.text, compact.sources, currentRequests);
+    messages.unshift({ id: 'request-semantic-memory', role: 'user', text, createdAt: compact.snapshot.createdAt });
+  }
+  return { ...request, messages, system: request.system.filter(layer => layer.source !== 'summary'),
+    protocolHistory: request.protocolHistory?.filter(exchange => !coveredIds.has(exchange.anchorMessageId)) };
 }
 
 const CONTEXT_TEXT_TOKEN_CACHE_MAX_ENTRIES = 256;

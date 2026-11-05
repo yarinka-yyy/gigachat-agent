@@ -1,3 +1,5 @@
+import type { ChatMessage, CompactSnapshot } from './contracts';
+
 export interface SkillCommandOption {
   id: string;
   name: string;
@@ -29,7 +31,7 @@ function commandOptions(compactionAvailable: boolean): readonly ComposerSuggesti
     label: '/compact',
     insertText: '/compact',
     description: compactionAvailable
-      ? 'Сжать старую часть истории и сохранить два последних обмена.'
+      ? 'Сжать завершённую историю и сохранить исходные сообщения.'
       : 'Доступна в текстовом чате с подключённой моделью GigaChat Lite.',
     available: compactionAvailable,
   }];
@@ -106,4 +108,18 @@ export function classifyCompactCommand(value: string): CompactCommandInput {
   const trimmed = value.trim();
   if (!/^\/compact(?:\s|$)/i.test(trimmed)) return 'none';
   return /^\/compact$/i.test(trimmed) ? 'exact' : 'arguments';
+}
+
+export function latestCompactionBoundary(messages: readonly ChatMessage[], snapshot: CompactSnapshot | null,
+  beforeMessageId?: string): ChatMessage | null {
+  const end = beforeMessageId === undefined ? messages.length : messages.findIndex(message => message.id === beforeMessageId);
+  const covered = snapshot ? messages.findIndex(message => message.id === snapshot.coveredThroughMessageId) : -1;
+  if (snapshot && covered < 0) return null;
+  let completed = false;
+  for (let index = end - 1; index > covered; index -= 1) {
+    const message = messages[index]!;
+    if (message.role === 'assistant') completed = true;
+    else if (message.role === 'user' && completed) return message;
+  }
+  return null;
 }

@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import type { ChatArtifact, ChatDetail, ChatMessage, ChatToolReceipt, CompactSnapshot, ProviderProtocolExchange } from './contracts';
 import { assertCompactionWireReduction, buildNextTurnContext, buildSemanticCompactionReviewRequest, COMPACTION_TASK_INSTRUCTION,
   countContextTextTokens, countEstimatedContextTextTokens, createContextTextTokenCache, hashCompactionPrefix,
-  estimateProviderPromptTokens, estimateSerializedProviderPrompt, readContextTextTokenCacheCoverage,
+  estimateProviderPromptTokens, estimateSerializedProviderPrompt, projectSemanticCompactionContinuation, readContextTextTokenCacheCoverage,
   SEMANTIC_COMPACTION_TASK_INSTRUCTION, validateCompactSummary } from './context';
 import { GigaChatProviderError, MAX_PROVIDER_REQUEST_BYTES, serializeProviderTurnRequest } from './gigachat-provider';
 import { calculateLiteWorkingBudget, isLitePromptOverMeasuredInputGuard, liteHardInputLimit } from './context-budget';
@@ -338,6 +338,15 @@ test('uses a v2 semantic archive only after covered-prefix hash and source valid
   }));
   assert.deepEqual(emptySuffix.request.messages.map(message => message.id), ['request-semantic-memory'], 'an assistant-covered tail may leave only the stored archive');
   assert.match(emptySuffix.request.messages[0]?.text ?? '', /Continue the current task\./);
+
+  const activeTool = { ...protocol, anchorMessageId: currentUser.id, result: '{"text":"Already executed."}' };
+  const live = buildNextTurnContext(input([...covered, currentUser], { protocolHistory: [protocol, activeTool] })).request;
+  const projected = projectSemanticCompactionContinuation(live, new Set(covered.map(message => message.id)), { snapshot, sources });
+  assert.deepEqual(projected.messages, context.request.messages);
+  assert.deepEqual(projected.protocolHistory, [activeTool]);
+  assert.deepEqual(projected.system, live.system);
+  assert.equal(projected.modelId, live.modelId);
+  assert.equal(projected.permissionProfile, live.permissionProfile);
 
   const fullSources = createCompactionSources([...covered, currentUser], [receipt], [artifact]);
   const futureReference = { ...snapshot, id: 'semantic-future-ref', text: compileSemanticCompactionMemory(JSON.stringify(memory('m2')), fullSources) };

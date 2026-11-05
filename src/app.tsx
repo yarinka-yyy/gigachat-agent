@@ -49,7 +49,7 @@ import {
   X,
   type LucideIcon,
 } from 'lucide-react';
-import { classifyCompactCommand, completeComposerSuggestion, getComposerCompletion, type ComposerSuggestion } from './commands';
+import { classifyCompactCommand, completeComposerSuggestion, getComposerCompletion, latestCompactionBoundary, type ComposerSuggestion } from './commands';
 import type {
   AppInfo,
   CloseAttemptResult,
@@ -1681,12 +1681,8 @@ export default function App() {
     : availableChatModelOptions;
   const composerModelAvailable = isChatModelAvailable(modelRegistry, composerModelId);
   const compactChatDetail = route.page === 'chat' && chatDetail?.id === route.id ? chatDetail : null;
-  const compactUsers = compactChatDetail?.messages.filter((message) => message.role === 'user') ?? [];
-  const compactBoundary = compactUsers.length >= 3 ? compactUsers[compactUsers.length - 3] : null;
+  const compactBoundary = compactChatDetail ? latestCompactionBoundary(compactChatDetail.messages, compactChatDetail.compactSnapshot) : null;
   const compactBoundaryIndex = compactBoundary ? compactChatDetail?.messages.findIndex((message) => message.id === compactBoundary.id) ?? -1 : -1;
-  const compactCoveredIndex = compactChatDetail?.compactSnapshot
-    ? compactChatDetail.messages.findIndex((message) => message.id === compactChatDetail.compactSnapshot?.coveredThroughMessageId)
-    : -1;
   const compactionSuggestionAvailable = Boolean(runtimeAvailability?.compactionAvailable
     && runtimeAvailability.providerConfigured
     && runtimeMode === 'api'
@@ -1696,12 +1692,10 @@ export default function App() {
     && compactChatDetail?.kind === 'text'
     && composerModelId === 'GigaChat-3-Lightning'
     && isChatModelAvailable(modelRegistry, 'GigaChat-3-Lightning')
-    && compactChatDetail.draftAttachments.length === 0
     && !compactChatDetail.turns.some((turn) => turn.status === 'queued' || turn.status === 'running')
     && !runtimeTurns.some((turn) => turn.chatId === route.id && (turn.status === 'queued' || turn.status === 'running'))
     && compactBoundary !== null
     && compactBoundaryIndex >= 0
-    && (!compactChatDetail.compactSnapshot || compactCoveredIndex >= 0 && compactBoundaryIndex > compactCoveredIndex)
     && !compactChatDetail.messages.slice(0, compactBoundaryIndex + 1).some((message) => message.role === 'user' && message.attachmentIds?.length));
   const composerModelFamily = modelFamilyForId(composerModelId);
   const composerModelUnknown = !composerIsImageChat && Boolean(composerModelId && !composerModelFamily);
@@ -2036,10 +2030,6 @@ export default function App() {
       setNotice('Подключите GigaChat API перед сжатием контекста.');
       return;
     }
-    if (detail.draftAttachments.length > 0) {
-      setNotice('Сначала удалите файлы из черновика перед сжатием контекста.');
-      return;
-    }
     if (chatDraftImportInFlight.current.has(chatId)) {
       setNotice('Дождитесь завершения выбора файла перед сжатием контекста.');
       return;
@@ -2054,19 +2044,11 @@ export default function App() {
       setNotice('Дождитесь завершения текущего хода перед сжатием контекста.');
       return;
     }
-    const users = detail.messages.filter((message) => message.role === 'user');
-    const boundary = users.length >= 3 ? users[users.length - 3] : null;
+    const boundary = latestCompactionBoundary(detail.messages, detail.compactSnapshot);
     const boundaryIndex = boundary ? detail.messages.findIndex((message) => message.id === boundary.id) : -1;
     if (!boundary || boundaryIndex < 0) {
-      setNotice('Нужно сохранить два последних обмена; старой истории для сжатия пока недостаточно.');
+      setNotice('Нет новой завершённой истории для сжатия; прежний контекст сохранён.');
       return;
-    }
-    if (detail.compactSnapshot) {
-      const coveredIndex = detail.messages.findIndex((message) => message.id === detail.compactSnapshot?.coveredThroughMessageId);
-      if (coveredIndex < 0 || boundaryIndex <= coveredIndex) {
-        setNotice('Нет новой старой части истории для сжатия; прежний контекст сохранён.');
-        return;
-      }
     }
     if (detail.messages.slice(0, boundaryIndex + 1)
       .some((message) => message.role === 'user' && (message.attachmentIds?.length ?? 0) > 0)) {
@@ -2120,7 +2102,7 @@ export default function App() {
         if (commandIsCurrent()) {
           changeDraft('');
           setNotice('');
-          showSuccess('Сжатие поставлено в очередь GigaChat; последние два обмена сохранены.');
+          showSuccess('Сжатие поставлено в очередь GigaChat.');
         } else if (sourceRouteIsCurrent()) {
           showSuccess('Сжатие поставлено в очередь GigaChat; новый черновик оставлен без изменений.');
         }

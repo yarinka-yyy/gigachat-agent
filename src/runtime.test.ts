@@ -1000,6 +1000,84 @@ test('semantic compaction reviews once on the selected model and accounts for bo
   });
 });
 
+test('auto Compact uses one slot and resumes the same accepted turn without replaying tool effects', async (t) => {
+  for (const scenario of ['initial', 'tool-boundary', 'no-reduction', 'oversized', 'cancel'] as const) await t.test(scenario, async () => {
+    const input = { ...turnFor(`auto-${scenario}`, 'Keep this exact new input.'), modelId: 'GigaChat-3-Lightning' as const, skillId: 'test-skill' };
+    const earlier = turnFor('compact-prefix', 'Older work remains open.');
+    const archive = buildNextTurnContext({ globalText: '', messages: earlier.messages, modelId: input.modelId,
+      permissionProfile: input.permissionProfile, usageKind: 'compaction', compactionFormat: 'semantic',
+      compactionToolReceipts: [], compactionArtifacts: [] }).request;
+    const original = structuredClone(input);
+    const receipts = new Map<string, UsageReceipt>();
+    const effects = makeReceiptStore();
+    const requests: ProviderTurnRequest[] = [];
+    let attempts = 0, commits = 0, consumed = 0, toolCalls = 0, attachmentPreparations = 0;
+    const toolBoundary = scenario === 'tool-boundary';
+    const runtime = createTurnRuntime({ provider: makeProvider(async function* (request) {
+      requests.push(request);
+      if (request.usageKind === 'compaction') {
+        if (request.messages.length === 2) yield { type: 'text-delta', text: JSON.stringify({ taskSubject: 'Earlier work', state: 'Open.',
+          activeTask: 'm0', topics: [], notes: { m0: 'Earlier work.' }, verbatim: { m0: true } }) };
+        else {
+          if (scenario === 'cancel') { runtime.cancel(runtime.list()[0]!.id); return; }
+          yield { type: 'text-delta', text: JSON.stringify({ state: 'Earlier work stays open.', activeTask: 'm0',
+            topicUpdates: { proposed: {}, other: [] }, sources: { m0: 'openWork|none' }, unresolvedDefects: { proposed: {}, other: '' } }) };
+        }
+      } else if (toolBoundary && requests.length === 1) { yield functionCall('read', { path: 'fixture.txt' }); return; }
+      else {
+        assert.equal(commits, 1);
+        assert.equal(request.messages[request.messages.length - 1]?.text, input.messages[0]!.text);
+        assert.equal(request.protocolHistory?.length ?? 0, toolBoundary ? 1 : 0);
+        yield { type: 'text-delta', text: 'Continued.' };
+      }
+      yield { type: 'completed' };
+    }),
+      prepareTurn: async (turn) => ({ ...requestFor(turn), functionCallMode: 'auto',
+        system: [{ source: 'skill', label: 'Test skill', text: 'Retain selected skill.' }] }),
+      prepareProviderRequest: async (_turn, request) => { attachmentPreparations++; return request; },
+      preflightProviderRequest: async (_turn, request, _signal, _owner, reservation) => {
+        if (reservation) return { inputTokens: 100, maxInputTokens: 200 };
+        if (request.usageKind === 'compaction') return { inputTokens: 150 };
+        return { inputTokens: 90_000, autoCompact: !toolBoundary || Boolean(request.protocolHistory?.length), overInputLimit: scenario === 'oversized' };
+      },
+      prepareAutoCompaction: async (turn, request) => {
+        attempts++;
+        assert.equal(turn.modelId, input.modelId);
+        if (scenario === 'oversized') return null;
+        return { request: archive, compaction: preparedCompactionContext(earlier), commit: async (text) => {
+          assert.equal(JSON.parse(text).activeTask.text, earlier.messages[0]!.text);
+          if (scenario === 'no-reduction') throw new Error('COMPACTION_NO_REDUCTION');
+          commits++;
+          return { beforeBytes: 200, afterBytes: 100, request: { ...request,
+            messages: [{ ...request.messages[0]!, id: 'memory', text: 'Validated semantic memory.' }, ...request.messages] } };
+        } };
+      },
+      tools: { read: async () => { toolCalls++; return { contents: 'fixture result' }; } } as unknown as LocalTools,
+      beginToolReceipt: effects.begin, completeToolReceipt: effects.complete,
+      consumeTurn: async () => { consumed++; },
+      releaseTurn: () => undefined,
+      recordUsageReceipt: async (receipt) => { receipts.set(receipt.localRequestId, receipt); },
+      appendAssistant: async (_turn, answer) => { assert.equal(answer, 'Continued.'); },
+    });
+    const drafts: string[] = [];
+    runtime.onUpdate(turn => { if (turn.draft) drafts.push(turn.draft); });
+    assert.ok(runtime.enqueue(input));
+    await runtime.whenIdle();
+    const accepted = scenario === 'initial' || toolBoundary;
+    assert.equal(runtime.list()[0]?.status, accepted ? 'completed' : scenario === 'cancel' ? 'cancelled' : 'failed');
+    assert.equal(attempts, 1);
+    assert.equal(commits, accepted ? 1 : 0);
+    assert.equal(consumed, accepted ? 1 : 0);
+    assert.equal(toolCalls, toolBoundary ? 1 : 0);
+    assert.equal(attachmentPreparations, 1);
+    assert.ok(drafts.every(draft => draft === 'Continued.'));
+    assert.deepEqual([...receipts.values()].map(receipt => receipt.requestKind), toolBoundary
+      ? ['chat', 'compaction', 'compaction', 'tool-continuation']
+      : scenario === 'initial' ? ['compaction', 'compaction', 'chat'] : scenario === 'oversized' ? [] : ['compaction', 'compaction']);
+    assert.deepEqual(input, original);
+  });
+});
+
 test('semantic failures keep the previous checkpoint and never retry the draft or review', async (t) => {
   for (const fault of ['missing-preflight', 'reserve-budget', 'reserve-mutation', 'missing-reserve-budget', 'zero-reserve-budget', 'invalid-reserve-budget', 'excessive-reserve-budget', 'model-switch', 'changed-archive', 'changed-service-task', 'invalid-draft', 'invalid-review',
     'missing-source-note', 'unquoted-review', 'private-review-shape', 'review-budget', 'missing-review-count', 'invalid-review-count', 'review-reserve-exceeded', 'review-network', 'review-cancel', 'unexpected-function'] as const) await t.test(fault, async () => {

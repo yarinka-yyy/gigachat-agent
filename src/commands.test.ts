@@ -1,6 +1,17 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { classifyCompactCommand, completeComposerSuggestion, getComposerCompletion } from './commands';
+import { classifyCompactCommand, completeComposerSuggestion, getComposerCompletion, latestCompactionBoundary } from './commands';
+import type { ChatMessage, CompactSnapshot } from './contracts';
+
+test('selects the final completed exchange for manual and stops before the active input for auto', () => {
+  const messages: ChatMessage[] = ['user', 'assistant', 'user', 'assistant', 'assistant', 'user'].map((role, index) => ({
+    role: role as ChatMessage['role'], id: `m${index}`, text: `Message ${index}`, createdAt: '2026-11-05T00:00:00.000Z',
+  }));
+  assert.equal(latestCompactionBoundary(messages, null)?.id, 'm2');
+  assert.equal(latestCompactionBoundary(messages.slice(0, -1), null)?.id, 'm2');
+  assert.equal(latestCompactionBoundary(messages, null, 'm2')?.id, 'm0');
+  assert.equal(latestCompactionBoundary(messages, { coveredThroughMessageId: 'm4' } as CompactSnapshot, 'm5'), null);
+});
 
 test('suggests compact only when Main reports it available and classifies exact input separately from arguments', () => {
   const completion = getComposerCompletion('/comp');

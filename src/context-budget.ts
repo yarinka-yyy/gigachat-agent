@@ -219,6 +219,19 @@ export function reserveSemanticReviewInput(
   return { inputTokens: estimate.tokens!, maxInputTokens: Math.min(limit, estimate.tokens! + maximumDraftReserve) };
 }
 
+export function liteAutoCompactionPreflight(
+  request: Pick<ProviderTurnRequest, 'modelId' | 'usageKind' | 'compactionFormat' | 'maxOutputTokens'>,
+  estimate: ContextPromptEstimate,
+): { inputTokens: number; autoCompact: boolean; overInputLimit: boolean } | null {
+  if (request.usageKind === 'compaction' || estimate.status !== 'complete' || estimate.provenance !== 'estimated'
+    || estimate.unknownReasons.length || estimate.tokens === null || !Number.isSafeInteger(estimate.tokens) || estimate.tokens < 0
+    || liteHardInputLimit(request, estimate) === null) return null;
+  const overInputLimit = isLitePromptOverMeasuredInputGuard(request, estimate);
+  const working = calculateLiteWorkingBudget(null, estimate);
+  return { inputTokens: estimate.tokens, overInputLimit,
+    autoCompact: overInputLimit || working.status === 'available' && estimate.tokens >= working.budgetTokens! };
+}
+
 type ParsedMeasure =
   | { status: 'known'; tokens: number; confidence: KnownConfidence }
   | { status: 'unknown' }

@@ -9,6 +9,8 @@ const errorLabels: Record<ProviderErrorCategory, string> = {
 };
 
 function activityLabel(activity: RuntimeActivity): string {
+  if (activity.kind === 'compaction') return activity.phase === 'started' ? 'Сжатие контекста начато'
+    : `Запрос после сжатия ${activity.beforeBytes.toLocaleString('ru-RU')} → ${activity.afterBytes.toLocaleString('ru-RU')} байт`;
   const toolNames = {
     list: 'Список файлов', search: 'Поиск', read: 'Чтение файла', write: 'Запись файла', open: 'Открытие', powershell: 'PowerShell',
   } as const;

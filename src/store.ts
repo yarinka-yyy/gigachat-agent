@@ -873,6 +873,16 @@ const MAX_TURN_DURATION_MS = 366 * 24 * 60 * 60 * 1000;
 
 function validateRuntimeActivity(value: unknown): RuntimeActivity {
   if (!isRecord(value) || typeof value.kind !== 'string') throw new Error('Некорректная запись активности хода.');
+  if (value.kind === 'compaction') {
+    const at = requireTimestamp(value.at);
+    if (value.phase === 'started') return { kind: 'compaction', at, phase: 'started' };
+    const { beforeBytes, afterBytes } = value;
+    if (value.phase === 'completed' && typeof beforeBytes === 'number' && typeof afterBytes === 'number'
+      && Number.isSafeInteger(beforeBytes) && Number.isSafeInteger(afterBytes) && afterBytes > 0 && afterBytes < beforeBytes) {
+      return { kind: 'compaction', at, phase: 'completed', beforeBytes, afterBytes };
+    }
+    throw new Error('Некорректная запись сжатия контекста.');
+  }
   if (value.kind === 'provider') {
     if (!(CHAT_TURN_PROVIDER_EVENTS as readonly unknown[]).includes(value.activity)
       || (value.tool !== undefined && !(CHAT_TURN_TOOL_NAMES as readonly unknown[]).includes(value.tool))
@@ -2671,10 +2681,10 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
       && item.permissionProfile?.revision === revisions.permissionProfile);
     const skillAlreadyReserved = [...turnReservations.values()].some((item) => item.chatId === detail.id
       && item.skill?.revision === revisions.skill);
-    const profileReservation = detail.nextTurnPermissionProfile !== null && !profileAlreadyReserved
+    const profileReservation = operation !== 'compaction' && detail.nextTurnPermissionProfile !== null && !profileAlreadyReserved
       ? { value: detail.nextTurnPermissionProfile, revision: revisions.permissionProfile }
       : null;
-    const skillReservation = detail.nextTurnSkillId !== null && !skillAlreadyReserved
+    const skillReservation = operation !== 'compaction' && detail.nextTurnSkillId !== null && !skillAlreadyReserved
       ? { value: detail.nextTurnSkillId, revision: revisions.skill }
       : null;
     const boundaryIndex = detail.messages.findIndex((message) => message.id === messageId && message.role === 'user');
@@ -3436,9 +3446,6 @@ export async function openStore(directory: string, options: StoreOpenOptions = {
         : detail.messages.find((message) => message.id === requireId(boundaryMessageIdInput) && message.role === 'user');
       if (!boundaryMessage) throw new Error('Сначала добавьте сообщение перед сжатием контекста.');
       if (boundaryMessageIdInput !== undefined) {
-        if (detail.draftAttachments.length > 0) {
-          throw new Error('Сначала удалите файлы из черновика перед сжатием контекста.');
-        }
         const prefix = buildCompactionPrefix(detail, boundaryMessage.id);
         const anchors = new Set(prefix.messages.filter(message => message.role === 'user').map(message => message.id));
         if (prefix.messages[prefix.messages.length - 1]?.role !== 'assistant'

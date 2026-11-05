@@ -70,6 +70,14 @@ export interface PreparedTurn {
   imageGeneration?: AsyncIterable<ProviderEvent>;
 }
 
+interface CompactionReduction { beforeBytes: number; afterBytes: number }
+
+interface PreparedAutoCompaction {
+  request: ProviderTurnRequest;
+  compaction: PreparedCompactionContext;
+  commit(text: string, signal: AbortSignal): Promise<CompactionReduction & { request: ProviderTurnRequest }>;
+}
+
 export interface TurnRuntimeOptions {
   provider?: GigaChatProvider | null;
   tools: LocalTools;
@@ -78,7 +86,9 @@ export interface TurnRuntimeOptions {
     providerStateOwner?: ProviderStateOwner): Promise<ProviderTurnRequest>;
   preflightProviderRequest?(turn: AcceptedTurnInput, request: ProviderTurnRequest, signal: AbortSignal,
     // Reservation returns an enforced input ceiling; exact semantic review returns its measured input count.
-    providerStateOwner?: ProviderStateOwner, reservation?: { additionalInputTokenReserve: number }): Promise<void | { inputTokens: number; maxInputTokens?: number }>;
+    providerStateOwner?: ProviderStateOwner, reservation?: { additionalInputTokenReserve: number }): Promise<void | { inputTokens: number; maxInputTokens?: number; autoCompact?: boolean; overInputLimit?: boolean }>;
+  prepareAutoCompaction?(turn: AcceptedTurnInput, request: ProviderTurnRequest, signal: AbortSignal,
+    providerStateOwner?: ProviderStateOwner): Promise<PreparedAutoCompaction | null>;
   assertProviderStateOwner?(providerStateOwner: ProviderStateOwner | undefined, signal: AbortSignal): void;
   consumeTurn(turn: AcceptedTurnInput, signal: AbortSignal): Promise<void>;
   releaseTurn(turn: AcceptedTurnInput): void;
@@ -86,7 +96,7 @@ export interface TurnRuntimeOptions {
   appendAssistant(turn: AcceptedTurnInput, text: string, signal: AbortSignal, functionsStateId: string | undefined,
     terminalTurn: RuntimeTurnSnapshot, providerStateOwner?: ProviderStateOwner, generatedArtifactId?: string): Promise<void>;
   appendCompaction?(turn: AcceptedTurnInput, text: string, signal: AbortSignal, context: PreparedCompactionContext,
-    terminalTurn: RuntimeTurnSnapshot, functionsStateId?: string, providerStateOwner?: ProviderStateOwner): Promise<void>;
+    terminalTurn: RuntimeTurnSnapshot, functionsStateId?: string, providerStateOwner?: ProviderStateOwner): Promise<void | CompactionReduction>;
   compactionEnabled?: boolean;
   recordUsageReceipt(receipt: UsageReceipt): Promise<void>;
   beginToolReceipt?(turn: AcceptedTurnInput, receipt: ToolReceiptInput, providerStateOwner?: ProviderStateOwner,
@@ -205,6 +215,9 @@ function runtimeErrorCategory(error: unknown, turnTimedOut = false): ProviderErr
     case 'TURN_PREPARE_TIMEOUT':
     case 'COMPACTION_CONTEXT_UNAVAILABLE':
     case 'COMPACTION_CANDIDATE_REJECTED':
+    case 'COMPACTION_REVIEW_BUDGET_UNAVAILABLE':
+    case 'COMPACTION_REVIEW_RESERVE_EXCEEDED':
+    case 'COMPACTION_INPUT_TOO_LARGE':
     case 'COMPACTION_NO_REDUCTION':
     case 'UNEXPECTED_COMPACTION_FUNCTION':
     case 'RESPONSE_LIMIT': return 'context';
@@ -221,6 +234,7 @@ function runtimeErrorCategory(error: unknown, turnTimedOut = false): ProviderErr
     case 'USAGE_RECEIPT_SAVE_TIMEOUT':
     case 'USAGE_RECEIPT_SAVE_FAILED':
     case 'USAGE_RECEIPT_WRITE_FAILED':
+    case 'COMPACTION_SAVE_TIMEOUT':
     case 'COMPACTION_SAVE_UNAVAILABLE': return 'storage';
     case 'TOOL_STOP_STATE':
     case 'TOOL_ROUND_LIMIT':
@@ -762,6 +776,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     let providerCallStarted = false;
     let imageGenerationTurn = false;
     let answer = '';
+    let suppressDraft = false;
     let activeUsageReceipt: UsageReceipt | null = null;
     let usagePersistenceTimedOut = false;
     let draftTimer: ReturnType<typeof setTimeout> | null = null;
@@ -770,7 +785,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
     const flushDraft = (): void => {
       if (draftTimer) clearTimeout(draftTimer);
       draftTimer = null;
-      if (!answer) return;
+      if (!answer || suppressDraft) return;
       turn.draft = answer;
       lastDraftPublishedAt = Date.now();
       publish(turn);
@@ -923,6 +938,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       let semanticNotes: string | undefined;
       let semanticReviewStarted = false;
       let semanticReviewInputLimit: number | null = null;
+      let autoCompaction: PreparedAutoCompaction | null = null;
+      let autoAttempted = false;
       let providerStateOwner: ProviderStateOwner | undefined;
       let imageGeneration: AsyncIterable<ProviderEvent> | null = null;
       if (typeof prepared === 'object' && prepared !== null && 'request' in prepared) {
@@ -955,6 +972,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           semanticSourceRefs = getSemanticCompactionRequestSourceRefs(request, compactionContext.sources);
           if (!semanticSourceRefs) throw new Error('COMPACTION_CONTEXT_UNAVAILABLE');
           semanticArchiveText = request.messages[0]!.text;
+          suppressDraft = true;
+          addActivity(turn, { kind: 'compaction', at: new Date().toISOString(), phase: 'started' });
         }
         const beforeResults = await runHookEvent({ event: 'before-compaction', projectId: turn.input.projectId });
         const rejected = beforeResults.find((result) => result.status !== 'completed' || result.decision === 'block');
@@ -978,7 +997,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
       let toolRounds = 0;
       let totalToolResultBytes = 0;
       let generatedArtifactId: string | undefined;
-      for (;;) {
+      requestLoop: for (;;) {
         await flushTurnPersistence();
         if (controller.signal.aborted) throw abortError();
         if (stopState.pendingToolIds.size || stopState.pendingOperationCount > 0) throw new Error('TOOL_STOP_STATE');
@@ -1009,6 +1028,27 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
             if (request !== requestBeforePreflight || !unchanged) {
               throw Object.assign(new Error('Контекст запроса изменился во время проверки; ход не отправлен.'), { category: 'context' as const });
             }
+            if (budget && !compactionContext && !autoAttempted && budget.autoCompact && options.prepareAutoCompaction) {
+              autoAttempted = true;
+              autoCompaction = await waitTracked(options.prepareAutoCompaction(turn.input, request, controller.signal, providerStateOwner),
+                prepareTimeoutMs, 'TURN_PREPARE_TIMEOUT', 'Подготовка сжатия ещё не завершена; очередь приостановлена.');
+              if (autoCompaction) {
+                compactionContext = autoCompaction.compaction;
+                request = autoCompaction.request;
+                semanticSourceRefs = getSemanticCompactionRequestSourceRefs(request, compactionContext.sources);
+                if (!semanticSourceRefs || request.modelId !== turn.input.modelId) throw new Error('COMPACTION_CONTEXT_UNAVAILABLE');
+                semanticArchiveText = request.messages[0]!.text;
+                suppressDraft = true;
+                addActivity(turn, { kind: 'compaction', at: new Date().toISOString(), phase: 'started' });
+                const hooks = await runHookEvent({ event: 'before-compaction', projectId: turn.input.projectId });
+                const rejected = hooks.find(result => result.status !== 'completed' || result.decision === 'block');
+                if (rejected) throw new Error(rejected.reason ?? 'Проверка Hook остановила сжатие контекста.');
+                continue requestLoop;
+              }
+            }
+            if (budget && budget.overInputLimit) {
+              throw new Error('COMPACTION_INPUT_TOO_LARGE');
+            }
             if (checkedRequest === reservedReview) {
               if (!budget || !Number.isSafeInteger(budget.inputTokens) || budget.inputTokens < 0
                 || !Number.isSafeInteger(budget.maxInputTokens) || budget.maxInputTokens! <= budget.inputTokens
@@ -1029,8 +1069,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         const usageReceipt: UsageReceipt = {
           localRequestId: randomUUID(),
           chatId: turn.input.chatId,
-          requestKind: toolRounds > 0 ? 'tool-continuation'
-            : turn.input.operation === 'compaction' ? 'compaction' : request.usageKind ?? 'chat',
+          requestKind: compactionContext ? 'compaction' : toolRounds > 0 ? 'tool-continuation' : request.usageKind ?? 'chat',
           modelId: request.modelId,
           providerRequestId: null,
           providerModel: null,
@@ -1052,7 +1091,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
         await persistUsageReceipt(initialUsagePersistence);
         activeUsageReceipt = usageReceipt;
         if (controller.signal.aborted) throw abortError();
-        if (toolRounds === 0 && turn.input.operation !== 'compaction' && turn.input.skillId
+        if (toolRounds === 0 && !compactionContext && turn.input.skillId
           && request.system.some((layer) => layer.source === 'skill' && layer.text.trim().length > 0)) {
           turn.pendingSkillId = turn.input.skillId;
           await waitTracked(
@@ -1076,7 +1115,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           if (!providerCallStarted) {
             let firstNext: Promise<IteratorResult<ProviderEvent>>;
             try { firstNext = iterator.next(); }
-            finally { providerCallStarted = true; }
+            finally { if (!autoCompaction) providerCallStarted = true; }
             pendingNext = Promise.resolve(firstNext);
             void pendingNext.catch(() => undefined);
             if (turn.pendingSkillId) {
@@ -1103,7 +1142,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           }
           assertProviderEvent(result.value);
           if (completed || functionCall) throw new Error('PROVIDER_PROTOCOL');
-          if (!reservationConsumed) {
+          if (!reservationConsumed && !autoCompaction) {
             const consuming = options.consumeTurn(turn.input, controller.signal);
             const consumeOutcome = consuming.then(
               () => ({ status: turn.cancelRequested ? 'cancelled' as const : 'failed' as const,
@@ -1145,7 +1184,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           } else if (rawEvent.type === 'text-delta') {
             if (answer.length + rawEvent.text.length > MAX_ASSISTANT_CHARS) throw new Error('RESPONSE_LIMIT');
             answer += rawEvent.text;
-            scheduleDraftPublish();
+            if (!semanticSourceRefs) scheduleDraftPublish();
           } else if (rawEvent.type === 'error') {
             if (rawEvent.category === 'cancel') throw abortError();
             const diagnostic = imageGeneration && rawEvent.category === 'protocol' && isImageProtocolDiagnostic(rawEvent.imageProtocolDiagnostic)
@@ -1172,7 +1211,7 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
 
         if (controller.signal.aborted) throw abortError();
         if (functionCall) {
-          if (turn.input.operation === 'compaction') throw Object.assign(new Error('UNEXPECTED_COMPACTION_FUNCTION'), { category: 'context' });
+          if (compactionContext) throw Object.assign(new Error('UNEXPECTED_COMPACTION_FUNCTION'), { category: 'context' });
           if (completed) throw new Error('PROVIDER_PROTOCOL');
           if (toolRounds >= MAX_FUNCTION_ROUNDS || (request.protocolHistory?.length ?? 0) >= 256) {
             throw Object.assign(new Error('TOOL_ROUND_LIMIT'), { category: 'tool' });
@@ -1336,6 +1375,23 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           publish(turn);
           continue;
         }
+        if (autoCompaction) {
+          const text = compileCompactionCandidate(answer, compactionContext!.sources, semanticSourceRefs, semanticArchiveText, semanticNotes);
+          const result = await waitTracked(autoCompaction.commit(text, controller.signal), operationTimeoutMs,
+            'COMPACTION_SAVE_TIMEOUT', 'Сохранение сжатого контекста ожидается; очередь приостановлена.');
+          request = result.request;
+          autoCompaction = null;
+          compactionContext = null;
+          semanticSourceRefs = null;
+          semanticArchiveText = semanticNotes = undefined;
+          semanticReviewStarted = false;
+          semanticReviewInputLimit = null;
+          suppressDraft = false;
+          answer = '';
+          addActivity(turn, { kind: 'compaction', at: new Date().toISOString(), phase: 'completed', beforeBytes: result.beforeBytes, afterBytes: result.afterBytes });
+          await runHookEvent({ event: 'after-compaction', projectId: turn.input.projectId }).catch(() => undefined);
+          continue;
+        }
         stopHooksRan = true;
         await runHookEvent({ event: 'stop', projectId: turn.input.projectId }, new AbortController().signal).catch(() => undefined);
         await flushTurnPersistence();
@@ -1356,7 +1412,8 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
           ? options.appendCompaction && compactionContext
             ? options.appendCompaction(turn.input, compileCompactionCandidate(answer, compactionContext.sources, semanticSourceRefs, semanticArchiveText, semanticNotes), controller.signal, compactionContext,
               terminalTurn, completedFunctionsStateId, providerStateOwner)
-              .then(async () => {
+              .then(async (reduction) => {
+                if (reduction) addActivity(turn, { kind: 'compaction', at: new Date().toISOString(), phase: 'completed', ...reduction }, terminalTurn);
                 await runHookEvent({ event: 'after-compaction', projectId: turn.input.projectId }, new AbortController().signal, turn.input, terminalTurn).catch(() => undefined);
               })
             : Promise.reject(new Error('COMPACTION_SAVE_UNAVAILABLE'))
@@ -1456,6 +1513,10 @@ export function createTurnRuntime(options: TurnRuntimeOptions): TurnRuntime {
                     ? 'Проверка контекста превысила ограниченное время; запрос не отправлен.'
                   : terminalError instanceof Error && terminalError.message === 'COMPACTION_CANDIDATE_REJECTED'
                     ? 'Сжатие отклонено; прежний контекст сохранён.'
+                  : terminalError instanceof Error && terminalError.message === 'COMPACTION_INPUT_TOO_LARGE'
+                    ? 'Запрос превышает проверенный предел GigaChat Lite. Уменьшите новый ввод или историю.'
+                  : terminalError instanceof Error && ['COMPACTION_REVIEW_BUDGET_UNAVAILABLE', 'COMPACTION_REVIEW_RESERVE_EXCEEDED'].includes(terminalError.message)
+                    ? 'Запрос проверки сжатия не помещается в проверенный бюджет GigaChat Lite. Прежний контекст сохранён.'
                   : terminalError instanceof Error && terminalError.message === 'COMPACTION_NO_REDUCTION'
                     ? 'Сжатие отклонено: запрос не стал короче; прежний контекст сохранён.'
                   : terminalError instanceof Error && terminalError.message === 'PROVIDER_STEP_TIMEOUT'

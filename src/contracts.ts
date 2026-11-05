@@ -544,6 +544,8 @@ export interface ProviderGeneratedImageLedgerEntry {
 export type RuntimeTurnStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
 
 export type RuntimeActivity =
+  | { kind: 'compaction'; at: string; phase: 'started' }
+  | { kind: 'compaction'; at: string; phase: 'completed'; beforeBytes: number; afterBytes: number }
   | { kind: 'provider'; at: string; activity: Extract<ProviderEvent, { type: 'activity' }>['activity']; tool?: ProviderToolName; functionName?: 'get_file_content' | 'text2image'; detail?: string }
   | { kind: 'tool'; at: string; tool: ProviderToolName; phase: 'started' | 'completed' | 'failed' | 'cancelled'; durationMs?: number }
   | { kind: 'hook'; at: string; hookId: string; hookName: string; event: HookEvent; status: HookRunResult['status']; reason?: string };

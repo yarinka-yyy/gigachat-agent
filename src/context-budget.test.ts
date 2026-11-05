@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ContextBudgetInput, ContextBudgetMeasure } from './context-budget';
-import { calculateContextBudget, calculateLiteWorkingBudget, isLitePromptOverMeasuredInputGuard, liteHardInputLimit,
+import { calculateContextBudget, calculateLiteWorkingBudget, isLitePromptOverMeasuredInputGuard, liteAutoCompactionPreflight, liteHardInputLimit,
   LITE_OPERATIONAL_PROFILE, reserveSemanticReviewInput, withLiteNormalOutputCap } from './context-budget';
 import type { ContextPromptEstimate } from './contracts';
 
@@ -214,6 +214,11 @@ test('uses separate tested input guards and caps only normal Lightning turns', (
   assert.equal(isLitePromptOverMeasuredInputGuard(normal, { ...overLimit, status: 'partial', tokens: null }), false);
   assert.equal(isLitePromptOverMeasuredInputGuard(normal, { ...overLimit, wireMessageCount: 2_051 }), false);
   assert.equal(isLitePromptOverMeasuredInputGuard(other, overLimit), false);
+  assert.deepEqual(liteAutoCompactionPreflight(normal, { ...overLimit, tokens: 89_999 }), { inputTokens: 89_999, autoCompact: false, overInputLimit: false });
+  assert.deepEqual(liteAutoCompactionPreflight(normal, { ...overLimit, tokens: 90_000 }), { inputTokens: 90_000, autoCompact: true, overInputLimit: false });
+  assert.deepEqual(liteAutoCompactionPreflight(normal, overLimit), { inputTokens: 99_858, autoCompact: true, overInputLimit: true });
+  assert.equal(liteAutoCompactionPreflight(normal, { ...overLimit, status: 'partial', tokens: null }), null);
+  assert.equal(liteAutoCompactionPreflight(other, overLimit), null);
   assert.deepEqual(withLiteNormalOutputCap(normal), { modelId: normal.modelId, maxOutputTokens: 8_192 });
   assert.deepEqual(withLiteNormalOutputCap({ ...normal, maxOutputTokens: 12_000 }), { ...normal, maxOutputTokens: 8_192 });
   assert.deepEqual(withLiteNormalOutputCap({ ...normal, maxOutputTokens: 2_000 }), { ...normal, maxOutputTokens: 2_000 });

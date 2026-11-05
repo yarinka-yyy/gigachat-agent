@@ -1317,15 +1317,11 @@ test('manual compaction captures the selected boundary, keeps tool pairing, and 
   await appendAcceptedAnswer(store, third.turn, 'answer3');
   const pendingPath = join(directory, 'pending.txt');
   await writeFile(pendingPath, 'Pending draft attachment.', 'utf8');
+  await store.updateChat(chat.id, { draft: 'Keep the draft', nextTurnPermissionProfile: 'approve', nextTurnSkillId: 'global/review' });
   const pendingDraft = await store.stageChatDraftFile(chat.id, pendingPath);
-  await assert.rejects(
-    store.acceptCompactionTurn(chat.id, 'turn-compact-draft-file', first.turn.messageId),
-    /удалите файлы из черновика/i,
-    'the serialized acceptance check catches a draft attachment after Main preflight',
-  );
-  await store.removeChatDraftFile(chat.id, pendingDraft.draftAttachments[0]!.id);
   const compact = await store.acceptCompactionTurn(chat.id, 'turn-compact', first.turn.messageId);
   assert.equal(compact.turn.messageId, first.turn.messageId);
+  assert.equal(compact.turn.skillId, null);
 
   const prefix = await store.getCompactionPrefix(chat.id, compact.turn.messageId);
   assert.deepEqual(prefix.messages.map((message) => message.text), ['user1', 'answer1']);
@@ -1353,6 +1349,10 @@ test('manual compaction captures the selected boundary, keeps tool pairing, and 
   const beforeReload = await store.getChat(chat.id);
   assert.deepEqual(beforeReload.messages.map((message) => message.text), ['user1', 'answer1', 'user2', 'answer2', 'user3', 'answer3']);
   assert.deepEqual(beforeReload.compactSnapshot, snapshot);
+  assert.equal(beforeReload.draft, pendingDraft.draft);
+  assert.deepEqual(beforeReload.draftAttachments, pendingDraft.draftAttachments);
+  assert.equal(beforeReload.nextTurnSkillId, 'global/review');
+  assert.equal(beforeReload.nextTurnPermissionProfile, 'approve');
 
   const restored = await openStore(directory);
   const afterReload = await restored.getChat(chat.id);

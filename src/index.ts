@@ -4,15 +4,15 @@ import { lstat, mkdir, mkdtemp, readFile, realpath, rm, rmdir, stat, writeFile }
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, safeStorage, screen, session, shell, systemPreferences, Tray, WebContentsView, type IpcMainInvokeEvent, type MediaAccessPermissionRequest } from 'electron';
 import { openStore, type LocalStore } from './store';
-import { assertCompactionWireReduction, COMPACTION_QUALITY_VERIFIED, COMPACTION_UNAVAILABLE_REASON, COMPACTION_TASK_INSTRUCTION,
-  buildNextTurnContext, countEstimatedContextTextTokens, createContextTextTokenCache, estimateProviderPromptTokens,
-  validateCompactSummary } from './context';
-import { isLitePromptOverMeasuredInputGuard, liteHardInputLimit, LITE_OPERATIONAL_PROFILE, reserveSemanticReviewInput } from './context-budget';
+import { assertCompactionWireReduction, SEMANTIC_COMPACTION_QUALITY_VERIFIED, COMPACTION_UNAVAILABLE_REASON,
+  buildNextTurnContext, countEstimatedContextTextTokens, createContextTextTokenCache, estimateProviderPromptTokens, projectSemanticCompactionContinuation } from './context';
+import { latestCompactionBoundary } from './commands';
+import { isLitePromptOverMeasuredInputGuard, liteAutoCompactionPreflight, liteHardInputLimit, LITE_OPERATIONAL_PROFILE, reserveSemanticReviewInput } from './context-budget';
 import { createContextPreview } from './context-preview';
 import { createLocalTextTokenCounter } from './local-tokenizer';
 import { createLocalTools, createPowerShellHelper, resolvePowerShellHelperPath } from './local-tools';
 import { createTurnRuntime, queueAcceptedTurnOrMarkNotSent, type PreparedCompactionContext, type TurnRuntime } from './runtime';
-import type { AcceptedTurnInput, AttachmentImportBatchResult, ChatArtifact, ChatPatch, CompactSnapshot, FolderOpener, HomeDraftAttachment, HookRunResult, ModelRegistrySnapshot, NotificationSettings, PreferredOpener, RuntimeAvailability, SettingsPatch, Theme, VoiceAvailability } from './contracts';
+import type { AcceptedTurnInput, AttachmentImportBatchResult, ChatArtifact, ChatDetail, ChatPatch, CompactSnapshot, FolderOpener, HomeDraftAttachment, HookRunResult, ModelRegistrySnapshot, NotificationSettings, PreferredOpener, RuntimeAvailability, SettingsPatch, Theme, VoiceAvailability } from './contracts';
 import { requirePermissionProfile, type PermissionProfile } from './permissions';
 import { requireModelId } from './models';
 import { chatModelUnavailableReason, isChatModelAvailable } from './model-catalog';
@@ -21,7 +21,7 @@ import { createPermissionApprovals } from './permission-approvals';
 import { createSkillRegistry, isSkillId } from './skills';
 import { createHookApprovalGate, createHookDispatcher, createHookRegistry, transitionProjectHookContext, type HookApprovalRequestContext, type HookExecutionContext } from './hooks';
 import { createSecureStore } from './secure-store';
-import { createGigaChatProvider, createHttpsTransport, GIGACHAT_ROOT_CA_SHA256, GigaChatProviderError, type GigaChatProviderConnection, type ProviderTransport } from './gigachat-provider';
+import { createGigaChatProvider, createHttpsTransport, GIGACHAT_ROOT_CA_SHA256, GigaChatProviderError, serializeProviderTurnRequest, type GigaChatProviderConnection, type ProviderTransport } from './gigachat-provider';
 import { prepareTurnAttachments } from './attachments';
 import { attachmentConnectionBlocker, attachmentContentType, attachmentSendBlocker, inspectLocalAttachmentContent, PROVIDER_IMAGE_LIMIT_BYTES } from './attachment-policy';
 import { createImageGenerationStream, IMAGE_GENERATION_MODEL_ID, IMAGE_RECOVERY_REQUIRED_MESSAGE, type GeneratedImageDimensions } from './image-generation';
@@ -782,6 +782,24 @@ async function createMainRuntime(
   });
 
   const lastNotifiedStatus = new Map<string, string>();
+  const prepareCompaction = async (turn: AcceptedTurnInput, detail: ChatDetail, boundaryMessageId: string, expectedSnapshotId: string | null) => {
+    const prefix = await store.getCompactionPrefix(turn.chatId, boundaryMessageId);
+    const context = buildNextTurnContext({
+      globalText: '', messages: prefix.messages, protocolHistory: prefix.protocolHistory,
+      compactSnapshot: detail.compactSnapshot, compactionToolReceipts: detail.toolReceipts, compactionArtifacts: detail.artifacts,
+      permissionProfile: turn.permissionProfile, modelId: turn.modelId, usageKind: 'compaction', compactionFormat: 'semantic', functionCallMode: 'none',
+    });
+    if (!context.compactionSources) throw new Error('Для сжатия не подготовлены исходные записи истории.');
+    const compaction: PreparedCompactionContext = {
+      boundaryMessageId, coveredThroughMessageId: prefix.coveredThroughMessageId, coveredPrefixHash: prefix.coveredPrefixHash,
+      expectedSnapshotId, provenance: 'provider', sources: context.compactionSources,
+    };
+    return { request: context.request, compaction, messages: prefix.messages };
+  };
+  const makeSemanticSnapshot = (turn: AcceptedTurnInput, context: PreparedCompactionContext, text: string): CompactSnapshot => ({
+    id: randomUUID(), version: 2, boundaryMessageId: context.boundaryMessageId, coveredThroughMessageId: context.coveredThroughMessageId,
+    coveredPrefixHash: context.coveredPrefixHash, text, modelId: turn.modelId!, provenance: context.provenance, createdAt: new Date().toISOString(),
+  });
   const turnRuntime = createTurnRuntime({
     provider: providerConnection,
     tools,
@@ -822,7 +840,7 @@ async function createMainRuntime(
     },
     prepareTurn: async (turn, signal) => {
       if (signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
-      if (turn.operation === 'compaction' && !COMPACTION_QUALITY_VERIFIED) throw new Error(COMPACTION_UNAVAILABLE_REASON);
+      if (turn.operation === 'compaction' && !SEMANTIC_COMPACTION_QUALITY_VERIFIED) throw new Error(COMPACTION_UNAVAILABLE_REASON);
       if (turn.operation === 'compaction' && turn.modelId !== COMPACTION_MODEL_ID) {
         throw Object.assign(new Error('Для продолжения сжатия выберите GigaChat Lite; автоматической смены модели нет.'), { category: 'model' as const });
       }
@@ -856,11 +874,13 @@ async function createMainRuntime(
           throw new Error('Для генерации изображения выберите GigaChat Ultra. Выбор модели не изменён.');
         }
       }
-      const compactionPrefix = turn.operation === 'compaction'
-        ? await store.getCompactionPrefix(turn.chatId, turn.compactBoundaryMessageId)
-        : null;
-      const messages = compactionPrefix?.messages ?? await store.getMessagesThrough(turn.chatId, turn.messageId);
-      const protocolHistory = compactionPrefix?.protocolHistory ?? await store.getToolProtocolThrough(turn.chatId, turn.messageId);
+      if (turn.operation === 'compaction') {
+        const prepared = await prepareCompaction(turn, detail, turn.compactBoundaryMessageId!, turn.compactExpectedSnapshotId ?? null);
+        assertProviderStateOwner(providerStateOwner, providerStateScopeGuard, signal);
+        return { request: prepared.request, compaction: prepared.compaction, providerStateOwner };
+      }
+      const messages = await store.getMessagesThrough(turn.chatId, turn.messageId);
+      const protocolHistory = await store.getToolProtocolThrough(turn.chatId, turn.messageId);
       if (imageChat && (turn.attachmentIds?.length
         || messages.some((message) => message.role === 'user' && message.attachmentIds?.length))) {
         throw new Error('Генерация изображения не использует вложения этого хода или предыдущих сообщений.');
@@ -884,35 +904,14 @@ async function createMainRuntime(
         compactionArtifacts: detail.artifacts,
         permissionProfile: turn.permissionProfile,
         modelId: turn.modelId,
-        ...(turn.operation === 'compaction' ? {
-          taskInstruction: COMPACTION_TASK_INSTRUCTION,
-          usageKind: 'compaction' as const,
-          functionCallMode: 'none' as const,
-        } : {}),
         ...(imageChat ? { functionCallMode: 'none' as const } : {}),
       }, {
         providerStateFilter: {
           detail,
           ownership: providerStateOwnership,
-          currentAnchorMessageId: turn.operation === 'compaction' ? null : turn.messageId,
+          currentAnchorMessageId: turn.messageId,
         },
       });
-      if (turn.operation === 'compaction' && compactionPrefix) {
-        if (!context.compactionSources) throw new Error('Для сжатия не подготовлены исходные записи истории.');
-        assertProviderStateOwner(providerStateOwner, providerStateScopeGuard, signal);
-        return {
-          request: context.request,
-          providerStateOwner,
-          compaction: {
-            boundaryMessageId: turn.compactBoundaryMessageId!,
-            coveredThroughMessageId: compactionPrefix.coveredThroughMessageId,
-            coveredPrefixHash: compactionPrefix.coveredPrefixHash,
-            expectedSnapshotId: turn.compactExpectedSnapshotId ?? null,
-            provenance: 'provider' as const,
-            sources: context.compactionSources,
-          },
-        };
-      }
       assertProviderStateOwner(providerStateOwner, providerStateScopeGuard, signal);
       if (imageChat) {
         if (context.request.protocolHistory?.length || context.request.attachments?.length) {
@@ -951,6 +950,43 @@ async function createMainRuntime(
       assertProviderStateOwner(owner, providerStateScopeGuard, signal);
       return prepared;
     },
+    prepareAutoCompaction: async (turn, request, signal, owner) => {
+      assertProviderStateOwner(owner, providerStateScopeGuard, signal);
+      const detail = await store.getChat(turn.chatId);
+      if (detail.kind !== 'text' || detail.turns.some(record => record.anchorMessageId === turn.messageId
+        && record.activity.some(activity => activity.kind === 'compaction'))) return null;
+      const boundary = latestCompactionBoundary(detail.messages, detail.compactSnapshot, turn.messageId);
+      if (!boundary) return null;
+      const boundaryIndex = detail.messages.indexOf(boundary);
+      const anchors = new Set(detail.messages.slice(0, boundaryIndex + 1).filter(message => message.role === 'user').map(message => message.id));
+      if (detail.messages.slice(0, boundaryIndex + 1).some(message => message.attachmentIds?.length)
+        || detail.toolReceipts.some(receipt => anchors.has(receipt.anchorMessageId) && receipt.status === 'pending')) return null;
+      const prepared = await prepareCompaction(turn, detail, boundary.id, detail.compactSnapshot?.id ?? null);
+      const coveredIds = new Set(prepared.messages.map(message => message.id));
+      const tail = projectSemanticCompactionContinuation(request, coveredIds);
+      const estimateTail = await estimateProviderPromptTokens(tail, localTextTokenCounter.countTextTokens, signal, localContextTokenCache);
+      assertProviderStateOwner(owner, providerStateScopeGuard, signal);
+      if (isLitePromptOverMeasuredInputGuard(tail, estimateTail)) {
+        throw new Error('COMPACTION_INPUT_TOO_LARGE');
+      }
+      return {
+        request: prepared.request, compaction: prepared.compaction,
+        commit: async (text, commitSignal) => {
+          const snapshot = makeSemanticSnapshot(turn, prepared.compaction, text);
+          const next = projectSemanticCompactionContinuation(request, coveredIds, { snapshot, sources: prepared.compaction.sources });
+          const beforeBytes = serializeProviderTurnRequest(request).wireBytes;
+          const afterBytes = serializeProviderTurnRequest(next).wireBytes;
+          assertCompactionWireReduction(beforeBytes, afterBytes);
+          const estimateNext = await estimateProviderPromptTokens(next, localTextTokenCounter.countTextTokens, commitSignal, localContextTokenCache);
+          if (isLitePromptOverMeasuredInputGuard(next, estimateNext)) {
+            throw new Error('COMPACTION_INPUT_TOO_LARGE');
+          }
+          assertProviderStateOwner(owner, providerStateScopeGuard, commitSignal);
+          await store.commitCompactSnapshot(turn.chatId, snapshot, prepared.compaction.expectedSnapshotId, commitSignal);
+          return { beforeBytes, afterBytes, request: next };
+        },
+      };
+    },
     preflightProviderRequest: async (_turn, request, signal, owner, reservation) => {
       const estimate = await estimateProviderPromptTokens(
         request, localTextTokenCounter.countTextTokens, signal, localContextTokenCache,
@@ -966,10 +1002,14 @@ async function createMainRuntime(
         if (!budget) throw Object.assign(new Error('COMPACTION_REVIEW_BUDGET_UNAVAILABLE'), { category: 'context' as const });
         return budget;
       }
-      if (request.modelId === LITE_OPERATIONAL_PROFILE.modelId && isLitePromptOverMeasuredInputGuard(request, estimate)) {
+      const overInputLimit = isLitePromptOverMeasuredInputGuard(request, estimate);
+      if (request.usageKind === 'compaction' && overInputLimit) {
         throw Object.assign(new Error('Контекст запроса превышает проверенный безопасный предел GigaChat Lite. Уменьшите запрос или историю и повторите ход.'),
           { category: 'context' as const });
       }
+      const auto = SEMANTIC_COMPACTION_QUALITY_VERIFIED ? liteAutoCompactionPreflight(request, estimate) : null;
+      if (auto) return auto;
+      if (overInputLimit) throw new Error('COMPACTION_INPUT_TOO_LARGE');
       if (estimate.tokens !== null) return { inputTokens: estimate.tokens };
     },
     consumeTurn: (turn: AcceptedTurnInput, signal) => store.consumeTurnReservation(turn, signal),
@@ -1013,26 +1053,16 @@ async function createMainRuntime(
         });
         return context.wireBytes;
       };
-      const snapshot: CompactSnapshot = {
-        id: randomUUID(),
-        version: 1,
-        boundaryMessageId: context.boundaryMessageId,
-        coveredThroughMessageId: context.coveredThroughMessageId,
-        coveredPrefixHash: context.coveredPrefixHash,
-        text: validateCompactSummary(text),
-        modelId: turn.modelId ?? (() => { throw new Error('Модель для сводки не выбрана.'); })(),
-        provenance: context.provenance,
-        createdAt: new Date().toISOString(),
-      };
-      assertCompactionWireReduction(
-        buildMeasuredContext(detail.compactSnapshot),
-        buildMeasuredContext(snapshot),
-      );
+      const snapshot = makeSemanticSnapshot(turn, context, text);
+      const beforeBytes = buildMeasuredContext(detail.compactSnapshot);
+      const afterBytes = buildMeasuredContext(snapshot);
+      assertCompactionWireReduction(beforeBytes, afterBytes);
       assertProviderStateOwner(owner, providerStateScopeGuard, signal);
       await store.commitCompactSnapshot(turn.chatId, snapshot, context.expectedSnapshotId, signal, terminalTurn,
         functionsStateId ? { accountScope: owner.accountScope, functionsStateId } : undefined);
+      return { beforeBytes: beforeBytes!, afterBytes: afterBytes! };
     },
-    compactionEnabled: COMPACTION_QUALITY_VERIFIED,
+    compactionEnabled: SEMANTIC_COMPACTION_QUALITY_VERIFIED,
     recordUsageReceipt: (receipt) => store.recordUsageReceipt(receipt),
     runHooks: async (turn, input, signal) => {
       const context: HookExecutionContext = {
@@ -1132,7 +1162,7 @@ async function createMainRuntime(
       helperRecovered: Boolean(helper),
       rendererToolApi: false,
       helperUnavailableReason: unavailableReason,
-      compactionAvailable: COMPACTION_QUALITY_VERIFIED,
+      compactionAvailable: SEMANTIC_COMPACTION_QUALITY_VERIFIED,
       compactionUnavailableReason: COMPACTION_UNAVAILABLE_REASON,
     },
     voiceRuntime: voiceService.runtime,
@@ -1734,7 +1764,6 @@ async function registerIpcHandlers(
     const chatId = requireId(chatIdInput);
     const detail = await store.getChat(chatId);
     if (detail.kind !== 'text') throw new Error('Сжатие доступно только в текстовом чате.');
-    if (detail.draftAttachments.length > 0) throw new Error('Сначала удалите файлы из черновика.');
     if (detail.turns.some((turn) => turn.status === 'queued' || turn.status === 'running')
       || runtime.list(chatId).some((turn) => turn.status === 'queued' || turn.status === 'running')) {
       throw new Error('Дождитесь завершения текущего хода перед сжатием контекста.');
@@ -1748,9 +1777,8 @@ async function registerIpcHandlers(
       || !isChatModelAvailable(providerConnection.getModelRegistry(), COMPACTION_MODEL_ID)) {
       throw new Error('Подключите GigaChat и проверьте доступность GigaChat Lite перед сжатием.');
     }
-    const users = detail.messages.filter((message) => message.role === 'user');
-    const boundary = users.length >= 3 ? users[users.length - 3] : undefined;
-    if (!boundary) throw new Error('Нужно сохранить два последних обмена; старой истории для сжатия пока недостаточно.');
+    const boundary = latestCompactionBoundary(detail.messages, detail.compactSnapshot);
+    if (!boundary) throw new Error('Нет новой завершённой истории для сжатия; прежний контекст сохранён.');
 
     const accepted = await store.acceptCompactionTurn(chatId, randomUUID(), boundary.id);
     const queued = await queueAcceptedTurnOrMarkNotSent({
