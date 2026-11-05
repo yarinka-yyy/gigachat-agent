@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react';
+import { useMemo, useState, type ReactNode } from 'react';
 import { Copy } from 'lucide-react';
 import type { ChatArtifact, ChatMessage } from '../contracts';
 import { buildTranscriptItems, formatMessageTimestamp, type TranscriptTurn } from '../chat-transcript';
@@ -24,7 +24,7 @@ export default function ChatTranscript({
 }) {
   const [copyingMessageId, setCopyingMessageId] = useState<string | null>(null);
   const [copyErrorMessageId, setCopyErrorMessageId] = useState<string | null>(null);
-  const items = buildTranscriptItems(messages, turns);
+  const items = useMemo(() => buildTranscriptItems(messages, turns), [messages, turns]);
 
   async function copyMessage(messageId: string): Promise<void> {
     setCopyingMessageId(messageId);
@@ -40,7 +40,7 @@ export default function ChatTranscript({
 
   return (
     <div className="chat-history-layout">
-      <ChatNavigation messages={messages} turns={turns} artifacts={artifacts} onNavigate={onNavigateToMessage} />
+      <ChatNavigation items={items} artifacts={artifacts} onNavigate={onNavigateToMessage} />
       <div className="chat-history" aria-label="История сообщений">
         {items.map((item) => {
           if (item.kind === 'activity') {

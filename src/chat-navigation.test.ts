@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ChatArtifact, ChatMessage, ChatTurnRecord } from './contracts';
+import { buildTranscriptItems } from './chat-transcript';
 import {
   buildChatNavigationMarks,
   isNearChatScrollEnd,
@@ -43,6 +44,10 @@ function artifact(id: string, name: string, messageId: string | null): ChatArtif
   return { id, name, storedName: name, size: 20, createdAt: firstTime, messageId };
 }
 
+function items(messages: ChatMessage[], turns: ChatTurnRecord[]) {
+  return buildTranscriptItems(messages, turns.map((record) => ({ ...record, id: record.turnId, chatId: 'chat' })));
+}
+
 test('rail creates one mark per user message and uses the latest linked attempt without inventing legacy completion', () => {
   const messages = [
     user('prompt-a', 'Сохрани точный исходный вопрос.'),
@@ -60,7 +65,7 @@ test('rail creates one mark per user message and uses the latest linked attempt 
     artifact('legacy-only', 'old-local.xlsx', null),
   ];
 
-  const marks = buildChatNavigationMarks(messages, turns, artifacts, 'ru-RU', 'Europe/Moscow');
+  const marks = buildChatNavigationMarks(items(messages, turns), artifacts, 'ru-RU', 'Europe/Moscow');
 
   assert.deepEqual(marks.map((mark) => ({
     messageId: mark.messageId,
@@ -73,13 +78,12 @@ test('rail creates one mark per user message and uses the latest linked attempt 
     { messageId: 'files-only', preview: 'report.pdf · answer.ts', time: '13:22', status: 'Статус не сохранён', isLatest: false },
     { messageId: 'old-user-without-turn', preview: 'Старый запрос без сохранённого статуса.', time: '13:22', status: 'Статус не сохранён', isLatest: true },
   ]);
-  assert.match(marks[0].date ?? '', /2026/);
 });
 
 test('file-only messages have a useful fallback and a running request remains observable', () => {
   const marks = buildChatNavigationMarks(
-    [user('file-only', '', ['not-linked']), user('running', 'Проверь ход.')],
-    [turn({ turnId: 'running-turn', anchorMessageId: 'running', status: 'running', startedAt: firstTime })],
+    items([user('file-only', '', ['not-linked']), user('running', 'Проверь ход.')],
+      [turn({ turnId: 'running-turn', anchorMessageId: 'running', status: 'running', startedAt: firstTime })]),
     [artifact('not-linked', 'old.pdf', null)],
   );
 
@@ -87,6 +91,22 @@ test('file-only messages have a useful fallback and a running request remains ob
   assert.equal(marks[0].status, 'Статус не сохранён');
   assert.equal(marks[1].status, 'Выполняется');
   assert.equal(marks[1].isLatest, true);
+});
+
+test('preview follows the transcript answer for the latest attempt and handles legacy exchanges', () => {
+  const answer = (id: string): ChatMessage => ({ id, role: 'assistant', text: id, createdAt: firstTime });
+  const messages = [user('retry', 'Повтори.'), answer('first'), user('failed', 'Ошибка.'), answer('previous'),
+    user('legacy', 'Старый запрос.'), answer('unlinked'), answer('latest'), user('empty', 'Без ответа.')];
+  const turns = [
+    turn({ turnId: 'first', anchorMessageId: 'retry', assistantMessageId: 'first', status: 'completed' }),
+    turn({ turnId: 'latest', anchorMessageId: 'retry', assistantMessageId: 'latest', status: 'completed', createdAt: '2026-10-13T10:23:00.000Z' }),
+    turn({ turnId: 'previous', anchorMessageId: 'failed', assistantMessageId: 'previous', status: 'completed' }),
+    turn({ turnId: 'failure', anchorMessageId: 'failed', createdAt: '2026-10-13T10:23:00.000Z' }),
+    turn({ turnId: 'compact', anchorMessageId: 'retry', operation: 'compaction', status: 'completed', createdAt: '2026-10-13T10:24:00.000Z' }),
+  ];
+  const marks = buildChatNavigationMarks(items(messages, turns), []);
+  assert.deepEqual(marks.map(({ answer: preview }) => preview), ['latest', null, 'unlinked', null]);
+  assert.equal(marks[1].status, 'Не удалось завершить');
 });
 
 test('rail keyboard navigation clamps at both ends and supports Home and End', () => {

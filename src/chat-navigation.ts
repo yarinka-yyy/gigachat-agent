@@ -1,11 +1,11 @@
-import type { ChatArtifact, ChatMessage, ChatTurnRecord } from './contracts';
-import { formatMessageTimestamp, transcriptTurnStatusLabel, type TranscriptTurn } from './chat-transcript';
+import type { ChatArtifact, ChatMessage } from './contracts';
+import { formatMessageTimestamp, transcriptTurnStatusLabel, type ChatTranscriptItem, type TranscriptTurn } from './chat-transcript';
 
 export interface ChatNavigationMark {
   messageId: string;
   preview: string;
+  answer: string | null;
   time: string | null;
-  date: string | null;
   status: string;
   isLatest: boolean;
 }
@@ -17,24 +17,35 @@ export interface ChatScrollMetrics {
 }
 
 export function buildChatNavigationMarks(
-  messages: readonly ChatMessage[],
-  turns: readonly ChatTurnRecord[],
+  items: readonly ChatTranscriptItem[],
   artifacts: readonly ChatArtifact[],
   locale = 'ru-RU',
   timeZone?: string,
 ): ChatNavigationMark[] {
-  const userMessages = messages.filter((message) => message.role === 'user');
-  const userMessageIds = new Set(userMessages.map((message) => message.id));
-  const latestTurnByAnchor = new Map<string, ChatTurnRecord>();
-  for (const turn of turns) {
-    if (!userMessageIds.has(turn.anchorMessageId)) continue;
-    const previous = latestTurnByAnchor.get(turn.anchorMessageId);
-    if (!previous || turn.createdAt.localeCompare(previous.createdAt) >= 0) {
-      latestTurnByAnchor.set(turn.anchorMessageId, turn);
+  type Exchange = { message: ChatMessage; turn?: TranscriptTurn; compaction?: TranscriptTurn; answer: string | null };
+  const exchanges: Exchange[] = [];
+  const boundAnswers = new Set(items.flatMap((item) =>
+    item.kind === 'activity' && item.turn.assistantMessageId ? [item.turn.assistantMessageId] : []));
+  let exchange: Exchange | undefined;
+  for (const item of items) {
+    if (item.kind === 'message' && item.message.role === 'user') {
+      exchange = { message: item.message, answer: null };
+      exchanges.push(exchange);
+    } else if (exchange && item.kind === 'activity') {
+      if (item.turn.operation === 'compaction') exchange.compaction = item.turn;
+      else {
+        exchange.turn = item.turn;
+        exchange.answer = null;
+      }
+    } else if (exchange && item.kind === 'message' && item.message.role === 'assistant') {
+      const belongsToExchange = item.turnId
+        ? item.turnId === exchange.turn?.turnId
+        : !exchange.turn && !boundAnswers.has(item.message.id);
+      if (belongsToExchange && exchange.answer === null) exchange.answer = item.message.text.trim() || null;
     }
   }
 
-  return userMessages.map((message, index) => {
+  return exchanges.map(({ message, turn, compaction, answer }, index) => {
     const linkedNames = (message.attachmentIds ?? []).flatMap((attachmentId) => {
       const artifact = artifacts.find((candidate) => candidate.id === attachmentId && candidate.messageId === message.id);
       return artifact ? [artifact.name] : [];
@@ -44,18 +55,15 @@ export function buildChatNavigationMarks(
       : linkedNames.length > 0 ? linkedNames.join(' · ')
         : message.attachmentIds?.length ? 'Вложения недоступны' : 'Запрос без текста';
     const timestamp = formatMessageTimestamp(message.createdAt, locale, timeZone);
-    const turn = latestTurnByAnchor.get(message.id);
-    const status = turn
-      ? transcriptTurnStatusLabel({ ...turn, id: turn.turnId, chatId: '' } satisfies TranscriptTurn)
-      : 'Статус не сохранён';
+    const latest = turn ?? compaction;
 
     return {
       messageId: message.id,
       preview,
+      answer,
       time: timestamp?.time ?? null,
-      date: timestamp?.title ?? null,
-      status,
-      isLatest: index === userMessages.length - 1,
+      status: latest ? transcriptTurnStatusLabel(latest) : 'Статус не сохранён',
+      isLatest: index === exchanges.length - 1,
     };
   });
 }

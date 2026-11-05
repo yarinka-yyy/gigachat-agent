@@ -5358,13 +5358,14 @@ async function runElectronHost() {
     themeChat.messages.push(themeAnchor, themeAnswer);
     const longUserTranscriptText = `Длинный русский запрос остаётся компактно выровненным справа и переносится по доступной ширине.\n\nURL: https://example.test/very/long/user/request?query=проверка&mode=responsive\n\nКод: const request = { chatId: "stage4-layout", includeHistory: true };`;
     const longTranscriptText = `Длинное сообщение на русском сохраняет строки и переносится по доступной ширине.\n\nURL: https://example.test/very/long/path/for/a/transcript-layout-check?query=проверка&mode=responsive\n\nКод: const result = await client.request({ chatId: "stage4-layout", retry: false });`;
-    for (let index = 0; index < 28; index += 1) {
+    for (let index = 0; index < 160; index += 1) {
       const role = index % 2 === 0 ? 'user' : 'assistant';
       themeChat.messages.push({
         id: `stage4-theme-history-${index + 1}`,
         role,
         ...(role === 'assistant' ? { source: 'runtime' } : {}),
-        text: index === 26 ? longUserTranscriptText : index === 27 ? longTranscriptText : `Сообщение ${index + 1} из длинного synthetic диалога.`,
+        text: index === 26 || index === 158 ? longUserTranscriptText
+          : index === 27 ? longTranscriptText : index === 159 ? longTranscriptText.repeat(4) : `Сообщение ${index + 1} из длинного synthetic диалога.`,
         createdAt: timestamp,
       });
     }
@@ -5393,6 +5394,8 @@ async function runElectronHost() {
         };
         const buttons = [...document.querySelectorAll('.chat-navigation-mark')];
         const preview = document.querySelector('.chat-navigation-preview');
+        const request = preview?.querySelector('.chat-navigation-preview-request');
+        const answer = preview?.querySelector('.chat-navigation-preview-answer');
         return {
           area: box(area), nav: box(nav), list: { ...box(list), scrollHeight: list?.scrollHeight ?? 0,
             clientHeight: list?.clientHeight ?? 0, maxHeight: Number.parseFloat(getComputedStyle(list).maxHeight) || 0,
@@ -5403,12 +5406,17 @@ async function runElectronHost() {
             const rect = button.getBoundingClientRect();
             const bar = button.querySelector('.chat-navigation-mark-bar');
             return { id: button.dataset.navigationMessageId, top: rect.top, bottom: rect.bottom, height: rect.height,
+              left: bar?.getBoundingClientRect().left ?? 0,
               width: bar?.getBoundingClientRect().width ?? 0, tabIndex: button.tabIndex,
               color: bar ? getComputedStyle(bar).backgroundColor : null,
               expanded: button.classList.contains('expanded'), focused: button.classList.contains('focused') };
           }),
           previewText: preview?.textContent ?? null,
           preview: box(preview),
+          requestClipped: request && request.scrollWidth > request.clientWidth && getComputedStyle(request).textOverflow === 'ellipsis',
+          answerClipped: answer && answer.scrollHeight > answer.clientHeight && getComputedStyle(answer).webkitLineClamp === '3',
+          answerLines: answer ? answer.clientHeight / parseFloat(getComputedStyle(answer).lineHeight) : 0,
+          previewScrolls: preview && getComputedStyle(preview).overflowY === 'auto',
           viewportWidth: innerWidth,
           viewportHeight: innerHeight,
           rightScrollbarButton: area ? getComputedStyle(area, '::-webkit-scrollbar-button').display : null,
@@ -5485,6 +5493,11 @@ async function runElectronHost() {
         })()`));
       };
 
+      window.show();
+      window.focus();
+      window.webContents.focus();
+      await waitUntil(`${name} navigation window has focus`, () => window.isFocused());
+      await sleep(300);
       const resting = await inspectRail();
       assert.deepEqual(resting.marks.map((mark) => mark.id), expectedUserIds,
         `${name}: request marks follow exactly the persisted user message IDs`);
@@ -5492,9 +5505,11 @@ async function runElectronHost() {
         `${name}: the rendered transcript still has every accepted user target`);
       assert.ok(resting.area && resting.nav && resting.list && resting.history && resting.composer,
         `${name}: the rail, chat scroll owner, history and composer are present`);
-      assert.ok(resting.nav.left >= resting.area.left - 1 && resting.nav.right < resting.history.left,
+      assert.ok(resting.nav.left - resting.area.left >= 0 && resting.nav.left - resting.area.left <= 16
+        && resting.nav.right < resting.history.left,
         `${name}: the rail sits inside the chat pane before its history column: ${JSON.stringify(resting)}`);
-      assert.ok(resting.nav.top >= resting.area.top - 1 && resting.nav.bottom <= resting.area.bottom + 1,
+      assert.ok(resting.list.top >= resting.area.top - 1 && resting.list.bottom <= resting.area.bottom + 1
+        && Math.abs(resting.list.top + resting.list.bottom - resting.area.top - resting.area.bottom) <= 2,
         `${name}: the rail is bounded by the actual chat scroll owner: ${JSON.stringify(resting)}`);
       assert.ok(resting.list.maxHeight <= resting.area.height + 1,
         `${name}: the rail's own scroll limit uses the chat viewport height: ${JSON.stringify(resting.list)}`);
@@ -5503,8 +5518,9 @@ async function runElectronHost() {
       assert.equal(resting.previewText, null, `${name}: no preview or ghost-focused mark is open at rest`);
       assert.equal(resting.marks.filter((mark) => mark.expanded || mark.focused).length, 0,
         `${name}: marks do not expand before real hover or keyboard focus`);
-      assert.ok(resting.marks.every((mark) => mark.height >= 28 && Math.abs(mark.width - 8) <= 1),
-        `${name}: rail targets remain large enough and bars are horizontal at rest: ${JSON.stringify(resting.marks)}`);
+      assert.ok(resting.marks.every((mark) => Math.abs(mark.height - 11) <= 1 && Math.abs(mark.width - 8) <= 1),
+        `${name}: rail uses compact rows with horizontal bars: ${JSON.stringify(resting.marks)}`);
+      assert.ok(resting.list.scrollHeight > resting.list.clientHeight, `${name}: the long rail scrolls independently`);
       assert.notEqual(resting.marks[resting.marks.length - 1]?.color, resting.marks[0]?.color,
         `${name}: the latest request uses the foreground color while earlier requests stay muted`);
       for (let index = 1; index < resting.marks.length; index += 1) {
@@ -5545,31 +5561,56 @@ async function runElectronHost() {
       const clickId = expectedUserIds[expectedUserIds.length - 6];
       const clickSelector = `.chat-navigation-mark[data-navigation-message-id="${clickId}"]`;
       await moveMarkIntoRailView(hoverId);
+      await movePointerTo('.chat-header-title');
+      await waitDom(`${name} mark is ready to receive pointer input`, `(() => {
+        const mark = document.querySelector(${JSON.stringify(hoverSelector)});
+        const rect = mark.getBoundingClientRect();
+        return mark.contains(document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2));
+      })()`);
       await movePointerTo(hoverSelector);
-      const expectedExpandedBarWidth = Number(await evaluate(`matchMedia('(max-width: 620px)').matches ? 20 : 24`));
-      await waitUntil(`${name} hover expands only its own request bar`, async () => {
-        const state = await inspectRail();
-        return state.marks.find((mark) => mark.id === hoverId)?.width >= expectedExpandedBarWidth - 1;
-      });
+      const expectedExpandedBarWidth = 24;
+      try {
+        await waitUntil(`${name} hover expands only its own request bar`, async () => {
+          const state = await inspectRail();
+          const mark = state.marks.find((candidate) => candidate.id === hoverId);
+          if (!mark?.expanded) await movePointerTo(hoverSelector);
+          return mark?.width >= expectedExpandedBarWidth - 1;
+        });
+      } catch (error) {
+        const current = await inspectRail();
+        throw new Error(`${error.message}; hovered mark: ${JSON.stringify(current.marks.find((mark) => mark.id === hoverId))}; card: ${JSON.stringify(current.preview)}`);
+      }
       const hovered = await inspectRail();
       assert.deepEqual(hovered.marks.filter((mark) => mark.expanded).map((mark) => mark.id), [hoverId],
         `${name}: hovering expands only the pointed-to bar`);
       assert.ok(hovered.marks.find((mark) => mark.id === hoverId).width >= expectedExpandedBarWidth - 1
         && hovered.marks.find((mark) => mark.id === hoverId).width > resting.marks.find((mark) => mark.id === hoverId).width + 8,
         `${name}: the hovered horizontal bar expands measurably`);
+      assert.ok(hovered.marks.every((mark) => Math.abs((mark.left - hovered.list.left)
+        - (resting.marks.find((before) => before.id === mark.id).left - resting.list.left)) <= 0.5),
+        `${name}: all bar origins stay fixed as the hovered bar grows to the right`);
       assert.ok(hovered.marks.filter((mark) => mark.id !== hoverId).every((mark) =>
         Math.abs(mark.width - resting.marks.find((before) => before.id === mark.id).width) <= 1),
       `${name}: neighboring bars keep their original widths`);
       const hoverMessage = themeChat.messages.find((message) => message.id === hoverId);
       assert.ok(hovered.previewText?.includes(hoverMessage.text), `${name}: preview contains the original user request`);
-      assert.ok(hovered.previewText?.includes('2026') && /\b\d{2}:\d{2}\b/.test(hovered.previewText), `${name}: preview exposes local date and time`);
-      assert.ok(hovered.previewText?.includes('Статус'), `${name}: preview exposes a truthful saved status`);
+      assert.ok(hovered.previewText?.includes(longTranscriptText.repeat(4)), `${name}: preview uses the answer from the same exchange`);
+      assert.ok(hovered.requestClipped && hovered.answerClipped && hovered.answerLines <= 3.1 && !hovered.previewScrolls,
+        `${name}: preview clamps one request line and three answer lines without scrolling`);
       assert.ok(hovered.preview.left >= hovered.area.left - 1 && hovered.preview.right <= hovered.area.right + 1
         && hovered.preview.top >= hovered.area.top - 1 && hovered.preview.bottom <= hovered.area.bottom + 1,
       `${name}: contextual preview stays within the chat pane: ${JSON.stringify(hovered)}`);
       assert.ok(Math.abs(hovered.composer.top - resting.composer.top) <= 1 && Math.abs(hovered.composer.bottom - resting.composer.bottom) <= 1,
         `${name}: opening a preview does not move the composer`);
       await capture('stage5-request-navigation-hover-preview');
+      const cardOffset = await navigationExpectedOffset(hoverId, `${name} card click target`);
+      await waitUntil(`${name} card is available for pointer activation`, async () => {
+        if (await evaluate(`document.querySelector('.chat-navigation-preview')?.textContent.includes(${JSON.stringify(hoverMessage.text)})`)) return true;
+        await movePointerTo(hoverSelector);
+        return false;
+      });
+      await sendVisibleMouseClick('.chat-navigation-preview');
+      await waitForTargetOffset(hoverId, `${name} clicking the card navigates to its complete exchange`, cardOffset);
       await movePointerTo('.chat-header-title');
       await waitDom(`${name} hover preview closes when the pointer leaves the rail`, `!document.querySelector('.chat-navigation-preview')`);
 
@@ -5579,6 +5620,7 @@ async function runElectronHost() {
       await evaluate(`document.querySelector(${JSON.stringify(latestSelector)})?.focus()`);
       await sendKey('HOME');
       await waitUntil(`${name} Home focuses the first request`, () => evaluate(`document.activeElement?.dataset.navigationMessageId === ${JSON.stringify(firstId)}`));
+      await waitDom(`${name} keyboard focus remains visible`, `document.activeElement?.matches(':focus-visible')`);
       await sendKey('DOWN');
       await waitUntil(`${name} ArrowDown advances one request`, () => evaluate(`document.activeElement?.dataset.navigationMessageId === ${JSON.stringify(expectedUserIds[1])}`));
       await sendKey('UP');
@@ -5678,9 +5720,21 @@ async function runElectronHost() {
       assert.ok(readingGap > 120, `${name}: reading an older request does not snap to the streaming end`);
 
       const oldOffsetBeforeSwitch = await targetOffset(hoverId);
+      const shortChat = state.details.get('chat-a');
+      const previousShortMessages = shortChat.messages;
+      const previousShortTurns = shortChat.turns;
+      shortChat.messages = [{ ...themeAnchor, id: 'stage5-short-user' }, themeAnswer];
+      shortChat.turns = [];
       await clickChat('Chat A');
       await waitDom(`${name} navigation fixture switches to the other chat`, `document.querySelector('.chat-header-title')?.textContent === 'Chat A'`);
+      await waitDom(`${name} loads the one-exchange history`, `document.querySelector('.chat-navigation-mark[data-navigation-message-id="stage5-short-user"]')`);
+      const short = await inspectRail();
+      assert.equal(short.marks.length, 1, `${name}: the short fixture has one exchange`);
+      assert.ok(Math.abs(short.list.top + short.list.bottom - short.area.top - short.area.bottom) <= 2,
+        `${name}: short chat rail is centered: ${JSON.stringify(short)}`);
       await clickChat('Chat B');
+      shortChat.messages = previousShortMessages;
+      shortChat.turns = previousShortTurns;
       await waitDom(`${name} navigation fixture returns to the correct chat and loaded history`, `document.querySelector('.chat-header-title')?.textContent === 'Chat B'
         && document.querySelector('[data-message-id="${hoverId}"]')`);
       await waitUntil(`${name} switching chats restores the same user target and offset`, async () => {
@@ -5723,10 +5777,11 @@ async function runElectronHost() {
       const originalWindowSize = window.getSize();
       const originalWindowZoom = window.webContents.getZoomFactor();
       try {
-        window.webContents.setZoomFactor(1);
+        window.webContents.setZoomFactor(1.25);
         window.setSize(600, originalWindowSize[1]);
         await waitUntil(`${name} narrow chat viewport is ready`, () => evaluate(`innerWidth <= 620
           && document.querySelector('.view-area.chat-view-area')?.clientWidth > 0`));
+        await sleep(300);
         const narrow = await inspectRail();
         assert.deepEqual(narrow.marks.map((mark) => mark.id), expectedUserIds,
           `${name}: all request targets remain available in a narrow chat pane`);
@@ -5735,6 +5790,16 @@ async function runElectronHost() {
         `${name}: the narrow rail remains inside the measured scroll owner: ${JSON.stringify(narrow)}`);
         assert.ok(narrow.composer.height > 0 && narrow.composer.bottom <= narrow.viewportHeight + 2,
           `${name}: the composer remains visible and outside the rail in a narrow window: ${JSON.stringify(narrow)}`);
+        await moveMarkIntoRailView(hoverId);
+        await movePointerTo(hoverSelector);
+        await waitDom(`${name} compact preview remains visible at 125%`, `(() => {
+          const card = document.querySelector('.chat-navigation-preview');
+          return card && getComputedStyle(card).visibility === 'visible';
+        })()`);
+        const narrowPreview = await inspectRail();
+        assert.ok(narrowPreview.preview.right <= narrowPreview.area.right + 1 && narrowPreview.answerLines <= 3.1
+          && narrowPreview.answerClipped && !narrowPreview.previewScrolls,
+        `${name}: the narrow zoomed preview stays inside the chat pane and preserves its line clamp`);
         await capture('stage5-request-navigation-narrow');
       } finally {
         window.webContents.setZoomFactor(originalWindowZoom);
@@ -5759,6 +5824,12 @@ async function runElectronHost() {
       if (!stage5NavigationChecked) {
         await verifyStage5Navigation(name);
         stage5NavigationChecked = true;
+      }
+      if (name === 'light') {
+        await evaluate(`document.querySelector('.chat-navigation-mark[data-navigation-message-id="stage4-theme-user"]')?.focus()`);
+        await waitDom('light theme shows the linked answer in the card', `document.querySelector('.chat-navigation-preview-answer')?.textContent === ${JSON.stringify(themeAnswer.text)}`);
+        await capture('stage5-request-navigation-light-preview');
+        await evaluate(`document.activeElement?.blur()`);
       }
       const readShortBubbleState = async () => JSON.parse(await evaluate(`JSON.stringify((() => {
         const history = document.querySelector('.chat-history');

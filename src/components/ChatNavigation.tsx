@@ -1,98 +1,85 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type FocusEvent, type PointerEvent, type KeyboardEvent } from 'react';
-import type { ChatArtifact, ChatMessage, ChatTurnRecord } from '../contracts';
-import { buildChatNavigationMarks, nextChatNavigationIndex } from '../chat-navigation';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FocusEvent, type PointerEvent, type KeyboardEvent } from 'react';
+import type { ChatArtifact } from '../contracts';
+import type { ChatTranscriptItem } from '../chat-transcript';
+import { buildChatNavigationMarks, nextChatNavigationIndex, type ChatNavigationMark } from '../chat-navigation';
 
 export default function ChatNavigation({
-  messages,
-  turns,
+  items,
   artifacts,
   onNavigate,
 }: {
-  messages: readonly ChatMessage[];
-  turns: readonly ChatTurnRecord[];
+  items: readonly ChatTranscriptItem[];
   artifacts: readonly ChatArtifact[];
   onNavigate: (messageId: string, followStream: boolean) => void;
 }) {
-  const marks = useMemo(() => buildChatNavigationMarks(messages, turns, artifacts), [messages, turns, artifacts]);
+  const marks = useMemo(() => buildChatNavigationMarks(items, artifacts), [items, artifacts]);
   const navigationRef = useRef<HTMLElement | null>(null);
-  const previewRef = useRef<HTMLDivElement | null>(null);
+  const previewRef = useRef<HTMLButtonElement | null>(null);
   const buttonRefs = useRef(new Map<string, HTMLButtonElement>());
   const [focusedMessageId, setFocusedMessageId] = useState<string | null>(null);
   const [hoveredMessageId, setHoveredMessageId] = useState<string | null>(null);
   const [dismissedFocusMessageId, setDismissedFocusMessageId] = useState<string | null>(null);
-  const [previewStyle, setPreviewStyle] = useState<CSSProperties | null>(null);
   const activePreviewId = hoveredMessageId
     ?? (focusedMessageId !== dismissedFocusMessageId ? focusedMessageId : null);
   const previewMark = marks.find((mark) => mark.messageId === activePreviewId) ?? null;
+  const previewMessageId = previewMark?.messageId;
+  const hasMarks = marks.length > 0;
 
   useLayoutEffect(() => {
     const navigation = navigationRef.current;
     const boundary = navigation?.closest<HTMLElement>('.view-area');
-    if (!navigation || !boundary) return undefined;
-    const ownerLayout = navigation.closest<HTMLElement>('.chat-history-layout');
-    const measure = (): void => {
-      const boundaryRect = boundary.getBoundingClientRect();
-      const navigationRect = navigation.getBoundingClientRect();
-      const boundaryStyle = getComputedStyle(boundary);
-      const navigationStyle = getComputedStyle(navigation);
-      const paddingTop = Number.parseFloat(boundaryStyle.paddingTop) || 0;
-      const stickyTop = navigationStyle.position === 'sticky' ? Number.parseFloat(navigationStyle.top) || 0 : 0;
-      const stableTop = boundaryRect.top + paddingTop + stickyTop;
-      const availableHeight = Math.max(0, boundaryRect.bottom - Math.max(navigationRect.top, stableTop) - 8);
-      const nextHeight = `${availableHeight}px`;
-      if (navigation.style.getPropertyValue('--chat-navigation-max-height') !== nextHeight) {
-        navigation.style.setProperty('--chat-navigation-max-height', nextHeight);
-      }
+    const list = navigation?.querySelector('ol');
+    if (!navigation || !boundary || !list) return undefined;
+    const measure = () => {
+      const bounds = boundary.getBoundingClientRect();
+      navigation.style.setProperty('--chat-navigation-max-height', `${Math.max(0, boundary.clientHeight - 16)}px`);
+      navigation.style.top = `${bounds.top + (bounds.height - list.getBoundingClientRect().height) / 2}px`;
     };
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(boundary);
-    if (ownerLayout) observer.observe(ownerLayout);
-    boundary.addEventListener('scroll', measure, { passive: true });
+    observer.observe(list);
+    window.addEventListener('resize', measure);
     return () => {
       observer.disconnect();
-      boundary.removeEventListener('scroll', measure);
+      window.removeEventListener('resize', measure);
     };
-  }, [marks.length > 0]);
+  }, [hasMarks]);
 
-  function updatePreviewPosition(messageId: string): void {
-    const button = buttonRefs.current.get(messageId);
+  useLayoutEffect(() => {
+    const preview = previewRef.current;
+    const button = previewMessageId ? buttonRefs.current.get(previewMessageId) : undefined;
     const boundary = button?.closest<HTMLElement>('.view-area');
-    if (!button || !boundary) return;
-    const buttonRect = button.getBoundingClientRect();
-    const bounds = boundary.getBoundingClientRect();
-    const width = Math.max(96, Math.min(280, bounds.width - 20));
-    const previewHeight = Math.min(240, window.innerHeight - 24, bounds.height - 16);
-    const rightCandidate = buttonRect.right + 9;
-    const left = rightCandidate + width <= bounds.right - 8
-      ? rightCandidate
-      : Math.max(bounds.left + 8, buttonRect.left - width - 9);
-    const top = Math.max(bounds.top + 8, Math.min(
-      bounds.bottom - previewHeight - 8,
-      buttonRect.top + buttonRect.height / 2 - previewHeight / 2,
-    ));
-    setPreviewStyle({ left, top, width, maxHeight: previewHeight });
-  }
-
-  useEffect(() => {
-    if (!previewMark) {
-      setPreviewStyle(null);
-      return undefined;
-    }
-    const reposition = () => updatePreviewPosition(previewMark.messageId);
+    const list = button?.closest('ol');
+    if (!preview || !button || !boundary || !list) return undefined;
+    const reposition = () => {
+      const anchor = button.getBoundingClientRect();
+      const bounds = boundary.getBoundingClientRect();
+      const rail = list.getBoundingClientRect();
+      const center = anchor.top + anchor.height / 2;
+      const left = anchor.right + 6;
+      const width = Math.min(352, bounds.right - left - 8);
+      preview.style.width = `${Math.max(0, width)}px`;
+      const height = preview.getBoundingClientRect().height;
+      const top = Math.max(bounds.top + 8, Math.min(center - height / 2, bounds.bottom - height - 8));
+      preview.style.left = `${left}px`;
+      preview.style.top = `${top}px`;
+      preview.style.visibility = width > 0 && height + 16 <= bounds.height
+        && center >= Math.max(rail.top, bounds.top) && center <= Math.min(rail.bottom, bounds.bottom) ? 'visible' : 'hidden';
+    };
     reposition();
     window.addEventListener('resize', reposition);
     window.addEventListener('scroll', reposition, true);
-    const boundary = navigationRef.current?.closest<HTMLElement>('.view-area');
     const observer = new ResizeObserver(reposition);
-    if (boundary) observer.observe(boundary);
-    if (navigationRef.current) observer.observe(navigationRef.current);
+    observer.observe(boundary);
+    observer.observe(list);
+    observer.observe(preview);
     return () => {
       window.removeEventListener('resize', reposition);
       window.removeEventListener('scroll', reposition, true);
       observer.disconnect();
     };
-  }, [previewMark?.messageId]);
+  }, [previewMessageId]);
 
   useEffect(() => {
     if (marks.length === 0) {
@@ -116,7 +103,14 @@ export default function ChatNavigation({
     event.preventDefault();
     const nextMark = marks[nextIndex];
     setDismissedFocusMessageId(null);
-    buttonRefs.current.get(nextMark.messageId)?.focus();
+    const button = buttonRefs.current.get(nextMark.messageId);
+    const list = button?.closest('ol');
+    if (!button || !list) return;
+    const mark = button.getBoundingClientRect();
+    const rail = list.getBoundingClientRect();
+    if (mark.top < rail.top) list.scrollTop += mark.top - rail.top;
+    else if (mark.bottom > rail.bottom) list.scrollTop += mark.bottom - rail.bottom;
+    button.focus({ preventScroll: true });
   }
 
   function handleBlur(event: FocusEvent<HTMLElement>): void {
@@ -131,9 +125,11 @@ export default function ChatNavigation({
     setHoveredMessageId((current) => current === messageId ? null : current);
   }
 
-  if (marks.length === 0) return null;
-  const expandedMessageId = hoveredMessageId
-    ?? (focusedMessageId !== dismissedFocusMessageId ? focusedMessageId : null);
+  function navigate(mark: ChatNavigationMark): void {
+    onNavigate(mark.messageId, mark.isLatest && (mark.status === 'Выполняется' || mark.status === 'В очереди'));
+  }
+
+  if (!hasMarks) return null;
 
   return (
     <nav className="chat-navigation" aria-label="Навигация по запросам" ref={navigationRef} onBlurCapture={handleBlur}>
@@ -142,7 +138,7 @@ export default function ChatNavigation({
           const accessiblePreview = mark.preview.length > 240 ? `${mark.preview.slice(0, 237)}…` : mark.preview;
           const focused = focusedMessageId === mark.messageId;
           const hovered = hoveredMessageId === mark.messageId;
-          const expanded = expandedMessageId === mark.messageId;
+          const expanded = activePreviewId === mark.messageId;
           const previewId = `chat-navigation-preview-${mark.messageId}`;
           return (
             <li key={mark.messageId}>
@@ -161,15 +157,11 @@ export default function ChatNavigation({
                 onFocus={() => {
                   setFocusedMessageId(mark.messageId);
                   setDismissedFocusMessageId(null);
-                  updatePreviewPosition(mark.messageId);
                 }}
-                onPointerEnter={() => {
-                  setHoveredMessageId(mark.messageId);
-                  updatePreviewPosition(mark.messageId);
-                }}
+                onPointerEnter={() => setHoveredMessageId(mark.messageId)}
                 onPointerLeave={(event) => handlePointerLeave(event, mark.messageId)}
                 onKeyDown={(event) => handleKeyDown(event, index)}
-                onClick={() => onNavigate(mark.messageId, mark.isLatest && (mark.status === 'Выполняется' || mark.status === 'В очереди'))}
+                onClick={() => navigate(mark)}
               >
                 <span className="chat-navigation-mark-bar" aria-hidden="true" />
               </button>
@@ -177,21 +169,24 @@ export default function ChatNavigation({
           );
         })}
       </ol>
-      {previewMark && previewStyle && <div
+      {previewMark && <button
         className="chat-navigation-preview"
-        id={`chat-navigation-preview-${previewMark.messageId}`}
-        role="tooltip"
-        style={previewStyle}
+        type="button"
+        tabIndex={-1}
         ref={previewRef}
+        onMouseDown={(event) => event.preventDefault()}
         onPointerLeave={() => setHoveredMessageId(null)}
+        onClick={() => {
+          navigate(previewMark);
+          setHoveredMessageId(null);
+          setDismissedFocusMessageId(focusedMessageId);
+        }}
       >
-        <div className="chat-navigation-preview-meta">
-          {previewMark.date && <span>{previewMark.date}</span>}
-          {previewMark.time && <time>{previewMark.time}</time>}
-        </div>
-        <p>{previewMark.preview}</p>
-        <small>{previewMark.status}</small>
-      </div>}
+        <span className="chat-navigation-preview-request">{previewMark.preview}</span>
+        <span className="chat-navigation-preview-answer" id={`chat-navigation-preview-${previewMark.messageId}`}>
+          {previewMark.answer ?? previewMark.status}
+        </span>
+      </button>}
     </nav>
   );
 }
