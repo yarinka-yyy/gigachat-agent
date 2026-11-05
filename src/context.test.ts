@@ -614,7 +614,12 @@ test('both semantic wire requests preserve source distinctions for all four sele
       delete reviewed.evidenceIndex;
       delete reviewed.sourceReviews;
       delete reviewed.topicSources;
-      const records = wire.messages.slice(start + 1, -1).map(message => { const record = decode(message.content[0]!.text); delete record.review; return record; });
+      if (request === review) {
+        const focus = decode(wire.messages[wire.messages.length - 2]!.content[0]!.text);
+        assert.deepEqual(focus.primaryNotes, { m0: 'Do not publish ownerCode.', m2: 'Copy validated.' });
+      }
+      const records: Record<string, unknown>[] = wire.messages.slice(start + 1, request === review ? -2 : -1)
+        .map(message => { const record = decode(message.content[0]!.text); delete record.review; return record; });
       assert.deepEqual(records.map(record => record.sourceRef), ['m0', 'm1', 'm2'], 'review keeps each historical role beside its original chronological neighbors');
       records.sort((a, b) => Number((a.sourceRef as string).slice(1)) - Number((b.sourceRef as string).slice(1)));
       assert.deepEqual({ ...reviewed, messages: records }, archive);
@@ -737,13 +742,13 @@ test('builds an independent semantic review from the exact current archive and a
     const ref = record.sourceRef as string;
     assert.deepEqual(record.review, {
       categories: [...new Set(contract.properties.classifications.properties[ref]!.enum.flatMap(value => value.split('+')))],
-      updates: { stable: ['none'], independent: [], changes: Object.entries(quoteIndex).filter(([, quote]) => quote.role === 'user' && Number(quote.sourceRef.slice(1)) > Number(ref.slice(1))).map(([id, quote]) => `${quote.sourceRef}/${id}`) }, topic: null,
+      updates: { stable: ['none'], independent: [], changes: Object.values(quoteIndex).some(quote => quote.role === 'user' && Number(quote.sourceRef.slice(1)) > Number(ref.slice(1))) }, topic: null,
       evidence: Object.fromEntries(Object.entries(quoteIndex).filter(([, quote]) => quote.sourceRef === ref).map(([id, quote]) => [`${ref}/${id}`, { text: quote.text }])) });
   }
   const metadata = decode(wire.messages[2]!.content[0]!.text!);
   const toolReviews = metadata.sourceReviews as Record<string, unknown>;
   assert.deepEqual(toolReviews.t0, { categories: [...new Set(contract.properties.classifications.properties.t0!.enum.flatMap(value => value.split('+')))],
-    updates: { stable: ['none'], independent: [], changes: Object.entries(quoteIndex).filter(([, quote]) => quote.role === 'user' && Number(quote.sourceRef.slice(1)) > 2).map(([id, quote]) => `${quote.sourceRef}/${id}`) }, topic: null,
+    updates: { stable: ['none'], independent: [], changes: Object.values(quoteIndex).some(quote => quote.role === 'user' && Number(quote.sourceRef.slice(1)) > 2) }, topic: null,
     evidence: Object.fromEntries(Object.entries(quoteIndex).filter(([, quote]) => quote.sourceRef === 't0').map(([id, quote]) => [`t0/${id}`, { text: quote.text }])) });
   assert.equal(metadata.evidenceIndex, undefined, 'literal evidence is local to its source, not duplicated in a distant index');
   assert.equal(wire.messages[wire.messages.length - 1]?.content[0]?.text, review.messages[review.messages.length - 1]?.text);
