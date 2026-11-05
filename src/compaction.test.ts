@@ -712,8 +712,9 @@ test('topic closure removes all its details and defect state survives compilatio
     }), rollingNotes, rollingSources, rollingRefs, rollingArchive), /Закрытый источник|первичного источника/);
   }
   assert.deepEqual(continued.unresolvedDefects, memory.unresolvedDefects, 'state survives a second compaction without prefix accumulation');
-  assert.throws(() => compileResolvedSemanticCompactionMemory(reviewJson({ ...rollingResolution, unresolvedDefects: '' }), rollingNotes,
-    rollingSources, rollingRefs, rollingArchive), /нельзя потерять/);
+  const omittedDefect = compileResolvedSemanticCompactionMemory(reviewJson({ ...rollingResolution, unresolvedDefects: '' }), rollingNotes,
+    rollingSources, rollingRefs, rollingArchive);
+  assert.deepEqual(JSON.parse(omittedDefect).unresolvedDefects, memory.unresolvedDefects);
   const splitWitness = { ...memory, unresolvedDefects: memory.unresolvedDefects.map((entry: { exactQuotes: Array<{ sourceRef: string; text: string }> }) => ({ ...entry,
     exactQuotes: entry.exactQuotes.flatMap(quote => quote.text.split(/(?<=[.!?])\s+/u).map(text => ({ sourceRef: quote.sourceRef, text }))) })) };
   const splitArchive = serializeSemanticCompactionTranscript(rollingSources, splitWitness, 6);
@@ -1019,6 +1020,8 @@ test('critical assistant data requires retention or a cited earlier user origin'
   const suffixReview = semanticCompactionWireResponseFormat(undefined, rollingArchive, `ЗАМЕТКИ\n${suffixDraft}`).schema;
   assert.ok('sources' in suffixReview.properties);
   assert.equal(suffixReview.properties.topicUpdates.properties.other.maxItems, 0, 'a new witness cannot close a range starting in previously compacted history');
+  assert.match('constraint|none', new RegExp(suffixReview.properties.sources.properties.m0!.pattern));
+  assert.doesNotMatch('constraint+openWork|none', new RegExp(suffixReview.properties.sources.properties.m0!.pattern));
   assert.throws(() => compileRolling({ ...rolling.classifications, m2: 'fact' }), /первичного источника/);
   assert.throws(() => compileRolling({ ...rolling.classifications, m2: 'drop' }), /Критичный первичный/);
 });

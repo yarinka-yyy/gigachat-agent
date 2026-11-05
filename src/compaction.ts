@@ -171,6 +171,21 @@ const SOURCE_CATEGORIES = ['constraint', 'decision', 'openWork', 'fact'];
 const SOURCE_CLASSES = ['drop', 'defect', 'request', ...Array.from({ length: 15 }, (_, mask) =>
   SOURCE_CATEGORIES.filter((_category, bit) => (mask + 1) & (1 << bit)).join('+'))];
 
+function retainedReviewCategories(memory: SemanticCompactionMemory | null): Record<string, string> {
+  if (!memory) return {};
+  const categories: Record<string, string[]> = {};
+  const add = (entries: SemanticCompactionEntry[], category: string) => {
+    for (const entry of entries) for (const ref of entry.sourceRefs) (categories[ref] ??= []).push(category);
+  };
+  add(memory.constraints, 'constraint');
+  add([...memory.decisions, ...(memory.assistantReports ?? [])], 'decision');
+  add(memory.openWork, 'openWork');
+  add(memory.facts, 'fact');
+  add(memory.historicalRequests ?? [], 'request');
+  for (const ref of memory.activeTask?.sourceRefs ?? []) categories[ref] ??= ['openWork'];
+  return Object.fromEntries(Object.entries(categories).map(([ref, values]) => [ref, [...new Set(values)].join('+')]));
+}
+
 
 const SEMANTIC_REVIEW_FIELDS = ['sourceUpdates', 'topicUpdates', 'assistantOrigins', 'activeTask', 'classifications', 'unresolvedDefects'] as const;
 const SEMANTIC_GLOBAL_REVIEW_FIELDS = ['sourceUpdates', 'classifications', 'activeTask', 'topicUpdates', 'unresolvedDefects'] as const;
@@ -465,6 +480,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
       const messageRefs = archive.messages.map(source => source.sourceRef);
       const resolvedTopics = new Map<string, DraftTopic>();
       const classifications = selection.classifications as Record<string, string>;
+      Object.assign(classifications, retainedReviewCategories(archive.previousMemory));
       const activeTask = selection.activeTask;
       const review = selection.topicUpdates;
       if (!isRecord(review) || !hasOnlyKeys(review, ['proposed', 'other']) || !isRecord(review.proposed)
@@ -691,8 +707,11 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
     if (!exactQuotes.length || refs.some(ref => !exactQuotes.some(quote => quote.sourceRef === ref))) throw new Error('Каждый источник состояния дефекта требует дословного свидетельства.');
     return { sourceRefs: refs, exactQuotes };
   });
-  if (defects.length > 16) throw new Error('Слишком много открытых дефектов.');
   for (const prior of previous?.unresolvedDefects ?? []) {
+    const refs = prior.sourceRefs.filter(ref => !closed.has(ref));
+    if (refs.length && prior.exactQuotes && !defects.some(defect => defect.sourceRefs.some(ref => refs.includes(ref)))) {
+      defects.push({ sourceRefs: refs, exactQuotes: prior.exactQuotes.filter(quote => refs.includes(quote.sourceRef)) });
+    }
     if (prior.sourceRefs.some(ref => !closed.has(ref) && !defects.some(defect => defect.sourceRefs.includes(ref)))) {
       throw new Error('Наблюдённый дефект нельзя потерять без подтверждённого закрытия.');
     }
@@ -701,6 +720,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
       throw new Error('Точное свидетельство дефекта нельзя заменить пересказом.');
     }
   }
+  if (defects.length > 16) throw new Error('Слишком много открытых дефектов.');
   const exactRefs = [...new Set([...sourceRefs.filter(ref => verbatim[ref]), ...protectedRefs])];
   const retain = (entries: unknown) => {
     if (!Array.isArray(entries)) throw new Error('Некорректный список памяти.');
@@ -780,8 +800,12 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   const assistantOrigins = Object.fromEntries(archive.messages.filter(source => source.role === 'assistant').map(source => [source.sourceRef, userRefs.filter(ref => Number(ref.slice(1)) < Number(source.sourceRef.slice(1)))]));
   const requestCandidates = archive.messages.filter(source => source.role === 'user'
     && (!draft?.verbatim[source.sourceRef] || /[?？]/u.test(source.text))).map(source => source.sourceRef);
-  return semanticReviewDecisionResponseFormat(refs, taskRefs, archive.previousMemory ? semanticMemorySourceRefs(archive.previousMemory).filter(ref => !reportRefs.has(ref)) : [], protectedRefs, withSources(updateEvidence), withSources(independentEvidence), withSources(topicEvidence), assistantOrigins,
+  const format = semanticReviewDecisionResponseFormat(refs, taskRefs, archive.previousMemory ? semanticMemorySourceRefs(archive.previousMemory).filter(ref => !reportRefs.has(ref)) : [], protectedRefs, withSources(updateEvidence), withSources(independentEvidence), withSources(topicEvidence), assistantOrigins,
     refs.filter(ref => draft ? draft.verbatim[ref] : false), requestRefs, requestCandidates, closedRefs);
+  for (const [ref, category] of Object.entries(retainedReviewCategories(archive.previousMemory))) {
+    if (!closedRefs.includes(ref)) format.schema.properties.classifications.properties[ref]!.enum = [category];
+  }
+  return format;
 }
 
 export function semanticCompactionWireResponseFormat(archiveText?: string, reviewMetadata?: string, reviewNotes?: string) {
