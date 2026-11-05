@@ -380,8 +380,10 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
       const resolvedTopics = new Map<string, DraftTopic>();
       const classifications = selection.classifications as Record<string, string>;
       const activeTask = selection.activeTask;
-      if (!Array.isArray(selection.topicUpdates) || selection.topicUpdates.length > MAX_GENERATED_PAST_TOPICS) throw new Error('Review требует список закрытых тем.');
-      selection.topicUpdates = Object.fromEntries(selection.topicUpdates.map(update => {
+      if (!Array.isArray(selection.topicUpdates) || selection.topicUpdates.length > MAX_GENERATED_PAST_TOPICS
+        || selection.topicUpdates.length === 0 && witnesses.size > 0) throw new Error('Review требует явное решение о закрытии тем.');
+      const updates = selection.topicUpdates;
+      selection.topicUpdates = Object.fromEntries(updates.flatMap(update => {
         if (!isRecord(update) || !hasOnlyKeys(update, ['witness', 'first', 'last', 'subject'])
           || typeof update.witness !== 'string' || typeof update.first !== 'string' || typeof update.last !== 'string'
           || typeof update.subject !== 'string' || !update.subject.trim() || [...update.subject].length > MAX_SEMANTIC_SUBJECT_CHARS
@@ -389,6 +391,8 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
           throw new Error('Review требует решения и границы для каждой темы.');
         }
         const { witness: address, first, subject } = update;
+        if (address === 'none' && witnesses.size > 0 && updates.length === 1
+          && first === 'none' && update.last === 'none' && subject === 'none') return [];
         if (!witnesses.has(address)) throw new Error('Закрытие темы требует допустимого USER-свидетельства.');
         const witness = address.split('/')[0]!;
         const last = update.last === 'previous' ? messageRefs[messageRefs.indexOf(witness) - 1] : update.last;
@@ -397,7 +401,7 @@ export function compileResolvedSemanticCompactionMemory(value: string, notesValu
         }
         resolvedTopics.set(subject, { subject, firstSource: first, lastSource: last, evidence: address });
         if (witness === activeTask && classifications[witness] === 'request') classifications[witness] = 'openWork';
-        return [subject, { closed: true, evidence: address }];
+        return [[subject, { closed: true, evidence: address }]];
       }));
       topicByRef = topicSources(draftTopicSources([...resolvedTopics.values()], sourceRefs, archive.tools));
     }
@@ -645,8 +649,11 @@ export function semanticCompactionResponseFormat(archiveText?: string, reviewMet
   const updateEvidence = Object.fromEntries(refs.map(ref => [ref, closedRefs.includes(ref) ? [] : evidenceIds.filter(id => position(evidenceIndex[id]!.sourceRef) > position(ref))]));
   const firstAvailable = refs.filter(ref => ref.startsWith('m')).sort((a, b) => Number(a.slice(1)) - Number(b.slice(1)))[0]!;
   const scopes = draft ? draftTopicSources(draft.topics, refs, archive.tools) : Array.from({ length: MAX_GENERATED_PAST_TOPICS }, (_, i) => ({ subject: `${i}`.padEnd(MAX_SEMANTIC_SUBJECT_CHARS, 'X'), sourceRefs: [firstAvailable] }));
-  const topicEvidence = Object.fromEntries(scopes.map(topic => [topic.subject,
-    evidenceIds.filter(id => position(firstAvailable) < position(evidenceIndex[id]!.sourceRef))]));
+  const topicCandidates = evidenceIds.filter(id => position(firstAvailable) < position(evidenceIndex[id]!.sourceRef));
+  const explicitClosure = new Set(topicCandidates.filter(id => /(?<!\p{L})(?:закрыт[аоы]?|заверш[её]н[аоы]?|closed|finished|completed)[.!»"’”\s]*$/iu
+    .test(topicStatusSentence(evidenceIndex[id]!.text) ?? '')));
+  const orderedTopicCandidates = [...topicCandidates.filter(id => explicitClosure.has(id)), ...topicCandidates.filter(id => !explicitClosure.has(id))];
+  const topicEvidence = Object.fromEntries(scopes.map(topic => [topic.subject, orderedTopicCandidates]));
   const independentEvidence = Object.fromEntries(refs.map(ref => [ref, !closedRefs.includes(ref) && (!draft || scopes.length > 0)
     ? evidenceIds.filter(id => evidenceIndex[id]!.sourceRef === ref) : []]));
   const reportRefs = new Set((archive.previousMemory?.assistantReports ?? []).flatMap(entry => entry.sourceRefs));
@@ -668,11 +675,11 @@ export function semanticCompactionWireResponseFormat(archiveText?: string, revie
   const witnesses = [...new Set(Object.values(topicUpdates.properties).flatMap(topic => topic.properties.evidence.enum.slice(1)))];
   const alternatives = (values: string[]) => values.map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
   return { ...format, schema: { type: 'object', properties: {
-    topicUpdates: { type: 'array', maxItems: witnesses.length ? MAX_GENERATED_PAST_TOPICS : 0, items: {
+    topicUpdates: { type: 'array', minItems: witnesses.length ? 1 : 0, maxItems: witnesses.length ? MAX_GENERATED_PAST_TOPICS : 0, items: {
       type: 'object', properties: {
-        witness: { type: 'string', enum: witnesses.length ? witnesses : ['none'] },
-        first: { type: 'string', enum: boundaries },
-        last: { type: 'string', enum: ['previous', ...boundaries] },
+        witness: { type: 'string', enum: [...witnesses, 'none'] },
+        first: { type: 'string', enum: [...boundaries, 'none'] },
+        last: { type: 'string', enum: ['previous', ...boundaries, 'none'] },
         subject: { type: 'string', minLength: 1, maxLength: MAX_SEMANTIC_SUBJECT_CHARS },
       }, required: ['witness', 'first', 'last', 'subject'], additionalProperties: false,
     } },

@@ -889,7 +889,10 @@ test('source state transitions override stale categories without dropping durabl
   assert.equal(focus.topics, undefined);
   assert.ok(focus.witnesses[`m8/${idsFor('m8')[0]}`], 'unranked witnesses stay available');
   assert.ok(closureChoices.includes(closure.witness));
-  assert.ok(!closureChoices.includes('none'));
+  assert.equal(closureChoices[0], closure.witness);
+  assert.equal(closureChoices[closureChoices.length - 1], 'none');
+  assert.throws(() => groupedCompile({ ...paired, topicUpdates: [] }), /явное решение/);
+  assert.doesNotThrow(() => groupedCompile({ ...paired, topicUpdates: [{ witness: 'none', first: 'none', last: 'none', subject: 'none' }] }));
   for (const proof of [`m5/${witness}: fabricated`, `m3/${witness}`, `m0/${witness}`]) {
     assert.ok(!closureChoices.includes(proof));
     assert.throws(() => groupedCompile({ ...paired, topicUpdates: [{ ...closure, witness: proof }] }), /свидетельства/);
