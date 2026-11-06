@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type PointerEvent } from 'react';
-import { Activity, BarChart3, CalendarDays, CircleHelp, RefreshCw, Sparkles, Wrench, X } from 'lucide-react';
+import { Activity, BarChart3, CalendarDays, CircleHelp, RefreshCw, Wrench, X } from 'lucide-react';
 import type {
   BalanceFamilyId,
   ProviderConnectionSnapshot,
@@ -765,7 +765,7 @@ export default function UsageProfile({
 
       <section className="profile-detail-grid" aria-label="Детализация и дополнительные показатели">
         <section className="profile-detail-section" aria-labelledby="profile-family-table-title">
-          <div className="profile-section-heading"><div><h2 id="profile-family-table-title">Расход по моделям</h2><p>Сумма известных значений всех API-вызовов.</p></div><BarChart3 aria-hidden="true" /></div>
+          <div className="profile-section-heading"><div><h2 id="profile-family-table-title">Итоги по моделям</h2><p>Сумма известных значений всех API-вызовов.</p></div><BarChart3 aria-hidden="true" /></div>
           <div className="profile-table-scroll"><table><thead><tr><th>Модель</th><th>Запросы</th><th>Токены</th></tr></thead><tbody>
           {view.byFamily.map((aggregate) => {
               const id = FAMILY_IDS.find((family) => family === aggregate.key);
@@ -785,7 +785,7 @@ export default function UsageProfile({
       </section>
 
       <section className="profile-extra-section" aria-labelledby="profile-extra-title">
-        <div className="profile-section-heading"><div><h2 id="profile-extra-title">Ещё о работе</h2><p>Только сведения, которые удалось сохранить.</p></div><Sparkles aria-hidden="true" /></div>
+        <div className="profile-section-heading"><h2 id="profile-extra-title">Инструменты и рабочие сессии</h2></div>
         <div className="profile-extra-grid">
           <article><span>Самый длинный чат</span><strong>{view.chats.longestByMessages ? `${formatNumber(view.chats.longestByMessages.messageCount)} сообщений` : 'Нет данных'}</strong>
             {view.chats.longestByMessages && <small>{view.chats.longestByMessages.title}</small>}</article>

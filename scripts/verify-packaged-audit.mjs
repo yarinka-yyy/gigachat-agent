@@ -1776,7 +1776,7 @@ async function runElectronHost() {
     assert.equal(state.appendCalls.length, acceptedAppendCount + 1, 'only the two valid image prompts append; the final +1 is the pending second turn already recorded');
     assert.equal(state.generatedImageSaveCalls.length, 4);
     await clickText('.nav-action', 'Новый чат');
-    await waitDom('ordinary Home composer stays available', `document.querySelector('.empty-state h1')?.textContent === 'Что будем создавать?'`);
+    await waitDom('ordinary Home composer stays available', `document.querySelector('.empty-state h1')?.textContent === 'Новый чат'`);
     assert.equal(state.appSettings.defaultModelId, null, 'ordinary Home model default remains unchanged');
     assert.equal(window.isVisible(), false, 'image-generation smoke never reveals or focuses the BrowserWindow');
     console.log(`IMAGE_SMOKE_COUNTS ${JSON.stringify({ passCount, imageGenerationCalls: state.imageGenerationCalls, generatedImageArtifacts: state.imageGeneratedArtifacts,
@@ -2996,6 +2996,8 @@ async function runElectronHost() {
     await evaluate(`(() => { const button = document.querySelector('.runtime-retry'); button.click(); button.click(); })()`);
     await waitUntil('one retry IPC after a double click', () => state.retryCalls.length === 1);
     assert.deepEqual(state.retryCalls[0], { chatId: 'chat-a', turnId: failedTurn.id });
+    await waitDom('queued retry is announced as a status rather than an error',
+      `document.querySelector('.notice-success[role="status"]')?.textContent.includes('Повтор поставлен в очередь.')`);
     assert.equal(state.appendCalls.length, appendCountBeforeRetry, 'retry must not append a second user record');
     assert.equal(state.details.get('chat-a').messages.filter((message) => message.id === runtimeUserAnchor.id).length, 1,
       'synthetic renderer retry keeps the original user message exactly once');
@@ -4201,14 +4203,14 @@ async function runElectronHost() {
     const homeCreateCalls = state.createCalls.length;
     const homeSendCalls = state.homeDraftSendCalls.length;
     await clickText('.sidebar-actions button', 'Новый чат');
-    await waitDom('home draft editor ready', `document.querySelector('.home-view') && document.querySelector('.empty-state h1')?.textContent === 'Что будем создавать?' && !document.querySelector('.composer textarea')?.disabled`);
+    await waitDom('home draft editor ready', `document.querySelector('.home-view') && document.querySelector('.empty-state h1')?.textContent === 'Новый чат' && !document.querySelector('.composer textarea')?.disabled`);
     await evaluate(`document.querySelector(${JSON.stringify(draftSelector)})?.focus()`);
     await fillTextarea(draftSelector, 'x');
     await evaluate(`(() => { const element = document.querySelector(${JSON.stringify(draftSelector)}); const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set; setter.call(element, 'x' + 'a'.repeat(100)); element.setSelectionRange(101, 101); element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: 'a'.repeat(100) })); })()`);
     await waitUntil('home text autosaved without a chat', () => state.homeDraft.text === `x${'a'.repeat(100)}`);
     assert.equal(await evaluate(`document.activeElement === document.querySelector(${JSON.stringify(draftSelector)})`), true,
       'typing beyond the first character keeps focus in the same home composer');
-    assert.equal(await evaluate(`document.querySelector('.empty-state h1')?.textContent`), 'Что будем создавать?',
+    assert.equal(await evaluate(`document.querySelector('.empty-state h1')?.textContent`), 'Новый чат',
       'typing does not replace the welcome screen');
     assert.equal(state.chats.length, homeChatCount, 'typing does not create a recent chat');
     assert.equal(state.createCalls.length, homeCreateCalls, 'typing does not call chats.create');
@@ -5478,8 +5480,8 @@ async function runElectronHost() {
           if (!list || !button) return false;
           const listRect = list.getBoundingClientRect();
           const buttonRect = button.getBoundingClientRect();
-          if (buttonRect.top < listRect.top) list.scrollTop -= listRect.top - buttonRect.top;
-          else if (buttonRect.bottom > listRect.bottom) list.scrollTop += buttonRect.bottom - listRect.bottom;
+          if (buttonRect.top < listRect.top) list.scrollTop -= Math.ceil(listRect.top - buttonRect.top);
+          else if (buttonRect.bottom > listRect.bottom) list.scrollTop += Math.ceil(buttonRect.bottom - listRect.bottom);
           return true;
         })()`);
         await waitUntil(`request ${messageId} is inside the rail viewport`, () => evaluate(`(() => {
@@ -6039,6 +6041,7 @@ async function runElectronHost() {
               full: workspace?.classList.contains('is-full'),
               workspaceWidth: workspace?.getBoundingClientRect().width,
               panelBackgroundImage: panelStyle?.backgroundImage,
+              panelBackgroundColor: panelStyle?.backgroundColor,
               panelMidToken: frameStyle.getPropertyValue('--panel-mid').trim(),
               headerDivider: headerStyle?.borderBottomColor,
               toggleColor: expandStyle?.color,
@@ -6051,7 +6054,9 @@ async function runElectronHost() {
           assert.deepEqual(workspaceThemeSample.themeClasses, [`theme-${resolvedTheme}`], `${themeCase.label}: actual browser workspace uses its resolved theme`);
           assert.equal(workspaceThemeSample.full, full, `${themeCase.label}: workspace visual sample uses the requested split/full state`);
           assert.ok(workspaceThemeSample.workspaceWidth > 0, `${themeCase.label}: actual BrowserPanel is rendered`);
-          assert.notEqual(workspaceThemeSample.panelBackgroundImage, 'none', `${themeCase.label}: actual workspace panel resolves its gradient surface`);
+          assert.equal(workspaceThemeSample.panelBackgroundImage, 'none', `${themeCase.label}: chat workspace uses a flat surface`);
+          assert.ok(workspaceThemeSample.panelBackgroundColor && workspaceThemeSample.panelBackgroundColor !== 'rgba(0, 0, 0, 0)',
+            `${themeCase.label}: chat workspace has a visible background color`);
           assert.ok(workspaceThemeSample.panelMidToken, `${themeCase.label}: actual workspace panel theme token resolves`);
           assert.notEqual(workspaceThemeSample.headerDivider, 'rgba(0, 0, 0, 0)', `${themeCase.label}: actual workspace header has a visible divider`);
           assert.notEqual(workspaceThemeSample.toggleColor, 'rgba(0, 0, 0, 0)', `${themeCase.label}: actual workspace action icon has a resolved color`);
@@ -6174,7 +6179,7 @@ async function runElectronHost() {
 
     for (const name of ['Создать видео', 'Подкасты']) {
       await clickText('.nav-action', name);
-      await waitDom(`${name} opens a placeholder`, `document.querySelector('.content-page .future-badge')?.textContent === 'FUTURE'
+      await waitDom(`${name} opens a placeholder`, `document.querySelector('.content-page .future-badge')?.textContent === 'Запланировано'
         && document.querySelector('.content-page h1')?.textContent === ${JSON.stringify(name === 'Подкасты' ? name : 'Создание видео')}`);
     }
     passed('Permanent video and podcast actions open their planned-feature pages');

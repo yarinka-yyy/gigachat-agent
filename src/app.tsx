@@ -980,7 +980,8 @@ export default function App() {
     setRetryingTurnIds(new Set(retryingTurnIdsRef.current));
     try {
       const retryId = await window.gigaChat.runtime.retry(turn.chatId, turn.id);
-      setNotice(retryId ? 'Повтор поставлен в очередь.' : 'Повтор больше недоступен. Обновите состояние хода.');
+      if (retryId) showSuccess('Повтор поставлен в очередь.');
+      else setNotice('Повтор больше недоступен. Обновите состояние хода.');
     } catch (error) {
       setNotice(getErrorMessage(error));
     } finally {
@@ -3617,8 +3618,8 @@ export default function App() {
         return (
           <section className="empty-state">
             <img className="empty-logo" src={gigaChatLogo} alt="" draggable={false} />
-            <h1>Что будем создавать?</h1>
-            <p>Ваши идеи. Возможности ГигаЧат.</p>
+            <h1>Новый чат</h1>
+            <p>Напишите сообщение или прикрепите файл</p>
           </section>
         );
       case 'chat':
@@ -3702,9 +3703,10 @@ export default function App() {
         return (
           <section className="settings-layout">
             <nav className="settings-nav" aria-label="Разделы настроек">
-              <div className="settings-nav-heading"><h1>Настройки</h1></div>
+              <div className="settings-nav-heading"><h2>Настройки</h2></div>
               {SETTINGS_SECTIONS.map((item) => (
-                <button key={item.id} type="button" className={settingsSection === item.id ? 'settings-nav-item active' : 'settings-nav-item'} onClick={() => setSettingsSection(item.id)}>
+                <button key={item.id} type="button" className={settingsSection === item.id ? 'settings-nav-item active' : 'settings-nav-item'}
+                  aria-current={settingsSection === item.id ? 'page' : undefined} onClick={() => setSettingsSection(item.id)}>
                   <Icon name={item.icon} /><span>{item.label}</span>
                 </button>
               ))}
@@ -3738,9 +3740,9 @@ export default function App() {
           </section>
         </section>;
       case 'video':
-        return <section className="content-page"><div className="page-heading"><span className="eyebrow">Будущая функция</span><h1>Создание видео</h1></div><EmptyState title="Раздел подготовлен" description="Генерация видео появится после отдельной проверки возможностей API." icon="video" /><span className="future-badge">FUTURE</span></section>;
+        return <section className="content-page"><div className="page-heading"><h1>Создание видео</h1><span className="future-badge">Запланировано</span></div><EmptyState title="Видео пока недоступно" description="Сначала проверим поддержку видео в GigaChat API." icon="video" /></section>;
       case 'podcasts':
-        return <section className="content-page"><div className="page-heading"><span className="eyebrow">Будущая функция</span><h1>Подкасты</h1></div><EmptyState title="Раздел подготовлен" description="Создание подкастов появится после отдельной проверки возможностей API." icon="podcast" /><span className="future-badge">FUTURE</span></section>;
+        return <section className="content-page"><div className="page-heading"><h1>Подкасты</h1><span className="future-badge">Запланировано</span></div><EmptyState title="Создание подкастов пока недоступно" description="Сначала проверим поддержку подкастов в GigaChat API." icon="podcast" /></section>;
       case 'archive':
         return renderArchive();
       case 'profile':
@@ -3882,7 +3884,7 @@ export default function App() {
           }}
         />}
 
-        <main ref={mainPanelRef} className={route.page === 'settings' ? 'main-panel settings-panel' : 'main-panel'}
+        <main ref={mainPanelRef} className={route.page === 'settings' ? 'main-panel settings-panel' : route.page === 'chat' ? 'main-panel chat-panel' : 'main-panel'}
           onDragEnter={(event: ReactDragEvent<HTMLElement>) => {
             if (composerIsImageChat && Array.from(event.dataTransfer.types).includes('Files')) {
               event.preventDefault();
@@ -4040,8 +4042,8 @@ export default function App() {
                   onClick={(event) => setComposerCaret(event.currentTarget.selectionStart)}
                   onKeyDown={handleComposerKeyDown}
                   disabled={sendingOnCurrentRoute || !chatComposerReady || (route.page === 'home' && !homeDraftRecord)}
-                  placeholder={selectedChat?.kind === 'image' ? 'Опишите изображение' : 'Поручите что угодно'}
-                  rows={2}
+                  placeholder={selectedChat?.kind === 'image' ? 'Опишите изображение' : 'Напишите сообщение'}
+                  rows={route.page === 'chat' ? 1 : 2}
                 />
                 {selectedComposerSkillId && <div className="composer-skill-selection" role="status">
                   <span><strong>{selectedComposerSkill?.name ?? 'Выбранный Skill недоступен'}</strong><small>{selectedComposerSkill ? `${selectedComposerSkill.scope === 'global' ? 'Global' : selectedComposerSkill.projectName ?? 'Project'} · инструкция войдёт в запрос модели; scripts/assets не запускаются` : 'Включите Skill в настройках или снимите выбор.'}</small></span>
